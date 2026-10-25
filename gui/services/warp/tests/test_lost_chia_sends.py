@@ -3095,3 +3095,63 @@ def test_a_pending_third_party_sweep_is_pushed_again(monkeypatch):
     out = engine.step()
     assert out["status"] == JobStatus.CLAIMING and pushes == [1]
     assert "retrying" in _last_message(store, job.id)
+
+
+# --------------------------------------------------------------------------- #
+# Third independent review: what the operator can see.
+# --------------------------------------------------------------------------- #
+
+def test_the_job_view_carries_the_sweep_outcome_and_the_open_attempts():
+    store = new_store()
+    job = seed(store, JobStatus.FAILED, state={
+        "failed_from": JobStatus.FUNDING_CLAIM, "swept": False,
+        "sweep_status": "ok; attempt fund-a... could still land",
+        "funding_tx_id_prior": ["fund-a", "fund-b"], "funding_tx_id_prior_dead": ["fund-b"],
+        "burn_tx_id_prior": ["burn-a"]})
+    view = S._job_dict(store.get_job(job.id))
+    assert view["swept"] is False and "could still land" in view["sweep_status"]
+    assert view["attempts_open"] == 2
+
+
+def test_a_sweep_that_does_not_close_the_job_is_a_notice_in_the_snapshot(monkeypatch):
+    """[review] The operator saw a click do nothing."""
+    worker = S._WarpWorker()
+    worker._engine = SimpleNamespace(
+        job_action=lambda jid, action: {"status": JobStatus.FAILED,
+                                        "sweep_status": "ok; Sweep again later"},
+        snapshot=lambda: {"enabled": True})
+    monkeypatch.setattr(worker, "_ensure_engine", lambda: worker._engine)
+    monkeypatch.setattr(worker, "_wallet_summary", lambda hot: {})
+    snap = worker._guarded(lambda e: e.job_action(1, "sweep"))
+    assert snap["action_notice"] == "Sweep: ok; Sweep again later"
+    assert "action_error" not in snap
+
+
+def test_the_no_coin_sweep_status_names_the_sends_fate(monkeypatch):
+    """[review] Job 4's pre-Retry shape used to read "may not be indexed yet"."""
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store, funding_tx_id=DEAD_TX, funding_amount=EXPECTED,
+                        funding_tx_id_removals=[RID])
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = PEAK
+    resolved, status = engine._funding_provably_gone(job)
+    assert not resolved and "can never confirm" in status and "Retry sends it again" in status
+    ctx.coinset.records[RID] = _rec(spent=False)
+    resolved, status = engine._funding_provably_gone(job)
+    assert not resolved and "Retry sends it again" in status and "excluded" in status
+
+
+def test_a_completed_claims_deadline_names_the_funding_wait():
+    store = new_store()
+    engine, ctx = build(store)
+    limit = S._PENDING_MAX_POLLS[JobStatus.CLAIMING]
+    ctx.coinset.records["f2" * 32] = _rec(spent=False)        # the claim landed
+    reason = engine._pending_expired(SimpleNamespace(
+        status=JobStatus.CLAIMING,
+        state={"pending_polls": limit, "final_cat_coin_id": "f2" * 32}))
+    assert "the claim completed" in reason and "Sweep recovers a coin that landed" in reason
+    plain = engine._pending_expired(SimpleNamespace(
+        status=JobStatus.CLAIMING, state={"pending_polls": limit}))
+    assert "the claim completed" not in plain

@@ -5,6 +5,36 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — the bridge judges its Chia sends instead of assuming them
+
+### Lost Chia sends recovered, and never caused again (#191)
+
+On 2026-10-24 a USDC claim's fee-less funding send spent a coin an engine
+offer also used; the offer's spend landed, the engine's stuck-transaction
+cleanup deleted the wallet's unconfirmed transactions, and the job waited two
+hours for a coin that could never appear.
+
+**Judged, not assumed.** Every Chia send a warp job records (the claim's
+funding coin, an unwrap's toll coin, its cat_spend) is judged each tick from
+the wallet and the chain. A send the chain proves dead is sent again at once;
+one that merely vanished waits for Retry (an XCH funding send) or for proof
+of death (a cat_spend -- two burns can never both confirm). Every attempt
+stays on the job's books until it is proven dead, presumed gone after six
+hours absent from the wallet and the mempool, or landed and spent; only then
+does Sweep close the job, a claim complete, or an unwrap finish. Abandon
+records what actually happened.
+
+**Every send pays a fee.** `chia_funding_fee_mojos` and `unwrap_chia_fee_mojos`
+left at `0` are automatic: at least `strategy.offer_fee_mojos`, raised to the
+node's estimate when the mempool demands it. Sends wait for a synced wallet.
+
+**The engine leaves warp's sends alone.** It reads the bridge's job database
+(`warp.jobs_db`, anchored at the config file's directory) each heartbeat and
+excludes any wallet with a warp send in flight -- or a Dexie take whose
+outcome is not yet readable (the new `unknown` take status) -- from its
+stuck-transaction cleanup, fails closed when the database cannot be read,
+and keeps that protection across a config switch.
+
 ## [0.10.31] — 2026-10-24 — a Wallet Link page for the Chia wallet and Sage
 
 ### Settings → Wallet Link (#188)

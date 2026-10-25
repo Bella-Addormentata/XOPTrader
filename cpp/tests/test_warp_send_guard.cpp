@@ -159,6 +159,28 @@ TEST(WarpSendGuardTest, RetiredAttemptsProvenDeadProtectNothing) {
                      .has_value());
 }
 
+TEST(WarpSendGuardTest, AnOrphanedCurrentSendProtectsNothing) {
+    // The GUI's last judgement found the send in no wallet record and no
+    // mempool: nothing to protect.  A judgement that finds it again resets
+    // the count, and the count is only read as an integer.
+    const json orphan = {{"funding_tx_id", "x"}, {"funding_tx_id_orphan_polls", 480}};
+    EXPECT_FALSE(warp_job_chia_send("FUNDING_CLAIM", orphan, kUsdc).has_value());
+    const json failed = {{"failed_from", "FUNDING_CLAIM"}, {"funding_tx_id", "x"},
+                         {"funding_tx_id_orphan_polls", 480}};
+    EXPECT_FALSE(warp_job_chia_send("FAILED", failed, kUsdc).has_value());
+    const json seen = {{"funding_tx_id", "x"}, {"funding_tx_id_orphan_polls", 0}};
+    EXPECT_TRUE(warp_job_chia_send("FUNDING_CLAIM", seen, kUsdc).has_value());
+    const json burn = {{"burn_tx_id", "y"}, {"burn_tx_id_orphan_polls", 3}};
+    EXPECT_FALSE(warp_job_chia_send("BURN_SENT", burn, kUsdc).has_value());
+    const json odd = {{"funding_tx_id", "x"}, {"funding_tx_id_orphan_polls", "480"}};
+    EXPECT_TRUE(warp_job_chia_send("FUNDING_CLAIM", odd, kUsdc).has_value())
+        << "a non-integer count is not evidence";
+    // A retained live prior still protects regardless.
+    const json prior = {{"funding_tx_id", "x"}, {"funding_tx_id_orphan_polls", 9},
+                        {"funding_tx_id_prior", json::array({"a"})}};
+    EXPECT_TRUE(warp_job_chia_send("FUNDING_CLAIM", prior, kUsdc).has_value());
+}
+
 TEST(WarpSendGuardTest, OtherStatusesHoldNoWalletSend) {
     const json state = {{"funding_tx_id", "x"}, {"burn_tx_id", "y"}};
     for (const char* st : {"AWAITING_DEPOSIT", "APPROVING", "BRIDGING",

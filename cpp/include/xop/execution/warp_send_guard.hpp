@@ -129,18 +129,32 @@ struct WarpChiaSend {
         }
         return false;
     };
+    // [review] <tx_key>_orphan_polls > 0 means the GUI's last judgement
+    // found the send in NO wallet record and no mempool item (a judgement
+    // that finds it again resets the count): there is nothing in the
+    // wallet for a cleanup to delete, so the current marker protects
+    // nothing then -- a FAILED job left over a weekend must not hold the
+    // XCH wallet's own stuck-transaction cleanup for a record that is gone.
+    const auto orphaned = [&](const char* polls_key) -> bool {
+        if (!state.is_object() || !state.contains(polls_key)
+            || !state[polls_key].is_number_integer()) {
+            return false;
+        }
+        return state[polls_key].get<std::int64_t>() > 0;
+    };
     const std::string status =
         status_in == "FAILED" ? text("failed_from") : status_in;
     WarpChiaSend s;
     bool any = false;
     if (status == "FUNDING_CLAIM" || status == "BURNING") {
-        if (!text("funding_tx_id").empty()) {
+        if (!text("funding_tx_id").empty()
+            && !orphaned("funding_tx_id_orphan_polls")) {
             s.xch = true;
             any   = true;
         }
     }
     if (status == "BURN_SENT") {
-        if (!text("burn_tx_id").empty()) {
+        if (!text("burn_tx_id").empty() && !orphaned("burn_tx_id_orphan_polls")) {
             s.xch          = true;
             s.cat_asset_id = fingerprint_asset_id(text("asset_fingerprint"));
             if (s.cat_asset_id.empty()) s.cat_asset_id = default_cat_asset_id;

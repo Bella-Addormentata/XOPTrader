@@ -729,7 +729,23 @@ def _job_dict(job: Optional[WarpJob]) -> Optional[dict]:
         "retry_count": job.retry_count,
         "last_error": job.last_error,
         "next_retry_at": job.next_retry_at,
+        # [review] What Sweep found and whether every Chia send the job made
+        # is ruled out: a Sweep that recovered the coin but could not close
+        # the job was otherwise invisible to the operator.
+        "swept": job.state.get("swept"),
+        "sweep_status": job.state.get("sweep_status"),
+        "attempts_open": _open_attempts(job.state),
     }
+
+
+def _open_attempts(state: dict) -> int:
+    """How many replaced Chia sends of a job are not yet proven dead or
+    presumed gone (the ones that keep Sweep / completion waiting)."""
+    n = 0
+    for tx_key in ("funding_tx_id", "burn_tx_id"):
+        dead = set(state.get(f"{tx_key}_prior_dead") or [])
+        n += sum(1 for t in (state.get(f"{tx_key}_prior") or []) if t and t not in dead)
+    return n
 
 
 # --------------------------------------------------------------------------- #
@@ -935,6 +951,16 @@ class WarpEngine:
         if polls < limit:
             return None
         hours = polls * float(self._params.poll_interval_s) / 3600.0
+        if job.status == JobStatus.CLAIMING and self._claim_completed(job):
+            # [review] The claim DID land; the wait is for a replaced funding
+            # send to be ruled out.  "Sweep recovers the funding coin" would
+            # misread: that coin is spent.
+            return (
+                f"the claim completed, but a replaced funding send is not ruled "
+                f"out after {polls} polls (~{hours:.1f}h); handing over to the "
+                "operator -- Sweep recovers a coin that landed, Retry resumes "
+                "the wait, Abandon closes the job"
+            )
         if job.state.get("delivered_by"):
             # [WARP-LOST-SEND] The unwrap WAS delivered; the wait is for a
             # replaced toll send to be ruled out before the job may close
@@ -3230,9 +3256,9 @@ class WarpEngine:
                              f"history (poll {polls}): {why}; waiting"),
                 ), {}
             hint = (("its coins are unknown, so it can never be proven dead; "
-                     "Abandon closes the job if it never lands")
+                     "Abandon (once the job fails at its deadline) closes it")
                     if tx_key == "burn_tx_id"
-                    else "the operator's Retry sends it again")
+                    else "Retry (once the job fails at its deadline) sends it again")
             return _stay(
                 state={polls_key: polls},
                 message=(f"{label} unnamed by the wallet and absent from its "
@@ -3255,9 +3281,10 @@ class WarpEngine:
         if verdict is cs.Verdict.ORPHAN:
             polls += 1
             hint = (("it is sent again once those coins are spent by anything "
-                     "else, which proves it dead; Abandon closes the job")
+                     "else, which proves it dead; Abandon (once the job fails at "
+                     "its deadline) closes it")
                     if tx_key == "burn_tx_id"
-                    else "the operator's Retry sends it again")
+                    else "Retry (once the job fails at its deadline) sends it again")
             return _stay(
                 state={**learned, polls_key: polls},
                 message=f"{label} {tx_id} is {why} (poll {polls}); waiting -- {hint}",
@@ -3950,8 +3977,9 @@ class WarpEngine:
         if int(xch.get("spendable_balance") or 0) < toll_need:
             raise WarpPending(
                 f"spendable XCH below the unwrap budget of {toll_need} mojos "
-                "(toll + 2x unwrap_chia_fee_mojos: the fee is paid on both "
-                "the cat_spend and the toll funding send)"
+                "(the toll plus a fee for the cat_spend and one for the toll "
+                "funding send -- automatic, at least strategy.offer_fee_mojos "
+                "each, unless unwrap_chia_fee_mojos pins them)"
             )
 
         burn_inner_ph = drivers.expected_burn_inner_puzzle_hash(
@@ -5126,6 +5154,28 @@ class WarpEngine:
                     return True, "security coin already spent; nothing left to sweep"
             except Exception as exc:  # noqa: BLE001 -- unknown is not resolved
                 return False, f"could not confirm the security coin's fate: {exc}"
+        # [review] The recorded send is judged, so the status names its fate
+        # and the remedy (job 4's shape read "may not be indexed yet").
+        tx_id = str(job.state.get("funding_tx_id") or "")
+        if tx_id and tx_id != _FUNDING_TX_UNKNOWN:
+            from . import chia_send as cs
+
+            try:
+                ph = claim.security_coin_puzzle_hash(self._load_ephemeral_sk(job)).hex()
+                verdict, why, _ev = self._recorded_send_verdict(
+                    job, tx_key="funding_tx_id", out_ph_hex=ph,
+                    out_amount=int(self._funded_amount(job)), unique_output=True)
+            except Exception as exc:  # noqa: BLE001 -- the generic text below
+                verdict, why = None, str(exc)
+            if verdict is cs.Verdict.DEAD:
+                return False, (f"the recorded funding send can never confirm ({why}); "
+                               "Retry sends it again")
+            if verdict is cs.Verdict.ORPHAN:
+                return False, (f"the recorded funding send is {why}; Retry sends it "
+                               "again (its coins are excluded from the replacement)")
+            if verdict is cs.Verdict.ALIVE:
+                return False, (f"the recorded funding send is still in flight ({why}); "
+                               "Retry resumes waiting for its coin")
         return False, (
             "no unspent security coin at the expected amount -- it may not be "
             "indexed yet, or claim_fee_mojos changed since funding. Leaving the "
@@ -7049,16 +7099,25 @@ class _WarpWorker(QObject):
         to the operator, who sees an enabled button that silently does nothing.
         """
         action_error: Optional[str] = None
+        notice: Optional[str] = None
         try:
             engine = self._ensure_engine()
             if engine is not None:
-                fn(engine)
+                result = fn(engine)
+                # [review] A Sweep that did not close the job says why only
+                # in state.sweep_status: surface it as a notice, as an error
+                # would be, or the operator sees a click do nothing.
+                if isinstance(result, dict) and result.get("sweep_status") \
+                        and result.get("status") == JobStatus.FAILED:
+                    notice = f"Sweep: {result['sweep_status']}"
         except Exception as exc:  # noqa: BLE001 -- never kill the worker
             action_error = str(exc)
             _log.warning("warp worker step failed: %s", exc)
         snap = self._snapshot_or_error()
         if action_error:
             snap["action_error"] = action_error
+        elif notice:
+            snap["action_notice"] = notice
         return snap
 
     def _snapshot_or_error(self) -> dict:
