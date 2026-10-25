@@ -2278,40 +2278,56 @@ class WarpEngine:
         return ((lambda: self._wallet.get_transaction_or_none(tx_id)),
                 (lambda: self._coinset.get_mempool_item_by_tx_id(tx_id)))
 
-    def _identify_unnamed_funding(self, out_ph_hex: str, out_amount: int, *,
-                                  exclude_ids: Sequence[str]) -> Optional[tuple]:
-        """``(tx_id, removals)`` for a funding send the daemon never named,
-        read back from the wallet history ([review]: its coin may have
-        appeared before the next tick, leaving the sentinel with no coins);
-        ``None`` when nothing identifies it or the scan could not run."""
+    def _identify_unnamed(self, scan: Callable[[Sequence[str]], Any], *,
+                          exclude_ids: Sequence[str],
+                          known_removals: Sequence[str]) -> Optional[tuple]:
+        """``(tx_id, removals)`` for a send the daemon never named, read back
+        from the wallet history ([review]: its coin may have appeared before
+        the next tick, leaving the sentinel with no coins).
+
+        One-to-one: a transaction already identified for another attempt
+        (*exclude_ids*), or one whose coins are already recorded under some
+        attempt (*known_removals*), is never handed out again -- one swept
+        output must not settle two attempts.  ``None`` when nothing
+        identifies it or the scan could not run.
+        """
         from . import chia_send as cs
 
-        try:
-            found = self._find_existing_funding(
-                out_ph_hex, int(out_amount), exclude_ids=exclude_ids)
-            if not found:
+        used = [t for t in exclude_ids if t]
+        known = {_hx(c) for c in known_removals if c}
+        for _ in range(16):
+            try:
+                found = scan(used)
+                if not found:
+                    return None
+                tx_id = str(found[0] if isinstance(found, tuple) else found)
+                rec = self._wallet.get_transaction_or_none(tx_id)
+            except Exception:  # noqa: BLE001 -- unidentified, not proof
                 return None
-            rec = self._wallet.get_transaction_or_none(str(found))
-        except Exception:  # noqa: BLE001 -- unidentified, not proof
-            return None
-        return str(found), [_hx(c) for c in cs.removal_ids(rec)] if rec else []
+            removals = [_hx(c) for c in cs.removal_ids(rec)] if rec else []
+            if removals and known.intersection(removals):
+                used.append(tx_id)            # already an attempt on the books
+                continue
+            return tx_id, removals
+        return None
+
+    def _identify_unnamed_funding(self, out_ph_hex: str, out_amount: int, *,
+                                  exclude_ids: Sequence[str],
+                                  known_removals: Sequence[str] = ()) -> Optional[tuple]:
+        return self._identify_unnamed(
+            lambda used: self._find_existing_funding(
+                out_ph_hex, int(out_amount), exclude_ids=used),
+            exclude_ids=exclude_ids, known_removals=known_removals)
 
     def _identify_unnamed_burn(self, job: WarpJob, out_ph_hex: str, out_amount: int, *,
-                               exclude_ids: Sequence[str]) -> Optional[tuple]:
+                               exclude_ids: Sequence[str],
+                               known_removals: Sequence[str] = ()) -> Optional[tuple]:
         """The cat_spend counterpart of :meth:`_identify_unnamed_funding`."""
-        from . import chia_send as cs
-
-        try:
-            found = self._find_existing_burn(
-                int(job.state["cat_wallet_id"]), out_ph_hex, int(out_amount),
-                exclude_ids=exclude_ids)
-            if not found:
-                return None
-            tx_id = found[0]
-            rec = self._wallet.get_transaction_or_none(str(tx_id))
-        except Exception:  # noqa: BLE001
-            return None
-        return str(tx_id), [_hx(c) for c in cs.removal_ids(rec)] if rec else []
+        wid = int(job.state["cat_wallet_id"])
+        return self._identify_unnamed(
+            lambda used: self._find_existing_burn(
+                wid, out_ph_hex, int(out_amount), exclude_ids=used),
+            exclude_ids=exclude_ids, known_removals=known_removals)
 
     def _refresh_exclusions(self, job: WarpJob, *, tx_key: str, out_ph_hex: str,
                             out_amount: int, pending: Dict[str, Any]) -> Dict[str, Any]:
@@ -2507,7 +2523,11 @@ class WarpEngine:
             prior_removals.setdefault(
                 current, list(st.get(f"{tx_key}_removals") or []))
         min_depth = int(self._net.chia_confirmation_min_height)
+        # [review] Identification is one-to-one: every named attempt, every
+        # id handed to an unnamed one, and every coin already on the books
+        # is excluded from the next identification.
         named = [t for t in attempts if not self._unnamed(t)]
+        on_the_books = [c for cs_ in prior_removals.values() for c in (cs_ or [])]
         for tx_id in attempts:
             probe_id, coins = tx_id, list(prior_removals.get(tx_id) or [])
             if self._unnamed(tx_id) and not coins:
@@ -2518,12 +2538,15 @@ class WarpEngine:
                 # that would have adopted the id -- and the current marker is
                 # then persisted under that name; otherwise nothing can rule
                 # it out.
-                ident = self._identify_unnamed_funding(ph, amount, exclude_ids=named)
+                ident = self._identify_unnamed_funding(
+                    ph, amount, exclude_ids=named, known_removals=on_the_books)
                 if not ident or not ident[1]:
                     return False, ("a send the wallet never named, whose coins are "
                                    "not known, cannot be ruled out; Sweep again "
                                    "later or Abandon")
                 probe_id, coins = ident
+                named.append(probe_id)
+                on_the_books.extend(coins)
                 if tx_id == f"{_FUNDING_TX_UNKNOWN}#current":
                     try:
                         self._store.update_job(
@@ -2602,14 +2625,21 @@ class WarpEngine:
         prior_removals = st.get("burn_tx_id_prior_removals") or {}
         min_depth = int(self._net.chia_confirmation_min_height)
         named = [t for t in priors if not self._unnamed(t)]
+        on_the_books = [c for cs_ in prior_removals.values() for c in (cs_ or [])]
+        if st.get("burn_tx_id") and not self._unnamed(str(st.get("burn_tx_id"))):
+            named.append(str(st.get("burn_tx_id")))
+        on_the_books.extend(c for c in (st.get("burn_tx_id_removals") or []) if c)
         for tx_id in priors:
             probe_id, coins = tx_id, list(prior_removals.get(tx_id) or [])
             if self._unnamed(tx_id) and not coins:
-                ident = self._identify_unnamed_burn(job, ph, amount, exclude_ids=named)
+                ident = self._identify_unnamed_burn(
+                    job, ph, amount, exclude_ids=named, known_removals=on_the_books)
                 if not ident or not ident[1]:
                     return False, ("an earlier cat_spend the wallet never named, "
                                    "whose coins are not known, cannot be ruled out")
                 probe_id, coins = ident
+                named.append(probe_id)
+                on_the_books.extend(coins)
             probe_wallet, probe_mempool = self._send_probes(probe_id)
             ev = cs.gather(
                 wallet_record=probe_wallet,

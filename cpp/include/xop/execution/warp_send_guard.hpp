@@ -128,8 +128,12 @@ struct WarpChiaSend {
     // A job that REPLACED a send keeps its wallets protected in every
     // active status until it closes: an earlier attempt's coin may have
     // carried the job forward while the replacement is still confirming,
-    // and the GUI settles the attempts only when it closes the job.
-    if (has_priors("funding_tx_id_prior") && !text("funding_tx_id").empty()) {
+    // and the GUI settles the attempts only when it closes the job.  For
+    // the XCH funding sends the retained attempts alone suffice: Retry
+    // clears the marker and keeps the orphan on the books, and a gate or a
+    // refusal can leave the job in that state with the orphan still able
+    // to resurface.
+    if (has_priors("funding_tx_id_prior")) {
         s.xch = true;
         any   = true;
     }

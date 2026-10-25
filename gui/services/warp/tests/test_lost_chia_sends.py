@@ -2250,3 +2250,76 @@ def test_an_unnamed_current_attempt_is_identified_from_the_history_for_settlemen
     ctx.wallet.txs = []
     settled, note = engine._prior_sends_settled(store.get_active_job())
     assert not settled and "not known" in note
+
+
+# --------------------------------------------------------------------------- #
+# Review round 24.
+# --------------------------------------------------------------------------- #
+
+def test_one_history_transaction_identifies_at_most_one_attempt():
+    """[review] Two unnamed attempts with no coins and one matching history
+    transaction: one is identified, the other stays unresolved; a second
+    transaction settles both."""
+    from gui.services.warp import chia_send as cs
+
+    k1, k2 = S._FUNDING_TX_UNKNOWN + "#1", S._FUNDING_TX_UNKNOWN + "#2"
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    ph = claim_mod.security_coin_puzzle_hash(engine._load_ephemeral_sk(job)).hex()
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": [k1, k2], "funding_tx_id_prior_removals": None})
+
+    def tx(name, parent):
+        removal = {"parent_coin_info": parent, "puzzle_hash": "11" * 32,
+                   "amount": 499_005_000_000}
+        rid = cs.coin_id(parent, "11" * 32, 499_005_000_000)
+        ctx.wallet.tx_records[name] = {"confirmed": True, "removals": [removal]}
+        ctx.coinset.records[rid] = _rec(spent=True)
+        return ({"name": name, "confirmed": True, "removals": [removal],
+                 "additions": [{"puzzle_hash": ph, "amount": NET.chia_toll_mojos}]},
+                SimpleNamespace(coin=SimpleNamespace(parent_coin_info=rid, puzzle_hash=ph,
+                                                     amount=NET.chia_toll_mojos),
+                                spent=True, confirmed_block_index=PEAK - 50,
+                                spent_block_index=PEAK - 40))
+
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID2] = _rec(spent=True)             # the current attempt: dead
+    tx1, out1 = tx("toll-x", "d4" * 32)
+    ctx.wallet.txs = [tx1]
+    ctx.coinset.by_ph = [out1]
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "not known" in note, "toll-x cannot settle both"
+
+    tx2, out2 = tx("toll-y", "d5" * 32)
+    ctx.wallet.txs = [tx1, tx2]
+    ctx.coinset.by_ph = [out1, out2]
+    assert engine._prior_sends_settled(store.get_active_job())[0]
+
+
+def test_a_transaction_already_on_the_books_is_not_handed_to_an_unnamed_attempt():
+    """[review] A history transaction whose coins are recorded under some
+    attempt is that attempt, not the unnamed one's."""
+    from gui.services.warp import chia_send as cs
+
+    k1 = S._FUNDING_TX_UNKNOWN + "#1"
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    ph = claim_mod.security_coin_puzzle_hash(engine._load_ephemeral_sk(job)).hex()
+    removal = {"parent_coin_info": "d4" * 32, "puzzle_hash": "11" * 32,
+               "amount": 499_005_000_000}
+    rid = cs.coin_id("d4" * 32, "11" * 32, 499_005_000_000)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id": "toll-x", "funding_tx_id_removals": [rid],  # named, on the books
+        "funding_tx_id_prior": [k1], "funding_tx_id_prior_removals": None})
+    ctx.wallet.tx_records["toll-x"] = {"confirmed": True, "removals": [removal]}
+    ctx.wallet.txs = [{"name": "toll-x", "confirmed": True, "removals": [removal],
+                       "additions": [{"puzzle_hash": ph, "amount": NET.chia_toll_mojos}]}]
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[rid] = _rec(spent=True)
+    ctx.coinset.by_ph = [SimpleNamespace(
+        coin=SimpleNamespace(parent_coin_info=rid, puzzle_hash=ph, amount=NET.chia_toll_mojos),
+        spent=True, confirmed_block_index=PEAK - 50, spent_block_index=PEAK - 40)]
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "not known" in note

@@ -119,12 +119,18 @@ TEST(WarpSendGuardTest, AReplacedSendKeepsProtectionInEveryActiveStatus) {
     ASSERT_TRUE(b.has_value());
     EXPECT_TRUE(b->xch);
     EXPECT_EQ(b->cat_asset_id, kUsdc);
-    // No replacement, no marker, or an empty prior list: the status rules.
+    // A retained funding attempt protects XCH even with no current marker
+    // (Retry cleared it; a gate or a refusal left no replacement yet).
+    const auto r = warp_job_chia_send(
+        "FUNDING_CLAIM", json{{"funding_tx_id_prior", json::array({"a"})}}, kUsdc);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->xch);
+    EXPECT_TRUE(warp_job_chia_send(
+        "CLAIMING", json{{"funding_tx_id_prior", json::array({"a"})}}, kUsdc)
+                    .has_value());
+    // No replacement, or an empty prior list: the status rules.
     EXPECT_FALSE(warp_job_chia_send(
         "CLAIMING", json{{"funding_tx_id", "b"}}, kUsdc).has_value());
-    EXPECT_FALSE(warp_job_chia_send(
-        "CLAIMING", json{{"funding_tx_id_prior", json::array({"a"})}}, kUsdc)
-                     .has_value());
     EXPECT_FALSE(warp_job_chia_send(
         "CLAIMING", json{{"funding_tx_id", "b"},
                          {"funding_tx_id_prior", json::array()}}, kUsdc)
