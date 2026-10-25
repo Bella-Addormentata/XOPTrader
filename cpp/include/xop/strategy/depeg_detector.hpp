@@ -96,7 +96,23 @@ public:
     // WITHOUT resetting its depeg state (a streak in progress keeps counting
     // against the new thresholds), a newly stablecoin pair starts fresh, and
     // a pair no longer marked stablecoin stops being monitored.
-    void set_global_config(const DepegConfig& global_cfg) { global_cfg_ = global_cfg; }
+    //
+    // Switching the detector OFF clears every AUTOMATIC verdict (a Bailed or
+    // Warning pair would otherwise stay blocked by should_bail() with no
+    // update() left to clear it). An operator's flag_suspected_failure() is
+    // kept: only clear_suspected_failure() undoes that.
+    void set_global_config(const DepegConfig& global_cfg)
+    {
+        const bool switched_off = global_cfg_.enabled && !global_cfg.enabled;
+        global_cfg_ = global_cfg;
+        if (!switched_off) return;
+        for (auto& [name, s] : state_) {
+            if (s.manually_flagged) continue;
+            s.blocks_above_bail  = 0;
+            s.block_entered_warn = 0;
+            s.status             = DepegStatus::Normal;
+        }
+    }
 
     void sync_pair(const PairConfig& pair)
     {

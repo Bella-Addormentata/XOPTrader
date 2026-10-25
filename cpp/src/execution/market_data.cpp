@@ -1232,8 +1232,23 @@ void MarketDataFeed::set_arb_threshold_bps(double threshold_bps) {
 
 void MarketDataFeed::set_config(const MarketDataConfig& cfg)
 {
-    std::unique_lock lock(mtx_config_);
-    config_ = cfg;
+    bool bucket_size_changed = false;
+    {
+        std::unique_lock lock(mtx_config_);
+        bucket_size_changed = cfg.vpin_bucket_size != config_.vpin_bucket_size;
+        config_ = cfg;
+    }
+    // Completed VPIN buckets are imbalances of the OLD size; divided by the
+    // new one they mis-state toxicity until they roll out. Start over.
+    // (mtx_config_ is released first: it is never held with another lock.)
+    if (bucket_size_changed) {
+        {
+            std::unique_lock lock(mtx_vpin_);
+            vpin_state_.clear();
+        }
+        std::unique_lock lock(mtx_vpin_metrics_);
+        vpin_metrics_.clear();
+    }
 }
 
 // MEDIUM-6 FIX: Protect arb_callback_ write with mtx_config_ to prevent a

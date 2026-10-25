@@ -1127,6 +1127,7 @@ private:
     /// walking the book (the detached cancel coroutine reads OfferManager
     /// state across awaits). Applied on the first heartbeat after it clears.
     std::optional<LiveConfigPlan> reload_deferred_plan_;
+    std::string reload_deferred_request_id_;   ///< its request id
 
     /// Write data/config_reload.result.json for the GUI: what the last
     /// processed save did. `status` is "applied", "deferred" or "rejected".
@@ -1134,6 +1135,10 @@ private:
                              const std::string& error,
                              const std::vector<std::string>& restart_required);
     std::filesystem::path config_reload_result_path_;
+    /// The request id the GUI wrote into the flag being answered ("reload
+    /// <id>"), echoed as request_id so the GUI matches answer to request
+    /// exactly. Empty for a flag without one.
+    std::string reload_request_id_;
 
     /// [LIVECFG] risk.watchdog_stall_seconds as the dead man's switch was
     /// armed with. The watchdog THREAD reads this, never config_.risk, which

@@ -2271,6 +2271,10 @@ class MainWindow(QMainWindow):
             return
 
         bridge.request_config_reload()
+        # [LIVECFG] _on_config_reload_result checks the answer is about
+        # THIS file: an engine on another config beside the same database
+        # consumes the same flag.
+        self._reload_saved_path = saved_path
 
         launched = getattr(bridge, "launched_config_path", None)
         running = bool(getattr(bridge, "engine_running_locally", False))
@@ -2305,9 +2309,28 @@ class MainWindow(QMainWindow):
         ``restart_required``, the saved settings the running engine could
         not adopt.
         """
+        from pathlib import Path
+
         settings = self._unwrap(self._settings_widget)
         if settings is None:
             return
+        expected = getattr(self, "_reload_saved_path", None)
+        answered = str(result.get("config_file", "") or "")
+        if expected and answered and Path(answered).is_absolute():
+            try:
+                same = Path(answered).resolve() == Path(expected).resolve()
+            except OSError:
+                same = True
+            if not same:
+                if hasattr(settings, "note_reload_state"):
+                    settings.note_reload_state(
+                        f"the engine sharing this database runs a DIFFERENT "
+                        f"config ({answered}) -- this save did NOT reach it")
+                if hasattr(settings, "note_restart_required"):
+                    settings.note_restart_required([])
+                _log.warning("[LIVECFG] reload answered for %s, not the "
+                             "saved %s", answered, expected)
+                return
         status = str(result.get("status", ""))
         restart = [str(item) for item in result.get("restart_required", [])]
         if status == "rejected":
@@ -2358,6 +2381,13 @@ class MainWindow(QMainWindow):
         self._style_start_stop_button()
         self._style_pause_resume_button()
         settings = self._unwrap(self._settings_widget)
+        if not self._bot_running:
+            # start_engine() has reported why; the restart list still stands.
+            if settings is not None and hasattr(settings, "note_reload_state"):
+                settings.note_reload_state(
+                    "the engine stopped but did NOT start again -- see the "
+                    "error message, then use the Start button")
+            return
         if settings is not None and hasattr(settings, "note_restart_required"):
             settings.note_restart_required([])
         if settings is not None and hasattr(settings, "note_reload_state"):

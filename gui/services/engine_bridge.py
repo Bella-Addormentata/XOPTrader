@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Final, Optional
 
@@ -61,13 +62,14 @@ _DEFAULT_DB_PATH: Final[str] = "data/xop_trader.db"
 _DEFAULT_METRICS_URL: Final[str] = "http://localhost:9090/metrics"
 
 
-def read_reload_result(path: Path, *, not_before: float) -> Optional[dict[str, Any]]:
+def read_reload_result(path: Path, *, request_id: str) -> Optional[dict[str, Any]]:
     """[LIVECFG] Parse the engine's config_reload.result.json.
 
-    Returns None unless the file exists, parses, and was processed at or after
-    *not_before* (a time.time() value; the engine stamps whole seconds, so a
-    one-second slack is allowed). The keys are normalised so callers can rely
-    on ``status`` (str), ``error`` (str) and ``restart_required`` (list[str]).
+    Returns None unless the file exists, parses, and answers *request_id*
+    (the id written into the reload flag, which the engine echoes back as
+    ``request_id``; a time stamp could match an older answer). The keys are
+    normalised so callers can rely on ``status`` (str), ``error`` (str),
+    ``restart_required`` (list[str]) and ``config_file`` (str).
     """
     import json  # noqa: WPS433 -- only this helper needs it
 
@@ -77,11 +79,7 @@ def read_reload_result(path: Path, *, not_before: float) -> Optional[dict[str, A
         return None
     if not isinstance(raw, dict):
         return None
-    try:
-        processed_at = float(raw.get("processed_at", 0))
-    except (TypeError, ValueError):
-        return None
-    if processed_at + 1.0 < not_before:
+    if str(raw.get("request_id", "") or "") != request_id:
         return None
     restart = raw.get("restart_required") or []
     if not isinstance(restart, list):
@@ -220,9 +218,11 @@ class EngineBridge(QObject):
         # case an engine (re)start re-reads the port from the saved config.
         self._metrics_url_user_supplied: bool = (
             metrics_url is not None and metrics_url != _DEFAULT_METRICS_URL)
-        # [LIVECFG] time.time() of the last reload request still waiting for
-        # the engine's answer in config_reload.result.json; None when none.
-        self._reload_requested_at: Optional[float] = None
+        # [LIVECFG] Id of the last reload request still waiting for the
+        # engine's final answer in config_reload.result.json; None when none.
+        self._reload_request_id: Optional[str] = None
+        # True once that request's interim "deferred" answer was reported.
+        self._reload_deferred_reported: bool = False
 
         # -- Child services -------------------------------------------------
         self._config_svc: ConfigService = ConfigService(
@@ -774,14 +774,16 @@ class EngineBridge(QObject):
         flag_path = self._db_path.parent / "config_reload.flag"
         try:
             flag_path.parent.mkdir(parents=True, exist_ok=True)
-            # Stamped BEFORE the flag exists: an answer the engine writes
-            # after this moment is the answer to this request.
-            self._reload_requested_at = time.time()
+            # The engine echoes this id in its answer, so an answer to an
+            # earlier save is never taken for this one's.
+            request_id = uuid.uuid4().hex
+            self._reload_request_id = request_id
+            self._reload_deferred_reported = False
             with open(flag_path, "w", encoding="utf-8") as fh:
-                fh.write("reload" + chr(10))
+                fh.write("reload " + request_id + chr(10))
             _log.info("Config reload requested via %s", flag_path)
         except OSError as exc:
-            self._reload_requested_at = None
+            self._reload_request_id = None
             _log.error("Could not write config reload flag %s: %s",
                        flag_path, exc)
             # A silent failure here would leave the Settings label promising
@@ -798,18 +800,25 @@ class EngineBridge(QObject):
     def read_config_reload_result(self) -> Optional[dict[str, Any]]:
         """[LIVECFG] The engine's answer to the last reload, or None.
 
-        None while no answer newer than the last request exists (the engine
-        has not reached its next heartbeat yet), when no request is pending,
-        or when the file cannot be read. Reading it clears the pending
-        request, so each answer is reported once.
+        None while the engine has not answered the last request yet (it
+        has not reached its next heartbeat), when no request is pending, or
+        when the file cannot be read. Each answer is reported once. A
+        "deferred" answer is interim: the request stays pending, and the
+        engine's later "applied" for the same request is reported too.
         """
-        requested = self._reload_requested_at
-        if requested is None:
+        request_id = self._reload_request_id
+        if request_id is None:
             return None
         result = read_reload_result(self.config_reload_result_path,
-                                    not_before=requested)
-        if result is not None:
-            self._reload_requested_at = None
+                                    request_id=request_id)
+        if result is None:
+            return None
+        if result["status"] == "deferred":
+            if self._reload_deferred_reported:
+                return None
+            self._reload_deferred_reported = True
+            return result
+        self._reload_request_id = None
         return result
 
     def set_refresh_interval_ms(self, interval_ms: int) -> None:
@@ -1674,17 +1683,14 @@ class EngineBridge(QObject):
         self._last_trade_request_ts = 0.0
 
     def _follow_restart_only_settings(self) -> None:
-        """[LIVECFG] Before an engine start: re-read the two saved settings
-        the GUI shares with the engine and that only a start can change --
-        database.path (where the DB and every flag file live) and
-        monitoring.prometheus_port (where metrics are served)."""
-        previous_db = self._db_path
-        self._apply_configured_database_path()
-        if self._db_path != previous_db:
-            # The replacement service is not started by its constructor.
-            if not self._database_svc.start():
-                _log.warning("Database open failed for %s; DB features "
-                             "disabled.", self._db_path)
+        """[LIVECFG] Before an engine start: re-read the saved setting the
+        GUI shares with the engine that only a start can change --
+        monitoring.prometheus_port (where metrics are served).
+
+        database.path is deliberately NOT followed here: MainWindow's panels
+        hold the open DatabaseService and its query subscriptions, and the
+        new file may not exist until the engine creates it. It applies when
+        the GUI itself is reopened (Settings says so)."""
         self._sync_metrics_url_from_config()
 
     def _resolve_config_relative_path(self, raw_path: str) -> Path:

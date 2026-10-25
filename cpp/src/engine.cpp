@@ -25944,6 +25944,7 @@ asio::awaitable<void> Engine::check_config_reload_flag()
         apply_live_config(deferred.merged);
         spdlog::info("[Engine] [LIVECFG] the save held back during operator "
                      "Cancel All is now applied");
+        reload_request_id_ = reload_deferred_request_id_;
         write_reload_result("applied", "", deferred.restart_required);
     }
 
@@ -25959,6 +25960,25 @@ asio::awaitable<void> Engine::check_config_reload_flag()
         co_return;
     }
     reload_flag_stuck_mtime_.reset();
+
+    // [LIVECFG] "reload <id>": the id is echoed in the result file.
+    reload_request_id_.clear();
+    {
+        std::ifstream flag_in(config_reload_flag_path_);
+        std::string line;
+        if (flag_in && std::getline(flag_in, line)) {
+            const std::string prefix = "reload ";
+            if (line.rfind(prefix, 0) == 0) {
+                for (char c : line.substr(prefix.size())) {
+                    if (reload_request_id_.size() >= 64) break;
+                    if (std::isalnum(static_cast<unsigned char>(c)) || c == '-'
+                        || c == '_' || c == '.') {
+                        reload_request_id_ += c;
+                    }
+                }
+            }
+        }
+    }
 
     // Consume FIRST: a poison config must trigger one loud failure, not a
     // failure every heartbeat until someone deletes a file by hand.
@@ -26083,6 +26103,7 @@ asio::awaitable<void> Engine::check_config_reload_flag()
     const bool settings_deferred = cancel_all_inflight_;
     if (settings_deferred) {
         reload_deferred_plan_ = plan;
+        reload_deferred_request_id_ = reload_request_id_;
         spdlog::info("[Engine] [LIVECFG] operator Cancel All is in flight -- "
                      "the rest of this save applies on the first heartbeat "
                      "after it completes");
@@ -26246,6 +26267,11 @@ void Engine::apply_live_config(const AppConfig& m)
     }
 
     for (const auto& pair : config_.pairs) {
+        if (depeg_detector_) depeg_detector_->sync_pair(pair);
+        // A pair that is off (at startup, or by this very save) cannot come
+        // back without a restart, and validate_live_config() checked only
+        // the enabled ones: its strategy and tiers are left as they were.
+        if (!pair.enabled) continue;
         if (auto it = strategies_.find(pair.name); it != strategies_.end()) {
             // Built as AvellanedaStoikov by the constructor; anything else
             // there has no saved-config parameters to adopt.
@@ -26258,7 +26284,6 @@ void Engine::apply_live_config(const AppConfig& m)
             it != liquidity_engines_.end() && it->second) {
             it->second->set_config(liquidity_config_from(pair, config_.strategy));
         }
-        if (depeg_detector_) depeg_detector_->sync_pair(pair);
     }
     if (spread_opt_) {
         const SpreadConfig sp = spread_config_from(config_.strategy);
@@ -26326,6 +26351,7 @@ void Engine::write_reload_result(const std::string& status,
         j["error"]            = error;
         j["restart_required"] = restart_required;
         j["config_file"]      = config_file_path_;
+        j["request_id"]       = reload_request_id_;
         j["pid"]              = process_identity_.pid;
         j["processed_at"]     = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();

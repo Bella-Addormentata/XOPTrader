@@ -285,9 +285,25 @@ void VolatilityEstimator::set_tunables(std::uint32_t lookback_blocks,
                                        std::uint32_t candle_aggregation_blocks) noexcept
 {
     std::unique_lock lock(mtx_);
+    // A new candle size makes the window's candles (and the partial one)
+    // samples of a different period: mixing them would mis-state sigma
+    // until they rolled out. Start the window over, as a fresh estimator.
+    if (candle_aggregation_blocks != cfg_.candle_aggregation_blocks) {
+        candles_.clear();
+        agg_tick_count_ = 0;
+        agg_open_ = agg_high_ = agg_low_ = agg_close_ = 0.0;
+        sigma_block_  = 0.0;
+        sigma_annual_ = 0.0;
+        variance_ratio_ = 1.0;
+        regime_ = RegimeInfo{MarketRegime::Random, 1.0, 1.0, 1.0};
+        regime_duration_blocks_ = 0;
+        last_regime_ = MarketRegime::Random;
+        candle_span_ticks_ = 1.0;
+    }
     cfg_.lookback_blocks           = lookback_blocks;
     cfg_.yz_alpha                  = yz_alpha;
     cfg_.candle_aggregation_blocks = candle_aggregation_blocks;
+    while (candles_.size() > cfg_.lookback_blocks) candles_.pop_front();
 }
 
 // ---------------------------------------------------------------------------

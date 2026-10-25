@@ -272,7 +272,9 @@ public:
     /// [LIVECFG] Adopt the operator-tunable fields of a saved config --
     /// lookback, Yang-Zhang alpha and candle aggregation -- keeping the
     /// candle history and the adaptive block time (set_block_time_seconds).
-    /// A shorter lookback trims the oldest candles on the next update.
+    /// A shorter lookback trims the oldest candles. A different candle
+    /// aggregation restarts the window: candles of another period would
+    /// mis-state sigma until they rolled out.
     void set_tunables(std::uint32_t lookback_blocks, double yz_alpha,
                       std::uint32_t candle_aggregation_blocks) noexcept;
 

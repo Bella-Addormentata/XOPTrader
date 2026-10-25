@@ -38,7 +38,7 @@ def qapp():
 
 def _write_result(path: Path, **fields) -> None:
     payload = {"status": "applied", "error": "", "restart_required": [],
-               "processed_at": int(time.time())}
+               "request_id": "req-1", "processed_at": int(time.time())}
     payload.update(fields)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -53,53 +53,84 @@ def test_a_fresh_answer_is_read_and_normalised(tmp_path):
 
     path = tmp_path / "config_reload.result.json"
     _write_result(path, restart_required=["database.path"], error=None)
-    result = read_reload_result(path, not_before=time.time())
+    result = read_reload_result(path, request_id="req-1")
     assert result is not None
     assert result["status"] == "applied"
     assert result["error"] == ""
     assert result["restart_required"] == ["database.path"]
 
 
-def test_an_answer_older_than_the_request_is_ignored(tmp_path):
+def test_an_answer_to_another_request_is_ignored(tmp_path):
+    # Even one written in the same second: only the echoed id counts.
     from gui.services.engine_bridge import read_reload_result
 
     path = tmp_path / "config_reload.result.json"
-    _write_result(path, processed_at=int(time.time()) - 60)
-    assert read_reload_result(path, not_before=time.time()) is None
+    _write_result(path, request_id="req-0")
+    assert read_reload_result(path, request_id="req-1") is None
 
 
 @pytest.mark.parametrize("body", ["", "not json", "[1, 2]",
-                                  '{"processed_at": "soon"}'])
+                                  '{"status": "applied"}'])
 def test_a_missing_or_malformed_answer_is_none(tmp_path, body):
     from gui.services.engine_bridge import read_reload_result
 
     path = tmp_path / "config_reload.result.json"
-    assert read_reload_result(path, not_before=0.0) is None
+    assert read_reload_result(path, request_id="req-1") is None
     path.write_text(body, encoding="utf-8")
-    assert read_reload_result(path, not_before=0.0) is None
+    assert read_reload_result(path, request_id="req-1") is None
 
 
 # --------------------------------------------------------------------------- #
 # EngineBridge: one answer per request
 # --------------------------------------------------------------------------- #
 
-def test_the_bridge_reports_each_answer_once(tmp_path):
+def _bridge(tmp_path):
     from gui.services.engine_bridge import EngineBridge
 
     bridge = EngineBridge.__new__(EngineBridge)
     bridge._db_path = tmp_path / "data" / "xop_trader.db"
-    bridge._reload_requested_at = None
+    bridge._reload_request_id = None
+    bridge._reload_deferred_reported = False
+    return bridge
+
+
+def _flag_id(bridge) -> str:
+    flag = bridge._db_path.parent / "config_reload.flag"
+    word, request_id = flag.read_text(encoding="utf-8").split()
+    assert word == "reload"
+    return request_id
+
+
+def test_the_bridge_reports_each_answer_once(tmp_path):
+    bridge = _bridge(tmp_path)
     assert bridge.read_config_reload_result() is None, "no request pending"
 
     bridge.request_config_reload()
+    request_id = _flag_id(bridge)
+    _write_result(bridge.config_reload_result_path, request_id="older")
     assert bridge.read_config_reload_result() is None, "engine has not answered"
 
-    _write_result(bridge.config_reload_result_path,
+    _write_result(bridge.config_reload_result_path, request_id=request_id,
                   restart_required=["monitoring.prometheus_port"])
     result = bridge.read_config_reload_result()
     assert result is not None
     assert result["restart_required"] == ["monitoring.prometheus_port"]
     assert bridge.read_config_reload_result() is None, "reported once"
+
+
+def test_a_deferred_answer_is_followed_by_the_final_one(tmp_path):
+    bridge = _bridge(tmp_path)
+    bridge.request_config_reload()
+    request_id = _flag_id(bridge)
+    path = bridge.config_reload_result_path
+
+    _write_result(path, request_id=request_id, status="deferred")
+    assert bridge.read_config_reload_result()["status"] == "deferred"
+    assert bridge.read_config_reload_result() is None, "interim reported once"
+
+    _write_result(path, request_id=request_id, status="applied")
+    assert bridge.read_config_reload_result()["status"] == "applied"
+    assert bridge.read_config_reload_result() is None
 
 
 # --------------------------------------------------------------------------- #
@@ -124,12 +155,14 @@ def test_the_restart_row_names_the_waiting_settings(panel):
     assert "database.path" in panel._restart_label.text()
     assert "pair XCH/C enabled" in panel._restart_label.text()
 
+    assert "reopened" in panel._restart_label.text()
+
     panel.note_restart_required([])
     assert panel._restart_btn.isHidden()
     assert panel._restart_label.isHidden()
 
 
-def _route(result: dict) -> SimpleNamespace:
+def _route(result: dict, saved_path=None) -> SimpleNamespace:
     from gui.widgets.main_window import MainWindow
 
     calls = SimpleNamespace(state=None, restart=None)
@@ -137,7 +170,8 @@ def _route(result: dict) -> SimpleNamespace:
         note_reload_state=lambda text: setattr(calls, "state", text),
         note_restart_required=lambda items: setattr(calls, "restart", items),
     )
-    window = SimpleNamespace(_settings_widget=settings, _unwrap=lambda w: w)
+    window = SimpleNamespace(_settings_widget=settings, _unwrap=lambda w: w,
+                             _reload_saved_path=saved_path)
     MainWindow._on_config_reload_result(window, result)
     return calls
 
@@ -160,3 +194,46 @@ def test_a_rejected_save_shows_the_error_and_no_restart_list():
                     "restart_required": ["database.path"]})
     assert "REJECTED" in calls.state and "bad tiers" in calls.state
     assert calls.restart == []
+
+
+def test_an_answer_about_another_config_file_is_not_this_saves(tmp_path):
+    # Settings saved B.yaml; the engine beside the same database runs
+    # A.yaml and answered the shared flag with A's reload.
+    saved = tmp_path / "B.yaml"
+    calls = _route({"status": "applied", "restart_required": [],
+                    "config_file": str(tmp_path / "A.yaml")},
+                   saved_path=str(saved))
+    assert "DIFFERENT" in calls.state and "NOT" in calls.state
+    assert calls.restart == []
+
+    calls = _route({"status": "applied", "restart_required": [],
+                    "config_file": str(saved)}, saved_path=str(saved))
+    assert calls.state == "applied live by the running engine"
+
+
+def test_a_failed_restart_keeps_the_restart_list():
+    from gui.widgets.main_window import MainWindow
+
+    calls = SimpleNamespace(state=None, restart="untouched")
+    settings = SimpleNamespace(
+        note_reload_state=lambda text: setattr(calls, "state", text),
+        note_restart_required=lambda items: setattr(calls, "restart", items),
+    )
+    bridge = SimpleNamespace(engine_running_locally=True)
+
+    def _stop(**_kw):
+        bridge.engine_running_locally = False
+
+    bridge.stop_engine = _stop
+    bridge.start_engine = lambda: None   # launch failed: still not running
+    window = SimpleNamespace(
+        _bridge=bridge, _settings_widget=settings, _unwrap=lambda w: w,
+        _engine_stop_is_ours=lambda: True,
+        _decide_engine_stop=lambda closing: SimpleNamespace(
+            proceed=True, policy="keep"),
+        _style_start_stop_button=lambda: None,
+        _style_pause_resume_button=lambda: None,
+    )
+    MainWindow._on_restart_engine_for_settings(window)
+    assert "did NOT start" in calls.state
+    assert calls.restart == "untouched"

@@ -1828,8 +1828,10 @@ class SettingsWidget(QWidget):
 
         self._db_path = self._make_path_row(
             db_form, "DB Path:", "database_path",
-            "Path to the SQLite database file.  Opened when the engine "
-            "starts: a change applies after an engine restart.",
+            "Path to the SQLite database file.  The engine and this window "
+            "both open it at startup, and every flag file between them lives "
+            "beside it: a change applies after closing and reopening the "
+            "GUI (which restarts the engine).",
             "SQLite Files (*.db *.sqlite *.sqlite3);;All Files (*)",
         )
         layout.addWidget(db_group)
@@ -5374,9 +5376,13 @@ class SettingsWidget(QWidget):
         row: everything saved is live.
         """
         if items:
-            self._restart_label.setText(
-                "Saved, but the running engine applies these only after a "
-                "restart: " + ", ".join(items))
+            text = ("Saved, but the running engine applies these only after a "
+                    "restart: " + ", ".join(items))
+            if "database.path" in items:
+                # This window has the old database open too.
+                text += (". The new database.path also needs the GUI closed "
+                         "and reopened.")
+            self._restart_label.setText(text)
         else:
             self._restart_label.setText("")
         self._restart_label.setVisible(bool(items))

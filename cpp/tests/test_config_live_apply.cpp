@@ -17,6 +17,9 @@
 #include "xop/strategy/kappa_calibrator.hpp"
 #include "xop/strategy/liquidity.hpp"
 #include "xop/execution/offer_manager.hpp"
+#include "xop/execution/market_data.hpp"
+#include "xop/data/volatility.hpp"
+#include "xop/state.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -215,6 +218,74 @@ TEST(ConfigLiveApplySetters, depeg_sync_keeps_a_streak_and_adopts_thresholds)
     d.sync_pair(pc);
     EXPECT_EQ(d.update(pc.name, 0.50, 4u), xop::DepegStatus::Normal)
         << "a pair no longer marked stablecoin is no longer monitored";
+}
+
+TEST(ConfigLiveApplySetters, depeg_switched_off_releases_automatic_bails_only)
+{
+    xop::PairConfig a;
+    a.name                   = "BYC/wUSDC.b";
+    a.is_stablecoin          = true;
+    a.peg_target             = 1.0;
+    a.depeg_warn_pct         = 2.0;
+    a.depeg_bail_pct         = 10.0;
+    a.depeg_sustained_blocks = 1;
+    xop::PairConfig b = a;
+    b.name = "XYZ/wUSDC.b";
+
+    xop::DepegConfig on;
+    on.enabled = true;
+    xop::DepegDetector d{on};
+    d.register_pair(a);
+    d.register_pair(b);
+    ASSERT_EQ(d.update(a.name, 0.50, 1u), xop::DepegStatus::Bailed);
+    d.flag_suspected_failure(b.name);
+    ASSERT_TRUE(d.should_bail(a.name));
+
+    auto off = on;
+    off.enabled = false;
+    d.set_global_config(off);
+    EXPECT_FALSE(d.should_bail(a.name))
+        << "nothing would ever clear an automatic bail while switched off";
+    EXPECT_TRUE(d.should_bail(b.name)) << "an operator's flag is kept";
+}
+
+TEST(ConfigLiveApplySetters, volatility_restarts_its_window_on_a_new_candle_size)
+{
+    xop::VolatilityEstimatorConfig vc;
+    vc.candle_aggregation_blocks = 1;
+    vc.lookback_blocks           = 100;
+    xop::VolatilityEstimator est{vc};
+    for (int i = 0; i < 40; ++i) est.update_tick(1.0 + 0.01 * (i % 3));
+    ASSERT_GT(est.candle_count(), 0u);
+
+    est.set_tunables(100, vc.yz_alpha, 1);
+    EXPECT_GT(est.candle_count(), 0u) << "same candle size: history kept";
+    est.set_tunables(20, vc.yz_alpha, 1);
+    EXPECT_LE(est.candle_count(), 20u) << "a shorter lookback trims";
+
+    est.set_tunables(20, vc.yz_alpha, 10);
+    EXPECT_EQ(est.candle_count(), 0u)
+        << "candles of another period would mis-state sigma";
+}
+
+TEST(ConfigLiveApplySetters, vpin_starts_over_on_a_new_bucket_size)
+{
+    xop::MarketDataConfig mc;
+    mc.vpin_bucket_size    = 10.0;
+    mc.vpin_window_buckets = 50;
+    xop::State state;
+    xop::MarketDataFeed feed{mc, state};
+    const std::string pair = "XCH/wUSDC";
+    for (int i = 0; i < 5; ++i) feed.ingest_trade_for_vpin(pair, xop::Side::Bid, 10.0);
+    ASSERT_TRUE(feed.get_vpin_metrics(pair).has_value());
+
+    feed.set_config(mc);
+    EXPECT_TRUE(feed.get_vpin_metrics(pair).has_value()) << "same size: kept";
+
+    mc.vpin_bucket_size = 100.0;
+    feed.set_config(mc);
+    EXPECT_FALSE(feed.get_vpin_metrics(pair).has_value())
+        << "buckets of the old size would read one-sided flow as ~0.1";
 }
 
 TEST(ConfigLiveApplySetters, kappa_default_moves_until_fills_take_over)
