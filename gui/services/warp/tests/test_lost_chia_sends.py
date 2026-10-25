@@ -2019,3 +2019,106 @@ def test_only_attempts_that_could_still_land_are_excluded(monkeypatch):
     assert st["funding_tx_id_prior_dead"] == ["fund-b"]
     assert st["funding_tx_id_prior_removals"] == {"fund-a": [RID],
                                                   "fund-b": [RID2, other]}
+
+
+# --------------------------------------------------------------------------- #
+# Review round 21.
+# --------------------------------------------------------------------------- #
+
+def test_an_unpinned_scan_adopts_only_a_coin_with_provenance():
+    """[review] After a replacement whose response named no coin, an
+    unrelated CAT of the same receiver and amount is not adopted; a coin
+    the wallet history names as our cat_spend's output is."""
+    from gui.services.warp import clvm_utils as cu
+
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _to_burn_sent(store, engine)
+    burn_ph = store.get_active_job().state["burn_cat_ph"]
+    store.update_job(job.id, state_patch={
+        "burn_tx_id": "burn-b", "burn_tx_id_removals": None,   # inputs unknown
+        "burn_cat_coin_id": None,
+        "burn_tx_id_prior": ["burn-a"],
+        "burn_tx_id_prior_removals": {"burn-a": [RID]},
+        "burn_tx_id_prior_dead": ["burn-a"]})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID] = _rec(spent=True)
+    stranger = SimpleNamespace(                              # someone else's CAT
+        coin=SimpleNamespace(parent_coin_info="cc" * 32, puzzle_hash=burn_ph,
+                             amount=AMOUNT),
+        spent=False, confirmed_block_index=PEAK - 3, spent_block_index=0)
+    ctx.coinset.by_ph = [stranger]
+    out = engine.step()
+    assert out["status"] == JobStatus.BURN_SENT
+    assert ctx.wallet.cat_spends == []
+
+    ours = SimpleNamespace(
+        coin=SimpleNamespace(parent_coin_info="dd" * 32, puzzle_hash=burn_ph,
+                             amount=AMOUNT),
+        spent=False, confirmed_block_index=PEAK - 2, spent_block_index=0)
+    ctx.coinset.by_ph = [stranger, ours]
+    ctx.wallet.cat_txs = [{"name": "burn-b", "additions": [
+        {"puzzle_hash": burn_ph, "amount": AMOUNT, "parent_coin_info": "dd" * 32}]}]
+    out = engine.step()
+    assert out["status"] == JobStatus.BURNING
+    st = store.get_active_job().state
+    assert st["burn_cat_parent"] == "dd" * 32
+    assert st["burn_cat_coin_id"] == cu.coin_name(
+        bytes.fromhex("dd" * 32), bytes.fromhex(burn_ph), AMOUNT).hex()
+
+
+def test_the_third_party_checkpoint_survives_a_failing_settlement_check(monkeypatch):
+    """[review] The resolved sweep is on disk before the settlement check,
+    which can raise; the next tick resumes from it."""
+    monkeypatch.setattr(claim_mod, "find_security_coin",
+                        lambda *a, **k: FakeCoin(b"\x5a" * 32))
+    monkeypatch.setattr(claim_mod, "claim_landed", lambda coinset, cid: False)
+    monkeypatch.setattr(claim_mod, "sync_portal",
+                        lambda coinset, net, *, hint, max_hops=64:
+                        SimpleNamespace(coin_id=b"\x50" * 32))
+    monkeypatch.setattr(claim_mod, "build_and_push_claim",
+                        lambda coinset, net, **kw: SimpleNamespace(
+                            claim=SimpleNamespace(final_cat_coin_id=b"\xf4" * 32),
+                            accepted=False, status="conflict: coin already spent"))
+    monkeypatch.setattr(claim_mod, "message_claimed_on_chain", lambda *a, **k: True)
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep",
+                        lambda *a, **k: ("accepted", "ok"))
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
+    store = new_store()
+    engine, ctx = build(store)
+    job = seed(store, JobStatus.CLAIMING,
+               columns={"bridge_nonce": "00" * 31 + "07", "post_tip_mojos": 4985,
+                        "receiver_ph": "ab" * 32},
+               state={"message_destination": "00" * 32,
+                      "message_contents": ["aa", "bb", "cc"],
+                      "portal_coin_id": (b"\x50" * 32).hex(),
+                      "sigs": {str(i): bytes([0xC0 + i]).hex() for i in range(6)},
+                      "security_coin_id": (b"\x5a" * 32).hex()})
+    blob, _sk = make_ephemeral_blob(job.id)
+    store.update_job(job.id, state_patch={
+        "ephemeral_blob": blob, "funding_amount": EXPECTED,
+        "funding_tx_id": "replacement-tx", "funding_tx_id_removals": [RID2],
+        "funding_tx_id_prior": [DEAD_TX],
+        "funding_tx_id_prior_removals": {DEAD_TX: [RID]}})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID] = _rec(spent=False)             # the orphan could land
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    real = engine._prior_sends_settled
+    boom = {"on": True}
+
+    def flaky(j, *a, **k):
+        if boom["on"]:
+            raise RuntimeError("wallet rpc down")
+        return real(j, *a, **k)
+
+    monkeypatch.setattr(engine, "_prior_sends_settled", flaky)
+    out = engine.step()                                      # the check raised...
+    assert out["status"] == JobStatus.CLAIMING and out["retry_count"] == 1
+    st = store.get_job(job.id).state
+    assert st.get("third_party_claim") and st.get("swept"), "...but the sweep is recorded"
+    boom["on"] = False
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
+    store.update_job(job.id, columns={"next_retry_at": None})
+    out = engine.step()                                      # resumes from the checkpoint
+    assert out["status"] == JobStatus.CLAIMING
+    assert "could still land" in _last_message(store, job.id)

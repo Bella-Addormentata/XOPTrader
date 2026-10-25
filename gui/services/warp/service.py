@@ -1963,9 +1963,15 @@ class WarpEngine:
             if resolved:
                 # [WARP-LOST-SEND] ...and no replaced funding send of this job
                 # could still land: COMPLETED would leave its XCH no Sweep.
-                # The resolved sweep is PERSISTED, so later ticks -- which
-                # find no unspent security coin -- resume from it (below)
-                # instead of pending on a coin that is gone.
+                # The resolved sweep is PERSISTED FIRST ([review]: the
+                # settlement check below can raise -- a wallet login, an
+                # output lookup -- and later ticks, which find no unspent
+                # security coin, must resume from the checkpoint rather than
+                # pend on a coin that is gone).
+                self._store.update_job(
+                    job.id, expected_status=job.status,
+                    state_patch={"third_party_claim": True, "swept": True,
+                                 "sweep_status": status})
                 settled, note = self._prior_sends_settled(job)
                 if not settled:
                     return _stay(
@@ -3501,13 +3507,41 @@ class WarpEngine:
                                      "chain; the unwrap is now forward-only"),
                         )
         else:
+            # [review] Unpinned (a replacement whose response named no coin,
+            # or timed out after broadcasting): once this job has attempts
+            # on record, a coin is adopted only with provenance -- its parent
+            # is one of the coins an attempt spent, or the wallet history
+            # names it as the output of our cat_spend.  A bare ph+amount
+            # match could otherwise bridge an unrelated CAT of the same
+            # receiver and amount while our own replacement lands untracked.
+            mine = self._attempt_coins(job, "burn_tx_id")
+            attempted = bool(mine or job.state.get("burn_tx_id_prior"))
+            known_ids: set = set()
+            if attempted and not job.state.get("burn_tx_id_removals"):
+                # The current attempt's inputs are unknown: the wallet
+                # history is the only way to name its output.
+                try:
+                    found = self._find_existing_burn(
+                        int(job.state["cat_wallet_id"]), burn_cat_ph, amount)
+                except Exception:  # noqa: BLE001 -- then nothing is adopted here
+                    found = None
+                if found and found[1]:
+                    known_ids.add(_hx(found[1]))
+            from . import clvm_utils as cu
+
             for rec in self._coinset.get_coin_records_by_puzzle_hash(burn_cat_ph):
-                if int(rec.coin.amount) == amount and not rec.spent:
-                    return _advance(
-                        JobStatus.BURNING,
-                        state={"burn_cat_parent": _hx(rec.coin.parent_coin_info)},
-                        message="burn CAT is on chain; the unwrap is now forward-only",
-                    )
+                if int(rec.coin.amount) != amount or rec.spent:
+                    continue
+                parent = _hx(rec.coin.parent_coin_info)
+                coin_id = cu.coin_name(
+                    bytes.fromhex(parent), bytes.fromhex(burn_cat_ph), amount).hex()
+                if attempted and parent not in mine and coin_id not in known_ids:
+                    continue                      # not provably this job's
+                return _advance(
+                    JobStatus.BURNING,
+                    state={"burn_cat_parent": parent, "burn_cat_coin_id": coin_id},
+                    message="burn CAT is on chain; the unwrap is now forward-only",
+                )
 
         # b) The persisted marker.  [WARP-LOST-SEND] Judged, not assumed:
         # a cat_spend whose coin went to another spend can never land and is
