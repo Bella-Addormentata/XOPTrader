@@ -20,8 +20,8 @@ parties that matter give independently:
 Verdicts, most certain first:
 
 ``LANDED``   the output exists on chain (spent or not);
-``DEAD``     an input is spent and our output is not among that spend's
-             children: nothing can ever include this send;
+``DEAD``     an input is spent and the chain was asked and showed no output
+             of ours: nothing can ever include this send;
 ``ALIVE``    the wallet still holds it, or the mempool still has it;
 ``ORPHAN``   nowhere, with its inputs unspent: it MAY still surface, so a
              caller waits a bounded number of polls before treating it as
@@ -174,16 +174,27 @@ def gather(
 
 
 def judge(ev: SendEvidence) -> tuple:
-    """``(Verdict, reason)`` for one recorded send."""
+    """``(Verdict, reason)`` for one recorded send.
+
+    DEAD is the one verdict a caller acts on irreversibly (a cat_spend is
+    sent again), so it needs the chain to have ANSWERED that no output of
+    ours exists: a spent input with the output probe unanswered is UNKNOWN,
+    and a wallet that calls the send confirmed is believed over a spent
+    input (the input was spent by this very send).
+    """
     if ev.output_landed:
         return Verdict.LANDED, "its output is on chain"
+    if ev.wallet_known and ev.wallet_confirmed:
+        return Verdict.LANDED, "the wallet calls it confirmed; awaiting the index"
     if ev.removal_spent:
-        return Verdict.DEAD, (
-            "a coin it spent was spent by another transaction, so it can "
-            "never confirm")
+        if ev.output_landed is False:
+            return Verdict.DEAD, (
+                "a coin it spent was spent by another transaction, so it can "
+                "never confirm")
+        return Verdict.UNKNOWN, (
+            "a coin it spent is spent, but the chain did not answer whether "
+            "our output exists")
     if ev.wallet_known:
-        if ev.wallet_confirmed:
-            return Verdict.LANDED, "the wallet calls it confirmed; awaiting the index"
         return Verdict.ALIVE, "the wallet still holds it unconfirmed"
     if ev.in_mempool:
         return Verdict.ALIVE, "the wallet no longer holds it, but the mempool does"

@@ -1672,8 +1672,8 @@ class WarpEngine:
                 job, tx_key="funding_tx_id", label="funding tx",
                 out_ph_hex=security_ph.hex(), out_amount=expected,
                 unique_output=True,
-                scan=lambda: self._find_existing_funding(
-                    security_ph.hex(), expected),
+                scan=lambda dead: self._find_existing_funding(
+                    security_ph.hex(), expected, exclude_ids=dead),
                 resend_on_orphan=True,
             )
             if step is not None:
@@ -2136,8 +2136,8 @@ class WarpEngine:
 
     def _judge_recorded_send(
         self, job: WarpJob, *, tx_key: str, label: str, out_ph_hex: str,
-        out_amount: int, unique_output: bool, scan: Callable[[], Any],
-        resend_on_orphan: bool,
+        out_amount: int, unique_output: bool, scan: Callable[[Sequence[str]], Any],
+        resend_on_orphan: bool, also_clear: Sequence[str] = (),
     ) -> tuple:
         """Judge the Chia send recorded under *tx_key* on this tick.
 
@@ -2149,10 +2149,12 @@ class WarpEngine:
         names coins the replacement must not reuse, where the first send's
         coins are still unspent.
 
-        *scan* is the fail-closed wallet-history dedupe scan (tx id or
-        falsy; raises when it could not run), used for a send the wallet
-        accepted but never named (_FUNDING_TX_UNKNOWN): the history is the
-        only handle on it.
+        *scan* is the fail-closed wallet-history dedupe scan (given the ids
+        already proven dead to skip; returns a tx id or falsy; raises when
+        it could not run), used for a send the wallet accepted but never
+        named (_FUNDING_TX_UNKNOWN): the history is the only handle on it.
+        *also_clear* names state the dead send pinned and a replacement must
+        not inherit (the burn's output coin id).
         """
         from . import chia_send as cs
 
@@ -2170,17 +2172,20 @@ class WarpEngine:
             patch: Dict[str, Any] = {
                 tx_key: None, polls_key: 0, removals_key: None,
                 prior_key: priors + [tx_id],
+                **{key: None for key in also_clear},
             }
             if exclude:
                 patch["_exclude_coin_ids"] = [c for c in exclude if c]
             return None, patch
 
         if tx_id == _FUNDING_TX_UNKNOWN:
-            found = scan()
+            found = scan(priors)
             found_id = found[0] if isinstance(found, tuple) else found
             if found_id:
+                # The coins it spent are re-learned from the record itself.
                 return _stay(
-                    state={tx_key: str(found_id), polls_key: 0},
+                    state={tx_key: str(found_id), polls_key: 0,
+                           removals_key: None},
                     message=(f"{label} identified as {found_id} in the wallet "
                              "history; awaiting the coin"),
                 ), {}
@@ -2296,12 +2301,12 @@ class WarpEngine:
                 return {}
             priors = [t for t in (job.state.get("burn_tx_id_prior") or []) if t]
             cleared = {"burn_tx_id": None, "burn_tx_id_orphan_polls": 0,
-                       "burn_tx_id_removals": None,
+                       "burn_tx_id_removals": None, "burn_cat_coin_id": None,
                        "burn_tx_id_prior": priors + [tx_id]}
             if tx_id == _FUNDING_TX_UNKNOWN:
                 found = self._find_existing_burn(
                     int(job.state["cat_wallet_id"]), job.state["burn_cat_ph"],
-                    int(job.amount_mojos))
+                    int(job.amount_mojos), exclude_ids=priors)
                 return {} if found else cleared
             from . import chia_send as cs
 
@@ -2962,8 +2967,10 @@ class WarpEngine:
             step, resend = self._judge_recorded_send(
                 job, tx_key="burn_tx_id", label="cat_spend",
                 out_ph_hex=burn_cat_ph, out_amount=amount, unique_output=False,
-                scan=lambda: self._find_existing_burn(wid, burn_cat_ph, amount),
+                scan=lambda dead: self._find_existing_burn(
+                    wid, burn_cat_ph, amount, exclude_ids=dead),
                 resend_on_orphan=False,
+                also_clear=("burn_cat_coin_id",),
             )
             if step is not None:
                 return step
@@ -3136,7 +3143,8 @@ class WarpEngine:
                 step, resend = self._judge_recorded_send(
                     job, tx_key="funding_tx_id", label="toll tx",
                     out_ph_hex=ph.hex(), out_amount=toll, unique_output=True,
-                    scan=lambda: self._find_existing_funding(ph.hex(), toll),
+                    scan=lambda dead: self._find_existing_funding(
+                        ph.hex(), toll, exclude_ids=dead),
                     resend_on_orphan=True,
                 )
                 if step is not None:
@@ -3632,6 +3640,22 @@ class WarpEngine:
         """
         from . import claim
 
+        # [WARP-LOST-SEND] One fee per job, fixed on the first sweep: the
+        # bundle is a pure function of (coin, destination, fee), so a later
+        # Sweep re-pushes the SAME bundle (an idempotent "pending") instead
+        # of a differently-priced twin the mempool would reject as a
+        # conflict with the first.
+        fee = job.state.get("sweep_fee_mojos")
+        if not isinstance(fee, int) or isinstance(fee, bool) or fee < 0:
+            fee = self._sweep_fee_for(job)
+            try:
+                self._store.update_job(
+                    job.id, expected_status=job.status,
+                    state_patch={"sweep_fee_mojos": int(fee)},
+                )
+            except Exception as exc:  # noqa: BLE001 -- the push still proceeds
+                _log.warning("warp job %s: could not record the sweep fee (%s)",
+                             job.id, exc)
         try:
             kind, status = claim.build_and_push_sweep(
                 self._coinset,
@@ -3639,15 +3663,26 @@ class WarpEngine:
                 security_coin=coin,
                 destination_puzzle_hash=self._sweep_destination_ph(),
                 ephemeral_sk=sk,
-                sweep_fee=self._sweep_fee_for(job),
+                sweep_fee=int(fee),
             )
         except Exception as exc:  # noqa: BLE001 -- operator can re-sweep later
             return False, f"sweep failed: {exc}"
 
         if kind == "conflict":
-            # The coin is already spent -- by our own claim, or a prior sweep.
-            # Nothing left to recover, so this genuinely is resolved.
-            return True, status
+            # The coin is spent -- by our own claim, a prior sweep -- or a
+            # pending spend of it is in the mempool (an earlier sweep that
+            # has not mined).  Only an ON-CHAIN spend means nothing is left
+            # to recover; a mempool conflict alone must not close the job
+            # over a coin that could still be evicted unspent ([review]).
+            try:
+                if claim.security_coin_spent(self._coinset, coin.name()):
+                    return True, status
+            except Exception as exc:  # noqa: BLE001 -- unknown is not resolved
+                return False, f"sweep conflicted ({status}); the coin's fate is unknown: {exc}"
+            return False, (
+                f"sweep conflicts with a pending spend of the coin ({status}); "
+                "run Sweep again once it confirms"
+            )
 
         # [WARP-SWEEP-VERIFY 2026-08-08] "accepted" and "pending" only say the
         # node took the bundle into its mempool. Treating that as resolved

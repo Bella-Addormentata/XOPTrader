@@ -20634,10 +20634,15 @@ execution::WarpSendGuard read_warp_send_guard(const std::string& db_path,
                                               const std::string& default_cat)
 {
     execution::WarpSendGuard guard;
+    if (db_path.empty()) return guard;
     std::error_code ec;
-    if (db_path.empty() || !std::filesystem::exists(db_path, ec)) {
+    const bool exists = std::filesystem::exists(db_path, ec);
+    if (ec) {
+        // Could not even inspect the path: not "absent", unknown.
+        guard.readable = false;
         return guard;
     }
+    if (!exists) return guard;
     sqlite3* raw_db = nullptr;
     const int rc = sqlite3_open_v2(db_path.c_str(), &raw_db,
                                    SQLITE_OPEN_READONLY, nullptr);
@@ -20679,13 +20684,21 @@ execution::WarpSendGuard read_warp_send_guard(const std::string& db_path,
     }
     {
         // dexie_takes arrived with [MILLIETH-TOPUP]; an older store has no
-        // such table, which is not an error here.
+        // such table, which is not an error here.  Any OTHER prepare
+        // failure (locked, I/O) leaves the takes unknown: unreadable.
         static constexpr const char* kTakesSql =
             "SELECT COALESCE(status, ''), COALESCE(asset_id, '') "
             "FROM dexie_takes WHERE status IN ('submitting', 'submitted')";
         sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(raw_db, kTakesSql, -1, &stmt, nullptr)
-            == SQLITE_OK) {
+        const int prep = sqlite3_prepare_v2(raw_db, kTakesSql, -1, &stmt,
+                                            nullptr);
+        if (prep != SQLITE_OK) {
+            const char* msg = sqlite3_errmsg(raw_db);
+            if (std::string(msg ? msg : "").find("no such table")
+                == std::string::npos) {
+                guard.readable = false;
+            }
+        } else {
             const std::unique_ptr<sqlite3_stmt, int (*)(sqlite3_stmt*)> sg(
                 stmt, &sqlite3_finalize);
             int step_rc;

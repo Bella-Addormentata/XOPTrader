@@ -145,7 +145,9 @@ def test_a_spent_input_outranks_the_wallets_optimism():
     assert cs.judge(ev)[0] is cs.Verdict.DEAD
 
 
-def test_a_failing_output_probe_does_not_hide_a_dead_send():
+def test_a_spent_input_with_no_output_answer_is_unknown_not_dead():
+    """[review] DEAD re-sends a cat_spend; it needs the chain to have said
+    there is no output of ours, not merely to have failed to answer."""
     rid = "c" * 64
 
     def boom():
@@ -154,5 +156,21 @@ def test_a_failing_output_probe_does_not_hide_a_dead_send():
     ev = cs.gather(wallet_record=lambda: None, mempool_item=lambda: None,
                    coin_spent=lambda cid: True, outputs_at=boom,
                    known_removals=[rid], out_amount=OUT_AMOUNT, unique_output=True)
-    assert ev.output_landed is None
-    assert cs.judge(ev)[0] is cs.Verdict.DEAD
+    assert ev.output_landed is None and ev.removal_spent is True
+    verdict, why = cs.judge(ev)
+    assert verdict is cs.Verdict.UNKNOWN and "did not answer" in why
+
+
+def test_the_wallets_confirmation_outranks_a_spent_input():
+    """[review] A confirmed send spent its own inputs; with the output
+    probe down that must read LANDED, never DEAD."""
+    rid = "c" * 64
+
+    def boom():
+        raise RuntimeError("coinset down")
+
+    ev = cs.gather(wallet_record=lambda: {"confirmed": True},
+                   mempool_item=lambda: None, coin_spent=lambda cid: True,
+                   outputs_at=boom, known_removals=[rid], out_amount=OUT_AMOUNT,
+                   unique_output=True)
+    assert cs.judge(ev)[0] is cs.Verdict.LANDED

@@ -70,8 +70,12 @@ def test_the_guard_is_read_from_warp_jobs_db_and_fails_closed():
     assert "SQLITE_OPEN_READONLY" in body
     assert "FROM warp_jobs WHERE active = 1" in body
     assert "FROM dexie_takes WHERE status IN ('submitting', 'submitted')" in body
-    assert body.count("guard.readable = false") >= 3
+    assert body.count("guard.readable = false") >= 5
     assert "std::filesystem::exists(db_path, ec)" in body
+    # An unanswerable path and a dexie_takes prepare error other than the
+    # table's absence both read as unreadable.
+    assert "if (ec) {" in body
+    assert '"no such table"' in body
     holds = text.index("bool Engine::wallet_holds_warp_send(")
     holds_body = text[holds:text.index("\n}\n", holds)]
     assert "if (!g.readable) return true;" in holds_body

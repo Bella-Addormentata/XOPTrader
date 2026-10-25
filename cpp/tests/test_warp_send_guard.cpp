@@ -81,6 +81,26 @@ TEST(WarpSendGuardTest, AnUnstampedCatSpendIsTheBridgeAsset) {
     EXPECT_EQ(t->cat_asset_id, kUsdc);
 }
 
+TEST(WarpSendGuardTest, AFailedJobIsReadByWhereItFailedFrom) {
+    // Job 4 after its two-hour timeout: FAILED, marker kept, slot kept --
+    // and the send it recorded is still whatever it was.
+    const json state = {{"failed_from", "FUNDING_CLAIM"},
+                        {"funding_tx_id", "0xa7f5"}};
+    const auto s = warp_job_chia_send("FAILED", state, kUsdc);
+    ASSERT_TRUE(s.has_value());
+    EXPECT_TRUE(s->xch);
+    const json burn = {{"failed_from", "BURN_SENT"}, {"burn_tx_id", "x"}};
+    const auto b = warp_job_chia_send("FAILED", burn, kUsdc);
+    ASSERT_TRUE(b.has_value());
+    EXPECT_EQ(b->cat_asset_id, kUsdc);
+    // Failed from a state with no wallet send, or with no record of where.
+    EXPECT_FALSE(warp_job_chia_send(
+        "FAILED", json{{"failed_from", "BRIDGING"}, {"funding_tx_id", "x"}},
+        kUsdc).has_value());
+    EXPECT_FALSE(warp_job_chia_send("FAILED", json{{"funding_tx_id", "x"}},
+                                    kUsdc).has_value());
+}
+
 TEST(WarpSendGuardTest, OtherStatusesHoldNoWalletSend) {
     const json state = {{"funding_tx_id", "x"}, {"burn_tx_id", "y"}};
     for (const char* st : {"AWAITING_DEPOSIT", "APPROVING", "BRIDGING",

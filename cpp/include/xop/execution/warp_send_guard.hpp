@@ -75,11 +75,14 @@ struct WarpChiaSend {
 /// cat_spend (state.burn_tx_id) moves the job's CAT and pays any fee from
 /// XCH, so it touches both wallets; the CAT is the fingerprint's asset,
 /// else @p default_cat_asset_id (the wUSDC.b bridge asset, the only one
-/// jobs stamped before fingerprints could unwrap).  Every other status
-/// either has no Chia send outstanding or pushes bundles the wallet never
-/// holds (the claim and burn bundles go straight to the node).
+/// jobs stamped before fingerprints could unwrap).  A FAILED job keeps the
+/// active slot AND its markers -- a confirmation timeout does not stop the
+/// send it recorded -- so it is read by the status it failed from
+/// (state.failed_from) until the operator retries or closes it.  Every
+/// other status either has no Chia send outstanding or pushes bundles the
+/// wallet never holds (the claim and burn bundles go straight to the node).
 [[nodiscard]] inline std::optional<WarpChiaSend> warp_job_chia_send(
-    const std::string& status, const nlohmann::json& state,
+    const std::string& status_in, const nlohmann::json& state,
     const std::string& default_cat_asset_id)
 {
     const auto text = [&](const char* key) -> std::string {
@@ -89,6 +92,8 @@ struct WarpChiaSend {
         }
         return state[key].get<std::string>();
     };
+    const std::string status =
+        status_in == "FAILED" ? text("failed_from") : status_in;
     if (status == "FUNDING_CLAIM" || status == "BURNING") {
         if (text("funding_tx_id").empty()) return std::nullopt;
         WarpChiaSend s;

@@ -144,7 +144,10 @@ class WalletClient:
         if memos:
             body["memos"] = list(memos)
         if exclude_coin_ids:
-            body["exclude_coin_ids"] = [
+            # The daemon's coin-selection field (tx_config) is
+            # ``excluded_coin_ids``, as the engine's create_offer_for_ids
+            # payload spells it.
+            body["excluded_coin_ids"] = [
                 c if str(c).startswith("0x") else "0x" + str(c)
                 for c in exclude_coin_ids
             ]

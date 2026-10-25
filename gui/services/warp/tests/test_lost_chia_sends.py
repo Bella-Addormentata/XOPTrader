@@ -434,3 +434,110 @@ def test_the_sweep_pays_the_automatic_fee_from_the_coin(monkeypatch):
         job = _seed_funding(store, funding_amount=EXPECTED)
         resolved, _status = engine._sweep_security(job, FakeCoin(b"\x5a" * 32), b"\x01" * 32)
         assert resolved and seen["fee"] == want
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1.
+# --------------------------------------------------------------------------- #
+
+def test_the_excluded_coins_reach_the_daemon_under_its_field_name():
+    """[review] The daemon's tx_config field is excluded_coin_ids."""
+    from gui.services.warp.wallet import WalletClient
+
+    seen = {}
+
+    def poster(url, body):
+        seen["body"] = body
+        return {"success": True, "transaction": {"name": "0xaa"}}
+
+    WalletClient({}, poster=poster).send_transaction(
+        1, 5, "xch1abc", fee_mojos=3, exclude_coin_ids=[RID, "0x" + "ee" * 32])
+    assert seen["body"]["excluded_coin_ids"] == ["0x" + RID, "0x" + "ee" * 32]
+    assert "exclude_coin_ids" not in seen["body"]
+
+
+def test_a_dead_cat_spends_output_pin_goes_with_it():
+    """[review] The replacement must not inherit the first send's burn CAT
+    coin id, or completion polls a coin that can never exist."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _to_burn_sent(store, engine)
+    store.update_job(job.id, state_patch={
+        "burn_tx_id": "burn-dead", "burn_tx_id_removals": [RID],
+        "burn_cat_coin_id": "aa" * 32})
+    ctx.coinset.records[RID] = _rec(spent=True)
+    engine.step()
+    st = store.get_active_job().state
+    assert len(ctx.wallet.cat_spends) == 1
+    assert st.get("burn_cat_coin_id") is None
+    assert st["burn_tx_id"] == "burn-tx-1"
+
+
+def test_retry_clears_the_output_pin_with_the_vanished_cat_spend():
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _to_burn_sent(store, engine)
+    store.update_job(job.id, state_patch={
+        "burn_tx_id": "burn-gone", "burn_tx_id_removals": [RID],
+        "burn_cat_coin_id": "aa" * 32})
+    ctx.coinset.records[RID] = _rec(spent=False)
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     expected_status=JobStatus.BURN_SENT,
+                     state_patch={"failed_from": JobStatus.BURN_SENT})
+    engine.job_action(job.id, "retry")
+    st = store.get_job(job.id).state
+    assert st["burn_tx_id"] is None and st["burn_cat_coin_id"] is None
+
+
+def test_an_unnamed_send_never_adopts_an_id_proven_dead(monkeypatch):
+    """[review] The history scan for an unnamed send skips the dead ids."""
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_funding(store, funding_tx_id=S._FUNDING_TX_UNKNOWN,
+                  funding_tx_id_prior=[DEAD_TX])
+    ctx.wallet.txs = [{"name": DEAD_TX, "additions": [
+        {"puzzle_hash": SECURITY_PH.hex(), "amount": EXPECTED}]}]
+    engine.step()
+    st = store.get_active_job().state
+    assert st["funding_tx_id"] == S._FUNDING_TX_UNKNOWN
+    assert st["funding_tx_id_orphan_polls"] == 1
+    assert ctx.wallet.sent == []
+
+
+def test_the_sweep_fee_is_fixed_on_the_first_sweep(monkeypatch):
+    """[review] A re-sweep must push the SAME bundle: a differently-priced
+    twin conflicts with the pending first one in the mempool."""
+    fees = []
+
+    def capture(coinset, net, *, security_coin, destination_puzzle_hash,
+                ephemeral_sk, sweep_fee=0):
+        fees.append(sweep_fee)
+        return ("accepted", "ok")
+
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep", capture)
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: False)
+    store = new_store()
+    engine, ctx = build(store, params=default_params(offer_fee_mojos=10_000_000))
+    job = _seed_funding(store, funding_amount=EXPECTED)
+    engine._sweep_security(job, FakeCoin(b"Z" * 32), b"" * 32)
+    assert store.get_active_job().state["sweep_fee_mojos"] == 10_000_000
+    ctx.coinset.fee_estimates = [50_000_000]            # the market moved
+    engine._sweep_security(store.get_active_job(), FakeCoin(b"Z" * 32), b"" * 32)
+    assert fees == [10_000_000, 10_000_000]
+
+
+def test_a_sweep_conflict_resolves_only_a_spent_coin(monkeypatch):
+    """[review] A mempool conflict may be our own pending sweep; only an
+    on-chain spend means nothing is left to recover."""
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep",
+                        lambda *a, **k: ("conflict", "MEMPOOL_CONFLICT"))
+    store = new_store()
+    engine, _ctx = build(store)
+    job = _seed_funding(store, funding_amount=EXPECTED)
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: False)
+    resolved, status = engine._sweep_security(job, FakeCoin(b"Z" * 32), b"" * 32)
+    assert not resolved and "pending spend" in status
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
+    resolved, _status = engine._sweep_security(job, FakeCoin(b"Z" * 32), b"" * 32)
+    assert resolved
