@@ -3572,11 +3572,15 @@ def test_a_send_hold_pends_before_the_wallet_is_asked():
     engine._require_wallet_synced("claim security-coin funding")
 
 
-def _funding_advance_state(monkeypatch, parent_hex):
+def _funding_advance_state(monkeypatch, parent_hex, *, deep):
     store = new_store()
     engine, ctx = build(store)
+    coin_id = b"\x5a" * 32
     monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: SimpleNamespace(
-        name=lambda: b"\x5a" * 32, parent_coin_info=bytes.fromhex(parent_hex)))
+        name=lambda: coin_id, parent_coin_info=bytes.fromhex(parent_hex)))
+    ctx.coinset.peak = PEAK
+    if deep:
+        ctx.coinset.records[coin_id.hex()] = _rec(spent=False)   # 2,421 confirmations
     _seed_funding(store, funding_tx_id="toll-b", funding_amount=EXPECTED,
                   funding_tx_id_removals=["d4" * 32])
     assert engine.step()["status"] == JobStatus.CLAIM_FUNDED
@@ -3585,12 +3589,16 @@ def _funding_advance_state(monkeypatch, parent_hex):
 
 def test_the_current_attempts_own_coin_marks_it_landed_for_the_guard(monkeypatch):
     """[review] The engine's guard protects the current attempt in every
-    status until the wallet drops its record or ITS OWN output is on chain:
-    the advance that finds the coin says which, by the coin's parent."""
-    assert _funding_advance_state(monkeypatch, "d4" * 32).get("funding_tx_id_landed") is True
+    status until the wallet drops its record or ITS OWN output is on chain
+    AT DEPTH: the advance that finds the coin says which, by the coin's
+    parent -- and records nothing while the coin is shallow or unindexed."""
+    assert _funding_advance_state(
+        monkeypatch, "d4" * 32, deep=True).get("funding_tx_id_landed") is True
     # An EARLIER attempt's coin carried the job: the current one may still
     # be confirming, so it stays protected (no flag).
-    assert "funding_tx_id_landed" not in _funding_advance_state(monkeypatch, "d9" * 32)
+    assert "funding_tx_id_landed" not in _funding_advance_state(monkeypatch, "d9" * 32, deep=True)
+    # Its own coin, but not indexed at depth yet: nothing tentative is kept.
+    assert "funding_tx_id_landed" not in _funding_advance_state(monkeypatch, "d4" * 32, deep=False)
 
 
 def test_a_replacement_clears_the_landed_flag(monkeypatch):
@@ -3606,7 +3614,7 @@ def test_a_replacement_clears_the_landed_flag(monkeypatch):
     assert st["funding_tx_id"] == "funding-tx-1" and st.get("funding_tx_id_landed") is None
 
 
-def test_the_burn_cats_parent_marks_the_cat_spend_landed_for_the_guard():
+def _burn_sent_advance_state(confirmed_block_index):
     store = new_store()
     engine, ctx = build_unwrap(store, params=params_with_cap())
     job = _to_burn_sent(store, engine)
@@ -3614,11 +3622,19 @@ def test_the_burn_cats_parent_marks_the_cat_spend_landed_for_the_guard():
     x = "d4" * 32
     store.update_job(job.id, state_patch={
         "burn_tx_id": "burn-x", "burn_tx_id_removals": [x], "burn_cat_coin_id": "c1" * 32})
+    ctx.coinset.peak = PEAK
     ctx.coinset.records["c1" * 32] = SimpleNamespace(
         coin=SimpleNamespace(parent_coin_info=x, puzzle_hash=burn_ph, amount=AMOUNT),
-        spent=False, confirmed_block_index=PEAK - 3, spent_block_index=0)
+        spent=False, confirmed_block_index=confirmed_block_index, spent_block_index=0)
     assert engine.step()["status"] == JobStatus.BURNING
-    assert store.get_active_job().state.get("burn_tx_id_landed") is True
+    return store.get_active_job().state
+
+
+def test_the_burn_cats_parent_marks_the_cat_spend_landed_for_the_guard():
+    """[review] At depth only: a shallow burn CAT records nothing (a reorg
+    could take it back), a deep one names the cat_spend landed."""
+    assert "burn_tx_id_landed" not in _burn_sent_advance_state(PEAK - 3)
+    assert _burn_sent_advance_state(PEAK - 40).get("burn_tx_id_landed") is True
 
 
 def test_the_worker_follows_the_running_engines_store(tmp_path):
@@ -3779,3 +3795,60 @@ def test_publish_retained_pointer_names_the_store_with_open_work(tmp_path):
         wanted, [str(tmp_path / "missing.db"), str(idle), str(busy)]) == str(busy)
     assert pointer.read_text(encoding="utf-8").strip() == str(busy.resolve())
     assert S.publish_retained_pointer(":memory:", [str(busy)]) is None
+
+
+def test_the_landed_flag_waits_for_depth_and_clears_when_the_coin_vanishes(monkeypatch):
+    """[review] CLAIM_FUNDED revalidates the evidence: a flag set earlier is
+    withdrawn while the pinned coin is off chain, nothing is recorded at
+    4/32 confirmations, and the advance at depth sets it."""
+    from gui.services.warp import clvm_utils as cu
+
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
+    store = new_store()
+    engine, ctx = build(store)
+    job = seed(store, JobStatus.CLAIM_FUNDED,
+               columns={"receiver_ph": "ab" * 32, "post_tip_mojos": 4985})
+    blob, _sk = make_ephemeral_blob(job.id)
+    store.update_job(job.id, state_patch={"ephemeral_blob": blob})
+    ph = claim_mod.security_coin_puzzle_hash(engine._load_ephemeral_sk(store.get_job(job.id)))
+    parent = "d4" * 32
+    cid = cu.coin_name(bytes.fromhex(parent), ph, EXPECTED).hex()
+    store.update_job(job.id, state_patch={
+        "funding_amount": EXPECTED, "funding_tx_id": "toll-b",
+        "funding_tx_id_removals": [parent], "funding_tx_id_landed": True,
+        "security_coin_id": cid})
+    ctx.coinset.peak = PEAK
+    # The pinned coin is nowhere: the evidence is withdrawn, the job waits.
+    assert engine.step()["status"] == JobStatus.CLAIM_FUNDED
+    assert store.get_active_job().state.get("funding_tx_id_landed") is None
+    # Back, shallow (4/32): still nothing recorded.
+    rec = SimpleNamespace(
+        coin=SimpleNamespace(parent_coin_info=parent, puzzle_hash=ph.hex(), amount=EXPECTED),
+        spent=False, confirmed_block_index=PEAK - 3, spent_block_index=0)
+    ctx.coinset.records[cid] = rec
+    assert engine.step()["status"] == JobStatus.CLAIM_FUNDED
+    assert store.get_active_job().state.get("funding_tx_id_landed") is None
+    # At depth: the advance records it.
+    rec.confirmed_block_index = PEAK - 40
+    assert engine.step()["status"] == JobStatus.COLLECTING_SIGS
+    assert store.get_active_job().state.get("funding_tx_id_landed") is True
+
+
+def test_publish_retained_pointer_fails_closed_when_the_pointer_cannot_be_written(
+        tmp_path, monkeypatch):
+    """[review] Open work in a candidate store, and no pointer: a distinct
+    failure the bridge refuses to launch on -- never "nothing to name"."""
+    from gui.services.warp.jobs import WarpJobStore
+
+    busy = tmp_path / "one" / "data" / "old.db"
+    with WarpJobStore(busy) as s:
+        s.create_job("mainnet", status=JobStatus.FUNDING_CLAIM, state={})
+    wanted = str(tmp_path / "two" / "data" / "warp_jobs.db")
+
+    def refuse(pointer, held):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(S, "_write_retained_pointer", refuse)
+    with pytest.raises(S.RetainedPointerError, match="could not be named"):
+        S.publish_retained_pointer(wanted, [str(busy)])
+    assert isinstance(S.RetainedPointerError("x"), S.WarpError)

@@ -38,14 +38,16 @@ stuck-transaction cleanup, fails closed when the database cannot be read,
 and keeps that protection across a config switch. The current attempt
 protects its wallet in every active status -- an earlier attempt's coin may
 carry the job forward while it is still confirming -- until the wallet
-drops its record or its own output is on chain. The bridge records its jobs
+drops its record or its own output is on chain at confirmation depth
+(evidence recorded only then, and withdrawn if the coin is reorged away). The bridge records its jobs
 beside the config the running engine was launched with, and a store move
 waits while a job or a Dexie take is open (the banner says so): a pointer
 file beside the configured store names the kept one -- written as the
 switch happens and again before any engine is launched on the new config,
 never left to the next tick -- so an engine started on the new config
 guards both from its first cleanup and a GUI restarted on it finds the kept
-work again. An `unknown` take is released only
+work again; an engine is not started at all while open work in another
+store cannot be named for its guard. An `unknown` take is released only
 after a day of unreadable trade-record lookups counted from the last pending
 read, never from its age. While an engine this GUI launched runs, the
 bridge records in the jobs database that engine was launched with -- its

@@ -278,3 +278,41 @@ def test_an_absent_or_blank_path_is_refused_in_a_bundle(value):
 
     with pytest.raises(RuntimeError):
         module._require_explicit("config", value)
+
+
+# ---------------------------------------------------------------------------
+# [review] an engine never starts over warp work it could not be told about
+# ---------------------------------------------------------------------------
+
+def test_an_unpublishable_retained_store_blocks_the_engine_launch(app, tmp_path, monkeypatch):
+    """Open work in a store the new engine would not guard, and no way to
+    name it for the guard: the launch does not happen, and the error says
+    so -- never a start whose first cleanup could prune the kept sends."""
+    from gui.services import engine_bridge as eb
+    from gui.services.engine_bridge import EngineBridge
+    from gui.services.warp.service import RetainedPointerError
+
+    cfg = _write_config(tmp_path / "two", "data/xop_trader.db")
+    bridge = EngineBridge(config_path=cfg)
+    try:
+        errors: list = []
+        bridge.error.connect(errors.append)
+        launched: list = []
+        monkeypatch.setattr(bridge, "_start_engine_process",
+                            lambda: launched.append(1) or True)
+
+        def refuse(wanted, candidates):
+            raise RetainedPointerError(
+                "open work (job 1 (FUNDING_CLAIM)) in one/data/old.db could not be named")
+
+        monkeypatch.setattr(eb, "publish_retained_pointer", refuse)
+        bridge.start_engine()
+        assert launched == [], "no launch while the kept store cannot be named"
+        assert errors and "Engine not started" in errors[0] and "old.db" in errors[0]
+        # Nothing to name (or named): the launch proceeds.
+        monkeypatch.setattr(eb, "publish_retained_pointer", lambda wanted, candidates: None)
+        bridge.start_engine()
+        assert launched == [1]
+    finally:
+        bridge.deleteLater()
+        app.processEvents()

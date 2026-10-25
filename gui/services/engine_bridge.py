@@ -35,7 +35,11 @@ from gui.services.config_split import split_and_save
 from gui.services.database_service import DatabaseService
 from gui.services.metrics_service import MetricsService
 from gui.services.wallet_service import WalletService
-from gui.services.warp.service import WarpService
+from gui.services.warp.service import (
+    RetainedPointerError,
+    WarpService,
+    publish_retained_pointer,
+)
 
 # ---------------------------------------------------------------------------
 # Module-level logger and constants
@@ -637,8 +641,14 @@ class EngineBridge(QObject):
         self._follow_restart_only_settings()
         # [review] BEFORE the launch: the engine's startup cleanup runs
         # against the store beside this config, and a store the warp worker
-        # still records in elsewhere must already be named there.
-        self._publish_retained_warp_store()
+        # still records in elsewhere must already be named there -- or the
+        # engine does not start (fail closed).
+        blocked = self._publish_retained_warp_store()
+        if blocked:
+            self.error.emit(
+                f"Engine not started: {blocked}; finish or close that work, or start "
+                "the engine on the config it was started under.")
+            return
         if self._start_engine_process():
             _log.info("Engine started via start_engine().")
             self.engine_launched.emit()
@@ -707,7 +717,7 @@ class EngineBridge(QObject):
             _log.debug("could not resolve the warp jobs database (%s)", exc)
             return None
 
-    def _publish_retained_warp_store(self) -> None:
+    def _publish_retained_warp_store(self) -> Optional[str]:
         """[review] Synchronously, before an engine starts on the current
         config and as the GUI switches to it: if the store the warp worker
         has been recording in -- the one the previous engine was launched
@@ -716,18 +726,23 @@ class EngineBridge(QObject):
         NOW (service.publish_retained_pointer), so the engine's first cleanup
         already guards it.  The worker publishes the same pointer on its own
         thread; that update is queued, and this closes the window between
-        the launch and it."""
+        the launch and it.  Returns None when the engine may start, else why
+        it must not: open work exists in a store it would not guard and the
+        pointer naming that store could not be written (fail closed -- an
+        empty configured store would read as "nothing to protect")."""
         wanted = self._configured_warp_db()
         if not wanted:
-            return
+            return None
         snap = self._warp_svc.get_snapshot() or {}
         candidates = [getattr(self, "_launched_warp_db", None), snap.get("store_path")]
         try:
-            from gui.services.warp.service import publish_retained_pointer
-
             publish_retained_pointer(wanted, [c for c in candidates if c])
+        except RetainedPointerError as exc:
+            _log.error("warp: %s", exc)
+            return str(exc)
         except Exception as exc:  # noqa: BLE001 -- never break a launch
             _log.debug("retained warp store not published: %s", exc)
+        return None
 
     def _sync_warp_engine_store(self) -> None:
         """[review] Tell the warp worker which jobs database the engine WE
@@ -1120,7 +1135,9 @@ class EngineBridge(QObject):
             # [review] The previous engine's store may hold open work: name
             # it beside this config's store now, so an engine started here
             # later -- or a GUI reopened here -- finds it at once.
-            self._publish_retained_warp_store()
+            blocked = self._publish_retained_warp_store()
+            if blocked:
+                self.error.emit(f"Warp: {blocked}")
         if success:
             _log.info("Config path updated and reloaded.")
         else:

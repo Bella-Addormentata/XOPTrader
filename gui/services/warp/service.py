@@ -1897,6 +1897,9 @@ class WarpEngine:
 
         coin = self._security_coin_for(job, sk, expected)
         if coin is None:
+            # [review] Off chain again (a shallow reorg): landed evidence
+            # recorded for it is withdrawn, so the guard protects the send.
+            self._clear_landed(job, "funding_tx_id")
             raise WarpPending("security coin not yet on chain")
         depth = self._chia_depth(coin.name().hex())
         if depth is None:
@@ -1907,7 +1910,8 @@ class WarpEngine:
             )
         return _advance(
             JobStatus.COLLECTING_SIGS,
-            state={"security_coin_id": coin.name().hex()},
+            state={"security_coin_id": coin.name().hex(),
+                   **self._landed_patch(job, "funding_tx_id", coin, depth=depth)},
             message=f"security coin confirmed ({depth} blocks)",
         )
 
@@ -2462,20 +2466,70 @@ class WarpEngine:
         if status.get("synced") is not True or status.get("syncing") is True:
             raise WarpPending(f"{context}: the Chia wallet is syncing; waiting")
 
-    def _landed_patch(self, job: WarpJob, tx_key: str, coin: Any) -> Dict[str, Any]:
+    def _landed_patch(self, job: WarpJob, tx_key: str, coin: Any, *,
+                      depth: Optional[int] = None) -> Dict[str, Any]:
         """[review] ``{<tx_key>_landed: True}`` when *coin* -- the coin that
         carries the job forward -- descends from a coin the CURRENT attempt
-        spent: its own output is on chain, so its wallet record is confirmed
-        and the engine's guard may release the wallet.  ``{}`` when an earlier
-        attempt's coin carried the job (the current one may still be
-        confirming, and stays protected) or the attempt's coins are not
-        known.  Cleared by every new attempt (_send_reserved)."""
+        spent AND sits at the Chia confirmation depth: its own output is on
+        chain for good, so its wallet record is confirmed and the engine's
+        guard may release the wallet.  ``{}`` when an earlier attempt's coin
+        carried the job (the current one may still be confirming, and stays
+        protected), the attempt's coins are not known, or the coin is still
+        shallow or unindexed -- a reorg could yet take it back, so nothing
+        tentative is recorded; the depth wait that follows sets the flag.
+        *depth* is the coin's confirmations when the caller holds its record;
+        else the coin is looked up.  Cleared by every new attempt
+        (_send_reserved) and withdrawn by _clear_landed when the coin is
+        gone."""
         parent = getattr(coin, "parent_coin_info", None)
         if parent is None:
             return {}
         phex = parent.hex() if isinstance(parent, (bytes, bytearray)) else _hx(str(parent))
         mine = {_hx(c) for c in (job.state.get(f"{tx_key}_removals") or []) if c}
-        return {f"{tx_key}_landed": True} if phex and phex in mine else {}
+        if not phex or phex not in mine:
+            return {}
+        if depth is None:
+            try:
+                if hasattr(coin, "name"):
+                    name = coin.name().hex()
+                else:
+                    from . import clvm_utils as cu
+
+                    ph = getattr(coin, "puzzle_hash")
+                    name = cu.coin_name(
+                        bytes.fromhex(phex),
+                        ph if isinstance(ph, (bytes, bytearray))
+                        else bytes.fromhex(_hx(str(ph))),
+                        int(getattr(coin, "amount"))).hex()
+                depth = self._chia_depth(name)
+            except Exception:  # noqa: BLE001 -- unknown depth: not recorded
+                depth = None
+        if depth is None or int(depth) < int(self._net.chia_confirmation_min_height):
+            return {}
+        return {f"{tx_key}_landed": True}
+
+    def _record_confirmations(self, rec: Any) -> Optional[int]:
+        """Confirmations of a coin record's creation, or None when the peak
+        or the record's height is unknown."""
+        try:
+            return int(self._coinset.get_peak_height()) - int(rec.confirmed_block_index) + 1
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _clear_landed(self, job: WarpJob, tx_key: str) -> None:
+        """[review] The coin that set ``<tx_key>_landed`` is not on chain (or
+        not indexed) any more: the evidence is withdrawn, and the engine's
+        guard protects the attempt's wallet record again.  Best effort."""
+        key = f"{tx_key}_landed"
+        if not job.state.get(key):
+            return
+        try:
+            self._store.update_job(job.id, expected_status=job.status,
+                                   state_patch={key: None})
+            _log.info("warp job %s: %s withdrawn; its coin is not on chain any more",
+                      job.id, key)
+        except Exception as exc:  # noqa: BLE001 -- withdrawn on a later tick
+            _log.debug("warp job %s: could not withdraw %s (%s)", job.id, key, exc)
 
     def _coin_spent_depth(self, coin_id_hex: str) -> Optional[int]:
         """Confirmations of the spend of a coin: 0 when unspent, None when
@@ -4345,7 +4399,8 @@ class WarpEngine:
                 return _advance(
                     JobStatus.BURNING,
                     state={"burn_cat_parent": _hx(rec.coin.parent_coin_info),
-                           **self._landed_patch(job, "burn_tx_id", rec.coin)},
+                           **self._landed_patch(job, "burn_tx_id", rec.coin,
+                                                depth=self._record_confirmations(rec))},
                     message="burn CAT is on chain; the unwrap is now forward-only",
                 )
             # [WARP-LOST-SEND] The pin names a coin that never appeared (its
@@ -4411,7 +4466,8 @@ class WarpEngine:
                 return _advance(
                     JobStatus.BURNING,
                     state={"burn_cat_parent": parent, "burn_cat_coin_id": coin_id,
-                           **self._landed_patch(job, "burn_tx_id", rec.coin)},
+                           **self._landed_patch(job, "burn_tx_id", rec.coin,
+                                                depth=self._record_confirmations(rec))},
                     message="burn CAT is on chain; the unwrap is now forward-only",
                 )
 
@@ -4627,7 +4683,9 @@ class WarpEngine:
                 # [review] Not indexed yet: wait.  Re-electing another coin
                 # of the amount here (a replaced toll send that landed too)
                 # would rebuild the bundle around a different bridging coin
-                # than the nonce the job polls.
+                # than the nonce the job polls.  Landed evidence recorded for
+                # the toll send is withdrawn meanwhile.
+                self._clear_landed(job, "funding_tx_id")
                 raise WarpPending("pinned toll coin is not indexed yet; awaiting it")
         if sec is None:
             sec = claim.find_security_coin(self._coinset, sk, toll)
@@ -4722,6 +4780,7 @@ class WarpEngine:
                         rec = cand
                         break
             if rec is None:
+                self._clear_landed(job, "burn_tx_id")
                 raise WarpPending("the job's burn CAT is not indexed yet; awaiting it")
             if rec.spent:
                 raise WarpPending(
@@ -4767,6 +4826,7 @@ class WarpEngine:
                 "unwrap_nonce": out.nonce.hex(),
                 "security_coin_id": sec.name().hex(),
                 **self._landed_patch(job, "funding_tx_id", sec),
+                **self._landed_patch(job, "burn_tx_id", burn_cat),
             },
         )
         kind, status = claim.push_burn_bundle(self._coinset, out.bundle)
@@ -6518,6 +6578,13 @@ def _same_path(a: str, b: str) -> bool:
 _RETAINED_POINTER_SUFFIX = ".retained"
 
 
+class RetainedPointerError(WarpError):
+    """[review] Open work exists in a store the engine about to start would
+    not guard, and the pointer naming it could not be written: the launch
+    must not proceed (an empty configured store would read as "nothing to
+    protect")."""
+
+
 def _retained_pointer(wanted: str) -> Optional[Path]:
     """The pointer file beside the configured store *wanted* (None for an
     in-memory store)."""
@@ -6552,9 +6619,11 @@ def publish_retained_pointer(wanted: str, candidates: Iterable[str]) -> Optional
     cleanup already guards that store -- the worker publishes the same
     pointer on its own thread, but that update is queued, and a send aged
     past the prune threshold must not sit unguarded in the window between
-    the launch and it.  Returns the store named, or None.  Never raises (a
-    launch must not fail on it); a store that cannot be read counts as
-    holding work (fail closed), a missing one as holding none."""
+    the launch and it.  Returns the store named, or None when no candidate
+    holds work.  Raises :class:`RetainedPointerError` -- and only that --
+    when a store holds work and the pointer cannot be written: the caller
+    must not launch then.  A store that cannot be read counts as holding
+    work (fail closed), a missing one as holding none."""
     pointer = _retained_pointer(wanted)
     if pointer is None:
         return None
@@ -6573,9 +6642,10 @@ def publish_retained_pointer(wanted: str, candidates: Iterable[str]) -> Optional
             continue
         try:
             _write_retained_pointer(pointer, cand)
-        except Exception as exc:  # noqa: BLE001 -- the worker's hold then waits
-            _log.warning("warp: could not write %s naming %s (%s)", pointer, cand, exc)
-            return None
+        except Exception as exc:  # noqa: BLE001 -- fail closed: the launch waits
+            raise RetainedPointerError(
+                f"open work ({work}) in {cand} could not be named beside {wanted} "
+                f"for the engine's guard ({exc})") from exc
         _log.info("warp: %s names %s (%s) for the engine's guard", pointer, cand, work)
         return cand
     return None
