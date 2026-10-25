@@ -2773,9 +2773,10 @@ class WarpEngine:
         """[review] A retired unnamed attempt identified from the wallet
         history is re-keyed under its real id, with the coins it spent, in
         every book (<tx_key>_prior, _prior_removals, _prior_dead,
-        _prior_retired_at): later probes then ask the wallet and the
-        mempool about THAT id and judge it by those coins -- it is never
-        "unobservable" again, so a record that later drops out of the
+        _prior_retired_at; the hit is a sighting, so its absence clock in
+        _prior_absent_since is dropped): later probes then ask the wallet
+        and the mempool about THAT id and judge it by those coins -- it is
+        never "unobservable" again, so a record that later drops out of the
         history cannot start the absence-based grace while the bundle may
         still sit in a mempool.  Best effort: this tick judges it anyway."""
         # [review] The LATEST books, not the caller's snapshot: a settlement
@@ -2804,6 +2805,10 @@ class WarpEngine:
         if old_key in stamps:
             stamps[tx_id] = stamps.pop(old_key)
             patch[f"{tx_key}_prior_retired_at"] = stamps
+        absent = dict(st.get(f"{tx_key}_prior_absent_since") or {})
+        dropped = [absent.pop(k, None) for k in {old_key, tx_id}]
+        if any(d is not None for d in dropped):
+            patch[f"{tx_key}_prior_absent_since"] = absent or None
         try:
             self._store.update_job(job.id, expected_status=fresh.status, state_patch=patch)
             if old_key == tx_id:
@@ -2847,26 +2852,35 @@ class WarpEngine:
 
     def _unobservable_settled(self, job: WarpJob, tx_key: str, tx_id: str, *,
                               coins_known: bool = False) -> tuple:
-        """``(settled, note)`` for a RETIRED attempt that is nowhere: no
-        wallet record, no mempool item, and either no recorded coins or
-        coins still unspent (an orphan).  Presumed gone once
-        ``_UNOBSERVABLE_ATTEMPT_GRACE_S`` has passed since it was retired (an
-        attempt retired before the clock existed starts it now); until then
-        it keeps the job open.  [review] An orphan with coins is bounded the
-        same way: unbounded, a finished claim would sit in CLAIMING until the
-        operator abandoned it; its coins stay on the books, so were it to
-        land after all, Sweep (available on a COMPLETED job) recovers it."""
-        key = f"{tx_key}_prior_retired_at"
-        stamps = dict(job.state.get(key) or {})
-        since = stamps.get(tx_id)
+        """``(settled, note)`` for a RETIRED attempt observed absent on THIS
+        pass: no wallet record and no mempool item (an unnamed one: no
+        history record), and either no recorded coins or coins still
+        unspent (an orphan).  Presumed gone once
+        ``_UNOBSERVABLE_ATTEMPT_GRACE_S`` of ESTABLISHED absence has passed;
+        until then it keeps the job open.  [review] The clock
+        (``<tx_key>_prior_absent_since``) starts at the first probe that
+        finds the attempt absent -- never at its retirement, after which it
+        may stay alive for hours -- and :meth:`_absence_broken` drops it
+        whenever the attempt is seen alive or a probe does not answer: the
+        grace is absence actually established, not age.  An orphan with
+        coins is bounded the same way: unbounded, a finished claim would sit
+        in CLAIMING until the operator abandoned it; its coins stay on the
+        books, so were it to land after all, Sweep (available on a COMPLETED
+        job) recovers it."""
+        key = f"{tx_key}_prior_absent_since"
+        since = (job.state.get(key) or {}).get(tx_id)
         now = float(self._now())
         if not isinstance(since, (int, float)) or isinstance(since, bool):
-            stamps[tx_id] = now
+            # The latest books: several attempts may start their clocks on
+            # one pass, and each write must keep the earlier ones.
             try:
-                self._store.update_job(job.id, expected_status=job.status,
+                fresh = self._store.get_job(job.id)
+                stamps = dict(fresh.state.get(key) or {})
+                stamps[tx_id] = now
+                self._store.update_job(fresh.id, expected_status=fresh.status,
                                        state_patch={key: stamps})
-            except Exception as exc:  # noqa: BLE001 -- the clock starts next tick
-                _log.debug("warp job %s: could not stamp attempt %s (%s)",
+            except Exception as exc:  # noqa: BLE001 -- the clock starts next pass
+                _log.debug("warp job %s: could not stamp attempt %s absent (%s)",
                            job.id, tx_id, exc)
             since = now
         waited = now - float(since)
@@ -2885,6 +2899,28 @@ class WarpEngine:
         return False, (f"attempt {tx_id[:16]}... is nowhere to be seen (no coins on "
                        f"record); presumed gone after {hours}h "
                        f"({waited / 3600.0:.1f}h so far) -- Sweep again later")
+
+    def _absence_broken(self, job: WarpJob, tx_key: str, tx_id: str) -> None:
+        """[review] Attempt *tx_id* was seen alive on this pass (a wallet
+        record, a mempool item, its output, a history record), was settled
+        by the chain, or a probe for it did not answer: whatever absence
+        clock it had is dropped, and the next pass that finds it absent
+        starts a new one.  Best effort."""
+        key = f"{tx_key}_prior_absent_since"
+        if tx_id not in (job.state.get(key) or {}):
+            return
+        try:
+            fresh = self._store.get_job(job.id)
+            stamps = dict(fresh.state.get(key) or {})
+            if stamps.pop(tx_id, None) is None:
+                return
+            self._store.update_job(fresh.id, expected_status=fresh.status,
+                                   state_patch={key: stamps or None})
+            _log.info("warp job %s: attempt %s is not established absent; its "
+                      "absence clock restarts", job.id, tx_id[:16])
+        except Exception as exc:  # noqa: BLE001 -- dropped on a later pass
+            _log.debug("warp job %s: could not drop the absence clock of %s (%s)",
+                       job.id, tx_id, exc)
 
     def _prior_sends_settled(self, job: WarpJob,
                              tx_key: str = "funding_tx_id") -> tuple:
@@ -2945,8 +2981,22 @@ class WarpEngine:
         # surviving coins may legitimately reappear in its replacement.
         named = [t for t in attempts if not self._unnamed(t)]
         dead = list(_settled_ids(st, tx_key))
+        proven_dead = {t for t in (st.get(f"{tx_key}_prior_dead") or []) if t}
         live_coins, recorded_sets = self._attempt_books(prior_removals, dead)
+        # [review] EVERY attempt is judged on every pass, and the first
+        # thing that keeps the job open is reported: a verdict found behind
+        # an unsettled attempt is kept, and each attempt's absence clock is
+        # started, kept or dropped from what THIS pass saw of it.
+        notes: list = []
         for tx_id in attempts:
+            if tx_id in proven_dead and tx_id != current:
+                # [review] Proven dead at depth: nothing to identify or
+                # probe.  Looked for by its coins, a replacement that reused
+                # one of its surviving inputs could be handed to it once its
+                # own record is gone from the history -- and the dead marker
+                # with it, leaving the replacement unable to adopt its own
+                # record and the job unable to settle.
+                continue
             probe_id, coins = tx_id, list(prior_removals.get(tx_id) or [])
             if self._unnamed(tx_id) and coins and tx_id != current:
                 # [review] Retired, unnamed, coins known: the history may
@@ -2957,6 +3007,7 @@ class WarpEngine:
                         job, tx_key, tx_id, coins, ph=ph, amount=amount, named=named,
                         live_coins=live_coins, recorded_sets=recorded_sets)
                 except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
+                    self._absence_broken(job, tx_key, tx_id)
                     return False, (f"the wallet history could not be read ({exc}); "
                                    f"attempt {tx_id[:16]}... is not ruled out")
                 if found:
@@ -2975,6 +3026,7 @@ class WarpEngine:
                         ph, amount, exclude_ids=named, live_coins=live_coins,
                         recorded_sets=recorded_sets)
                 except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
+                    self._absence_broken(job, tx_key, tx_id)
                     return False, (f"the wallet history could not be read ({exc}); "
                                    f"attempt {tx_id[:16]}... is not ruled out")
                 if ident and ident[0] and not ident[1]:
@@ -2994,20 +3046,26 @@ class WarpEngine:
                                        "id (%s)", job.id, exc)
                     else:
                         self._persist_identified_attempt(job, tx_key, tx_id, found_id, [])
-                    return False, (f"attempt {tx_id[:16]}... identified as "
-                                   f"{found_id[:16]}...; its coins are being read")
+                    named.append(found_id)
+                    notes.append(f"attempt {tx_id[:16]}... identified as "
+                                 f"{found_id[:16]}...; its coins are being read")
+                    continue
                 if not ident or not ident[1]:
                     if tx_id != current:
+                        if tx_id in dead:
+                            continue                         # presumed gone already
                         # [review] Retired and unobservable: the grace clock,
                         # and the presumed-gone record Sweep access relies on.
                         gone, note = self._unobservable_settled(job, tx_key, tx_id)
                         if gone:
                             self._mark_attempts_dead(job, tx_key, [tx_id], presumed=True)
                             continue
-                        return False, note
-                    return False, ("a send the wallet never named, whose coins are "
-                                   "not known, cannot be ruled out; Sweep again "
-                                   "later or Abandon")
+                        notes.append(note)
+                        continue
+                    notes.append("a send the wallet never named, whose coins are "
+                                 "not known, cannot be ruled out; Sweep again "
+                                 "later or Abandon")
+                    continue
                 probe_id, coins = ident
                 named.append(probe_id)
                 live_coins = [*live_coins, *coins]
@@ -3053,6 +3111,10 @@ class WarpEngine:
                 else:
                     self._persist_identified_attempt(job, tx_key, tx_id, tx_id, learned)
                 coins = learned
+            if tx_id != current and verdict is not cs.Verdict.ORPHAN:
+                # [review] Seen alive, settled by the chain, or unanswered:
+                # not an absent observation, so no absence clock survives it.
+                self._absence_broken(job, tx_key, tx_id)
             if verdict is cs.Verdict.ORPHAN and tx_id != current:
                 # [review] Retired and nowhere -- wallet and mempool both
                 # answered "no".  With no coins on record (a send recorded
@@ -3063,18 +3125,22 @@ class WarpEngine:
                 # Either way it is presumed gone after the grace rather than
                 # keeping a finished job open for good; its coins stay on
                 # the books, so a landing after all is still sweepable.
+                if tx_id in dead:
+                    continue                                 # presumed gone already
                 gone, note = self._unobservable_settled(
                     job, tx_key, tx_id, coins_known=bool(ev.removals))
                 if gone:
                     self._mark_attempts_dead(job, tx_key, [tx_id], presumed=True)
                     continue
-                return False, note
+                notes.append(note)
+                continue
             if verdict is cs.Verdict.DEAD:
                 if (tx_id == _FUNDING_TX_UNKNOWN and len(ev.removals) > 1
                         and not self._unnamed_group_dead(ev.removals, min_depth)):
-                    return False, ("unnamed funding sends share one record; not "
-                                   "every coin of theirs is spent yet; Sweep "
-                                   "again later")
+                    notes.append("unnamed funding sends share one record; not "
+                                 "every coin of theirs is spent yet; Sweep "
+                                 "again later")
+                    continue
                 if tx_id != current and tx_id not in dead:
                     # [review] A verdict found here is kept: the guard and the
                     # exclusions read <tx_key>_prior_dead.
@@ -3087,18 +3153,22 @@ class WarpEngine:
             if verdict is cs.Verdict.LANDED and ev.output_landed:
                 if (tx_id == _FUNDING_TX_UNKNOWN and len(ev.removals) > 1
                         and not self._unnamed_group_dead(ev.removals, min_depth)):
-                    return False, ("unnamed funding sends share one record; one "
-                                   "landed but not every coin of theirs is spent "
-                                   "yet; Sweep again later")
+                    notes.append("unnamed funding sends share one record; one "
+                                 "landed but not every coin of theirs is spent "
+                                 "yet; Sweep again later")
+                    continue
                 deep, depth_why = self._outputs_settled(
                     outputs, amount=amount, removals=ev.removals,
                     min_depth=min_depth)
                 if deep:
                     continue
-                return False, (f"funding send {tx_id[:16]}... landed and "
-                               f"{depth_why}; Sweep again later")
-            return False, (f"funding send {tx_id[:16]}... could still land "
-                           f"({why}); Sweep again later")
+                notes.append(f"funding send {tx_id[:16]}... landed and "
+                             f"{depth_why}; Sweep again later")
+                continue
+            notes.append(f"funding send {tx_id[:16]}... could still land "
+                         f"({why}); Sweep again later")
+        if notes:
+            return False, notes[0]
         return True, ""
 
     def _attempt_coins(self, job: WarpJob, tx_key: str) -> set:
@@ -3137,8 +3207,18 @@ class WarpEngine:
                 named.append(current)
             books.setdefault(current, list(st.get("burn_tx_id_removals") or []))
         dead = list(_settled_ids(st, "burn_tx_id"))
+        proven_dead = {t for t in (st.get("burn_tx_id_prior_dead") or []) if t}
         live_coins, recorded_sets = self._attempt_books(books, dead)
+        # [review] Every attempt judged on every pass, as for the funding
+        # sends: verdicts kept, absence clocks maintained, the first thing
+        # that keeps the job open reported.
+        notes: list = []
         for tx_id in priors:
+            if tx_id in proven_dead:
+                # [review] Proven dead: neither looked for by its coins (a
+                # replacement that reused a survivor would be handed to it,
+                # see _prior_sends_settled) nor probed again.
+                continue
             probe_id, coins = tx_id, list(prior_removals.get(tx_id) or [])
             if self._unnamed(tx_id) and coins:
                 try:
@@ -3146,6 +3226,7 @@ class WarpEngine:
                         job, "burn_tx_id", tx_id, coins, ph=ph, amount=amount, named=named,
                         live_coins=live_coins, recorded_sets=recorded_sets)
                 except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
+                    self._absence_broken(job, "burn_tx_id", tx_id)
                     return False, (f"the wallet history could not be read ({exc}); "
                                    "an earlier cat_spend is not ruled out")
                 if found:
@@ -3157,17 +3238,21 @@ class WarpEngine:
                         job, ph, amount, exclude_ids=named, live_coins=live_coins,
                         recorded_sets=recorded_sets)
                 except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
+                    self._absence_broken(job, "burn_tx_id", tx_id)
                     return False, (f"the wallet history could not be read ({exc}); "
                                    f"an earlier cat_spend is not ruled out")
                 if ident and ident[0] and not ident[1]:
                     # [review] Identified without coins: keep the id, probe it
                     # next pass (see _prior_sends_settled).
                     self._persist_identified_attempt(job, "burn_tx_id", tx_id, str(ident[0]), [])
-                    return False, (f"an earlier cat_spend identified as "
-                                   f"{str(ident[0])[:16]}...; its coins are being read")
+                    named.append(str(ident[0]))
+                    notes.append(f"an earlier cat_spend identified as "
+                                 f"{str(ident[0])[:16]}...; its coins are being read")
+                    continue
                 if not ident or not ident[1]:
-                    return False, ("an earlier cat_spend the wallet never named, "
-                                   "whose coins are not known, cannot be ruled out")
+                    notes.append("an earlier cat_spend the wallet never named, "
+                                 "whose coins are not known, cannot be ruled out")
+                    continue
                 probe_id, coins = ident
                 self._persist_identified_attempt(job, "burn_tx_id", tx_id, probe_id, coins)
                 named.append(probe_id)
@@ -3188,21 +3273,29 @@ class WarpEngine:
                 # record taught are kept in the attempt's book.
                 self._persist_identified_attempt(
                     job, "burn_tx_id", tx_id, tx_id, [_hx(c) for c in ev.removals])
+            if verdict is not cs.Verdict.ORPHAN:
+                # [review] Not an absent observation: no absence clock
+                # survives it (see _prior_sends_settled).
+                self._absence_broken(job, "burn_tx_id", tx_id)
             if verdict is cs.Verdict.ORPHAN:
                 # [review] A retired cat_spend that is nowhere: the same
                 # bounded grace as the funding sends (a retired burn is
                 # DEAD-only by construction, so this is a legacy shape).
+                if tx_id in dead:
+                    continue                                 # presumed gone already
                 gone, note = self._unobservable_settled(
                     job, "burn_tx_id", tx_id, coins_known=bool(ev.removals))
                 if gone:
                     self._mark_attempts_dead(job, "burn_tx_id", [tx_id], presumed=True)
                     continue
-                return False, note
+                notes.append(note)
+                continue
             if verdict is cs.Verdict.DEAD:
                 if (tx_id == _FUNDING_TX_UNKNOWN and len(ev.removals) > 1
                         and not self._unnamed_group_dead(ev.removals, min_depth)):
-                    return False, ("unnamed cat_spends share one record; not "
-                                   "every coin of theirs is spent yet")
+                    notes.append("unnamed cat_spends share one record; not "
+                                 "every coin of theirs is spent yet")
+                    continue
                 if tx_id not in dead:
                     self._mark_attempts_dead(job, "burn_tx_id", [tx_id])
                     dead.append(tx_id)
@@ -3210,18 +3303,22 @@ class WarpEngine:
             if verdict is cs.Verdict.LANDED and ev.output_landed:
                 if (tx_id == _FUNDING_TX_UNKNOWN and len(ev.removals) > 1
                         and not self._unnamed_group_dead(ev.removals, min_depth)):
-                    return False, ("unnamed cat_spends share one record; one "
-                                   "landed but not every coin of theirs is spent "
-                                   "yet")
+                    notes.append("unnamed cat_spends share one record; one "
+                                 "landed but not every coin of theirs is spent "
+                                 "yet")
+                    continue
                 deep, depth_why = self._outputs_settled(
                     outputs, amount=amount, removals=ev.removals,
                     min_depth=min_depth)
                 if deep:
                     continue
-                return False, (f"an earlier cat_spend {tx_id[:16]}... landed "
-                               f"and {depth_why}")
-            return False, (f"an earlier cat_spend {tx_id[:16]}... could still "
-                           f"land ({why})")
+                notes.append(f"an earlier cat_spend {tx_id[:16]}... landed "
+                             f"and {depth_why}")
+                continue
+            notes.append(f"an earlier cat_spend {tx_id[:16]}... could still "
+                         f"land ({why})")
+        if notes:
+            return False, notes[0]
         return True, ""
 
     def _recorded_send_verdict(self, job: WarpJob, *, tx_key: str,
@@ -6182,10 +6279,12 @@ def _trade_status_name(status: Any) -> str:
 #: A submitted Dexie take the wallet still cannot read after this long is
 #: settled as failed (its record is lost), so it cannot block every later buy.
 _TAKE_UNKNOWN_FAIL_S: int = 3600
-# [review] How long an unknown-outcome take keeps the engine's wallet
-# protection before it is released as failed: a Chia transaction still
-# unconfirmed after a day is gone from every mempool, and a take that did
-# land shows up as CAT held (and as a readable trade record first).
+# [review] How long an unknown-outcome take's trade record must stay
+# unreadable -- since it went unknown, or since it was last read pending
+# (``unknown_since``) -- before it is released as failed: a Chia transaction
+# still unconfirmed after a day is gone from every mempool, and a take that
+# did land shows up as CAT held (and as a readable trade record first).
+# Never its age: one unanswered lookup on an old take releases nothing.
 _TAKE_UNKNOWN_RELEASE_S: int = 24 * 3600
 # [review] A retired attempt with no recorded coins, no wallet record and no
 # mempool item -- a send recorded before coins were kept whose record the
@@ -7010,8 +7109,10 @@ class _WarpWorker(QObject):
         """[review] Takes the planner stopped waiting for are still open for
         the engine's guard: each is settled for real once its trade record
         reads CONFIRMED or FAILED, and released as failed only after
-        ``_TAKE_UNKNOWN_RELEASE_S`` -- a Chia transaction unconfirmed for a
-        day is gone from every mempool.  Never blocks a buy."""
+        ``_TAKE_UNKNOWN_RELEASE_S`` of unreadable lookups since it went
+        unknown or was last read pending (its ``unknown_since``) -- a Chia
+        transaction unconfirmed for a day is gone from every mempool.
+        Never blocks a buy."""
         unknown = engine._store.list_takes(status=jobs.TAKE_UNKNOWN, limit=-1)
         if not unknown:
             return
@@ -7044,10 +7145,21 @@ class _WarpWorker(QObject):
             elif readable:
                 # [review] A record that reads PENDING_* is positive evidence
                 # the take is live: it stays protected however old it is,
-                # until the wallet calls it confirmed or failed.
+                # until the wallet calls it confirmed or failed -- and its
+                # unknown-duration clock restarts, so the release below needs
+                # a full _TAKE_UNKNOWN_RELEASE_S of unreadable lookups AFTER
+                # this sighting, never one unanswered lookup on an old take.
+                try:
+                    engine._store.take_still_live(take.trade_id)
+                except Exception as exc:  # noqa: BLE001 -- restarts next pass
+                    _log.debug("Dexie take %s: could not restart its clock (%s)",
+                               take.trade_id, exc)
                 _log.debug("Dexie take %s: wallet reports %s; still open",
                            take.trade_id, status)
-            elif _age_s(take.created_at) > _TAKE_UNKNOWN_RELEASE_S:
+            elif _age_s(take.unknown_since or take.updated_at) > _TAKE_UNKNOWN_RELEASE_S:
+                # [review] Unreadable for a day since it went unknown or was
+                # last read pending (a row from before the stamp existed:
+                # since it was last written, which was that transition).
                 engine._store.settle_take(
                     take.trade_id, jobs.TAKE_FAILED,
                     error=(f"outcome unknown for {_TAKE_UNKNOWN_RELEASE_S // 3600}h; "

@@ -369,8 +369,10 @@ it, so a failure can't be silently buried under a new job. **Sweep is the usual 
 a sweep that *resolves* — the coin was recovered, was already spent, or never
 existed — moves the job to **Cancelled** and frees the slot, **once every Chia
 send the job ever made is ruled out**: a replaced funding send that is not yet
-proven dead keeps the job open (it is presumed gone after six hours absent from
-the wallet and the mempool), and the status cell's tooltip says what Sweep
+proven dead keeps the job open (it is presumed gone after six hours of
+established absence from the wallet and the mempool: the clock starts at the
+first probe that finds it absent, and restarts whenever it is seen alive or a
+probe goes unanswered), and the status cell's tooltip says what Sweep
 found. A sweep that could not reach the chain leaves the job FAILED so you can
 try again with the funds still known recoverable. Sweep is also available on a
 **Completed** job, should a replaced send land after the fact.

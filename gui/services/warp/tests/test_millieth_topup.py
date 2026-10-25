@@ -299,6 +299,77 @@ def test_a_readable_pending_unknown_take_is_never_released(monkeypatch):
     assert eng._store.get_take(OUR_TID).status == J.TAKE_CONFIRMED
 
 
+def test_a_pending_read_restarts_the_unknown_takes_release_clock(monkeypatch):
+    """[review] The release clock is the take's own unknown-duration stamp,
+    restarted by every readable PENDING_* record: one unanswered lookup
+    after a pending one releases nothing, however old the take; a full day
+    of unreadable lookups after the last pending read does."""
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    clock = ["t0"]
+    eng._store._now = lambda: clock[0]
+    w._maybe_rebalance(eng)                                  # created_at t0
+    ages = {}
+    monkeypatch.setattr(S, "_age_s", lambda iso: ages.get(iso, 0.0))
+    real = eng._wallet.get_offer
+    eng._wallet.get_offer = lambda tid: (_ for _ in ()).throw(RuntimeError("lost"))
+    clock[0], ages["t0"] = "t1", S._TAKE_UNKNOWN_FAIL_S + 1
+    w._settle_dexie_takes(eng)
+    take = eng._store.get_take(OUR_TID)
+    assert take.status == J.TAKE_UNKNOWN and take.unknown_since == "t1"
+    clock[0] = "t2"
+    eng._wallet.get_offer = real
+    eng._wallet.trade_status = "PENDING_CONFIRM"
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).unknown_since == "t2", "restarted by the pending read"
+    # The take and its first unknown stamp are a day old; the pending read
+    # was a minute ago.  One lost lookup releases nothing.
+    eng._wallet.get_offer = lambda tid: (_ for _ in ()).throw(RuntimeError("lost"))
+    ages.update({"t0": S._TAKE_UNKNOWN_RELEASE_S + 1, "t1": S._TAKE_UNKNOWN_RELEASE_S + 1,
+                 "t2": 60.0})
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+    ages["t2"] = S._TAKE_UNKNOWN_RELEASE_S + 1                # a day unreadable since t2
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_FAILED
+
+
+def test_an_older_takes_table_gains_the_added_columns(tmp_path):
+    """[review] A jobs database whose dexie_takes predates confirmed_height
+    and unknown_since is read and written by this store: the columns are
+    added on open, and the unknown clock works on it."""
+    import sqlite3
+
+    path = tmp_path / "warp_jobs.db"
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+CREATE TABLE dexie_takes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id TEXT NOT NULL UNIQUE,
+    offer_id TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    asset_id TEXT NOT NULL, cat_mojos INTEGER NOT NULL, xch_mojos INTEGER NOT NULL,
+    fee_mojos INTEGER NOT NULL, status TEXT NOT NULL, confirmed_at TEXT, last_error TEXT
+);
+INSERT INTO dexie_takes(trade_id, offer_id, created_at, updated_at, asset_id,
+                        cat_mojos, xch_mojos, fee_mojos, status)
+VALUES ('aa', 'bb', 't0', 't0', 'cc', 1, 2, 3, 'submitted');
+""")
+    conn.close()
+    clock = ["t1"]
+    store = J.WarpJobStore(path, now=lambda: clock[0])
+    try:
+        take = store.get_take("aa")
+        assert take.confirmed_height is None and take.unknown_since is None
+        assert store.settle_take("aa", J.TAKE_UNKNOWN, error="lost").unknown_since == "t1"
+        clock[0] = "t2"
+        assert store.take_still_live("aa").unknown_since == "t2"
+        done = store.settle_take("aa", J.TAKE_CONFIRMED, confirmed_height=5)
+        assert done.unknown_since is None and done.confirmed_height == 5
+        with pytest.raises(J.StaleJobError):
+            store.take_still_live("aa")                      # not unknown any more
+    finally:
+        store.close()
+
+
 def test_unknown_takes_select_the_configured_key_first(monkeypatch):
     _http(monkeypatch)
     w, eng = _worker(_params(buy=True)), FakeEngine()

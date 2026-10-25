@@ -1641,7 +1641,12 @@ def test_an_unnamed_attempt_with_known_coins_is_judged_for_settlement():
     ctx.coinset.records[RID] = _rec(spent=True)              # its coin went elsewhere
     ctx.coinset.records[RID2] = _rec(spent=True)
     assert engine._prior_sends_settled(job)[0]
+    # [review] The verdict was kept: with its coins forgotten the attempt is
+    # still proven dead, so it is neither re-judged nor "presumed gone".
     store.update_job(job.id, state_patch={"funding_tx_id_prior_removals": None})
+    assert engine._prior_sends_settled(store.get_active_job())[0]
+    # Without that record -- no coins, no history: the grace.
+    store.update_job(job.id, state_patch={"funding_tx_id_prior_dead": None})
     settled, note = engine._prior_sends_settled(store.get_active_job())
     assert not settled and "presumed gone" in note
 
@@ -2508,22 +2513,25 @@ def test_an_unobservable_retired_attempt_is_presumed_gone_after_the_grace(monkey
     ctx.coinset.peak = PEAK
     ctx.coinset.records[RID2] = _rec(spent=True)             # the current attempt: dead
     settled, note = engine._prior_sends_settled(store.get_active_job())
-    assert not settled and "presumed gone after 6h" in note
+    assert not settled and "presumed gone after 6h" in note and "0.0h so far" in note
+    # [review] The clock is the first absent probe's, not the retirement's.
+    assert store.get_job(job.id).state["funding_tx_id_prior_absent_since"] == {"toll-a": now}
     store.update_job(job.id, state_patch={
-        "funding_tx_id_prior_retired_at": {"toll-a": now - 7 * 3600.0}})
+        "funding_tx_id_prior_absent_since": {"toll-a": now - 7 * 3600.0}})
     assert engine._prior_sends_settled(store.get_active_job())[0]
 
     # An unnamed retired attempt with no coins and no history: the same clock,
     # started the first time it is seen.
     k1 = S._FUNDING_TX_UNKNOWN + "#1"
     store.update_job(job.id, state_patch={
-        "funding_tx_id_prior": [k1], "funding_tx_id_prior_retired_at": None})
+        "funding_tx_id_prior": [k1], "funding_tx_id_prior_retired_at": None,
+        "funding_tx_id_prior_absent_since": None})
     settled, note = engine._prior_sends_settled(store.get_active_job())
     assert not settled and "presumed gone" in note
-    stamped = store.get_job(job.id).state["funding_tx_id_prior_retired_at"]
+    stamped = store.get_job(job.id).state["funding_tx_id_prior_absent_since"]
     assert k1 in stamped
     store.update_job(job.id, state_patch={
-        "funding_tx_id_prior_retired_at": {k1: now - 7 * 3600.0}})
+        "funding_tx_id_prior_absent_since": {k1: now - 7 * 3600.0}})
     assert engine._prior_sends_settled(store.get_active_job())[0]
     # [review] ...and it is on the presumed-gone record, so Sweep stays
     # available on the closed job should it land after all.
@@ -2537,6 +2545,8 @@ def test_the_current_attempt_never_settles_by_time_alone():
     store.update_job(job.id, state_patch={
         "funding_tx_id": S._FUNDING_TX_UNKNOWN, "funding_tx_id_removals": None,
         "funding_tx_id_prior_retired_at": {
+            S._FUNDING_TX_UNKNOWN + "#current": engine._now() - 48 * 3600.0},
+        "funding_tx_id_prior_absent_since": {
             S._FUNDING_TX_UNKNOWN + "#current": engine._now() - 48 * 3600.0}})
     ctx.coinset.peak = PEAK
     ctx.coinset.records[RID] = _rec(spent=True)
@@ -2632,13 +2642,15 @@ def test_a_failed_history_lookup_never_starts_or_advances_the_grace(monkeypatch)
     ctx.wallet.get_transactions = down
     settled, note = engine._prior_sends_settled(store.get_active_job())
     assert not settled and "could not be read" in note
-    assert not store.get_job(job.id).state.get("funding_tx_id_prior_retired_at"), \
+    assert not store.get_job(job.id).state.get("funding_tx_id_prior_absent_since"), \
         "no clock started on an unanswered lookup"
-    # Even past the grace, an unanswered lookup settles nothing.
+    # Even past the grace, an unanswered lookup settles nothing -- and it
+    # drops the clock: absence was not established on this pass.
     store.update_job(job.id, state_patch={
-        "funding_tx_id_prior_retired_at": {k1: now - 48 * 3600.0}})
+        "funding_tx_id_prior_absent_since": {k1: now - 48 * 3600.0}})
     settled, note = engine._prior_sends_settled(store.get_active_job())
     assert not settled and "could not be read" in note
+    assert not store.get_job(job.id).state.get("funding_tx_id_prior_absent_since")
 
 
 def test_the_worker_follows_a_config_switch(tmp_path):
@@ -2703,7 +2715,8 @@ def test_an_identified_retired_attempt_is_persisted_under_its_real_id(monkeypatc
     monkeypatch.setattr(engine, "_now", lambda: now)
     store.update_job(job.id, state_patch={
         "funding_tx_id_prior": [k1], "funding_tx_id_prior_removals": None,
-        "funding_tx_id_prior_retired_at": {k1: now - 10 * 3600.0}})
+        "funding_tx_id_prior_retired_at": {k1: now - 10 * 3600.0},
+        "funding_tx_id_prior_absent_since": {k1: now - 5 * 3600.0}})
     removal = {"parent_coin_info": "d4" * 32, "puzzle_hash": "11" * 32,
                "amount": 499_005_000_000}
     rid = cs.coin_id("d4" * 32, "11" * 32, 499_005_000_000)
@@ -2719,6 +2732,7 @@ def test_an_identified_retired_attempt_is_persisted_under_its_real_id(monkeypatc
     assert st["funding_tx_id_prior"] == ["toll-x"]
     assert st["funding_tx_id_prior_removals"] == {"toll-x": [rid]}
     assert "toll-x" in st["funding_tx_id_prior_retired_at"] and k1 not in st["funding_tx_id_prior_retired_at"]
+    assert not st.get("funding_tx_id_prior_absent_since"), "a history hit is a sighting"
 
     # The record drops out of the wallet history and the wallet: judged by
     # its coins, still unspent -- not "unobservable", not presumed gone.
@@ -2912,8 +2926,12 @@ def test_an_attempt_identified_without_coins_is_probed_before_any_absence_rule(m
     settled, note = engine._prior_sends_settled(store.get_active_job())
     assert not settled and "mempool" in note and "presumed gone" not in note
 
-    del ctx.coinset.mempool["toll-x"]                        # nowhere, no coins: grace (10h)
+    del ctx.coinset.mempool["toll-x"]                        # nowhere, no coins: the grace...
     ctx.wallet.txs = []
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "0.0h so far" in note, note       # ...from THIS probe, not retirement
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior_absent_since": {"toll-x": now - 10 * 3600.0}})
     assert engine._prior_sends_settled(store.get_active_job())[0]
 
 
@@ -2939,7 +2957,7 @@ def test_an_orphaned_retired_attempt_with_coins_settles_after_the_grace(monkeypa
     settled, note = engine._prior_sends_settled(store.get_active_job())
     assert not settled and "its coins are unspent" in note and "presumed gone after 6h" in note
     store.update_job(job.id, state_patch={
-        "funding_tx_id_prior_retired_at": {"toll-a": now - 7 * 3600.0}})
+        "funding_tx_id_prior_absent_since": {"toll-a": now - 7 * 3600.0}})
     assert engine._prior_sends_settled(store.get_active_job())[0]
     st = store.get_job(job.id).state
     assert st["funding_tx_id_prior_presumed"] == ["toll-a"]
@@ -3317,3 +3335,185 @@ def test_abandon_judges_completion_once(monkeypatch):
     note = store.get_events(job.id, limit=5000)[-1].message
     assert "the claim completed" in note
     assert len(calls) == 1, "one lookup, reused"
+
+
+# --------------------------------------------------------------------------- #
+# Review round 44.
+# --------------------------------------------------------------------------- #
+
+def test_the_absence_clock_starts_at_the_first_absent_probe_not_at_retirement(monkeypatch):
+    """[review] An attempt retired ten hours ago that stayed alive until now
+    is not presumed gone on its first absent probe: the grace counts
+    established absence, from the first probe that finds it absent."""
+    monkeypatch.setattr(S, "_UNOBSERVABLE_ATTEMPT_GRACE_S", 6 * 3600)
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    now = 1_000_000.0
+    monkeypatch.setattr(engine, "_now", lambda: now)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior_retired_at": {"toll-a": now - 10 * 3600.0}})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID2] = _rec(spent=True)             # the current attempt: dead
+    ctx.coinset.records[RID] = _rec(spent=False)             # toll-a: an orphan, as of now
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "0.0h so far" in note, note
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id_prior_absent_since"] == {"toll-a": now}
+    assert not st.get("funding_tx_id_prior_presumed")
+    # Six hours of established absence later: presumed gone.
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior_absent_since": {"toll-a": now - 6 * 3600.0}})
+    assert engine._prior_sends_settled(store.get_active_job())[0]
+    assert store.get_job(job.id).state["funding_tx_id_prior_presumed"] == ["toll-a"]
+
+
+def test_a_sighting_or_an_unanswered_probe_restarts_the_absence_clock(monkeypatch):
+    """[review] Five hours into the grace the wallet holds the attempt again
+    (or a probe does not answer): the clock is dropped, and the next absent
+    probe starts a new one -- never "absent for six hours" on the strength
+    of two absent probes six hours apart with liveness, or silence, between."""
+    monkeypatch.setattr(S, "_UNOBSERVABLE_ATTEMPT_GRACE_S", 6 * 3600)
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    clock = [1_000_000.0]
+    monkeypatch.setattr(engine, "_now", lambda: clock[0])
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    ctx.coinset.records[RID] = _rec(spent=False)
+    key = "funding_tx_id_prior_absent_since"
+    # Seen alive: the wallet holds it unconfirmed.
+    store.update_job(job.id, state_patch={key: {"toll-a": clock[0] - 5 * 3600.0}})
+    ctx.wallet.tx_records["toll-a"] = {"confirmed": False, "removals": []}
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "wallet still holds" in note, note
+    assert not store.get_job(job.id).state.get(key), "the clock is dropped"
+    # A probe that does not answer establishes nothing either.
+    store.update_job(job.id, state_patch={key: {"toll-a": clock[0] - 5 * 3600.0}})
+    ctx.wallet.tx_records.clear()
+
+    def down(tx_id):
+        raise RuntimeError("wallet rpc timed out")
+
+    ctx.wallet.get_transaction_or_none = down
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "did not answer" in note, note
+    assert not store.get_job(job.id).state.get(key)
+    # Absent again: a fresh clock, so two hours later it is still not gone,
+    # though its first absent probe was seven hours ago.
+    del ctx.wallet.get_transaction_or_none
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "0.0h so far" in note, note
+    clock[0] += 2 * 3600.0
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "2.0h so far" in note, note
+    assert not store.get_job(job.id).state.get("funding_tx_id_prior_presumed")
+
+
+def test_every_attempt_is_judged_on_every_pass(monkeypatch):
+    """[review] A verdict behind an unsettled attempt is not deferred: with
+    toll-a an orphan inside its grace and toll-c proven dead, one pass
+    reports toll-a and records toll-c dead."""
+    monkeypatch.setattr(S, "_UNOBSERVABLE_ATTEMPT_GRACE_S", 6 * 3600)
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    now = 1_000_000.0
+    monkeypatch.setattr(engine, "_now", lambda: now)
+    rid3 = "e3" * 32
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": ["toll-a", "toll-c"],
+        "funding_tx_id_prior_removals": {"toll-a": [RID], "toll-c": [rid3]}})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    ctx.coinset.records[RID] = _rec(spent=False)             # toll-a: an orphan
+    ctx.coinset.records[rid3] = _rec(spent=True)             # toll-c: dead
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "toll-a" in note and "0.0h so far" in note, note
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id_prior_dead"] == ["toll-c"]
+    assert list(st["funding_tx_id_prior_absent_since"]) == ["toll-a"]
+
+
+def test_a_proven_dead_attempt_is_skipped_before_identification():
+    """[review] Dead k1 spent X+Y, X conflicted, and the unnamed replacement
+    reused Y: with k1's own record gone from the history, the replacement's
+    record must not be handed to k1 (and the dead marker to it) -- k1 is
+    settled already and is neither identified nor probed; the replacement
+    adopts its own record and settles."""
+    from gui.services.warp import chia_send as cs
+
+    k1 = S._FUNDING_TX_UNKNOWN + "#1"
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    ph = claim_mod.security_coin_puzzle_hash(engine._load_ephemeral_sk(job)).hex()
+
+    def coin(parent):
+        return ({"parent_coin_info": parent, "puzzle_hash": "11" * 32,
+                 "amount": 499_005_000_000},
+                cs.coin_id(parent, "11" * 32, 499_005_000_000))
+
+    x, xid = coin("d4" * 32)
+    y, yid = coin("d5" * 32)
+    z, zid = coin("d6" * 32)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id": S._FUNDING_TX_UNKNOWN, "funding_tx_id_removals": None,
+        "funding_tx_id_prior": [k1], "funding_tx_id_prior_removals": {k1: [xid, yid]},
+        "funding_tx_id_prior_dead": [k1]})
+    ctx.coinset.peak = PEAK
+    for cid in (xid, yid, zid):
+        ctx.coinset.records[cid] = _rec(spent=True)
+    # Only the replacement's record is in the history (the wallet dropped
+    # the dead one); it reused k1's survivor Y.
+    ctx.wallet.txs = [{"name": "toll-r", "confirmed": True, "removals": [y, z],
+                       "additions": [{"puzzle_hash": ph, "amount": NET.chia_toll_mojos}]}]
+    ctx.wallet.tx_records["toll-r"] = {"confirmed": True, "removals": [y, z]}
+    ctx.coinset.by_ph = [SimpleNamespace(                    # the replacement landed, swept
+        coin=SimpleNamespace(parent_coin_info=yid, puzzle_hash=ph,
+                             amount=NET.chia_toll_mojos),
+        spent=True, confirmed_block_index=PEAK - 50, spent_block_index=PEAK - 40)]
+    assert engine._prior_sends_settled(store.get_active_job())[0]
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id"] == "toll-r"
+    assert sorted(st["funding_tx_id_removals"]) == sorted([yid, zid])
+    assert st["funding_tx_id_prior"] == [k1] and st["funding_tx_id_prior_dead"] == [k1]
+    assert st["funding_tx_id_prior_removals"] == {k1: [xid, yid]}
+
+
+def test_a_proven_dead_cat_spend_is_skipped_before_identification():
+    """[review] The burn books likewise: a dead unnamed cat_spend whose
+    survivor the replacement reused is never looked for in the history, so
+    the replacement's record cannot be re-keyed to it."""
+    from gui.services.warp import chia_send as cs
+
+    k1 = S._FUNDING_TX_UNKNOWN + "#1"
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _to_burn_sent(store, engine)
+    burn_ph = store.get_active_job().state["burn_cat_ph"]
+
+    def coin(parent):
+        return ({"parent_coin_info": parent, "puzzle_hash": "22" * 32, "amount": 5000},
+                cs.coin_id(parent, "22" * 32, 5000))
+
+    x, xid = coin("d4" * 32)
+    y, yid = coin("d5" * 32)
+    z, zid = coin("d6" * 32)
+    store.update_job(job.id, state_patch={
+        "burn_tx_id": "new-burn", "burn_tx_id_removals": [yid, zid],
+        "burn_tx_id_prior": [k1], "burn_tx_id_prior_removals": {k1: [xid, yid]},
+        "burn_tx_id_prior_dead": [k1]})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[xid] = _rec(spent=True)
+    ctx.wallet.cat_txs = [{"name": "new-burn", "removals": [y, z], "additions": [
+        {"puzzle_hash": burn_ph, "amount": AMOUNT, "parent_coin_info": "d5" * 32}]}]
+    looked = []
+    real = engine._identify_unnamed_burn
+    engine._identify_unnamed_burn = lambda *a, **k: looked.append(1) or real(*a, **k)
+    assert engine._burn_priors_settled(store.get_active_job())[0]
+    assert looked == [], "a dead attempt is not looked for"
+    st = store.get_active_job().state
+    assert st["burn_tx_id_prior"] == [k1] and st["burn_tx_id_prior_dead"] == [k1]
+    assert st["burn_tx_id"] == "new-burn" and st["burn_tx_id_removals"] == [yid, zid]

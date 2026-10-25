@@ -20,7 +20,9 @@ the wallet and the chain. A send the chain proves dead is sent again at once;
 one that merely vanished waits for Retry (an XCH funding send) or for proof
 of death (a cat_spend -- two burns can never both confirm). Every attempt
 stays on the job's books until it is proven dead, presumed gone after six
-hours absent from the wallet and the mempool, or landed and spent; only then
+hours of established absence from the wallet and the mempool (counted from
+the first absent probe, restarted by any sighting or unanswered probe), or
+landed and spent; only then
 does Sweep close the job, a claim complete, or an unwrap finish. Abandon
 records what actually happened.
 
@@ -33,7 +35,9 @@ node's estimate when the mempool demands it. Sends wait for a synced wallet.
 excludes any wallet with a warp send in flight -- or a Dexie take whose
 outcome is not yet readable (the new `unknown` take status) -- from its
 stuck-transaction cleanup, fails closed when the database cannot be read,
-and keeps that protection across a config switch.
+and keeps that protection across a config switch. An `unknown` take is
+released only after a day of unreadable trade-record lookups counted from
+the last pending read, never from its age.
 
 ## [0.10.31] — 2026-10-24 — a Wallet Link page for the Chia wallet and Sage
 

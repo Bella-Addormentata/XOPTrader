@@ -296,9 +296,21 @@ CREATE TABLE IF NOT EXISTS dexie_takes (
                                             -- unknown | confirmed | failed
     confirmed_at TEXT,
     confirmed_height INTEGER,               -- chain block the trade landed in
-    last_error   TEXT
+    last_error   TEXT,
+    unknown_since TEXT                      -- [review] since when its outcome
+                                            -- has been unreadable: set as it
+                                            -- settles unknown, restarted by
+                                            -- every pending read
 )
 """
+
+# [review] Columns added to dexie_takes after the table first shipped: a
+# store opened on an older file adds them (CREATE TABLE IF NOT EXISTS leaves
+# an existing table as it is).
+_DEXIE_TAKE_COLUMNS_ADDED: tuple = (
+    ("confirmed_height", "INTEGER"),
+    ("unknown_since", "TEXT"),
+)
 
 TAKE_SUBMITTING = "submitting"   # recorded before the take RPC
 TAKE_SUBMITTED = "submitted"
@@ -326,6 +338,7 @@ class DexieTake:
     confirmed_at: Optional[str]
     last_error: Optional[str]
     confirmed_height: Optional[int] = None
+    unknown_since: Optional[str] = None     # [review] the release clock's start
 
 
 _JOB_COLUMNS = (
@@ -394,6 +407,12 @@ class WarpJobStore:
             self._conn.execute(_CREATE_EVENTS_INDEX)
             self._conn.execute(_CREATE_META)
             self._conn.execute(_CREATE_DEXIE_TAKES)
+            have = {str(r["name"]) for r in self._conn.execute(
+                "PRAGMA table_info(dexie_takes)").fetchall()}
+            for name, decl in _DEXIE_TAKE_COLUMNS_ADDED:
+                if name not in have:
+                    self._conn.execute(
+                        f"ALTER TABLE dexie_takes ADD COLUMN {name} {decl}")
             row = self._conn.execute(
                 "SELECT value FROM warp_meta WHERE key = 'schema_version'"
             ).fetchone()
@@ -717,7 +736,9 @@ class WarpJobStore:
         """Move an open take to ``confirmed``, ``failed`` or ``unknown``,
         once. Only a take with a wallet trade record (``submitted``, or
         ``unknown`` after one) can confirm; ``unknown`` is the open state of
-        a take whose outcome the planner stopped waiting for."""
+        a take whose outcome the planner stopped waiting for, and stamps
+        ``unknown_since`` -- the release clock :meth:`take_still_live`
+        restarts on every pending read."""
         if status not in (TAKE_CONFIRMED, TAKE_FAILED, TAKE_UNKNOWN):
             raise WarpJobStoreError(f"a take cannot settle as {status!r}")
         take = self.get_take(trade_id)
@@ -735,13 +756,31 @@ class WarpJobStore:
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE dexie_takes SET status = ?, updated_at = ?, "
-                "confirmed_at = ?, confirmed_height = ?, last_error = ? "
-                "WHERE trade_id = ? AND status = ?",
+                "confirmed_at = ?, confirmed_height = ?, last_error = ?, "
+                "unknown_since = ? WHERE trade_id = ? AND status = ?",
                 (status, now, now if status == TAKE_CONFIRMED else None,
                  confirmed_height if status == TAKE_CONFIRMED else None,
-                 error, take.trade_id, take.status),
+                 error, now if status == TAKE_UNKNOWN else None,
+                 take.trade_id, take.status),
             )
         return self.get_take(take.trade_id)
+
+    def take_still_live(self, trade_id: str) -> DexieTake:
+        """[review] An ``unknown`` take whose trade record read as live
+        (PENDING_*) on this pass: ``unknown_since`` restarts, so the release
+        needs a full run of unreadable lookups after this sighting, never
+        one unanswered lookup on an old take."""
+        tid = _norm_hex(trade_id)
+        now = self._now()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE dexie_takes SET unknown_since = ?, updated_at = ? "
+                "WHERE trade_id = ? AND status = ?",
+                (now, now, tid, TAKE_UNKNOWN),
+            )
+            if cur.rowcount != 1:
+                raise StaleJobError(f"Dexie take {tid} is not unknown")
+        return self.get_take(tid)
 
     # -- meta (portal-coin hint, schema version, misc singletons) ------------ #
 
@@ -777,7 +816,8 @@ class WarpJobStore:
 
 _TAKE_COLUMNS = (
     "id, trade_id, offer_id, created_at, updated_at, asset_id, cat_mojos, "
-    "xch_mojos, fee_mojos, status, confirmed_at, last_error, confirmed_height"
+    "xch_mojos, fee_mojos, status, confirmed_at, last_error, confirmed_height, "
+    "unknown_since"
 )
 
 
@@ -796,6 +836,7 @@ def _row_to_take(row: sqlite3.Row) -> DexieTake:
         last_error=row["last_error"],
         confirmed_height=(int(row["confirmed_height"])
                           if row["confirmed_height"] is not None else None),
+        unknown_since=row["unknown_since"],
     )
 
 
