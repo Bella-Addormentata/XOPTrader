@@ -2624,8 +2624,12 @@ class WarpEngine:
             patch[f"{tx_key}_prior_retired_at"] = stamps
         try:
             self._store.update_job(job.id, expected_status=fresh.status, state_patch=patch)
-            _log.info("warp job %s: retired %s identified as %s (%d coins)",
-                      job.id, old_key, tx_id, len(removal_book[tx_id]))
+            if old_key == tx_id:
+                _log.info("warp job %s: learned the coins of retired %s (%d)",
+                          job.id, tx_id[:16], len(removal_book[tx_id]))
+            else:
+                _log.info("warp job %s: retired %s identified as %s (%d coins)",
+                          job.id, old_key, tx_id, len(removal_book[tx_id]))
         except Exception as exc:  # noqa: BLE001 -- judged this tick regardless
             _log.debug("warp job %s: could not persist the identified attempt (%s)",
                        job.id, exc)
@@ -2775,6 +2779,23 @@ class WarpEngine:
                 out_amount=amount, unique_output=False, min_depth=min_depth,
             )
             verdict, why = cs.judge(ev)
+            if ev.removals and not coins:
+                # [review] A record that reappeared taught the coins this
+                # attempt spent: kept in its book, so a record that vanishes
+                # again is judged by them (never presumed gone by absence).
+                learned = [_hx(c) for c in ev.removals]
+                if tx_id == current:
+                    if not self._unnamed(tx_id):
+                        try:
+                            self._store.update_job(
+                                job.id, expected_status=job.status,
+                                state_patch={f"{tx_key}_removals": learned})
+                        except Exception as exc:  # noqa: BLE001 -- judged anyway
+                            _log.debug("warp job %s: could not keep the learned coins "
+                                       "(%s)", job.id, exc)
+                else:
+                    self._persist_identified_attempt(job, tx_key, tx_id, tx_id, learned)
+                coins = learned
             if (verdict is cs.Verdict.ORPHAN and not ev.removals
                     and tx_id != current):
                 # [review] Named, retired, nowhere, and with no coins on
@@ -2878,6 +2899,11 @@ class WarpEngine:
                 out_amount=amount, unique_output=False, min_depth=min_depth,
             )
             verdict, why = cs.judge(ev)
+            if ev.removals and not coins:
+                # [review] As for the funding sends: coins a reappearing
+                # record taught are kept in the attempt's book.
+                self._persist_identified_attempt(
+                    job, "burn_tx_id", tx_id, tx_id, [_hx(c) for c in ev.removals])
             if verdict is cs.Verdict.DEAD:
                 if (tx_id == _FUNDING_TX_UNKNOWN and len(ev.removals) > 1
                         and not self._unnamed_group_dead(ev.removals, min_depth)):

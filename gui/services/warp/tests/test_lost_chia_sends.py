@@ -2830,3 +2830,35 @@ def test_the_burn_bundle_spends_the_pinned_cat_not_the_first_match(monkeypatch):
     store.update_job(job.id, columns={"next_retry_at": None})
     out = engine.step()
     assert not built and "not indexed yet" in (out.get("last_error") or _last_message(store, job.id))
+
+
+def test_learned_removals_of_a_named_retired_attempt_are_persisted(monkeypatch):
+    """[review] A retired send recorded without coins whose wallet record
+    reappears teaches its coins; they stay in its book, so when the record
+    vanishes again the send is judged by them and never presumed gone."""
+    from gui.services.warp import chia_send as cs
+
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    now = 1_000_000.0
+    monkeypatch.setattr(engine, "_now", lambda: now)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": ["toll-a"], "funding_tx_id_prior_removals": None,
+        "funding_tx_id_prior_retired_at": {"toll-a": now - 10 * 3600.0}})
+    removal = {"parent_coin_info": "d4" * 32, "puzzle_hash": "11" * 32,
+               "amount": 499_005_000_000}
+    rid = cs.coin_id("d4" * 32, "11" * 32, 499_005_000_000)
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    ctx.coinset.records[rid] = _rec(spent=False)
+    ctx.wallet.tx_records["toll-a"] = {"confirmed": False, "removals": [removal]}
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "could still land" in note
+    assert store.get_job(job.id).state["funding_tx_id_prior_removals"] == {"toll-a": [rid]}
+
+    ctx.wallet.tx_records.clear()                            # the record vanishes again
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "could still land" in note and "presumed gone" not in note
+    ctx.coinset.records[rid] = _rec(spent=True)              # ...until proven dead
+    assert engine._prior_sends_settled(store.get_active_job())[0]
