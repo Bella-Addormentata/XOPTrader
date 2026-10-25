@@ -2382,3 +2382,84 @@ def test_a_replacement_may_reuse_a_dead_predecessors_surviving_coin():
     ctx.wallet.txs = ctx.wallet.txs[:1]
     settled, note = engine._prior_sends_settled(store.get_active_job())
     assert not settled and "not known" in note
+
+
+# --------------------------------------------------------------------------- #
+# Review round 26.
+# --------------------------------------------------------------------------- #
+
+def test_a_retired_unnamed_attempts_record_is_never_adopted_as_the_replacements():
+    """[review] Retired unnamed A (coins X) and unnamed replacement B (coins
+    Y): the history hit for A's real record must not become B's id, which
+    would discard B's coins and let a DEAD verdict on A authorise a second
+    cat_spend while B can still confirm."""
+    from gui.services.warp import chia_send as cs
+
+    k1 = S._FUNDING_TX_UNKNOWN + "#1"
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _to_burn_sent(store, engine)
+    burn_ph = store.get_active_job().state["burn_cat_ph"]
+
+    def coin(parent):
+        return ({"parent_coin_info": parent, "puzzle_hash": "22" * 32, "amount": 5000},
+                cs.coin_id(parent, "22" * 32, 5000))
+
+    x, xid = coin("d4" * 32)
+    y, yid = coin("d5" * 32)
+    store.update_job(job.id, state_patch={
+        "burn_tx_id": S._FUNDING_TX_UNKNOWN, "burn_tx_id_removals": [yid],
+        "burn_cat_coin_id": None,
+        "burn_tx_id_prior": [k1], "burn_tx_id_prior_removals": {k1: [xid]},
+        "burn_tx_id_prior_dead": [k1]})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[xid] = _rec(spent=True)              # A dead
+    ctx.coinset.records[yid] = _rec(spent=False)             # B could still confirm
+    ctx.wallet.cat_txs = [{"name": "old-burn", "removals": [x], "additions": [
+        {"puzzle_hash": burn_ph, "amount": AMOUNT, "parent_coin_info": "d4" * 32}]}]
+    out = engine.step()
+    assert out["status"] == JobStatus.BURN_SENT
+    st = store.get_active_job().state
+    assert st["burn_tx_id"] == S._FUNDING_TX_UNKNOWN, "A's record is not B"
+    assert st["burn_tx_id_removals"] == [yid]
+    assert ctx.wallet.cat_spends == []
+
+    ctx.wallet.cat_txs.append({"name": "new-burn", "removals": [y], "additions": [
+        {"puzzle_hash": burn_ph, "amount": AMOUNT, "parent_coin_info": "d5" * 32}]})
+    engine.step()
+    st = store.get_active_job().state
+    assert st["burn_tx_id"] == "new-burn"
+    assert st["burn_tx_id_removals"] == [yid], "B's own evidence is kept"
+
+
+def test_the_dedupe_scan_skips_a_retired_orphans_record(monkeypatch):
+    """[review] After Retry retired an orphan, its record still in the
+    history must not be adopted as "already in flight", or the replacement
+    is never sent and Retry loops."""
+    from gui.services.warp import chia_send as cs
+
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    x = {"parent_coin_info": "d4" * 32, "puzzle_hash": "11" * 32, "amount": 499_005_000_000}
+    xid = cs.coin_id("d4" * 32, "11" * 32, 499_005_000_000)
+    job = _seed_funding(store, funding_tx_id=S._FUNDING_TX_UNKNOWN,
+                        funding_amount=EXPECTED, funding_tx_id_removals=[xid])
+    ctx.coinset.records[xid] = _rec(spent=False)             # an orphan
+    ctx.wallet.txs = [{"name": "orphan-rec", "removals": [x], "additions": [
+        {"puzzle_hash": SECURITY_PH.hex(), "amount": EXPECTED}]}]
+    ctx.wallet.tx_records["orphan-rec"] = {"confirmed": False, "removals": [x]}
+    # Not adopted while it is the current attempt either: its record IS the
+    # current attempt (same coins), so it is adopted by name...
+    engine.step()
+    assert store.get_active_job().state["funding_tx_id"] == "orphan-rec"
+    # ...and once Retry retires it, the record is nobody's to adopt.
+    ctx.wallet.get_transaction_or_none = lambda tid: None     # gone from the wallet
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     expected_status=JobStatus.FUNDING_CLAIM,
+                     state_patch={"failed_from": JobStatus.FUNDING_CLAIM})
+    engine.job_action(job.id, "retry")
+    assert store.get_job(job.id).state["funding_tx_id"] is None
+    engine.step()
+    assert len(ctx.wallet.sent) == 1, "the replacement is sent"
+    assert ctx.wallet.sent_excludes[-1] == [xid]

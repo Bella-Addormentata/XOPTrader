@@ -1685,8 +1685,9 @@ class WarpEngine:
                 job, tx_key="funding_tx_id", label="funding tx",
                 out_ph_hex=security_ph.hex(), out_amount=expected,
                 unique_output=True,
-                scan=lambda dead: self._find_existing_funding(
-                    security_ph.hex(), expected, exclude_ids=dead),
+                scan=lambda dead, **kw: self._find_existing_funding(
+                    security_ph.hex(), expected, exclude_ids=dead,
+                    **{**self._history_filters(job, "funding_tx_id"), **kw}),
             )
             if step is not None:
                 return step
@@ -1694,7 +1695,8 @@ class WarpEngine:
         priors = [t for t in (resend.get("funding_tx_id_prior")
                               or job.state.get("funding_tx_id_prior") or []) if t]
         existing = self._find_existing_funding(
-            security_ph.hex(), expected, exclude_ids=priors)
+            security_ph.hex(), expected, exclude_ids=priors,
+            **self._history_filters(job, "funding_tx_id", pending=resend))
         if existing:
             return _stay(
                 # funding_amount travels with the id here too: a job that
@@ -2094,13 +2096,56 @@ class WarpEngine:
             return {"receiver_address": "", "receiver_source": f"unavailable: {exc}"}
         return {"receiver_address": address, "receiver_source": "wallet"}
 
+    @staticmethod
+    def _history_hit_excluded(tx: dict, *, exclude_coin_sets: Sequence[Sequence[str]],
+                              exclude_coins: Sequence[str],
+                              require_coins: Sequence[str]) -> bool:
+        """[review] Whether a wallet-history record is some OTHER attempt's
+        (its coins exactly a retired attempt's set, or overlapping an attempt
+        still on the books), or cannot be attributed to the attempt sought
+        (*require_coins* known, and the record's coins unknown or disjoint).
+        A record without a removals list is excluded only when attribution
+        is required."""
+        from . import chia_send as cs
+
+        coins = {_hx(c) for c in cs.removal_ids(tx)}
+        if coins:
+            if any(coins == {_hx(c) for c in s if c} for s in exclude_coin_sets if s):
+                return True
+            if coins.intersection(_hx(c) for c in exclude_coins if c):
+                return True
+        wanted = {_hx(c) for c in require_coins if c}
+        if wanted and not coins.intersection(wanted):
+            return True
+        return False
+
+    def _history_filters(self, job: WarpJob, tx_key: str,
+                         pending: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """The attempts on the books, as the history scanners' exclusions:
+        every retired attempt's exact coin set, and the coins of the attempts
+        not proven dead.  *pending* is a state patch not yet written."""
+        st = {**job.state, **(pending or {})}
+        prior_removals = dict(st.get(f"{tx_key}_prior_removals") or {})
+        dead = [t for t in (st.get(f"{tx_key}_prior_dead") or []) if t]
+        live, sets = self._attempt_books(prior_removals, dead)
+        return {"exclude_coin_sets": sets, "exclude_coins": live}
+
     def _find_existing_funding(self, security_ph_hex: str, expected: int,
-                               exclude_ids: Sequence[str] = ()) -> Optional[str]:
+                               exclude_ids: Sequence[str] = (), *,
+                               exclude_coin_sets: Sequence[Sequence[str]] = (),
+                               exclude_coins: Sequence[str] = (),
+                               require_coins: Sequence[str] = ()) -> Optional[str]:
         """Scan wallet history for an already-broadcast funding of this coin.
 
         ``exclude_ids`` are sends already proven dead ([WARP-LOST-SEND]): the
         wallet may keep retrying one whose coin is spent elsewhere, and
-        adopting it again would wait forever.
+        adopting it again would wait forever.  [review] A record that is a
+        RETIRED attempt's (its coins exactly one of ``exclude_coin_sets``, or
+        overlapping ``exclude_coins`` -- an attempt still on the books) is
+        never a hit either: a retired unnamed attempt's real record would
+        otherwise be adopted as the current one's.  With ``require_coins``
+        (the current attempt's own recorded coins) a hit must spend one of
+        them.
 
         Fails **closed**. This scan is the only thing standing between a lost
         ``send_transaction`` response and a second send of the same amount to the
@@ -2132,6 +2177,10 @@ class WarpEngine:
         dead = {_hx(t) for t in exclude_ids if t}
         for tx in list(pending or []) + list(txs or []):
             if _hx(tx.get("name") or tx.get("transaction_id") or "") in dead:
+                continue
+            if self._history_hit_excluded(
+                    tx, exclude_coin_sets=exclude_coin_sets,
+                    exclude_coins=exclude_coins, require_coins=require_coins):
                 continue
             for add in tx.get("additions") or []:
                 if _hx(add.get("puzzle_hash", "")) == want and int(
@@ -2780,11 +2829,16 @@ class WarpEngine:
         priors = [t for t in (st.get(prior_key) or []) if t]
 
         if tx_id == _FUNDING_TX_UNKNOWN:
-            found = scan(priors)
+            recorded = [c for c in (st.get(removals_key) or []) if c]
+            # [review] A hit must be THIS attempt's record: never a retired
+            # attempt's (the scan knows their coin sets), and, when the
+            # daemon listed the coins this send spent, one spending them.
+            found = scan(priors, require_coins=recorded)
             found_id = found[0] if isinstance(found, tuple) else found
             if found_id:
-                # The coins it spent are re-learned from the record itself.
-                adopted = {tx_key: str(found_id), polls_key: 0, removals_key: None}
+                # The coins it spent are kept (or re-learned from the record).
+                adopted = {tx_key: str(found_id), polls_key: 0,
+                           removals_key: recorded or None}
                 # [review] The burn scan also names the output coin: pinned,
                 # as the dedupe branch pins it, so a later unpinned scan
                 # cannot adopt an unrelated CAT of the same receiver and
@@ -2798,7 +2852,6 @@ class WarpEngine:
                              "history; awaiting the coin"),
                 ), {}
             polls += 1
-            recorded = [c for c in (st.get(removals_key) or []) if c]
             if recorded:
                 # [review] The daemon listed the coins it spent: the chain
                 # can still prove the send dead (a coin spent elsewhere at
@@ -3013,8 +3066,9 @@ class WarpEngine:
             out_amount = int(job.amount_mojos)
             also_clear: tuple = ("burn_cat_coin_id",)
             wid = int(job.state["cat_wallet_id"])
-            scan = lambda dead: self._find_existing_burn(  # noqa: E731
-                wid, out_ph, out_amount, exclude_ids=dead)
+            scan = lambda dead, **kw: self._find_existing_burn(  # noqa: E731
+                wid, out_ph, out_amount, exclude_ids=dead,
+                **{**self._history_filters(job, tx_key), **kw})
         else:
             unique, also_clear = True, ()
             out_ph = claim.security_coin_puzzle_hash(
@@ -3022,8 +3076,9 @@ class WarpEngine:
             out_amount = (int(self._net.chia_toll_mojos)
                           if target == JobStatus.BURNING
                           else int(self._funded_amount(job)))
-            scan = lambda dead: self._find_existing_funding(  # noqa: E731
-                out_ph, out_amount, exclude_ids=dead)
+            scan = lambda dead, **kw: self._find_existing_funding(  # noqa: E731
+                out_ph, out_amount, exclude_ids=dead,
+                **{**self._history_filters(job, tx_key), **kw})
         priors = [t for t in (job.state.get(f"{tx_key}_prior") or []) if t]
         # [review] A cat_spend is replaced ONLY when the chain proves it dead:
         # a replacement spends other coins, so an orphaned burn that surfaced
@@ -3033,7 +3088,8 @@ class WarpEngine:
         burn = target == JobStatus.BURN_SENT
         if tx_id == _FUNDING_TX_UNKNOWN:
             self._wallet.log_in()
-            found = scan(priors)
+            recorded = sorted({_hx(c) for c in (job.state.get(f"{tx_key}_removals") or []) if c})
+            found = scan(priors, require_coins=recorded)
             found_id = found[0] if isinstance(found, tuple) else found
             if found_id:
                 return {}
@@ -3043,7 +3099,6 @@ class WarpEngine:
             # under a key of its own.  With them the send is judged like a
             # named one (a cat_spend still only replaced when dead); without
             # them only an XCH funding send may be sent again.
-            recorded = sorted({_hx(c) for c in (job.state.get(f"{tx_key}_removals") or []) if c})
             key = self._unnamed_attempt_key(job, tx_key)
             if recorded:
                 verdict, _why, ev = self._recorded_send_verdict(
@@ -3578,7 +3633,10 @@ class WarpEngine:
         )
 
     def _find_existing_burn(self, wallet_id: int, burn_cat_ph_hex: str,
-                            amount: int, exclude_ids: Sequence[str] = ()):
+                            amount: int, exclude_ids: Sequence[str] = (), *,
+                            exclude_coin_sets: Sequence[Sequence[str]] = (),
+                            exclude_coins: Sequence[str] = (),
+                            require_coins: Sequence[str] = ()):
         """An in-flight or live transaction that already created OUR burn CAT.
 
         Two hazards shaped this, both reproduced by review:
@@ -3602,6 +3660,11 @@ class WarpEngine:
             for tx in txs:
                 # [WARP-LOST-SEND] Never a send already proven dead.
                 if _hx(tx.get("name") or tx.get("transaction_id") or "") in dead:
+                    continue
+                # [review] Nor another attempt's record (see _find_existing_funding).
+                if self._history_hit_excluded(
+                        tx, exclude_coin_sets=exclude_coin_sets,
+                        exclude_coins=exclude_coins, require_coins=require_coins):
                     continue
                 for add in tx.get("additions") or []:
                     if _hx(str(add.get("puzzle_hash") or "")) != burn_cat_ph_hex:
@@ -3697,7 +3760,9 @@ class WarpEngine:
                 try:
                     self._wallet.log_in()
                     found = self._find_existing_burn(
-                        int(job.state["cat_wallet_id"]), burn_cat_ph, amount)
+                        int(job.state["cat_wallet_id"]), burn_cat_ph, amount,
+                        exclude_ids=[t for t in (job.state.get("burn_tx_id_prior") or []) if t],
+                        **self._history_filters(job, "burn_tx_id"))
                 except Exception:  # noqa: BLE001 -- then nothing is adopted here
                     found = None
                 if found and found[1]:
@@ -3731,8 +3796,9 @@ class WarpEngine:
             step, resend = self._judge_recorded_send(
                 job, tx_key="burn_tx_id", label="cat_spend",
                 out_ph_hex=burn_cat_ph, out_amount=amount, unique_output=False,
-                scan=lambda dead: self._find_existing_burn(
-                    wid, burn_cat_ph, amount, exclude_ids=dead),
+                scan=lambda dead, **kw: self._find_existing_burn(
+                    wid, burn_cat_ph, amount, exclude_ids=dead,
+                    **{**self._history_filters(job, "burn_tx_id"), **kw}),
                 also_clear=("burn_cat_coin_id",),
             )
             if step is not None:
@@ -3745,6 +3811,7 @@ class WarpEngine:
             found = self._find_existing_burn(
                 int(job.state["cat_wallet_id"]), burn_cat_ph, amount,
                 exclude_ids=priors,
+                **self._history_filters(job, "burn_tx_id", pending=resend),
             )
         except Exception as exc:  # noqa: BLE001 -- cannot prove it was not sent
             raise WarpError(
@@ -3936,8 +4003,9 @@ class WarpEngine:
                 step, resend = self._judge_recorded_send(
                     job, tx_key="funding_tx_id", label="toll tx",
                     out_ph_hex=ph.hex(), out_amount=toll, unique_output=True,
-                    scan=lambda dead: self._find_existing_funding(
-                        ph.hex(), toll, exclude_ids=dead),
+                    scan=lambda dead, **kw: self._find_existing_funding(
+                        ph.hex(), toll, exclude_ids=dead,
+                        **{**self._history_filters(job, "funding_tx_id"), **kw}),
                 )
                 if step is not None:
                     return step
@@ -3946,7 +4014,8 @@ class WarpEngine:
                       if t]
             try:
                 existing = self._find_existing_funding(
-                    ph.hex(), toll, exclude_ids=priors)
+                    ph.hex(), toll, exclude_ids=priors,
+                    **self._history_filters(job, "funding_tx_id", pending=resend))
             except Exception as exc:  # noqa: BLE001
                 raise WarpError(
                     f"wallet history scan failed ({exc}); refusing to fund blindly"
