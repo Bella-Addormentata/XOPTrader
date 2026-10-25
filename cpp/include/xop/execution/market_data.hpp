@@ -881,6 +881,11 @@ public:
     /// next refresh() recomputes from what remains.
     void withdraw_reference_and_mid(const std::string& pair_name);
 
+    /// [LIVECFG] Withdraw the pair's TibetSwap AMM observation, for a feed
+    /// switched off or replaced by a reload: with
+    /// strategy.fair_value_amm_max_age_sec 0 nothing else would age it out.
+    void clear_amm_observation(const std::string& pair_name);
+
     /// Ingest the TibetSwap AMM implied mid-price for a pair.
     /// The implied price is computed from pool reserves: output_reserve / input_reserve.
     ///

@@ -283,16 +283,14 @@ OfferManager::OfferManager(asio::io_context&                    /*ioc*/,
 void OfferManager::reconfigure(const AppConfig& config)
 {
     validate_config(config);
-    const auto previous_static_fee = strategy_cfg_.offer_fee_mojos;
     strategy_cfg_            = config.strategy;
     risk_cfg_                = config.risk;
     dexie_cfg_.claim_rewards = config.dexie.claim_rewards;
     for (const auto& pc : config.pairs) {
         pair_config_map_.insert_or_assign(pc.name, pc);
     }
-    if (config.strategy.offer_fee_mojos != previous_static_fee) {
-        current_fee_mojos_ = config.strategy.offer_fee_mojos;
-    }
+    // The fee in force is the engine's to set (set_dynamic_fee, clamp_fees):
+    // with the FeeTracker on it is not strategy.offer_fee_mojos.
     logger_->info("[LIVECFG] OfferManager reconfigured: {} tiers, TTL {} blocks",
                   strategy_cfg_.num_tiers, strategy_cfg_.offer_ttl_blocks);
 }
@@ -3475,6 +3473,19 @@ void OfferManager::set_cancel_fees(std::uint64_t xch_offered_mojos,
 void OfferManager::clear_cancel_fees() noexcept
 {
     cancel_fees_active_ = false;
+}
+
+void OfferManager::clamp_fees(std::uint64_t min_fee_mojos,
+                              std::uint64_t max_fee_mojos) noexcept
+{
+    const auto clamp = [&](std::uint64_t fee) {
+        return std::min(std::max(fee, min_fee_mojos), max_fee_mojos);
+    };
+    current_fee_mojos_ = clamp(current_fee_mojos_);
+    if (cancel_fees_active_) {
+        cancel_fee_xch_mojos_ = clamp(cancel_fee_xch_mojos_);
+        cancel_fee_cat_mojos_ = clamp(cancel_fee_cat_mojos_);
+    }
 }
 
 void OfferManager::set_cancel_observer(

@@ -68,3 +68,33 @@ def test_step_8_records_the_wallet_of_each_reserve_it_sets():
         "without the record, a reserve dropped by a save has no wallet "
         "for apply_live_config() to clear"
     )
+
+
+def test_reloaded_fee_bounds_reach_the_cached_execution_fees():
+    body = _definition(APPLY)
+    reconf = body.find("offer_mgr_->reconfigure(config_);")
+    assert reconf != -1
+    after = body[reconf:]
+    assert "offer_mgr_->clamp_fees(config_.fees.min_fee_mojos,config_.fees.max_fee_mojos);" in after, (
+        "a gated Step 8 leaves OfferManager's attached and cancel fees as "
+        "they were, and the TTL sweep cancels at them: a lowered "
+        "max_fee_mojos must reach them at the reload"
+    )
+    assert "offer_mgr_->set_dynamic_fee(config_.strategy.offer_fee_mojos);" in after, (
+        "with the FeeTracker off the static fee is the fee"
+    )
+
+
+def test_a_tibetswap_change_withdraws_the_amm_observations():
+    body = _definition(APPLY)
+    start = body.find("if(tibetswap_changed){")
+    assert start != -1
+    block = body[start:]
+    for needle in ("arb_detector_->set_tibetswap_reserves({});",
+                   "tibetswap_reserves_at_=Timestamp{};",
+                   "tibetswap_reserves_pending_=false;",
+                   "market_data_->clear_amm_observation(pair.name);"):
+        assert needle in block, (
+            f"{needle} missing: a TibetSwap feed switched off kept feeding "
+            "the fair-value solve from its last reserves"
+        )

@@ -26358,6 +26358,20 @@ void Engine::apply_live_config(const AppConfig& m)
     }
     if (coin_mgr_) coin_mgr_->reconfigure(config_);
     if (offer_mgr_) offer_mgr_->reconfigure(config_);
+    // The fees OfferManager cached at the last Step 8 that got that far. A
+    // gated Step 8 leaves them, and the TTL sweep and escalations still
+    // cancel at them, so they are brought inside the saved bounds now. No
+    // new quote is asked for here: Step 8 sets them as usual next time.
+    if (offer_mgr_ && fee_tracker_) {
+        if (!fee_tracker_->enabled()) {
+            offer_mgr_->set_dynamic_fee(config_.strategy.offer_fee_mojos);
+            offer_mgr_->clear_cancel_fees();
+        } else {
+            offer_mgr_->clamp_fees(config_.fees.min_fee_mojos,
+                                   config_.fees.max_fee_mojos);
+            if (!fee_tracker_->class_fees_active()) offer_mgr_->clear_cancel_fees();
+        }
+    }
     const auto cpc = comp_pid_config_from(config_.strategy);
     for (auto& [name, pid] : comp_pid_state_) pid.set_config(cpc);
 
@@ -26384,6 +26398,18 @@ void Engine::apply_live_config(const AppConfig& m)
     if (tibetswap_changed) {
         if (tibetswap_) tibetswap_->close();
         tibetswap_.reset();
+        // As with CoinGecko: the reserves and the AMM observations came from
+        // the old section. Left in place, a feed switched off would keep
+        // feeding the fair-value solve (forever with
+        // fair_value_amm_max_age_sec 0). A rebuilt client refetches below.
+        if (arb_detector_) arb_detector_->set_tibetswap_reserves({});
+        tibetswap_reserves_at_      = Timestamp{};
+        tibetswap_reserves_pending_ = false;
+        if (market_data_) {
+            for (const auto& pair : config_.pairs) {
+                market_data_->clear_amm_observation(pair.name);
+            }
+        }
         if (config_.tibetswap.enabled) {
             tibetswap_ = std::make_shared<rpc::TibetSwapClient>(ioc_, config_.tibetswap);
             tibetswap_->open();

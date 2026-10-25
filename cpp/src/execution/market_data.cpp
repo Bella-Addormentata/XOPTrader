@@ -698,6 +698,18 @@ void MarketDataFeed::withdraw_reference_and_mid(const std::string& pair_name)
     publish_snapshot(ps);
 }
 
+void MarketDataFeed::clear_amm_observation(const std::string& pair_name)
+{
+    std::unique_lock lock(mtx_pairs_);
+    const auto it = pairs_.find(pair_name);
+    if (it == pairs_.end()) return;
+    PairState& ps = it->second;
+    ps.amm_mid        = 0.0;
+    ps.amm_pool_usd   = 0.0;
+    ps.amm_updated_at = Timestamp{};
+    publish_snapshot(ps);
+}
+
 void MarketDataFeed::ingest_cex_reference(const std::string& pair_name,
                                            double             cex_mid,
                                            Timestamp          observed_at,
@@ -1081,6 +1093,12 @@ bool MarketDataFeed::is_stale(const std::string& pair_name) const {
 }
 
 double MarketDataFeed::get_staleness_fraction(const std::string& pair_name) const {
+    // Read before mtx_pairs_: mtx_config_ is never held with another lock,
+    // and set_config() may replace config_ from a reload.
+    const auto stale_threshold = [&] {
+        std::shared_lock lk(mtx_config_);
+        return config_.stale_threshold;
+    }();
     std::shared_lock lock(mtx_pairs_);
 
     auto it = pairs_.find(pair_name);
@@ -1103,7 +1121,7 @@ double MarketDataFeed::get_staleness_fraction(const std::string& pair_name) cons
 
     const auto age = std::chrono::duration_cast<std::chrono::seconds>(now - best_ts);
     const auto threshold_s = std::chrono::duration_cast<std::chrono::seconds>(
-        config_.stale_threshold);
+        stale_threshold);
     if (threshold_s.count() <= 0) return 0.0;
 
     return static_cast<double>(age.count()) / static_cast<double>(threshold_s.count());
@@ -1482,7 +1500,7 @@ double MarketDataFeed::compute_mid(const PairState& ps,
     // When AMM is available, we re-normalise so all active weights sum to 1.0.
     double w_dex = kDexWeight;
     double w_cex = kCexWeight;
-    double w_amm = config_.amm_blend_weight;
+    double w_amm = cfg.amm_blend_weight;
 
     // Determine AMM availability + freshness.
     double amm_mid = 0.0;
@@ -2812,7 +2830,11 @@ std::optional<CompetitorMetrics> MarketDataFeed::compute_competitor_metrics(
 std::optional<CompetitorMetrics> MarketDataFeed::get_competitor_metrics(
     const std::string& pair_name) const
 {
-    if (!config_.enable_competitor_tracking) {
+    const bool tracking = [&] {
+        std::shared_lock lk(mtx_config_);
+        return config_.enable_competitor_tracking;
+    }();
+    if (!tracking) {
         return std::nullopt;
     }
 

@@ -366,6 +366,23 @@ TEST(ConfigLiveApplySetters, vpin_starts_over_on_a_new_bucket_size)
         << "buckets of the old size would read one-sided flow as ~0.1";
 }
 
+TEST(ConfigLiveApplySetters, a_withdrawn_amm_observation_is_gone)
+{
+    xop::MarketDataConfig mc;
+    xop::State state;
+    xop::MarketDataFeed feed{mc, state};
+    const std::string pair = "XCH/BYC";
+    feed.ingest_amm_mid(pair, 1.49, 250'000.0);
+    ASSERT_GT(feed.get_fair_value_inputs(pair).amm_mid, 0.0);
+
+    feed.clear_amm_observation(pair);
+    const auto obs = feed.get_fair_value_inputs(pair);
+    EXPECT_DOUBLE_EQ(obs.amm_mid, 0.0)
+        << "a TibetSwap feed switched off must stop feeding the solve";
+    EXPECT_DOUBLE_EQ(obs.amm_pool_usd, 0.0);
+    feed.clear_amm_observation("XCH/NONE");   // unknown pair: a no-op
+}
+
 TEST(ConfigLiveApplySetters, adverse_selection_priors_apply_without_a_new_fill)
 {
     xop::AdverseSelectionConfig ac;

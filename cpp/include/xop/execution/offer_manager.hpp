@@ -986,6 +986,13 @@ public:
     /// fees.cost_aware_estimate is on).
     void clear_cancel_fees() noexcept;
 
+    /// [LIVECFG] Bring the cached attached and cancel fees inside a reloaded
+    /// [fees.min_fee_mojos, fees.max_fee_mojos].  Step 8 sets them each
+    /// heartbeat it gets that far; a gated Step 8 does not, while the TTL
+    /// sweep and escalations still cancel at them.
+    void clamp_fees(std::uint64_t min_fee_mojos,
+                    std::uint64_t max_fee_mojos) noexcept;
+
     /// [review #163] Called after every per-offer SECURE cancel the wallet
     /// ACCEPTED, with the trade id and the fee that cancel really paid --
     /// whatever path chose it (Step 8, an emergency tier, a zero-fee retry,
