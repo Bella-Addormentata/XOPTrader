@@ -2461,9 +2461,31 @@ class WarpEngine:
         """A distinct key for the unnamed attempt being retired, so each
         is settled on its own evidence ([review]: merged under one key, one
         attempt's dead input would have settled them all)."""
-        priors = [t for t in (job.state.get(f"{tx_key}_prior") or []) if t]
-        n = 1 + sum(1 for t in priors if self._unnamed(t))
-        return f"{_FUNDING_TX_UNKNOWN}#{n}"
+        # [review] Never a key in use, nor one ever used: counting the
+        # unnamed entries would hand out "#2" again once "#1" was re-keyed
+        # under its real id, and retiring another send under a live key
+        # overwrites that attempt's coins.  The highest number ever seen in
+        # any book (and a persisted sequence, for re-keyed ones) plus one.
+        st = job.state
+        prefix = f"{_FUNDING_TX_UNKNOWN}#"
+        seen = int(st.get(f"{tx_key}_unnamed_seq") or 0)
+
+        def _num(t: Any) -> int:
+            t = str(t or "")
+            if not t.startswith(prefix):
+                return 0
+            try:
+                return int(t[len(prefix):])
+            except ValueError:
+                return 0
+
+        for key in (f"{tx_key}_prior", f"{tx_key}_prior_dead"):
+            for t in (st.get(key) or []):
+                seen = max(seen, _num(t))
+        for key in (f"{tx_key}_prior_removals", f"{tx_key}_prior_retired_at"):
+            for t in (st.get(key) or {}).keys():
+                seen = max(seen, _num(t))
+        return f"{prefix}{seen + 1}"
 
     def _unnamed_group_dead(self, coins: Sequence[str], min_depth: int) -> bool:
         """A legacy entry that merged several unnamed attempts' coins under
@@ -2529,6 +2551,14 @@ class WarpEngine:
         proven_dead = [t for t in (st.get(dead_key) or []) if t]
         retired_at = dict(st.get(f"{tx_key}_prior_retired_at") or {})
         retired_at.setdefault(tx_id, float(self._now()))
+        seq_patch: Dict[str, Any] = {}
+        prefix = f"{_FUNDING_TX_UNKNOWN}#"
+        if tx_id.startswith(prefix):
+            try:
+                seq_patch[f"{tx_key}_unnamed_seq"] = max(
+                    int(st.get(f"{tx_key}_unnamed_seq") or 0), int(tx_id[len(prefix):]))
+            except ValueError:
+                pass
         coins = [c for c in removals if c]
         if coins:
             prior_removals[tx_id] = coins
@@ -2552,6 +2582,7 @@ class WarpEngine:
             dead_key: proven_dead or None,
             f"{tx_key}_prior_retired_at": retired_at or None,
             f"{tx_key}_exclude": exclude or None,
+            **seq_patch,
             **{key: None for key in also_clear},
         }
 
@@ -2565,7 +2596,15 @@ class WarpEngine:
         "unobservable" again, so a record that later drops out of the
         history cannot start the absence-based grace while the bundle may
         still sit in a mempool.  Best effort: this tick judges it anyway."""
-        st = job.state
+        # [review] The LATEST books, not the caller's snapshot: a settlement
+        # pass may re-key several attempts, and each write must build on the
+        # previous one or the earlier identification is lost.
+        try:
+            fresh = self._store.get_job(job.id)
+        except Exception as exc:  # noqa: BLE001 -- judged this tick regardless
+            _log.debug("warp job %s: could not re-read before re-keying (%s)", job.id, exc)
+            return
+        st = fresh.state
         patch: Dict[str, Any] = {}
         priors = [t for t in (st.get(f"{tx_key}_prior") or []) if t]
         if old_key in priors:
@@ -2584,7 +2623,7 @@ class WarpEngine:
             stamps[tx_id] = stamps.pop(old_key)
             patch[f"{tx_key}_prior_retired_at"] = stamps
         try:
-            self._store.update_job(job.id, expected_status=job.status, state_patch=patch)
+            self._store.update_job(job.id, expected_status=fresh.status, state_patch=patch)
             _log.info("warp job %s: retired %s identified as %s (%d coins)",
                       job.id, old_key, tx_id, len(removal_book[tx_id]))
         except Exception as exc:  # noqa: BLE001 -- judged this tick regardless
@@ -4163,11 +4202,49 @@ class WarpEngine:
             )
 
         # The burn CAT (created by the cat_spend; unspent until our bundle).
+        # [review] By the coin BURN_SENT pinned (burn_cat_coin_id, with its
+        # parent), never the first same-amount coin at the shared puzzle:
+        # burn_cat_ph is (net, receiver)-scoped, so an unrelated unwrap's
+        # CAT can sit there, and a bundle that consumed it would complete
+        # this job while its own CAT stayed stranded.  A pinned coin that is
+        # not indexed yet, or already spent, waits (a landed bundle resolves
+        # via the nonce check next tick).  Only a job pinned before coin
+        # ids were recorded falls back to the parent / the bare scan.
         burn_cat = None
-        for rec in self._coinset.get_coin_records_by_puzzle_hash(
-            job.state["burn_cat_ph"]
-        ):
-            if int(rec.coin.amount) == amount and not rec.spent:
+        burn_ph_hex = _hx(job.state["burn_cat_ph"])
+        pinned_cat = _hx(job.state.get("burn_cat_coin_id") or "")
+        pinned_parent = _hx(job.state.get("burn_cat_parent") or "")
+        candidates = list(self._coinset.get_coin_records_by_puzzle_hash(burn_ph_hex))
+        if pinned_cat:
+            rec = self._coinset.get_coin_record_by_name(pinned_cat)
+            if rec is None:
+                # The by-name index may lag the puzzle-hash index: the same
+                # coin, recognised by its computed name.
+                for cand in candidates:
+                    if cu.coin_name(
+                            bytes.fromhex(_hx(cand.coin.parent_coin_info)),
+                            bytes.fromhex(burn_ph_hex),
+                            int(cand.coin.amount)).hex() == pinned_cat:
+                        rec = cand
+                        break
+            if rec is None:
+                raise WarpPending("the job's burn CAT is not indexed yet; awaiting it")
+            if rec.spent:
+                raise WarpPending(
+                    "the job's burn CAT is spent; awaiting the bridging coin index "
+                    "(a landed bundle resolves via the nonce check next tick)"
+                )
+            burn_cat = drivers.Coin(
+                bytes.fromhex(_hx(rec.coin.parent_coin_info)),
+                bytes.fromhex(burn_ph_hex),
+                int(rec.coin.amount),
+            )
+        else:
+            for rec in candidates:
+                if int(rec.coin.amount) != amount or rec.spent:
+                    continue
+                if pinned_parent and _hx(rec.coin.parent_coin_info) != pinned_parent:
+                    continue
                 burn_cat = drivers.Coin(
                     bytes.fromhex(_hx(rec.coin.parent_coin_info)),
                     bytes.fromhex(_hx(rec.coin.puzzle_hash)),

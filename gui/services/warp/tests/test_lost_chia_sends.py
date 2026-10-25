@@ -2709,3 +2709,124 @@ def test_an_identified_retired_attempt_is_persisted_under_its_real_id(monkeypatc
     assert not settled and "could still land" in note
     ctx.coinset.records[rid] = _rec(spent=True)              # ...until proven dead
     assert engine._prior_sends_settled(store.get_active_job())[0]
+
+
+# --------------------------------------------------------------------------- #
+# Review round 32.
+# --------------------------------------------------------------------------- #
+
+def test_a_retired_attempts_key_is_never_one_in_use_or_ever_used():
+    """[review] After #1 was re-keyed under its real id while #2 is still
+    outstanding, the next retired attempt must not be "#2" again."""
+    k2 = S._FUNDING_TX_UNKNOWN + "#2"
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": ["toll-x", k2],
+        "funding_tx_id_prior_removals": {"toll-x": [RID], k2: None}})
+    assert engine._unnamed_attempt_key(store.get_active_job(), "funding_tx_id") \
+        == S._FUNDING_TX_UNKNOWN + "#3"
+    # A re-keyed "#3" leaves no trace in the books but the sequence remembers it.
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": ["toll-x", "toll-y"], "funding_tx_id_unnamed_seq": 3})
+    assert engine._unnamed_attempt_key(store.get_active_job(), "funding_tx_id") \
+        == S._FUNDING_TX_UNKNOWN + "#4"
+
+
+def test_the_sequence_of_unnamed_keys_is_persisted_on_retirement(monkeypatch):
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store, funding_tx_id=S._FUNDING_TX_UNKNOWN,
+                        funding_amount=EXPECTED, funding_tx_id_removals=[RID])
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = PEAK
+    engine.step()                                            # dead: retired as #1
+    st = store.get_active_job().state
+    assert st["funding_tx_id_prior"] == [S._FUNDING_TX_UNKNOWN + "#1"]
+    assert st["funding_tx_id_unnamed_seq"] == 1
+
+
+def test_two_identifications_in_one_pass_are_both_kept():
+    """[review] Each re-key builds on the previous write, not on the
+    caller's stale snapshot."""
+    from gui.services.warp import chia_send as cs
+
+    k1, k2 = S._FUNDING_TX_UNKNOWN + "#1", S._FUNDING_TX_UNKNOWN + "#2"
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    ph = claim_mod.security_coin_puzzle_hash(engine._load_ephemeral_sk(job)).hex()
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": [k1, k2], "funding_tx_id_prior_removals": None})
+
+    def tx(name, parent):
+        removal = {"parent_coin_info": parent, "puzzle_hash": "11" * 32,
+                   "amount": 499_005_000_000}
+        rid = cs.coin_id(parent, "11" * 32, 499_005_000_000)
+        ctx.wallet.tx_records[name] = {"confirmed": False, "removals": [removal]}
+        ctx.coinset.records[rid] = _rec(spent=True)          # both proven dead
+        return rid, {"name": name, "confirmed": False, "removals": [removal],
+                     "additions": [{"puzzle_hash": ph, "amount": NET.chia_toll_mojos}]}
+
+    xid, tx1 = tx("toll-x", "d4" * 32)
+    yid, tx2 = tx("toll-y", "d5" * 32)
+    ctx.wallet.txs = [tx1, tx2]
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    assert engine._prior_sends_settled(store.get_active_job())[0]
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id_prior"] == ["toll-x", "toll-y"]
+    assert st["funding_tx_id_prior_removals"] == {"toll-x": [xid], "toll-y": [yid]}
+
+
+def test_the_burn_bundle_spends_the_pinned_cat_not_the_first_match(monkeypatch):
+    """[review] burn_cat_ph is shared by every unwrap to one receiver: the
+    bundle must spend the coin BURN_SENT pinned, never an unrelated
+    same-amount coin that happens to be listed first."""
+    from gui.services.warp import clvm_utils as cu, drivers
+    from .test_warp_service import seed, make_ephemeral_blob
+
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    ours_parent, other_parent = "dd" * 32, "cc" * 32
+    pinned_id = cu.coin_name(bytes.fromhex(ours_parent), bytes.fromhex("bb" * 32), AMOUNT).hex()
+    job = seed(store, JobStatus.BURNING, columns={"amount_mojos": AMOUNT},
+               state={"direction": "out", "receiver_evm": "ab" * 20,
+                      "burn_cat_ph": "bb" * 32, "cat_wallet_id": 3,
+                      "burn_cat_coin_id": pinned_id, "burn_cat_parent": ours_parent})
+    blob, _sk = make_ephemeral_blob(job.id)
+    sec = drivers.Coin(b"\x5a" * 32, b"\x5b" * 32, NET.chia_toll_mojos)
+    store.update_job(job.id, state_patch={"ephemeral_blob": blob,
+                                          "security_coin_id": sec.name().hex()})
+    sec_record = SimpleNamespace(
+        coin=SimpleNamespace(parent_coin_info=(b"\x5a" * 32).hex(),
+                             puzzle_hash=(b"\x5b" * 32).hex(), amount=NET.chia_toll_mojos),
+        spent=False, confirmed_block_index=100, spent_block_index=0)
+    ctx.coinset.records[sec.name().hex()] = sec_record
+
+    def cat(parent):
+        return SimpleNamespace(coin=SimpleNamespace(parent_coin_info=parent,
+                                                    puzzle_hash="bb" * 32, amount=AMOUNT),
+                               spent=False, confirmed_block_index=100, spent_block_index=0)
+
+    ctx.coinset.by_ph = [cat(other_parent), cat(ours_parent)]      # the stranger first
+    monkeypatch.setattr(claim_mod, "cat_lineage_proof_for",
+                        lambda coinset, parent: [b"\x33" * 32, b"\x44" * 32, AMOUNT])
+    built = {}
+
+    def capture(req):
+        built["cat"] = req.burn_cat_coin
+        raise S.WarpPending("stop here")
+
+    monkeypatch.setattr(drivers, "build_burn_bundle", capture)
+    engine.step()
+    assert built["cat"].parent_coin_info.hex() == ours_parent
+
+    # Pinned but not yet indexed anywhere: wait, never substitute.
+    built.clear()
+    ctx.coinset.by_ph = [cat(other_parent)]
+    store.update_job(job.id, columns={"next_retry_at": None})
+    out = engine.step()
+    assert not built and "not indexed yet" in (out.get("last_error") or _last_message(store, job.id))
