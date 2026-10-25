@@ -964,13 +964,17 @@ def test_a_definitively_rejected_sweep_fee_is_repriced_unless_already_pushed(
     engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5a" * 32), b"\x01" * 32)
     assert fees == [10_000_000, 30_000_000]
     assert store.get_job(job.id).state["sweep_pushed_by_coin"] == {COIN: True}
-    # Once pushed, a later fee rejection keeps the pin: a repriced twin
-    # would only conflict with the bundle a node already holds.
+    # [review] A later DEFINITIVE rejection of the identical bundle means the
+    # node no longer holds it (one it held would answer "pending"), and the
+    # coin is still unspent: the pin is released and the next Sweep reprices.
     outcome["raise"] = True
     ctx.coinset.fee_estimates = [50_000_000]
     engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5a" * 32), b"\x01" * 32)
     assert fees[-1] == 30_000_000
-    assert store.get_job(job.id).state["sweep_fee_by_coin"] == {COIN: 30_000_000}
+    assert store.get_job(job.id).state["sweep_fee_by_coin"] == {}
+    outcome["raise"] = False
+    engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5a" * 32), b"\x01" * 32)
+    assert fees[-1] == 50_000_000
 
 
 def _failed_with_replaced_funding(store, ctx, *, prior_removals):
@@ -1624,7 +1628,7 @@ def test_an_unnamed_attempt_with_known_coins_is_judged_for_settlement():
     assert engine._prior_sends_settled(job)[0]
     store.update_job(job.id, state_patch={"funding_tx_id_prior_removals": None})
     settled, note = engine._prior_sends_settled(store.get_active_job())
-    assert not settled and "not known" in note
+    assert not settled and "presumed gone" in note
 
 
 # --------------------------------------------------------------------------- #
@@ -1822,10 +1826,12 @@ def test_a_current_multi_input_unnamed_send_is_not_a_legacy_group():
     assert engine._prior_sends_settled(store.get_active_job())[0]
 
 
-def test_an_uncertain_sweep_push_keeps_its_fee_pin_through_a_later_rejection(
+def test_an_uncertain_sweep_push_is_retried_identically_until_the_node_decides(
         monkeypatch):
-    """[review] A timed-out push may have reached a node; a later fee
-    rejection must not reprice over the bundle it may still hold."""
+    """[review] A timed-out push may have reached the node: the next Sweep
+    re-pushes the IDENTICAL bundle (same fee).  A definitive fee rejection
+    of that bundle proves the node holds no copy, so the pin is released
+    and the Sweep after reprices -- the coin is never left unsweepable."""
     from gui.services.warp.coinset import CoinsetError
 
     fees = []
@@ -1852,11 +1858,13 @@ def test_an_uncertain_sweep_push_keeps_its_fee_pin_through_a_later_rejection(
     outcome["error"] = "push_tx failed: [INVALID_FEE_LOW_FEE] Failed to include transaction"
     ctx.coinset.fee_estimates = [50_000_000]
     engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5a" * 32), b"\x01" * 32)
-    assert fees == [10_000_000, 10_000_000], "the same bundle, not a repriced twin"
-    assert store.get_job(job.id).state["sweep_fee_by_coin"] == {COIN: 10_000_000}
+    assert fees == [10_000_000, 10_000_000], "the same bundle first, not a repriced twin"
+    st = store.get_job(job.id).state
+    assert st["sweep_fee_by_coin"] == {} and not st.get("sweep_pushed_by_coin")
 
     outcome["error"] = None
     engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5a" * 32), b"\x01" * 32)
+    assert fees[-1] == 50_000_000, "repriced once the node proved it held nothing"
     assert store.get_job(job.id).state["sweep_pushed_by_coin"] == {COIN: True}
 
 
@@ -2289,7 +2297,7 @@ def test_one_history_transaction_identifies_at_most_one_attempt():
     ctx.wallet.txs = [tx1]
     ctx.coinset.by_ph = [out1]
     settled, note = engine._prior_sends_settled(store.get_active_job())
-    assert not settled and "not known" in note, "toll-x cannot settle both"
+    assert not settled and "presumed gone" in note, "toll-x cannot settle both"
 
     tx2, out2 = tx("toll-y", "d5" * 32)
     ctx.wallet.txs = [tx1, tx2]
@@ -2322,7 +2330,7 @@ def test_a_transaction_already_on_the_books_is_not_handed_to_an_unnamed_attempt(
         coin=SimpleNamespace(parent_coin_info=rid, puzzle_hash=ph, amount=NET.chia_toll_mojos),
         spent=True, confirmed_block_index=PEAK - 50, spent_block_index=PEAK - 40)]
     settled, note = engine._prior_sends_settled(store.get_active_job())
-    assert not settled and "not known" in note
+    assert not settled and "presumed gone" in note
 
 
 # --------------------------------------------------------------------------- #
@@ -2463,3 +2471,122 @@ def test_the_dedupe_scan_skips_a_retired_orphans_record(monkeypatch):
     engine.step()
     assert len(ctx.wallet.sent) == 1, "the replacement is sent"
     assert ctx.wallet.sent_excludes[-1] == [xid]
+
+
+# --------------------------------------------------------------------------- #
+# Independent review (own pass before Copilot).
+# --------------------------------------------------------------------------- #
+
+def test_an_unobservable_retired_attempt_is_presumed_gone_after_the_grace(monkeypatch):
+    """A retired send with no coins on record, no wallet record and no
+    mempool item can never be proven anything; it keeps the job open for the
+    grace, then settles as gone -- never for good."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    now = 1_000_000.0
+    monkeypatch.setattr(engine, "_now", lambda: now)          # a still clock
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": ["toll-a"], "funding_tx_id_prior_removals": None,
+        "funding_tx_id_prior_retired_at": {"toll-a": now - 3600.0}})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID2] = _rec(spent=True)             # the current attempt: dead
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "presumed gone after 6h" in note
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior_retired_at": {"toll-a": now - 7 * 3600.0}})
+    assert engine._prior_sends_settled(store.get_active_job())[0]
+
+    # An unnamed retired attempt with no coins and no history: the same clock,
+    # started the first time it is seen.
+    k1 = S._FUNDING_TX_UNKNOWN + "#1"
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": [k1], "funding_tx_id_prior_retired_at": None})
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "presumed gone" in note
+    stamped = store.get_job(job.id).state["funding_tx_id_prior_retired_at"]
+    assert k1 in stamped
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior_retired_at": {k1: now - 7 * 3600.0}})
+    assert engine._prior_sends_settled(store.get_active_job())[0]
+
+
+def test_the_current_attempt_never_settles_by_time_alone():
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id": S._FUNDING_TX_UNKNOWN, "funding_tx_id_removals": None,
+        "funding_tx_id_prior_retired_at": {
+            S._FUNDING_TX_UNKNOWN + "#current": engine._now() - 48 * 3600.0}})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID] = _rec(spent=True)
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "not known" in note
+
+
+def test_retirement_is_stamped(monkeypatch):
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_funding(store, funding_tx_id=DEAD_TX, funding_amount=EXPECTED,
+                  funding_tx_id_removals=[RID])
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = PEAK
+    monkeypatch.setattr(engine, "_now", lambda: 1_000_000.0)
+    engine.step()
+    stamps = store.get_active_job().state["funding_tx_id_prior_retired_at"]
+    assert stamps[DEAD_TX] == 1_000_000.0
+
+
+def test_a_connection_never_made_releases_the_reservation(monkeypatch):
+    """No bytes reached the daemon: nothing was sent, and the next tick may
+    send without first waiting on an attempt nothing can ever rule out."""
+    from gui.services.warp.wallet import WalletError
+
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store)
+    calls = []
+
+    def refused(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise WalletError("send_transaction request failed: HTTPSConnectionPool: "
+                              "Max retries exceeded (NewConnectionError: [WinError "
+                              "10061] No connection could be made because the "
+                              "target machine actively refused it)")
+        return {"name": "funding-tx-2"}
+
+    ctx.wallet.send_transaction = refused
+    engine.step()
+    assert store.get_job(job.id).state.get("funding_tx_id") is None
+    store.update_job(job.id, columns={"next_retry_at": None})
+    engine.step()
+    assert store.get_active_job().state["funding_tx_id"] == "funding-tx-2"
+
+
+def test_abandon_records_a_completed_claim_or_delivery_truthfully():
+    store = new_store()
+    engine, ctx = build(store)
+    job = seed(store, JobStatus.FAILED,
+               columns={"bridge_nonce": "cd" * 32, "post_tip_mojos": 4985,
+                        "receiver_ph": "ab" * 32},
+               state={"failed_from": JobStatus.CLAIMING, "final_cat_coin_id": "f2" * 32,
+                      "funding_tx_id_prior": ["fund-a", "fund-b"],
+                      "funding_tx_id_prior_dead": ["fund-b"]})
+    ctx.coinset.records["f2" * 32] = _rec(spent=False)       # the claim landed
+    out = engine.job_action(job.id, "abandon")
+    assert out["status"] == JobStatus.CANCELLED
+    note = store.get_events(job.id, limit=5000)[-1].message
+    assert "the claim completed" in note and "never claimed" not in note
+    assert "1 replaced funding send(s) not ruled out: fund-a" in note
+
+    job2 = seed(store, JobStatus.FAILED,
+                columns={"bridge_nonce": "ce" * 32, "amount_mojos": AMOUNT},
+                state={"direction": "out", "failed_from": JobStatus.RELAYING,
+                       "delivered_by": "our relay", "receiver_evm": "ab" * 20})
+    engine.job_action(job2.id, "abandon")
+    note2 = store.get_events(job2.id, limit=5000)[-1].message
+    assert "the unwrap was delivered (our relay)" in note2 and "never claimed" not in note2

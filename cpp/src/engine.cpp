@@ -20655,7 +20655,8 @@ namespace {
 // nothing to protect; one that exists but cannot be read protects every
 // wallet this heartbeat (readable = false).
 execution::WarpSendGuard read_warp_send_guard(const std::string& db_path,
-                                              const std::string& default_cat)
+                                              const std::string& default_cat,
+                                              bool warp_enabled)
 {
     execution::WarpSendGuard guard;
     if (db_path.empty()) return guard;
@@ -20666,7 +20667,14 @@ execution::WarpSendGuard read_warp_send_guard(const std::string& db_path,
         guard.readable = false;
         return guard;
     }
-    if (!exists) return guard;
+    if (!exists) {
+        // [review] With warp enabled the GUI may be writing jobs to a file
+        // this process cannot see (a mistyped or differently anchored
+        // path): not "no warp", unknown -- fail closed, and the heartbeat
+        // warning names the path.
+        if (warp_enabled) guard.readable = false;
+        return guard;
+    }
     sqlite3* raw_db = nullptr;
     const int rc = sqlite3_open_v2(db_path.c_str(), &raw_db,
                                    SQLITE_OPEN_READONLY, nullptr);
@@ -20891,12 +20899,18 @@ void Engine::refresh_warp_send_guard(BlockHeight block_height, bool fresh)
     warp_send_guard_block_ = block_height;
     const auto& acc = config_.accounting;
     warp_send_guard_ = read_warp_send_guard(acc.bridge_jobs_db_path,
-                                            acc.bridge_asset_id);
+                                            acc.bridge_asset_id,
+                                            acc.warp_enabled);
     if (!warp_send_guard_.readable) {
-        spdlog::warn("[Engine] warp_jobs.db ({}) could not be read -- every "
-                     "wallet's unconfirmed transactions are left alone this "
-                     "heartbeat in case a warp send is among them",
-                     acc.bridge_jobs_db_path);
+        std::error_code ec;
+        const bool missing = !std::filesystem::exists(acc.bridge_jobs_db_path, ec) && !ec;
+        spdlog::warn("[Engine] warp_jobs.db ({}) {} -- every wallet's "
+                     "unconfirmed transactions are left alone this heartbeat "
+                     "in case a warp send is among them",
+                     acc.bridge_jobs_db_path,
+                     missing ? "does not exist while warp is enabled (is "
+                               "warp.jobs_db the file the GUI writes?)"
+                             : "could not be read");
     } else if (warp_send_guard_.any()) {
         spdlog::debug("[Engine] warp has a Chia send in flight (xch={}, cat "
                       "wallets={}); their unconfirmed transactions are off "

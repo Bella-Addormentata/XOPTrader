@@ -137,6 +137,28 @@ TEST(WarpSendGuardTest, AReplacedSendKeepsProtectionInEveryActiveStatus) {
                      .has_value());
 }
 
+TEST(WarpSendGuardTest, RetiredAttemptsProvenDeadProtectNothing) {
+    // Every retired attempt proven dead: nothing can still land, so the
+    // wallet is free for the engine's cleanup again.
+    const json all_dead = {{"funding_tx_id_prior", json::array({"a", "b"})},
+                           {"funding_tx_id_prior_dead", json::array({"a", "b"})}};
+    EXPECT_FALSE(warp_job_chia_send("CLAIMING", all_dead, kUsdc).has_value());
+    // One of them not proven dead: protected.
+    const json one_live = {{"funding_tx_id_prior", json::array({"a", "b"})},
+                           {"funding_tx_id_prior_dead", json::array({"a"})}};
+    const auto s = warp_job_chia_send("CLAIMING", one_live, kUsdc);
+    ASSERT_TRUE(s.has_value());
+    EXPECT_TRUE(s->xch);
+    // The current marker still rules in its own status.
+    const json dead_with_marker = {{"funding_tx_id", "c"},
+                                   {"funding_tx_id_prior", json::array({"a"})},
+                                   {"funding_tx_id_prior_dead", json::array({"a"})}};
+    EXPECT_TRUE(warp_job_chia_send("FUNDING_CLAIM", dead_with_marker, kUsdc)
+                    .has_value());
+    EXPECT_FALSE(warp_job_chia_send("CLAIMING", dead_with_marker, kUsdc)
+                     .has_value());
+}
+
 TEST(WarpSendGuardTest, OtherStatusesHoldNoWalletSend) {
     const json state = {{"funding_tx_id", "x"}, {"burn_tx_id", "y"}};
     for (const char* st : {"AWAITING_DEPOSIT", "APPROVING", "BRIDGING",

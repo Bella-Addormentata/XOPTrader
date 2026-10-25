@@ -11,6 +11,7 @@
 // ISO/IEC 27001:2022 -- no real secrets in test fixtures.
 // ISO/IEC 5055       -- deterministic tests; no undefined behaviour.
 
+#include <filesystem>
 #include <gtest/gtest.h>
 
 #include <xop/config.hpp>
@@ -30,6 +31,14 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+// [review] A relative jobs-db path anchors at the config file's directory,
+// as the GUI anchors warp.jobs_db.
+static std::string anchored(const std::string& config_path, const char* rel)
+{
+    return (std::filesystem::path(config_path).parent_path() / rel)
+        .lexically_normal().string();
+}
 
 namespace {
 
@@ -206,7 +215,7 @@ accounting:
     // [S19] Bridge-ingest keys (review round 5: non-default values so a
     // key rename or conversion regression is caught here, not live).
     EXPECT_FALSE(cfg.accounting.bridge_ingest_enabled);
-    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, "elsewhere/warp.db");
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, anchored(tmp.path(), "elsewhere/warp.db"));
     EXPECT_EQ(cfg.accounting.bridge_asset_id,
               "aabbccddeeff00112233445566778899"
               "aabbccddeeff00112233445566778899");
@@ -222,7 +231,7 @@ warp:
 )";
     TempYaml tmp(yaml.c_str());
     auto cfg = xop::load_config(tmp.path());
-    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, "custom/jobs.db");
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, anchored(tmp.path(), "custom/jobs.db"));
 
     // ...and with an accounting section that leaves the key unset.
     std::string yaml2 = std::string(kMinimalValidYaml) + R"(
@@ -234,7 +243,7 @@ warp:
 )";
     TempYaml tmp2(yaml2.c_str());
     auto cfg2 = xop::load_config(tmp2.path());
-    EXPECT_EQ(cfg2.accounting.bridge_jobs_db_path, "custom/jobs.db");
+    EXPECT_EQ(cfg2.accounting.bridge_jobs_db_path, anchored(tmp2.path(), "custom/jobs.db"));
 }
 
 TEST(ConfigParserTest, BridgeJobsDbPath_FromWarpExpandsTilde) {
@@ -263,7 +272,20 @@ warp:
 )";
     TempYaml tmp(yaml.c_str());
     auto cfg = xop::load_config(tmp.path());
-    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, "elsewhere/jobs.db");
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, anchored(tmp.path(), "elsewhere/jobs.db"));
+}
+
+TEST(ConfigParserTest, WarpEnabledIsReadForTheGuard) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+warp:
+  enabled: true
+  jobs_db: custom/jobs.db
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_TRUE(cfg.accounting.warp_enabled);
+    TempYaml plain(kMinimalValidYaml);
+    EXPECT_FALSE(xop::load_config(plain.path()).accounting.warp_enabled);
 }
 
 TEST(ConfigParserTest, BridgeJobsDbPath_ExplicitEngineKeyWins) {
@@ -276,7 +298,7 @@ warp:
 )";
     TempYaml tmp(yaml.c_str());
     auto cfg = xop::load_config(tmp.path());
-    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, "elsewhere/warp.db");
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, anchored(tmp.path(), "elsewhere/warp.db"));
 }
 
 TEST(ConfigParserTest, BridgeAssetWithoutEnabledPair_AutoDisables) {

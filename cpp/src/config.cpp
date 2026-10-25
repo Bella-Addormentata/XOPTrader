@@ -24,6 +24,7 @@
 // disagree about the threshold.
 #include "xop/execution/offer_min_input_coin.hpp"
 
+#include <filesystem>
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
 
@@ -3372,8 +3373,20 @@ AccountingConfig parse_accounting(const YAML::Node& root)
     // the engine's key wins, as before.
     const auto follow_warp_jobs_db = [&](bool explicit_engine_path) {
         const YAML::Node warp = root["warp"];
-        if (!warp || !warp.IsMap() || !warp["jobs_db"]
-            || !warp["jobs_db"].IsDefined() || warp["jobs_db"].IsNull()) {
+        if (!warp || !warp.IsMap()) return;
+        // [review] Whether warp jobs may exist at all: with warp enabled a
+        // missing jobs database is not "no warp", and the engine's
+        // stuck-transaction guard must not read it as such.
+        if (warp["enabled"] && warp["enabled"].IsDefined()
+            && !warp["enabled"].IsNull()) {
+            try {
+                cfg.warp_enabled = warp["enabled"].as<bool>();
+            } catch (const YAML::Exception&) {
+                cfg.warp_enabled = false;
+            }
+        }
+        if (!warp["jobs_db"] || !warp["jobs_db"].IsDefined()
+            || warp["jobs_db"].IsNull()) {
             return;
         }
         std::string gui_path;
@@ -4873,6 +4886,18 @@ AppConfig load_config(const std::string& path,
     cfg.fees       = parse_fees(root);
     cfg.inventory_aging = parse_inventory_aging(root);
     cfg.accounting = parse_accounting(root);
+    // [review] The GUI anchors a relative warp.jobs_db at the config file's
+    // directory (gui/services/warp/service.py _job_db_path); the engine must
+    // open the SAME file whatever its working directory, or its
+    // stuck-transaction guard protects a database no job is written to.
+    {
+        const std::filesystem::path db(cfg.accounting.bridge_jobs_db_path);
+        const std::filesystem::path base = std::filesystem::path(path).parent_path();
+        if (!db.empty() && db.is_relative() && !base.empty()) {
+            cfg.accounting.bridge_jobs_db_path =
+                (base / db).lexically_normal().string();
+        }
+    }
     cfg.market_data = parse_market_data(root);
     validate_usd_anchor(cfg);
     validate_enforced_pegs_are_observable(cfg);

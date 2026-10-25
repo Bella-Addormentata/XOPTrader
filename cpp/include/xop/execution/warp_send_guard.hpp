@@ -103,9 +103,31 @@ struct WarpChiaSend {
         }
         return state[key].get<std::string>();
     };
-    const auto has_priors = [&](const char* key) -> bool {
-        return state.is_object() && state.contains(key)
-            && state[key].is_array() && !state[key].empty();
+    // Retired attempts not proven dead (the GUI lists the dead ones under
+    // <key>_dead): only those can still land, so only those protect.  An
+    // all-dead list would otherwise hold the wallet for as long as the job
+    // stays open ([review]).
+    const auto has_live_priors = [&](const char* prior_key,
+                                     const char* dead_key) -> bool {
+        if (!state.is_object() || !state.contains(prior_key)
+            || !state[prior_key].is_array()) {
+            return false;
+        }
+        const auto is_dead = [&](const std::string& id) -> bool {
+            if (!state.contains(dead_key) || !state[dead_key].is_array()) {
+                return false;
+            }
+            for (const auto& d : state[dead_key]) {
+                if (d.is_string() && d.get<std::string>() == id) return true;
+            }
+            return false;
+        };
+        for (const auto& p : state[prior_key]) {
+            if (!p.is_string()) continue;
+            const auto id = p.get<std::string>();
+            if (!id.empty() && !is_dead(id)) return true;
+        }
+        return false;
     };
     const std::string status =
         status_in == "FAILED" ? text("failed_from") : status_in;
@@ -133,11 +155,12 @@ struct WarpChiaSend {
     // clears the marker and keeps the orphan on the books, and a gate or a
     // refusal can leave the job in that state with the orphan still able
     // to resurface.
-    if (has_priors("funding_tx_id_prior")) {
+    if (has_live_priors("funding_tx_id_prior", "funding_tx_id_prior_dead")) {
         s.xch = true;
         any   = true;
     }
-    if (has_priors("burn_tx_id_prior") && !text("burn_tx_id").empty()) {
+    if (has_live_priors("burn_tx_id_prior", "burn_tx_id_prior_dead")
+        && !text("burn_tx_id").empty()) {
         s.xch = true;
         if (s.cat_asset_id.empty()) {
             s.cat_asset_id = fingerprint_asset_id(text("asset_fingerprint"));

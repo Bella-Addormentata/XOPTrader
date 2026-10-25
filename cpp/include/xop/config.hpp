@@ -2275,8 +2275,16 @@ struct AccountingConfig {
     bool bridge_ingest_enabled{true};
 
     /// The GUI-owned warp jobs database, opened READ-ONLY each heartbeat.
-    /// A missing file is a clean no-op (warp never used on this host).
+    /// A relative path anchors at the config file's directory, where the
+    /// GUI anchors warp.jobs_db, so both processes open the same file.  A
+    /// missing file is a clean no-op while warp is disabled; with warp
+    /// enabled it reads as unreadable (the guard fails closed) and is
+    /// warned about, since a job may be in flight in a file the engine
+    /// cannot see ([review]).
     std::string bridge_jobs_db_path{"data/warp_jobs.db"};
+
+    /// warp.enabled, as the GUI reads it: whether warp jobs may exist.
+    bool warp_enabled{false};
 
     /// Asset the bridge mints/burns on the Chia side: wUSDC.b mainnet CAT
     /// id.  Valued at exactly $1.00 -- the numeraire doctrine of the peg

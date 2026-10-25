@@ -2274,10 +2274,18 @@ class WarpEngine:
             # reply ("unexpected response") may follow a broadcast: the
             # reservation stands and the history scan decides next tick.
             text = str(exc)
+            low = text.lower()
             refused = (isinstance(exc, WalletError)
                        and re.match(r"^\S+ failed: ", text) is not None
-                       and "request failed" not in text.lower())
-            if refused:
+                       and "request failed" not in low)
+            # [review] A connection that was never made (refused, no route,
+            # no such host) carried no bytes: nothing was sent either, and
+            # keeping the reservation would leave an attempt nothing can
+            # ever rule out.  A timeout or a reset after the request went
+            # out is different -- the daemon may have acted on it.
+            never_sent = (isinstance(exc, WalletError) and "request failed" in low
+                          and any(t in low for t in _NEVER_CONNECTED_MARKERS))
+            if refused or never_sent:
                 self._store.update_job(job.id, expected_status=job.status,
                                        state_patch=previous)
             raise
@@ -2519,6 +2527,8 @@ class WarpEngine:
         priors = [t for t in (st.get(prior_key) or []) if t]
         prior_removals = dict(st.get(prior_removals_key) or {})
         proven_dead = [t for t in (st.get(dead_key) or []) if t]
+        retired_at = dict(st.get(f"{tx_key}_prior_retired_at") or {})
+        retired_at.setdefault(tx_id, float(self._now()))
         coins = [c for c in removals if c]
         if coins:
             prior_removals[tx_id] = coins
@@ -2540,9 +2550,40 @@ class WarpEngine:
             prior_key: priors + ([tx_id] if tx_id not in priors else []),
             prior_removals_key: prior_removals or None,
             dead_key: proven_dead or None,
+            f"{tx_key}_prior_retired_at": retired_at or None,
             f"{tx_key}_exclude": exclude or None,
             **{key: None for key in also_clear},
         }
+
+    def _unobservable_settled(self, job: WarpJob, tx_key: str, tx_id: str) -> tuple:
+        """``(settled, note)`` for a RETIRED attempt nothing can observe: no
+        recorded coins, no wallet record, no mempool item.  Presumed gone
+        once ``_UNOBSERVABLE_ATTEMPT_GRACE_S`` has passed since it was
+        retired (an attempt retired before the clock existed starts it now);
+        until then it keeps the job open."""
+        key = f"{tx_key}_prior_retired_at"
+        stamps = dict(job.state.get(key) or {})
+        since = stamps.get(tx_id)
+        now = float(self._now())
+        if not isinstance(since, (int, float)) or isinstance(since, bool):
+            stamps[tx_id] = now
+            try:
+                self._store.update_job(job.id, expected_status=job.status,
+                                       state_patch={key: stamps})
+            except Exception as exc:  # noqa: BLE001 -- the clock starts next tick
+                _log.debug("warp job %s: could not stamp attempt %s (%s)",
+                           job.id, tx_id, exc)
+            since = now
+        waited = now - float(since)
+        hours = _UNOBSERVABLE_ATTEMPT_GRACE_S // 3600
+        if waited >= _UNOBSERVABLE_ATTEMPT_GRACE_S:
+            _log.warning("warp job %s: attempt %s has had no coins, no wallet record "
+                         "and no mempool item for %.1fh; presumed gone",
+                         job.id, tx_id[:16], waited / 3600.0)
+            return True, ""
+        return False, (f"attempt {tx_id[:16]}... has no coins on record and is "
+                       f"nowhere to be seen; presumed gone after {hours}h "
+                       f"({waited / 3600.0:.1f}h so far) -- Sweep again later")
 
     def _prior_sends_settled(self, job: WarpJob,
                              tx_key: str = "funding_tx_id") -> tuple:
@@ -2618,6 +2659,12 @@ class WarpEngine:
                     ph, amount, exclude_ids=named, live_coins=live_coins,
                     recorded_sets=recorded_sets)
                 if not ident or not ident[1]:
+                    if tx_id != current:
+                        # [review] Retired and unobservable: the grace clock.
+                        gone, note = self._unobservable_settled(job, tx_key, tx_id)
+                        if gone:
+                            continue
+                        return False, note
                     return False, ("a send the wallet never named, whose coins are "
                                    "not known, cannot be ruled out; Sweep again "
                                    "later or Abandon")
@@ -2647,6 +2694,17 @@ class WarpEngine:
                 out_amount=amount, unique_output=False, min_depth=min_depth,
             )
             verdict, why = cs.judge(ev)
+            if (verdict is cs.Verdict.ORPHAN and not ev.removals
+                    and tx_id != current):
+                # [review] Named, retired, nowhere, and with no coins on
+                # record (a send recorded before coins were kept whose
+                # record the wallet has since deleted): nothing can ever
+                # prove it either way, so it is presumed gone after the
+                # grace rather than keeping the job open for good.
+                gone, note = self._unobservable_settled(job, tx_key, tx_id)
+                if gone:
+                    continue
+                return False, note
             if verdict is cs.Verdict.DEAD:
                 if (tx_id == _FUNDING_TX_UNKNOWN and len(ev.removals) > 1
                         and not self._unnamed_group_dead(ev.removals, min_depth)):
@@ -4623,7 +4681,21 @@ class WarpEngine:
             fee_rejected = ("request failed" not in low and any(
                 t in low for t in ("invalid_fee", "fee_too_low", "low_fee",
                                    "fee too low")))
-            if fee_rejected and not prior_push:
+            if fee_rejected:
+                # [review] A definitive rejection of the IDENTICAL bundle by
+                # the node we push through proves it holds no copy (a copy
+                # it held answers "pending"), and a copy that confirmed
+                # shows as the coin spent -- checked first.  Only then is
+                # the pin released; an earlier uncertain or accepted push
+                # must not keep a bundle the node has since dropped pinned
+                # at a fee it now rejects, or the coin is never swept.
+                try:
+                    if claim.security_coin_spent(self._coinset, coin.name()):
+                        return True, f"{text}; the security coin is already spent"
+                except Exception as probe_exc:  # noqa: BLE001 -- not proof
+                    return False, (f"sweep rejected for its fee ({text}); the "
+                                   f"coin's fate is unknown ({probe_exc}); "
+                                   "run Sweep again")
                 pins.pop(cid, None)
                 pushed.pop(cid, None)
                 try:
@@ -4942,10 +5014,22 @@ class WarpEngine:
             "last_error": job.last_error,
             "portal": self._net.status_url,
         }
-        if job.bridge_nonce:
+        # [review] Abandon is also the exit for a job whose claim completed
+        # or whose unwrap was delivered but whose replaced Chia sends could
+        # not be ruled out; the record must say so, not that the message
+        # was never claimed.
+        unsettled = self._unsettled_attempts_note(job)
+        if job.state.get("delivered_by"):
+            detail = (f"the unwrap was delivered ({job.state['delivered_by']}); "
+                      f"closed by the operator{unsettled}")
+        elif job.bridge_nonce and self._claim_completed(job):
+            detail = (f"the claim completed (final CAT coin "
+                      f"{job.state.get('final_cat_coin_id')}); closed by the "
+                      f"operator{unsettled}")
+        elif job.bridge_nonce:
             detail = (
                 f"message nonce {job.bridge_nonce} was never claimed and remains "
-                f"claimable at {self._net.status_url}"
+                f"claimable at {self._net.status_url}{unsettled}"
             )
         elif job.state.get("bridge_raw"):
             if not mismatch or same_wallet:
@@ -4978,6 +5062,29 @@ class WarpEngine:
             event=("abandon", note, recovery),
         )
         return _job_dict(self._store.get_job(job.id))
+
+    def _claim_completed(self, job: WarpJob) -> bool:
+        """Whether the job's final CAT coin is on chain (the claim landed)."""
+        final = job.state.get("final_cat_coin_id")
+        if not final:
+            return False
+        try:
+            return self._coinset.get_coin_record_by_name(str(final)) is not None
+        except Exception:  # noqa: BLE001 -- unknown is not "completed"
+            return False
+
+    def _unsettled_attempts_note(self, job: WarpJob) -> str:
+        """The replaced Chia sends of *job* not proven dead, for the audit
+        record of a close; "" when there are none."""
+        parts = []
+        for tx_key, label in (("funding_tx_id", "funding"), ("burn_tx_id", "cat_spend")):
+            priors = [t for t in (job.state.get(f"{tx_key}_prior") or []) if t]
+            dead = set(job.state.get(f"{tx_key}_prior_dead") or [])
+            open_ = [t for t in priors if t not in dead]
+            if open_:
+                parts.append(f"{len(open_)} replaced {label} send(s) not ruled out: "
+                             + ", ".join(t[:16] for t in open_))
+        return ("; " + "; ".join(parts)) if parts else ""
 
     def request_unwrap(
         self, amount_mojos: int, receiver: str, external_relay: bool = False,
@@ -5538,6 +5645,24 @@ _TAKE_UNKNOWN_FAIL_S: int = 3600
 # unconfirmed after a day is gone from every mempool, and a take that did
 # land shows up as CAT held (and as a readable trade record first).
 _TAKE_UNKNOWN_RELEASE_S: int = 24 * 3600
+# [review] A retired attempt with no recorded coins, no wallet record and no
+# mempool item -- a send recorded before coins were kept whose record the
+# wallet has since deleted, or one that never left the GUI -- can never be
+# proven anything: there is nothing to watch.  Left as "not ruled out" it
+# would keep the job open for good and the engine's cleanup guard with it.
+# After this long absent from wallet and mempool it is presumed gone: no node
+# holds a transaction that long without including it.
+_UNOBSERVABLE_ATTEMPT_GRACE_S: int = 6 * 3600
+# Transport failures that prove the request never reached the daemon (the
+# connection was never made), so a reservation may be released.  A timeout or
+# a reset AFTER the request went out is not among them.
+_NEVER_CONNECTED_MARKERS: tuple = (
+    "connection refused", "connectionrefused", "actively refused",
+    "errno 111", "errno 10061", "winerror 10061", "connecttimeouterror",
+    "failed to establish a new connection", "newconnectionerror",
+    "name or service not known", "getaddrinfo failed", "nodename nor servname",
+    "no route to host", "network is unreachable",
+)
 
 
 def _age_s(iso: str) -> float:
