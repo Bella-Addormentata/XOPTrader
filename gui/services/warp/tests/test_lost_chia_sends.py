@@ -2323,3 +2323,62 @@ def test_a_transaction_already_on_the_books_is_not_handed_to_an_unnamed_attempt(
         spent=True, confirmed_block_index=PEAK - 50, spent_block_index=PEAK - 40)]
     settled, note = engine._prior_sends_settled(store.get_active_job())
     assert not settled and "not known" in note
+
+
+# --------------------------------------------------------------------------- #
+# Review round 25.
+# --------------------------------------------------------------------------- #
+
+def test_a_replacement_may_reuse_a_dead_predecessors_surviving_coin():
+    """[review] The dead predecessor's own record is never handed to the
+    unnamed replacement, but a record that merely reuses the predecessor's
+    surviving coin is the replacement's and settles it."""
+    from gui.services.warp import chia_send as cs
+
+    k1 = S._FUNDING_TX_UNKNOWN + "#1"
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    ph = claim_mod.security_coin_puzzle_hash(engine._load_ephemeral_sk(job)).hex()
+
+    def coin(parent):
+        return ({"parent_coin_info": parent, "puzzle_hash": "11" * 32,
+                 "amount": 499_005_000_000},
+                cs.coin_id(parent, "11" * 32, 499_005_000_000))
+
+    x, xid = coin("d4" * 32)                                 # spent elsewhere (dead)
+    y, yid = coin("d5" * 32)                                 # the survivor
+    z, zid = coin("d6" * 32)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id": S._FUNDING_TX_UNKNOWN, "funding_tx_id_removals": None,
+        "funding_tx_id_prior": [k1], "funding_tx_id_prior_removals": {k1: [xid, yid]},
+        "funding_tx_id_prior_dead": [k1]})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[xid] = _rec(spent=True)
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    # The dead predecessor's own record is still in the history (the wallet
+    # keeps retrying it), FIRST; the replacement reused its survivor.
+    ctx.wallet.txs = [
+        {"name": "dead-rec", "confirmed": False, "removals": [x, y],
+         "additions": [{"puzzle_hash": ph, "amount": NET.chia_toll_mojos}]},
+        {"name": "toll-r", "confirmed": True, "removals": [y, z],
+         "additions": [{"puzzle_hash": ph, "amount": NET.chia_toll_mojos}]}]
+    ctx.wallet.tx_records["dead-rec"] = {"confirmed": False, "removals": [x, y]}
+    ctx.wallet.tx_records["toll-r"] = {"confirmed": True, "removals": [y, z]}
+    ctx.coinset.records[yid] = _rec(spent=True)
+    ctx.coinset.records[zid] = _rec(spent=True)
+    ctx.coinset.by_ph = [SimpleNamespace(                    # the replacement landed, swept
+        coin=SimpleNamespace(parent_coin_info=yid, puzzle_hash=ph,
+                             amount=NET.chia_toll_mojos),
+        spent=True, confirmed_block_index=PEAK - 50, spent_block_index=PEAK - 40)]
+    assert engine._prior_sends_settled(store.get_active_job())[0]
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id"] == "toll-r"
+    assert sorted(st["funding_tx_id_removals"]) == sorted([yid, zid])
+
+    # Only the dead predecessor's record in the history: not the replacement's.
+    store.update_job(job.id, state_patch={
+        "funding_tx_id": S._FUNDING_TX_UNKNOWN, "funding_tx_id_removals": None})
+    ctx.wallet.txs = ctx.wallet.txs[:1]
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "not known" in note
