@@ -371,5 +371,34 @@ TEST_F(MarketAllocatorTest, SinglePairGets100Percent) {
     EXPECT_NEAR(alloc.get_allocation("XCH/wUSDC.b"), 1.0, 0.01);
 }
 
+// ---------------------------------------------------------------------------
+// [LIVECFG] A saved config that tightens the bounds re-evaluates from
+// scratch: hysteresis and smoothing must not blend from an allocation that
+// is outside the new bounds and keep it there.
+// ---------------------------------------------------------------------------
+TEST_F(MarketAllocatorTest, TightenedBoundsAreHonouredAtTheNextEvaluation) {
+    alloc_cfg_.max_alloc_pct = 0.90;
+    alloc_cfg_.smooth_alpha  = 0.2;
+
+    ingest_pair("XCH/wUSDC.b", 2.37, 2.38, 2.37, 50.0);
+    ingest_pair("BYC/wUSDC.b", 0.99, 1.01, 1.00, 500.0);
+    ingest_competitors("XCH/wUSDC.b", 3);
+    ingest_competitors("BYC/wUSDC.b", 3);
+    refresh_feed({"XCH/wUSDC.b", "BYC/wUSDC.b"});
+
+    MarketAllocator alloc(alloc_cfg_, feed_.get(), nullptr);
+    alloc.evaluate({"XCH/wUSDC.b", "BYC/wUSDC.b"}, 100);
+    ASSERT_GT(alloc.get_allocation("BYC/wUSDC.b"), 0.60);
+
+    auto tighter = alloc_cfg_;
+    tighter.max_alloc_pct = 0.60;
+    alloc.set_config(tighter);
+    ASSERT_TRUE(alloc.should_evaluate(101)) << "re-evaluates at once";
+    alloc.evaluate({"XCH/wUSDC.b", "BYC/wUSDC.b"}, 101);
+    EXPECT_LE(alloc.get_allocation("BYC/wUSDC.b"), 0.60 + 1e-9);
+    EXPECT_NEAR(alloc.get_allocation("BYC/wUSDC.b")
+                + alloc.get_allocation("XCH/wUSDC.b"), 1.0, 1e-6);
+}
+
 }  // namespace
 }  // namespace xop

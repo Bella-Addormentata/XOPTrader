@@ -68,13 +68,7 @@ CoinManager::CoinManager(asio::io_context&                    /*ioc*/,
     : wallet_(std::move(wallet))
     , logger_(spdlog::default_logger()->clone("CoinMgr"))
 {
-    default_split_fee_ = static_cast<Mojo>(config.strategy.offer_fee_mojos);
-    if (config.strategy.coin_pool_target_count > 0
-        && config.strategy.coin_pool_target_xch > 0.0) {
-        xch_pool_target_mojos_ = static_cast<Mojo>(std::llround(
-            config.strategy.coin_pool_target_xch
-            * static_cast<double>(kMojosPerXch)));
-    }
+    reconfigure(config);
 
     // Dust threshold: coins smaller than 1,000,000 mojos (0.000001 XCH)
     // are ignored to avoid unnecessary UTXO bloat.
@@ -83,6 +77,18 @@ CoinManager::CoinManager(asio::io_context&                    /*ioc*/,
     logger_->info("CoinManager initialised: split_fee={} mojos, "
                   "dust_threshold={} mojos",
                   default_split_fee_, dust_threshold_);
+}
+
+void CoinManager::reconfigure(const AppConfig& config) noexcept
+{
+    default_split_fee_ = static_cast<Mojo>(config.strategy.offer_fee_mojos);
+    xch_pool_target_mojos_ = 0;
+    if (config.strategy.coin_pool_target_count > 0
+        && config.strategy.coin_pool_target_xch > 0.0) {
+        xch_pool_target_mojos_ = static_cast<Mojo>(std::llround(
+            config.strategy.coin_pool_target_xch
+            * static_cast<double>(kMojosPerXch)));
+    }
 }
 
 // ---------------------------------------------------------------------------

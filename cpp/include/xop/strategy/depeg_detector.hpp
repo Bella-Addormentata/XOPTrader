@@ -91,6 +91,47 @@ public:
         state_[pair.name] = DepegPairState{};
     }
 
+    // [LIVECFG] A saved config reached the running engine.  The global
+    // switch and defaults are replaced; a pair's thresholds are refreshed
+    // WITHOUT resetting its depeg state (a streak in progress keeps counting
+    // against the new thresholds), a newly stablecoin pair starts fresh, and
+    // a pair no longer marked stablecoin stops being monitored.
+    //
+    // Switching the detector OFF clears every AUTOMATIC verdict (a Bailed or
+    // Warning pair would otherwise stay blocked by should_bail() with no
+    // update() left to clear it). An operator's flag_suspected_failure() is
+    // kept: only clear_suspected_failure() undoes that.
+    void set_global_config(const DepegConfig& global_cfg)
+    {
+        const bool switched_off = global_cfg_.enabled && !global_cfg.enabled;
+        global_cfg_ = global_cfg;
+        if (!switched_off) return;
+        for (auto& [name, s] : state_) {
+            if (s.manually_flagged) continue;
+            s.blocks_above_bail  = 0;
+            s.block_entered_warn = 0;
+            s.status             = DepegStatus::Normal;
+        }
+    }
+
+    void sync_pair(const PairConfig& pair)
+    {
+        if (!pair.is_stablecoin) {
+            thresholds_.erase(pair.name);
+            state_.erase(pair.name);
+            return;
+        }
+        if (state_.find(pair.name) == state_.end()) {
+            register_pair(pair);
+            return;
+        }
+        PairThresholds& t = thresholds_[pair.name];
+        t.peg_target       = pair.peg_target;
+        t.warn_pct         = pair.depeg_warn_pct;
+        t.bail_pct         = pair.depeg_bail_pct;
+        t.sustained_blocks = pair.depeg_sustained_blocks;
+    }
+
     // Update with the latest mid-price for a pair.  Call once per block.
     // Returns the new DepegStatus for the pair.
     DepegStatus update(const std::string& pair_name,

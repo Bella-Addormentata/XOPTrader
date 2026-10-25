@@ -881,6 +881,11 @@ public:
     /// next refresh() recomputes from what remains.
     void withdraw_reference_and_mid(const std::string& pair_name);
 
+    /// [LIVECFG] Withdraw the pair's TibetSwap AMM observation, for a feed
+    /// switched off or replaced by a reload: with
+    /// strategy.fair_value_amm_max_age_sec 0 nothing else would age it out.
+    void clear_amm_observation(const std::string& pair_name);
+
     /// Ingest the TibetSwap AMM implied mid-price for a pair.
     /// The implied price is computed from pool reserves: output_reserve / input_reserve.
     ///
@@ -1273,6 +1278,13 @@ public:
     /// [MEDIUM-1] Returns by value under shared_lock to prevent data races
     /// with concurrent set_*() mutations (ISO/IEC 5055 -- CWE-362).
     MarketDataConfig config() const;
+
+    /// [LIVECFG] Replace the whole configuration at runtime -- a GUI Save the
+    /// running engine adopts. Every field is read under mtx_config_ at use
+    /// time, so the next refresh() runs on the new values; nothing is sized
+    /// from the config at construction. A new vpin_bucket_size discards the
+    /// VPIN buckets (and metrics) built at the old size.
+    void set_config(const MarketDataConfig& cfg);
 
     /// Update the arbitrage threshold at runtime (e.g. from ML tuner).
     void set_arb_threshold_bps(double threshold_bps);

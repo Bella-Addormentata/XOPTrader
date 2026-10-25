@@ -235,6 +235,19 @@ public:
                  std::shared_ptr<State>                    state,
                  const AppConfig&                          config);
 
+    /// [LIVECFG] The constructor's refusals (tier array lengths, offer
+    /// expiry against the hard TTL), as a check a reload can run BEFORE it
+    /// changes anything. Throws std::invalid_argument.
+    static void validate_config(const AppConfig& config);
+
+    /// [LIVECFG] Adopt a saved config on a running engine: the strategy and
+    /// risk sections, Dexie reward claiming and every pair's settings. The
+    /// Dexie endpoint is restart-only (config_live_apply.hpp) and is kept.
+    /// A changed strategy.offer_fee_mojos becomes the current fee; the fee
+    /// controller, when on, overrides it again through set_dynamic_fee().
+    /// Throws -- and changes nothing -- when validate_config() would.
+    void reconfigure(const AppConfig& config);
+
     ~OfferManager() = default;
 
     // Non-copyable, non-movable -- owned by the engine via unique_ptr.
@@ -972,6 +985,13 @@ public:
     /// Back to one fee for everything (neither the controller nor
     /// fees.cost_aware_estimate is on).
     void clear_cancel_fees() noexcept;
+
+    /// [LIVECFG] Bring the cached attached and cancel fees inside a reloaded
+    /// [fees.min_fee_mojos, fees.max_fee_mojos].  Step 8 sets them each
+    /// heartbeat it gets that far; a gated Step 8 does not, while the TTL
+    /// sweep and escalations still cancel at them.
+    void clamp_fees(std::uint64_t min_fee_mojos,
+                    std::uint64_t max_fee_mojos) noexcept;
 
     /// [review #163] Called after every per-offer SECURE cancel the wallet
     /// ACCEPTED, with the trade id and the fee that cancel really paid --

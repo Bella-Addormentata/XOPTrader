@@ -161,6 +161,10 @@ public:
                      Mojo              total_capital_mojos,
                      bool              no_loss_constraint);
 
+    /// [LIVECFG] Adopt the limit fractions of a saved risk config, keeping
+    /// every position, cost basis and allocation.
+    void set_risk_limits(const RiskConfig& risk_cfg);
+
     // -- Cost Basis Tracking ------------------------------------------------
 
     /// Record a purchase of `qty` mojos of `asset_id` at `fill_price` mojos
@@ -417,12 +421,24 @@ private:
     Mojo allocated_[kCapitalCategoryCount];            // Per-category allocation.
     CapitalLimits limits_[kCapitalCategoryCount];       // Per-category limits.
 
-    // Configuration captured at construction.
+    // Configuration captured at construction.  [LIVECFG] Replaced by
+    // set_risk_limits() under mtx_capital_, so every reader takes
+    // risk_limits() (a copy made under that lock) -- before mtx_records_,
+    // never nested inside it.
     double soft_limit_pct_;
     double hard_limit_pct_;
     double single_cat_cap_pct_;
     double kelly_fraction_;
     double max_capital_per_pair_pct_;
+
+    struct RiskLimits {
+        double soft_limit_pct;
+        double hard_limit_pct;
+        double single_cat_cap_pct;
+        double kelly_fraction;
+        double max_capital_per_pair_pct;
+    };
+    [[nodiscard]] RiskLimits risk_limits() const;
     // ISO/IEC 5055: atomic to prevent data races -- this flag is read by
     // record_sell() / min_ask_price() (under mtx_records_) and written by
     // set_no_loss_constraint() without holding that mutex.

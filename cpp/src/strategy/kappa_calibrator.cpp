@@ -130,6 +130,15 @@ double KappaCalibrator::calibrate()
     return kappa_;
 }
 
+void KappaCalibrator::set_default_kappa(double kappa) noexcept
+{
+    std::unique_lock lock(mtx_);
+    if (kappa_ == cfg_.default_kappa) {
+        kappa_ = kappa;
+    }
+    cfg_.default_kappa = kappa;
+}
+
 double KappaCalibrator::current_kappa() const noexcept
 {
     std::shared_lock lock(mtx_);
@@ -143,7 +152,7 @@ std::uint32_t KappaCalibrator::total_fills() const noexcept
         std::accumulate(bucket_fills_.begin(), bucket_fills_.end(), 0.0));
 }
 
-const KappaCalibratorConfig& KappaCalibrator::config() const noexcept
+KappaCalibratorConfig KappaCalibrator::config() const noexcept
 {
     std::shared_lock lock(mtx_);
     return cfg_;

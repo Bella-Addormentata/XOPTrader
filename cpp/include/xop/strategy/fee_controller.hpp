@@ -165,6 +165,10 @@ struct ClassCosts {
     std::uint64_t cancel_xch{8'400'000ULL};
     std::uint64_t cancel_cat{42'300'000ULL};
     std::uint64_t take{125'000'000ULL};
+
+    /// [LIVECFG] Lets a config reload tell whether the controller's inputs
+    /// actually changed.
+    bool operator==(const ClassCosts&) const = default;
 };
 
 [[nodiscard]] constexpr std::uint64_t cost_of(const ClassCosts& costs, ActionClass c) noexcept
@@ -700,6 +704,10 @@ struct ControllerConfig {
     std::uint32_t ff_max_age_blocks{32};
 
     ClassCosts costs{};
+
+    /// [LIVECFG] Lets a config reload tell whether the controller's inputs
+    /// actually changed (FeeTracker::set_config).
+    bool operator==(const ControllerConfig&) const = default;
 };
 
 // ---------------------------------------------------------------------------

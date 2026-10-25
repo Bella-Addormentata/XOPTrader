@@ -227,6 +227,248 @@ int score_execution_quality(int competitiveness_score, int queue_ahead_score)
     return std::clamp(static_cast<int>(std::lround(weighted_score)), 1, 10);
 }
 
+// ---------------------------------------------------------------------------
+// [LIVECFG 2026-10-25] Subsystem configs derived from AppConfig.
+//
+// ONE derivation each, shared by the constructor and the live reload, so a
+// saved setting reaches a running subsystem exactly as it would have reached
+// it at boot. Before these existed every block lived inline in the
+// constructor, and a reload had no way to re-derive them.
+// ---------------------------------------------------------------------------
+
+MarketDataConfig market_data_config_from(const AppConfig& cfg)
+{
+    MarketDataConfig md_cfg;
+    md_cfg.whale_trade_threshold        = cfg.market_data.whale_trade_threshold;
+    md_cfg.whale_volume_fraction        = cfg.market_data.whale_volume_fraction;
+    md_cfg.whale_window_blocks          = cfg.market_data.whale_window_blocks;
+    md_cfg.whale_max_spread_multiplier  = cfg.market_data.whale_max_spread_multiplier;
+    md_cfg.vpin_bucket_size             = cfg.market_data.vpin_bucket_size;
+    md_cfg.vpin_window_buckets          = cfg.market_data.vpin_window_buckets;
+    md_cfg.ofi_window_size              = cfg.market_data.ofi_window_size;
+    md_cfg.enable_competitor_tracking   = cfg.market_data.enable_competitor_tracking;
+    md_cfg.min_competitor_offer_size    = cfg.market_data.min_competitor_offer_size;
+    md_cfg.competitor_alert_threshold_bps = cfg.market_data.competitor_alert_threshold_bps;
+    md_cfg.asymmetric_skew_factor       = cfg.market_data.asymmetric_skew_factor;
+    md_cfg.cex_freshness_threshold_sec  = cfg.market_data.cex_freshness_threshold_sec;
+    md_cfg.dex_last_trade_max_age_sec   = cfg.market_data.dex_last_trade_max_age_sec;
+    md_cfg.amm_blend_weight             = cfg.strategy.amm_blend_weight;
+    md_cfg.amm_freshness_threshold_sec  = 300.0;  // 5 min default
+    md_cfg.orderbook_mid_enabled        = cfg.market_data.orderbook_mid_enabled;
+    md_cfg.orderbook_mid_depth          = cfg.market_data.orderbook_mid_depth;
+    // Micro-price blend schedule.  Lives in [strategy] because it is a
+    // pricing-policy decision (how far to trust a depth signal), not a feed
+    // parameter, but it is consumed here where the book is turned into a mid.
+    md_cfg.microprice_narrow_bps        = cfg.strategy.microprice_narrow_bps;
+    md_cfg.microprice_wide_bps          = cfg.strategy.microprice_wide_bps;
+    // Published-mid BBO band: same [strategy] rationale as the micro-price
+    // schedule -- a pricing-policy decision consumed where the mid is made.
+    md_cfg.published_mid_band_floor_bps =
+        cfg.strategy.published_mid_band_floor_bps;
+    md_cfg.published_mid_band_spread_frac =
+        cfg.strategy.published_mid_band_spread_frac;
+    // [S20 2026-08-24] Published-mid plausibility gate.
+    md_cfg.mid_gate_enabled     = cfg.market_data.mid_gate_enabled;
+    md_cfg.mid_anchor_band_ratio = cfg.market_data.mid_anchor_band_ratio;
+    md_cfg.mid_gate_book_confirm_max_spread_bps =
+        cfg.market_data.mid_gate_book_confirm_max_spread_bps;
+    md_cfg.mid_gate_max_step_frac =
+        cfg.market_data.mid_gate_max_step_frac;
+    // [SIDEQUALITY 2026-09-01] Per-side anchor agreement.
+    md_cfg.book_side_anchor_band_ratio =
+        cfg.market_data.book_side_anchor_band_ratio;
+    md_cfg.book_side_agree_max_spread_bps =
+        cfg.market_data.book_side_agree_max_spread_bps;
+    // [S33 2026-09-12] ...and the per-pair overrides of it.  ONE feed serves
+    // every pair, so without this the line above is a bot-wide retune however
+    // local the operator's intent was.  Populated for EVERY pair, not just
+    // the enabled ones: the map is keyed by name and read on lookup, so
+    // carrying a disabled pair's override costs nothing and stops the value
+    // from silently vanishing when a pair is enabled and the engine restarted.
+    for (const auto& md_pair_cfg : cfg.pairs) {
+        if (md_pair_cfg.book_side_agree_max_spread_bps_override) {
+            md_cfg.set_agree_max_spread_bps_for(
+                md_pair_cfg.name,
+                *md_pair_cfg.book_side_agree_max_spread_bps_override);
+        }
+    }
+    return md_cfg;
+}
+
+VolatilityEstimatorConfig volatility_config_from(const AppConfig& cfg)
+{
+    VolatilityEstimatorConfig vol_cfg;
+    vol_cfg.lookback_blocks = cfg.volatility.lookback_blocks;
+    vol_cfg.yz_alpha        = cfg.volatility.yz_alpha;
+    // [T5-CR6] Pass candle aggregation window from user config.
+    vol_cfg.candle_aggregation_blocks = cfg.volatility.candle_aggregation_blocks;
+    return vol_cfg;
+}
+
+AdverseSelectionConfig adverse_selection_config_from(const AppConfig& cfg)
+{
+    AdverseSelectionConfig as_cfg;
+    as_cfg.prior_alpha        = cfg.adverse_selection.prior_alpha;
+    as_cfg.prior_beta         = cfg.adverse_selection.prior_beta;
+    as_cfg.observation_blocks = cfg.adverse_selection.observation_blocks;
+    as_cfg.adverse_threshold  = cfg.adverse_selection.adverse_threshold;
+    as_cfg.max_history        = cfg.adverse_selection.max_history;
+    as_cfg.decay_factor       = cfg.adverse_selection.decay_factor;
+    return as_cfg;
+}
+
+// [T1-11] Per-pair Avellaneda-Stoikov parameters: per-pair overrides first.
+AvellanedaConfig avellaneda_config_from(const PairConfig& pair,
+                                        const StrategyConfig& sc)
+{
+    AvellanedaConfig as_strat_cfg;
+    as_strat_cfg.gamma = pair.gamma_override.value_or(sc.gamma);
+    as_strat_cfg.kappa = pair.kappa_override.value_or(sc.kappa);
+    as_strat_cfg.q_max = effective_q_max(pair, sc);
+    as_strat_cfg.min_margin_bps =
+        pair.min_profit_margin_bps_override.value_or(sc.min_profit_margin_bps);
+    return as_strat_cfg;
+}
+
+SpreadConfig spread_config_from(const StrategyConfig& sc)
+{
+    SpreadConfig sp_cfg;
+    sp_cfg.gamma = sc.gamma;
+    sp_cfg.s_floor_bps = sc.min_profit_margin_bps;
+    sp_cfg.high_vol_multiplier = sc.high_vol_multiplier;
+    return sp_cfg;
+}
+
+// Per-pair liquidity engine config -- per-pair tier overrides when present.
+LiquidityConfig liquidity_config_from(const PairConfig& pair,
+                                      const StrategyConfig& sc)
+{
+    LiquidityConfig liq_cfg;
+    liq_cfg.tier_spacing_bps =
+        pair.tier_spacing_bps_override.value_or(
+            sc.tier_spacing_bps);
+    liq_cfg.tier_size_pct    =
+        pair.tier_size_pct_override.value_or(
+            sc.tier_size_pct);
+    // When per-pair overrides provide fewer tiers than the global
+    // num_tiers, derive the count from the override vectors to
+    // prevent out-of-bounds access in build_raw_ladder.
+    liq_cfg.num_tiers = static_cast<uint32_t>(std::min(
+        liq_cfg.tier_spacing_bps.size(),
+        liq_cfg.tier_size_pct.size()));
+    if (liq_cfg.num_tiers == 0) {
+        liq_cfg.num_tiers = sc.num_tiers;
+    }
+    liq_cfg.offer_ttl_blocks = sc.offer_ttl_blocks;
+
+    // Gap-aware dynamic tier spacing.
+    liq_cfg.gap_aware_spacing  = sc.gap_aware_spacing;
+    liq_cfg.min_gap_bps        = sc.min_gap_bps;
+    liq_cfg.max_gap_scan_bps   = sc.max_gap_scan_bps;
+    liq_cfg.gap_blend_factor   = sc.gap_blend_factor;
+
+    // Competitive anchor pricing (per-pair override takes precedence).
+    liq_cfg.competitive_anchor_enabled           = pair.competitive_anchor_enabled_override.value_or(sc.competitive_anchor_enabled);
+    liq_cfg.competitive_anchor_max_distance_bps  = pair.competitive_anchor_max_distance_bps_override.value_or(sc.competitive_anchor_max_distance_bps);
+    liq_cfg.competitive_anchor_stride_bps        = pair.competitive_anchor_stride_bps_override.value_or(sc.competitive_anchor_stride_bps);
+
+    // Adverse-selection-aware tier sizing.
+    liq_cfg.adverse_selection_sizing           = sc.adverse_selection_sizing;
+    liq_cfg.adverse_selection_decay            = sc.adverse_selection_decay;
+    liq_cfg.adverse_selection_sigma_threshold  = sc.adverse_selection_sigma_threshold;
+
+    // Fill-rate-weighted adaptive tier sizing.
+    liq_cfg.fill_rate_sizing          = sc.fill_rate_sizing;
+    liq_cfg.fill_rate_blend           = sc.fill_rate_blend;
+    liq_cfg.fill_rate_lookback_hours  = sc.fill_rate_lookback_hours;
+    liq_cfg.fill_rate_min_pct         = sc.fill_rate_min_pct;
+
+    // Inventory skew strength -- must be wired from config.
+    liq_cfg.phi = sc.phi;
+
+    // Stablecoin overrides: skip adverse-selection and gap-aware
+    // adjustments that widen spreads counterproductively.
+    if (pair.stablecoin_skip_gap_aware) {
+        liq_cfg.gap_aware_spacing = false;
+    }
+    if (pair.stablecoin_flat_sizing) {
+        liq_cfg.adverse_selection_sizing = false;
+    }
+    return liq_cfg;
+}
+
+// Build ArbitrageConfig from the YAML-parsed ArbitrageSettings.
+ArbitrageConfig arbitrage_config_from(const ArbitrageSettings& a)
+{
+    ArbitrageConfig arb_cfg;
+    arb_cfg.triangular_min_profit_bps  = a.triangular_min_profit_bps;
+    arb_cfg.triangular_slippage_bps    = a.triangular_slippage_bps;
+    arb_cfg.triangular_per_leg_fee_bps = a.triangular_per_leg_fee_bps;
+    arb_cfg.triangular_max_legs        = a.triangular_max_legs;
+    arb_cfg.cex_dex_min_edge_bps       = a.cex_dex_min_edge_bps;
+    arb_cfg.cex_dex_max_edge_bps       = a.cex_dex_max_edge_bps;
+    arb_cfg.cex_fee_bps               = a.cex_fee_bps;
+    arb_cfg.bridge_fee_bps            = a.bridge_fee_bps;
+    arb_cfg.cross_dex_min_edge_bps    = a.cross_dex_min_edge_bps;
+    arb_cfg.tibetswap_fee_bps         = a.tibetswap_fee_bps;
+    arb_cfg.dexie_fee_bps             = a.dexie_fee_bps;
+    arb_cfg.cross_bridge_min_edge_bps = a.cross_bridge_min_edge_bps;
+    arb_cfg.bridge_cost_bps           = a.bridge_cost_bps;
+    arb_cfg.crossed_book_enabled      = a.crossed_book_enabled;
+    arb_cfg.crossed_book_min_edge_bps = a.crossed_book_min_edge_bps;
+    arb_cfg.crossed_book_max_take_xch = a.crossed_book_max_take_xch;
+    arb_cfg.cross_stable_arb_enabled  = a.cross_stable_arb_enabled;
+    arb_cfg.cross_stable_min_edge_bps = a.cross_stable_min_edge_bps;
+    arb_cfg.cross_stable_max_take_xch = a.cross_stable_max_take_xch;
+    arb_cfg.max_position_size         = a.max_position_size;
+    arb_cfg.default_confidence        = a.default_confidence;
+    arb_cfg.min_confidence_threshold  = a.min_confidence_threshold;
+    arb_cfg.default_urgency_blocks    = a.default_urgency_blocks;
+    return arb_cfg;
+}
+
+// [v0.7.48] The per-pair competitiveness PID's gains and bounds.
+xop::strategy::CompetitivenessPidConfig comp_pid_config_from(const StrategyConfig& sc)
+{
+    xop::strategy::CompetitivenessPidConfig cpc;
+    cpc.enabled           = sc.comp_pid_enabled;
+    cpc.target_fill_rate  = sc.comp_pid_target_fill_rate;
+    cpc.kp                = sc.comp_pid_kp;
+    cpc.ki                = sc.comp_pid_ki;
+    cpc.kd                = sc.comp_pid_kd;
+    cpc.ema_alpha         = sc.comp_pid_ema_alpha;
+    cpc.integral_max      = sc.comp_pid_integral_max;
+    cpc.warmup_blocks     = sc.comp_pid_warmup_blocks;
+    // [S39] Derived, same reason as the Step 5 spread clamp.
+    // A no-op on the shipped config (raw -3.20 rounds to -3,
+    // which equals the configured floor), and note that -3 comes
+    // out of the ROUNDING step, not the clamp: widening
+    // comp_pid_min_offset would change nothing at all.
+    cpc.min_offset        = xop::strategy::effective_comp_pid_min_offset(
+        sc.comp_pid_min_offset,
+        xop::strategy::PidGains{
+            sc.comp_pid_kp,
+            sc.comp_pid_ki,
+            sc.comp_pid_kd,
+            sc.comp_pid_target_fill_rate,
+            sc.comp_pid_ema_alpha,
+            sc.comp_pid_integral_max,
+            sc.comp_pid_warmup_blocks});
+    cpc.max_offset        = sc.comp_pid_max_offset;
+    return cpc;
+}
+
+StablecoinPairSet stablecoin_pairs_from(const AppConfig& cfg)
+{
+    StablecoinPairSet stable_pairs;
+    for (const auto& pair : cfg.pairs) {
+        if (pair.is_stablecoin && pair.enabled) {
+            stable_pairs.insert(pair.name);
+        }
+    }
+    return stable_pairs;
+}
+
 }  // namespace
 
 // [S33 2026-09-05] See the contract in engine.hpp: the replacement whitelist
@@ -513,6 +755,13 @@ Engine::Engine(const AppConfig& config, bool dry_run,
     // [shutdown-flag-race] Assigned in the body, not the initialiser list:
     // the member is declared long after the ones listed above (-Wreorder).
     process_identity_ = process_identity;
+    // [LIVECFG] The two settings read OFF the engine thread get their own
+    // copies, so a live reload assigning config_ never races them: the dead
+    // man's switch thread's stall limit (restart-only) and the stop policy a
+    // signal-delivered shutdown() reads (updated by every reload).
+    watchdog_stall_seconds_ = config_.risk.watchdog_stall_seconds;
+    shutdown_offers_policy_.store(config_.engine.shutdown_offers,
+                                  std::memory_order_release);
     spdlog::info("[Engine] process identity: PID {}, started {} ms before "
                  "engine construction -- a shutdown.flag stop request is "
                  "honoured only if it names this PID (or no PID) and was "
@@ -722,77 +971,13 @@ Engine::Engine(const AppConfig& config, bool dry_run,
 
     // Market data feed: construct with a MarketDataConfig populated from
     // the YAML `market_data:` section (T4-05).
-    MarketDataConfig md_cfg;
-    md_cfg.whale_trade_threshold        = config_.market_data.whale_trade_threshold;
-    md_cfg.whale_volume_fraction        = config_.market_data.whale_volume_fraction;
-    md_cfg.whale_window_blocks          = config_.market_data.whale_window_blocks;
-    md_cfg.whale_max_spread_multiplier  = config_.market_data.whale_max_spread_multiplier;
-    md_cfg.vpin_bucket_size             = config_.market_data.vpin_bucket_size;
-    md_cfg.vpin_window_buckets          = config_.market_data.vpin_window_buckets;
-    md_cfg.ofi_window_size              = config_.market_data.ofi_window_size;
-    md_cfg.enable_competitor_tracking   = config_.market_data.enable_competitor_tracking;
-    md_cfg.min_competitor_offer_size    = config_.market_data.min_competitor_offer_size;
-    md_cfg.competitor_alert_threshold_bps = config_.market_data.competitor_alert_threshold_bps;
-    md_cfg.asymmetric_skew_factor       = config_.market_data.asymmetric_skew_factor;
-    md_cfg.cex_freshness_threshold_sec  = config_.market_data.cex_freshness_threshold_sec;
-    md_cfg.dex_last_trade_max_age_sec   = config_.market_data.dex_last_trade_max_age_sec;
-    md_cfg.amm_blend_weight             = config_.strategy.amm_blend_weight;
-    md_cfg.amm_freshness_threshold_sec  = 300.0;  // 5 min default
-    md_cfg.orderbook_mid_enabled        = config_.market_data.orderbook_mid_enabled;
-    md_cfg.orderbook_mid_depth          = config_.market_data.orderbook_mid_depth;
-    // Micro-price blend schedule.  Lives in [strategy] because it is a
-    // pricing-policy decision (how far to trust a depth signal), not a feed
-    // parameter, but it is consumed here where the book is turned into a mid.
-    md_cfg.microprice_narrow_bps        = config_.strategy.microprice_narrow_bps;
-    md_cfg.microprice_wide_bps          = config_.strategy.microprice_wide_bps;
-    // Published-mid BBO band: same [strategy] rationale as the micro-price
-    // schedule -- a pricing-policy decision consumed where the mid is made.
-    md_cfg.published_mid_band_floor_bps =
-        config_.strategy.published_mid_band_floor_bps;
-    md_cfg.published_mid_band_spread_frac =
-        config_.strategy.published_mid_band_spread_frac;
-    // [S20 2026-08-24] Published-mid plausibility gate.
-    md_cfg.mid_gate_enabled     = config_.market_data.mid_gate_enabled;
-    md_cfg.mid_anchor_band_ratio = config_.market_data.mid_anchor_band_ratio;
-    md_cfg.mid_gate_book_confirm_max_spread_bps =
-        config_.market_data.mid_gate_book_confirm_max_spread_bps;
-    md_cfg.mid_gate_max_step_frac =
-        config_.market_data.mid_gate_max_step_frac;
-    // [SIDEQUALITY 2026-09-01] Per-side anchor agreement.
-    md_cfg.book_side_anchor_band_ratio =
-        config_.market_data.book_side_anchor_band_ratio;
-    md_cfg.book_side_agree_max_spread_bps =
-        config_.market_data.book_side_agree_max_spread_bps;
-    // [S33 2026-09-12] ...and the per-pair overrides of it.  ONE feed serves
-    // every pair, so without this the line above is a bot-wide retune however
-    // local the operator's intent was.  Populated for EVERY pair, not just
-    // the enabled ones: the map is keyed by name and read on lookup, so
-    // carrying a disabled pair's override costs nothing and stops the value
-    // from silently vanishing when a pair is enabled and the engine restarted.
-    for (const auto& md_pair_cfg : config_.pairs) {
-        if (md_pair_cfg.book_side_agree_max_spread_bps_override) {
-            md_cfg.set_agree_max_spread_bps_for(
-                md_pair_cfg.name,
-                *md_pair_cfg.book_side_agree_max_spread_bps_override);
-        }
-    }
+    const MarketDataConfig md_cfg = market_data_config_from(config_);
     market_data_ = std::make_unique<MarketDataFeed>(md_cfg, *state_);
 
     // -- Data / analytics (per-pair estimators) --------------------------------
 
-    VolatilityEstimatorConfig vol_cfg;
-    vol_cfg.lookback_blocks = config_.volatility.lookback_blocks;
-    vol_cfg.yz_alpha        = config_.volatility.yz_alpha;
-    // [T5-CR6] Pass candle aggregation window from user config.
-    vol_cfg.candle_aggregation_blocks = config_.volatility.candle_aggregation_blocks;
-
-    AdverseSelectionConfig as_cfg;
-    as_cfg.prior_alpha        = config_.adverse_selection.prior_alpha;
-    as_cfg.prior_beta         = config_.adverse_selection.prior_beta;
-    as_cfg.observation_blocks = config_.adverse_selection.observation_blocks;
-    as_cfg.adverse_threshold  = config_.adverse_selection.adverse_threshold;
-    as_cfg.max_history        = config_.adverse_selection.max_history;
-    as_cfg.decay_factor       = config_.adverse_selection.decay_factor;
+    const VolatilityEstimatorConfig vol_cfg = volatility_config_from(config_);
+    const AdverseSelectionConfig    as_cfg  = adverse_selection_config_from(config_);
 
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
@@ -822,81 +1007,19 @@ Engine::Engine(const AppConfig& config, bool dry_run,
     // ISO/IEC 5055: no shared mutable state across independent pairs.
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
-        AvellanedaConfig as_strat_cfg;
-        as_strat_cfg.gamma = pair.gamma_override.value_or(config_.strategy.gamma);
-        as_strat_cfg.kappa = pair.kappa_override.value_or(config_.strategy.kappa);
-        as_strat_cfg.q_max = effective_q_max(pair, config_.strategy);
-        as_strat_cfg.min_margin_bps =
-            pair.min_profit_margin_bps_override.value_or(
-                config_.strategy.min_profit_margin_bps);
-        strategies_[pair.name] =
-            std::make_unique<AvellanedaStoikov>(as_strat_cfg);
+        strategies_[pair.name] = std::make_unique<AvellanedaStoikov>(
+            avellaneda_config_from(pair, config_.strategy));
     }
 
     // Spread optimizer with config-derived parameters.
-    SpreadConfig sp_cfg;
-    sp_cfg.gamma = config_.strategy.gamma;
-    sp_cfg.s_floor_bps = config_.strategy.min_profit_margin_bps;
-    sp_cfg.high_vol_multiplier = config_.strategy.high_vol_multiplier;
-    spread_opt_ = std::make_unique<SpreadOptimizer>(sp_cfg);
+    spread_opt_ = std::make_unique<SpreadOptimizer>(
+        spread_config_from(config_.strategy));
 
     // Per-pair liquidity engines -- use per-pair tier overrides when present.
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
-        LiquidityConfig liq_cfg;
-        liq_cfg.tier_spacing_bps =
-            pair.tier_spacing_bps_override.value_or(
-                config_.strategy.tier_spacing_bps);
-        liq_cfg.tier_size_pct    =
-            pair.tier_size_pct_override.value_or(
-                config_.strategy.tier_size_pct);
-        // When per-pair overrides provide fewer tiers than the global
-        // num_tiers, derive the count from the override vectors to
-        // prevent out-of-bounds access in build_raw_ladder.
-        liq_cfg.num_tiers = static_cast<uint32_t>(std::min(
-            liq_cfg.tier_spacing_bps.size(),
-            liq_cfg.tier_size_pct.size()));
-        if (liq_cfg.num_tiers == 0) {
-            liq_cfg.num_tiers = config_.strategy.num_tiers;
-        }
-        liq_cfg.offer_ttl_blocks = config_.strategy.offer_ttl_blocks;
-
-        // Gap-aware dynamic tier spacing.
-        liq_cfg.gap_aware_spacing  = config_.strategy.gap_aware_spacing;
-        liq_cfg.min_gap_bps        = config_.strategy.min_gap_bps;
-        liq_cfg.max_gap_scan_bps   = config_.strategy.max_gap_scan_bps;
-        liq_cfg.gap_blend_factor   = config_.strategy.gap_blend_factor;
-
-        // Competitive anchor pricing (per-pair override takes precedence).
-        liq_cfg.competitive_anchor_enabled           = pair.competitive_anchor_enabled_override.value_or(config_.strategy.competitive_anchor_enabled);
-        liq_cfg.competitive_anchor_max_distance_bps  = pair.competitive_anchor_max_distance_bps_override.value_or(config_.strategy.competitive_anchor_max_distance_bps);
-        liq_cfg.competitive_anchor_stride_bps        = pair.competitive_anchor_stride_bps_override.value_or(config_.strategy.competitive_anchor_stride_bps);
-
-        // Adverse-selection-aware tier sizing.
-        liq_cfg.adverse_selection_sizing           = config_.strategy.adverse_selection_sizing;
-        liq_cfg.adverse_selection_decay            = config_.strategy.adverse_selection_decay;
-        liq_cfg.adverse_selection_sigma_threshold  = config_.strategy.adverse_selection_sigma_threshold;
-
-        // Fill-rate-weighted adaptive tier sizing.
-        liq_cfg.fill_rate_sizing          = config_.strategy.fill_rate_sizing;
-        liq_cfg.fill_rate_blend           = config_.strategy.fill_rate_blend;
-        liq_cfg.fill_rate_lookback_hours  = config_.strategy.fill_rate_lookback_hours;
-        liq_cfg.fill_rate_min_pct         = config_.strategy.fill_rate_min_pct;
-
-        // Inventory skew strength -- must be wired from config.
-        liq_cfg.phi = config_.strategy.phi;
-
-        // Stablecoin overrides: skip adverse-selection and gap-aware
-        // adjustments that widen spreads counterproductively.
-        if (pair.stablecoin_skip_gap_aware) {
-            liq_cfg.gap_aware_spacing = false;
-        }
-        if (pair.stablecoin_flat_sizing) {
-            liq_cfg.adverse_selection_sizing = false;
-        }
-
-        liquidity_engines_[pair.name] =
-            std::make_unique<LiquidityEngine>(pair.name, liq_cfg);
+        liquidity_engines_[pair.name] = std::make_unique<LiquidityEngine>(
+            pair.name, liquidity_config_from(pair, config_.strategy));
     }
 
     // -- Depeg detector -------------------------------------------------------
@@ -907,41 +1030,11 @@ Engine::Engine(const AppConfig& config, bool dry_run,
 
     // -- Arbitrage detector ---------------------------------------------------
     {
-        // Build ArbitrageConfig from the YAML-parsed ArbitrageSettings.
-        ArbitrageConfig arb_cfg;
-        arb_cfg.triangular_min_profit_bps  = config_.arbitrage.triangular_min_profit_bps;
-        arb_cfg.triangular_slippage_bps    = config_.arbitrage.triangular_slippage_bps;
-        arb_cfg.triangular_per_leg_fee_bps = config_.arbitrage.triangular_per_leg_fee_bps;
-        arb_cfg.triangular_max_legs        = config_.arbitrage.triangular_max_legs;
-        arb_cfg.cex_dex_min_edge_bps       = config_.arbitrage.cex_dex_min_edge_bps;
-        arb_cfg.cex_dex_max_edge_bps       = config_.arbitrage.cex_dex_max_edge_bps;
-        arb_cfg.cex_fee_bps               = config_.arbitrage.cex_fee_bps;
-        arb_cfg.bridge_fee_bps            = config_.arbitrage.bridge_fee_bps;
-        arb_cfg.cross_dex_min_edge_bps    = config_.arbitrage.cross_dex_min_edge_bps;
-        arb_cfg.tibetswap_fee_bps         = config_.arbitrage.tibetswap_fee_bps;
-        arb_cfg.dexie_fee_bps             = config_.arbitrage.dexie_fee_bps;
-        arb_cfg.cross_bridge_min_edge_bps = config_.arbitrage.cross_bridge_min_edge_bps;
-        arb_cfg.bridge_cost_bps           = config_.arbitrage.bridge_cost_bps;
-        arb_cfg.crossed_book_enabled      = config_.arbitrage.crossed_book_enabled;
-        arb_cfg.crossed_book_min_edge_bps = config_.arbitrage.crossed_book_min_edge_bps;
-        arb_cfg.crossed_book_max_take_xch = config_.arbitrage.crossed_book_max_take_xch;
-        arb_cfg.cross_stable_arb_enabled  = config_.arbitrage.cross_stable_arb_enabled;
-        arb_cfg.cross_stable_min_edge_bps = config_.arbitrage.cross_stable_min_edge_bps;
-        arb_cfg.cross_stable_max_take_xch = config_.arbitrage.cross_stable_max_take_xch;
-        arb_cfg.max_position_size         = config_.arbitrage.max_position_size;
-        arb_cfg.default_confidence        = config_.arbitrage.default_confidence;
-        arb_cfg.min_confidence_threshold  = config_.arbitrage.min_confidence_threshold;
-        arb_cfg.default_urgency_blocks    = config_.arbitrage.default_urgency_blocks;
-
-        arb_detector_ = std::make_unique<ArbitrageDetector>(arb_cfg);
+        arb_detector_ = std::make_unique<ArbitrageDetector>(
+            arbitrage_config_from(config_.arbitrage));
 
         // Pre-populate the stablecoin pair set from config.
-        StablecoinPairSet stable_pairs;
-        for (const auto& pair : config_.pairs) {
-            if (pair.is_stablecoin && pair.enabled) {
-                stable_pairs.insert(pair.name);
-            }
-        }
+        const StablecoinPairSet stable_pairs = stablecoin_pairs_from(config_);
         if (!stable_pairs.empty()) {
             arb_detector_->set_stablecoin_pairs(stable_pairs);
         }
@@ -1072,6 +1165,8 @@ Engine::Engine(const AppConfig& config, bool dry_run,
         peg_reenable_flag_path_ = db_dir / "peg_reenable.flag";
         // [RELOAD] Touched by the GUI after every successful Save.
         config_reload_flag_path_ = db_dir / "config_reload.flag";
+        // [LIVECFG] ...and answered here: what that save did.
+        config_reload_result_path_ = db_dir / "config_reload.result.json";
         // [STOPDRAIN] The GUI's Cancel All button.
         cancel_all_flag_path_ = db_dir / "cancel_all.flag";
         // [STOPDRAIN review #7] Graceful-close request. [shutdown-flag-race]
@@ -1158,7 +1253,7 @@ Engine::Engine(const AppConfig& config, bool dry_run,
 
 void Engine::start_watchdog()
 {
-    const std::uint32_t secs = config_.risk.watchdog_stall_seconds;
+    const std::uint32_t secs = watchdog_stall_seconds_;
     if (secs == 0) {
         spdlog::warn("[Engine] [S31] dead man's switch DISABLED "
                      "(risk.watchdog_stall_seconds = 0). Offers will outlive "
@@ -1335,7 +1430,7 @@ void Engine::watchdog_loop()
     };
 
     risk::Watchdog watchdog{
-        static_cast<std::int64_t>(config_.risk.watchdog_stall_seconds) * 1000};
+        static_cast<std::int64_t>(watchdog_stall_seconds_) * 1000};
 
     // Arm from NOW, which is what closes the startup hole. last_beat_ms_ is
     // stamped only when a cycle COMPLETES, so it is 0 for the whole of
@@ -1376,7 +1471,7 @@ void Engine::watchdog_loop()
             const auto started =
                 graceful_cancel_started_ms_.load(std::memory_order_acquire);
             if (now_ms() - started < static_cast<std::int64_t>(
-                    config_.risk.watchdog_stall_seconds) * 1000) {
+                    watchdog_stall_seconds_) * 1000) {
                 continue;   // quiet: this fires once a second during shutdown
             }
         }
@@ -1595,11 +1690,13 @@ void Engine::shutdown()
     // The request's policy (a shutdown.flag "offers=" line, latched by
     // evaluate_shutdown_flag) or else engine.shutdown_offers; a signal carries
     // none. The table is util::plan_stop_offers, and dry run is decided inside
-    // it, first. config_.engine is never written after construction, so this
-    // read is safe on whichever thread a signal delivers us on.
+    // it, first. [LIVECFG] The default is read from shutdown_offers_policy_,
+    // an atomic copy a live reload updates, never from config_.engine, which
+    // that reload assigns on the engine thread: this read is safe on
+    // whichever thread a signal delivers us on.
     const util::StopOffersPlan stop_plan = util::plan_stop_offers(
         stop_offers_request_.load(std::memory_order_acquire),
-        config_.engine.shutdown_offers, dry_run_);
+        shutdown_offers_policy_.load(std::memory_order_acquire), dry_run_);
     const bool cancels_book = stop_plan.action == util::StopBookAction::CancelBook;
     const bool keeps_book   = stop_plan.action == util::StopBookAction::KeepBook;
     if (keeps_book) {
@@ -7651,34 +7748,10 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
             // Lazily create per-pair PID with current strategy config.
             auto pid_it = comp_pid_state_.find(pair_name);
             if (pid_it == comp_pid_state_.end()) {
-                xop::strategy::CompetitivenessPidConfig cpc;
-                cpc.enabled           = config_.strategy.comp_pid_enabled;
-                cpc.target_fill_rate  = config_.strategy.comp_pid_target_fill_rate;
-                cpc.kp                = config_.strategy.comp_pid_kp;
-                cpc.ki                = config_.strategy.comp_pid_ki;
-                cpc.kd                = config_.strategy.comp_pid_kd;
-                cpc.ema_alpha         = config_.strategy.comp_pid_ema_alpha;
-                cpc.integral_max      = config_.strategy.comp_pid_integral_max;
-                cpc.warmup_blocks     = config_.strategy.comp_pid_warmup_blocks;
-                // [S39] Derived, same reason as the spread clamp above.
-                // A no-op on the shipped config (raw -3.20 rounds to -3,
-                // which equals the configured floor), and note that -3 comes
-                // out of the ROUNDING step, not the clamp: widening
-                // comp_pid_min_offset would change nothing at all.
-                cpc.min_offset        = xop::strategy::effective_comp_pid_min_offset(
-                    config_.strategy.comp_pid_min_offset,
-                    xop::strategy::PidGains{
-                        config_.strategy.comp_pid_kp,
-                        config_.strategy.comp_pid_ki,
-                        config_.strategy.comp_pid_kd,
-                        config_.strategy.comp_pid_target_fill_rate,
-                        config_.strategy.comp_pid_ema_alpha,
-                        config_.strategy.comp_pid_integral_max,
-                        config_.strategy.comp_pid_warmup_blocks});
-                cpc.max_offset        = config_.strategy.comp_pid_max_offset;
                 pid_it = comp_pid_state_.emplace(
                     pair_name,
-                    xop::strategy::CompetitivenessPid{cpc}).first;
+                    xop::strategy::CompetitivenessPid{
+                        comp_pid_config_from(config_.strategy)}).first;
             }
             const int fills = comp_pid_fills_this_block_[pair_name];
             pid_it->second.observe_block(fills > 0);
@@ -12591,6 +12664,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 wid, execution::choose_reserve_coins(
                          std::move(coins),
                          execution::reserve_units_to_mojos(units, 1'000)));
+            reserve_wallet_ids_[asset_id] = wid;
         }
     }
 
@@ -25814,13 +25888,16 @@ asio::awaitable<bool> Engine::sweep_reload_disabled_offers()
 }
 
 // Consume data/config_reload.flag: re-parse config.yaml with FULL
-// validation and apply the one change that is safe on a running engine --
-// a pair going enabled -> disabled. Everything else is reported as
-// restart-required rather than silently ignored. A file that fails to
-// parse changes nothing: the engine keeps the config it booted with and
-// says so loudly. Every outcome alert names the file that was re-read, so
-// a save that landed in a DIFFERENT config universe is diagnosable from
-// the phone rather than silently ignored.
+// validation and adopt it live. [LIVECFG 2026-10-25] That used to mean one
+// change -- a pair going enabled -> disabled -- with everything else reported
+// as restart-required. Now the whole file applies, except the short
+// restart-only list in config_live_apply.hpp, which is named setting by
+// setting in the log, the alert and data/config_reload.result.json (the
+// GUI's Settings page reads that file). A file that fails to parse, or that
+// a subsystem refuses, changes nothing: the engine keeps the config it was
+// running and says so loudly. Every outcome alert names the file that was
+// re-read, so a save that landed in a DIFFERENT config universe is
+// diagnosable from the phone rather than silently ignored.
 asio::awaitable<void> Engine::check_config_reload_flag()
 {
     namespace fs = std::filesystem;
@@ -25860,6 +25937,18 @@ asio::awaitable<void> Engine::check_config_reload_flag()
         }
     }
 
+    // [LIVECFG] Retry leg: a save whose apply waited behind an operator
+    // Cancel All. A newer save below replaces it.
+    if (reload_deferred_plan_ && !cancel_all_inflight_) {
+        LiveConfigPlan deferred = std::move(*reload_deferred_plan_);
+        reload_deferred_plan_.reset();
+        apply_live_config(deferred.merged);
+        spdlog::info("[Engine] [LIVECFG] the save held back during operator "
+                     "Cancel All is now applied");
+        reload_request_id_ = reload_deferred_request_id_;
+        write_reload_result("applied", "", deferred.restart_required);
+    }
+
     std::error_code ec;
     if (!fs::exists(config_reload_flag_path_, ec)) co_return;
 
@@ -25873,11 +25962,40 @@ asio::awaitable<void> Engine::check_config_reload_flag()
     }
     reload_flag_stuck_mtime_.reset();
 
+    // [LIVECFG] Claim the flag by renaming it, THEN read it: a save that
+    // lands while this one is processed writes a fresh flag, which the next
+    // heartbeat answers, instead of being deleted with this one unanswered.
+    fs::path claimed_path = config_reload_flag_path_;
+    claimed_path += ".claimed";
+    std::error_code mv_ec;
+    fs::rename(config_reload_flag_path_, claimed_path, mv_ec);
+    const fs::path& flag_to_read = mv_ec ? config_reload_flag_path_ : claimed_path;
+
+    // "reload <id>": the id is echoed in the result file.
+    reload_request_id_.clear();
+    {
+        std::ifstream flag_in(flag_to_read);
+        std::string line;
+        if (flag_in && std::getline(flag_in, line)) {
+            const std::string prefix = "reload ";
+            if (line.rfind(prefix, 0) == 0) {
+                for (char c : line.substr(prefix.size())) {
+                    if (reload_request_id_.size() >= 64) break;
+                    if (std::isalnum(static_cast<unsigned char>(c)) || c == '-'
+                        || c == '_' || c == '.') {
+                        reload_request_id_ += c;
+                    }
+                }
+            }
+        }
+    }
+
     // Consume FIRST: a poison config must trigger one loud failure, not a
     // failure every heartbeat until someone deletes a file by hand.
     std::error_code rm_ec;
-    fs::remove(config_reload_flag_path_, rm_ec);
-    if (rm_ec) {
+    fs::remove(flag_to_read, rm_ec);
+    if (rm_ec && mv_ec) {
+        // Neither renamed nor deleted: the flag itself is stuck.
         spdlog::warn("[Engine] [RELOAD] could not delete {} ({}) -- this "
                      "reload still runs; further heartbeats skip the stuck "
                      "flag until the file changes",
@@ -25888,6 +26006,9 @@ asio::awaitable<void> Engine::check_config_reload_flag()
     if (config_file_path_.empty()) {
         spdlog::warn("[Engine] [RELOAD] reload requested but this engine was "
                      "never told its config path -- restart to apply changes");
+        write_reload_result("rejected",
+                            "this engine was never told its config path -- "
+                            "restart it to apply changes", {});
         co_return;
     }
 
@@ -25908,10 +26029,33 @@ asio::awaitable<void> Engine::check_config_reload_flag()
                   "this save was applied -- a pair disable or pace_enabled: false in "
                   "the same save included. Fix the key named above and save again.");
         }
+        write_reload_result("rejected", e.what(), {});
         co_return;
     }
 
-    auto diff = diff_pair_enables(config_.pairs, fresh.pairs);
+    // [LIVECFG] What the running engine adopts, and what waits for a
+    // restart; then every subsystem's own refusals, BEFORE anything moves.
+    LiveConfigPlan plan = plan_live_config(config_, fresh);
+    try {
+        validate_live_config(plan.merged);
+    } catch (const std::exception& e) {
+        spdlog::error("[Engine] [LIVECFG] saved config was refused by a "
+                      "subsystem: {} -- the engine keeps running on its "
+                      "previous settings; NOTHING in this save was applied",
+                      e.what());
+        if (alerts_) {
+            alerts_->send_alert(
+                AlertRule::ConfigReload,
+                "Re-read " + config_file_path_ + ": REJECTED ("
+                + std::string(e.what())
+                + "). The engine keeps running on its previous settings. NOTHING in "
+                  "this save was applied. Fix the setting named above and save again.");
+        }
+        write_reload_result("rejected", e.what(), {});
+        co_return;
+    }
+
+    ReloadDiff& diff = plan.pairs;
     // Duplicate names in a damaged running config would list a pair once
     // per occurrence; flip and report each NAME once.
     std::sort(diff.to_disable.begin(), diff.to_disable.end());
@@ -25950,16 +26094,37 @@ asio::awaitable<void> Engine::check_config_reload_flag()
         }
     }
 
-    // [PACE 2026-09-13] The pace controller may be turned OFF live; any other
-    // pace edit waits for a restart.  Off means the pre-pace pipeline, not
-    // flat: resting pace offers are left to the canceller.  The next
-    // step_evaluate_pace clears every plan and map.
+    // [PACE 2026-09-13] The pace controller turned OFF applies even when the
+    // rest of the save must wait (below): turning things off never waits.
+    // Off means the pre-pace pipeline, not flat: resting pace offers are left
+    // to the canceller.  The next step_evaluate_pace clears every plan and map.
     const bool pace_disabled_live =
         pace_disables_live(config_.strategy.pace_enabled, fresh.strategy.pace_enabled);
     if (pace_disabled_live) {
         config_.strategy.pace_enabled = false;
         spdlog::warn("[Engine] [RELOAD] pace controller DISABLED live -- the ladder reverts to the "
                      "pre-pace pipeline; resting pace offers are left to the canceller");
+    }
+    const bool pace_enabled_live =
+        !config_.strategy.pace_enabled && plan.merged.strategy.pace_enabled;
+
+    // [LIVECFG] Everything else. Not while an operator Cancel All is walking
+    // the book: its detached coroutine reads OfferManager state across
+    // awaits, so the apply waits for the first heartbeat after it clears.
+    const bool settings_deferred = cancel_all_inflight_;
+    if (settings_deferred) {
+        reload_deferred_plan_ = plan;
+        reload_deferred_request_id_ = reload_request_id_;
+        spdlog::info("[Engine] [LIVECFG] operator Cancel All is in flight -- "
+                     "the rest of this save applies on the first heartbeat "
+                     "after it completes");
+    } else {
+        reload_deferred_plan_.reset();
+        apply_live_config(plan.merged);
+        if (pace_enabled_live) {
+            spdlog::warn("[Engine] [LIVECFG] pace controller ENABLED live from "
+                         "the saved config");
+        }
     }
 
     // Honesty about everything the reload did NOT do.
@@ -25974,9 +26139,27 @@ asio::awaitable<void> Engine::check_config_reload_flag()
                      "saved config -- structural changes require an engine "
                      "restart", name);
     }
-    spdlog::info("[Engine] [RELOAD] processed {}: {} pair(s) disabled live; "
-                 "any other edited settings take effect on the next engine "
-                 "restart", config_file_path_, diff.to_disable.size());
+    auto join = [](const std::vector<std::string>& v) {
+        std::string out;
+        for (const auto& n : v) out += (out.empty() ? "" : ", ") + n;
+        return out;
+    };
+    if (plan.restart_required.empty()) {
+        spdlog::info("[Engine] [LIVECFG] processed {}: {} pair(s) disabled live; "
+                     "every saved setting {}", config_file_path_,
+                     diff.to_disable.size(),
+                     settings_deferred ? "applies once Cancel All completes"
+                                       : "is now live");
+    } else {
+        spdlog::warn("[Engine] [LIVECFG] processed {}: {} pair(s) disabled live; "
+                     "the rest {} EXCEPT these, which wait for an engine "
+                     "restart: {}", config_file_path_, diff.to_disable.size(),
+                     settings_deferred ? "applies once Cancel All completes"
+                                       : "is now live",
+                     join(plan.restart_required));
+    }
+    write_reload_result(settings_deferred ? "deferred" : "applied", "",
+                        plan.restart_required);
 
     // ONE outcome alert per consumed flag, stating what actually happened
     // -- including "nothing", which is what an operator whose save landed
@@ -25997,28 +26180,316 @@ asio::awaitable<void> Engine::check_config_reload_flag()
                     : "WARNING: some resting offers could NOT be cancelled and "
                       "are STILL LIVE; the engine retries each heartbeat. ";
         }
-        auto join = [](const std::vector<std::string>& v) {
-            std::string out;
-            for (const auto& n : v) out += (out.empty() ? "" : ", ") + n;
-            return out;
-        };
-        if (!diff.to_enable.empty()) {
-            msg += "Enabled in the file but RESTART-REQUIRED: "
-                 + join(diff.to_enable) + ". ";
+        msg += settings_deferred
+            ? "The other settings apply once operator Cancel All completes. "
+            : "All other saved settings are live. ";
+        if (!plan.restart_required.empty()) {
+            msg += "RESTART-REQUIRED (not applied): "
+                 + join(plan.restart_required) + ".";
         }
-        if (!diff.structural.empty()) {
-            msg += "Pairs added/removed (restart-required): "
-                 + join(diff.structural) + ". ";
-        }
-        if (disabled_list.empty() && diff.to_enable.empty()
-            && diff.structural.empty()) {
-            msg += "no pair enable changes; ";
-        }
-        msg += "Other edited settings take effect on the next engine "
-               "restart.";
         alerts_->send_alert(AlertRule::ConfigReload, msg);
     }
     co_return;
+}
+
+// [LIVECFG] Every refusal a subsystem would raise on this config, checked
+// on throwaway instances so a refusal changes nothing. load_config() has
+// already run the parser's validation; these are the checks that live in
+// the subsystems themselves (and so ran only at construction before).
+void Engine::validate_live_config(const AppConfig& cfg)
+{
+    // The merged config mixes the saved file with running values (pairs the
+    // file removed, restart-only settings), so the cross-section rules the
+    // parser applied to the file alone must be checked again on it.
+    validate_config_relations(cfg);
+    execution::OfferManager::validate_config(cfg);
+    AdverseSelectionEstimator::validate_config(adverse_selection_config_from(cfg));
+    (void)SpreadOptimizer{spread_config_from(cfg.strategy)};
+    (void)PreTradeCheck{cfg.risk, cfg.strategy};
+    for (const auto& pair : cfg.pairs) {
+        if (!pair.enabled) continue;
+        (void)AvellanedaStoikov{avellaneda_config_from(pair, cfg.strategy)};
+        (void)LiquidityEngine{pair.name, liquidity_config_from(pair, cfg.strategy)};
+    }
+}
+
+// [LIVECFG] Assign a validated plan into config_ and hand each subsystem
+// that cached a value at construction the new one -- through the SAME
+// *_config_from() derivations the constructor uses. Learned state (price
+// histories, estimators, PID memory, fee history, positions) is kept.
+void Engine::apply_live_config(const AppConfig& m)
+{
+    // -- config_ itself ------------------------------------------------------
+    // Section by section, never `config_ = m`: chia and database are
+    // restart-only (the dead man's switch thread reads config_.chia), and
+    // the pairs vector must not be reallocated.
+    const bool coingecko_changed = !(config_.coingecko == m.coingecko);
+    const bool tibetswap_changed = !(config_.tibetswap == m.tibetswap);
+
+    // A reserve dropped from the saved config: Step 8 refreshes only the
+    // assets still listed, so the dropped one's coins would stay excluded
+    // from every offer until a restart.
+    for (auto it = reserve_wallet_ids_.begin(); it != reserve_wallet_ids_.end();) {
+        if (m.strategy.asset_reserve_units.count(it->first) != 0) {
+            ++it;
+            continue;
+        }
+        if (offer_mgr_) offer_mgr_->set_reserved_coins(it->second, {});
+        spdlog::info("[Engine] [LIVECFG] reserve for {} removed -- its coins "
+                     "are no longer excluded from offers", it->first.substr(0, 12));
+        it = reserve_wallet_ids_.erase(it);
+    }
+
+    config_.pegged_assets     = m.pegged_assets;
+    // A peg the saved registry drops or stops enforcing is no longer
+    // watched, and the GUI offers no re-enable for it: a suspension latched
+    // on it would block its pairs for good. Those latches go; the
+    // still-enforced assets keep theirs. The gauges follow below.
+    for (auto it = asset_peg_rt_.begin(); it != asset_peg_rt_.end();) {
+        const PeggedAsset* a = config_.pegged_assets.find(it->first);
+        if (a != nullptr && a->enforce) {
+            ++it;
+            continue;
+        }
+        if (it->second.suspended) {
+            spdlog::warn("[Engine] [LIVECFG] [PEGSUSPEND] {} is no longer an "
+                         "enforced peg in the saved config -- its suspension "
+                         "is released", it->first.substr(0, 12));
+        }
+        peg_circular_anchor_warned_at_.erase(it->first);
+        it = asset_peg_rt_.erase(it);
+    }
+    config_.strategy          = m.strategy;
+    config_.risk              = m.risk;
+    config_.volatility        = m.volatility;
+    config_.depeg             = m.depeg;
+    config_.arbitrage         = m.arbitrage;
+    config_.coingecko         = m.coingecko;
+    config_.tibetswap         = m.tibetswap;
+    config_.fees              = m.fees;
+    config_.inventory_aging   = m.inventory_aging;
+    config_.accounting        = m.accounting;
+    config_.market_data       = m.market_data;
+    config_.adverse_selection = m.adverse_selection;
+    config_.market_allocator  = m.market_allocator;
+    config_.recovery          = m.recovery;
+    config_.buyer             = m.buyer;
+    config_.engine            = m.engine;
+    shutdown_offers_policy_.store(m.engine.shutdown_offers,
+                                  std::memory_order_release);
+    config_.monitoring.telegram_bot_token = m.monitoring.telegram_bot_token;
+    config_.monitoring.telegram_chat_id   = m.monitoring.telegram_chat_id;
+    config_.dexie.claim_rewards           = m.dexie.claim_rewards;
+
+    // Pairs in place, by position: plan_live_config() built m.pairs from
+    // the running vector in its own order. A pair that is off stays off.
+    if (m.pairs.size() == config_.pairs.size()) {
+        for (std::size_t i = 0; i < m.pairs.size(); ++i) {
+            if (m.pairs[i].name != config_.pairs[i].name) continue;
+            PairConfig next = m.pairs[i];
+            next.enabled = config_.pairs[i].enabled && next.enabled;
+            config_.pairs[i] = std::move(next);
+        }
+    } else {
+        spdlog::error("[Engine] [LIVECFG] pair list mismatch ({} running, {} "
+                      "planned) -- per-pair settings NOT applied",
+                      config_.pairs.size(), m.pairs.size());
+    }
+
+    // A pair that leaves isolated Revive (Revive off for it, or
+    // revive_isolate_flash_crash off) rejoins the global crash state. Its own
+    // state is no longer advanced, so a Crash or Recovery left here would
+    // keep suppressing its quotes (the post-pass after the global machine
+    // in on_new_block_coro).
+    for (auto it = revive_crash_state_.begin(); it != revive_crash_state_.end();) {
+        const PairConfig* pc = find_pair_config(it->first);
+        if (pc != nullptr && pc->revive_market
+            && config_.strategy.revive_isolate_flash_crash) {
+            ++it;
+            continue;
+        }
+        it = revive_crash_state_.erase(it);
+    }
+
+    // -- Subsystems that cached a value at construction ---------------------
+    max_drawdown_frac_ = config_.risk.max_drawdown_frac;
+    // The drawdown grace is a window counted from startup: a shorter saved
+    // value cuts what is left of it now (0 ends it), a longer one does not
+    // reopen a window that has already run.
+    drawdown_grace_remaining_ =
+        std::min(drawdown_grace_remaining_, config_.risk.drawdown_grace_blocks);
+
+    if (market_data_) market_data_->set_config(market_data_config_from(config_));
+
+    const VolatilityEstimatorConfig vol_cfg = volatility_config_from(config_);
+    for (auto& [name, est] : vol_estimators_) {
+        if (est) {
+            est->set_tunables(vol_cfg.lookback_blocks, vol_cfg.yz_alpha,
+                              vol_cfg.candle_aggregation_blocks);
+        }
+    }
+    const AdverseSelectionConfig as_cfg = adverse_selection_config_from(config_);
+    for (auto& [name, est] : pin_estimators_) {
+        if (est) est->set_config(as_cfg);
+    }
+
+    for (const auto& pair : config_.pairs) {
+        if (depeg_detector_) depeg_detector_->sync_pair(pair);
+        // A pair that is off (at startup, or by this very save) cannot come
+        // back without a restart, and validate_live_config() checked only
+        // the enabled ones: its strategy and tiers are left as they were.
+        if (!pair.enabled) continue;
+        if (auto it = strategies_.find(pair.name); it != strategies_.end()) {
+            // Built as AvellanedaStoikov by the constructor; anything else
+            // there has no saved-config parameters to adopt.
+            if (auto* as = dynamic_cast<AvellanedaStoikov*>(it->second.get())) {
+                const AvellanedaConfig a = avellaneda_config_from(pair, config_.strategy);
+                as->set_risk_params(a.gamma, a.kappa, a.q_max, a.min_margin_bps);
+            }
+        }
+        if (auto it = liquidity_engines_.find(pair.name);
+            it != liquidity_engines_.end() && it->second) {
+            it->second->set_config(liquidity_config_from(pair, config_.strategy));
+        }
+    }
+    if (spread_opt_) {
+        const SpreadConfig sp = spread_config_from(config_.strategy);
+        spread_opt_->set_tunables(sp.gamma, sp.s_floor_bps, sp.high_vol_multiplier);
+    }
+    if (depeg_detector_) depeg_detector_->set_global_config(config_.depeg);
+    if (arb_detector_) {
+        arb_detector_->set_config(arbitrage_config_from(config_.arbitrage));
+        arb_detector_->set_stablecoin_pairs(stablecoin_pairs_from(config_));
+    }
+    // A restarted controller has a new anchor and class costs, so the
+    // tickets' submit levels (computed against the old ones) would teach it
+    // wrong lessons. They are dropped unheard, like an abandoned ticket.
+    if (fee_tracker_ && fee_tracker_->set_config(config_.fees)
+        && !fee_tickets_.empty()) {
+        spdlog::info("[Engine] [LIVECFG] {} fee ticket(s) dropped unheard: "
+                     "the fee controller restarted", fee_tickets_.size());
+        fee_tickets_.clear();
+    }
+    if (kappa_calibrator_) kappa_calibrator_->set_default_kappa(config_.strategy.kappa);
+    if (inventory_) inventory_->set_risk_limits(config_.risk);
+    if (pre_trade_) {
+        pre_trade_->set_min_profit_margin_bps(config_.strategy.min_profit_margin_bps);
+    }
+    if (alerts_) {
+        alerts_->set_credentials(config_.monitoring.telegram_bot_token,
+                                 config_.monitoring.telegram_chat_id);
+    }
+    if (market_allocator_) market_allocator_->set_config(config_.market_allocator);
+    publish_peg_status();   // drops the gauges of pegs no longer enforced
+    // Recovery switched off mid-recovery: step_xch_recovery() returns before
+    // its exit check, so the latch would hold Steps 7-8 off for good.
+    if (!config_.recovery.enabled && xch_recovery_mode_) {
+        xch_recovery_mode_      = false;
+        xch_recovery_cancelled_ = false;
+        spdlog::warn("[Engine] [LIVECFG] recovery disabled in the saved config "
+                     "while XCH Recovery Mode was active -- leaving it; normal "
+                     "quoting resumes this heartbeat");
+    }
+    if (coin_mgr_) coin_mgr_->reconfigure(config_);
+    if (offer_mgr_) offer_mgr_->reconfigure(config_);
+    // The fees OfferManager cached at the last Step 8 that got that far. A
+    // gated Step 8 leaves them, and the TTL sweep and escalations still
+    // cancel at them, so they are brought inside the saved bounds now. No
+    // new quote is asked for here: Step 8 sets them as usual next time.
+    if (offer_mgr_ && fee_tracker_) {
+        if (!fee_tracker_->enabled()) {
+            offer_mgr_->set_dynamic_fee(config_.strategy.offer_fee_mojos);
+            offer_mgr_->clear_cancel_fees();
+        } else {
+            offer_mgr_->clamp_fees(config_.fees.min_fee_mojos,
+                                   config_.fees.max_fee_mojos);
+            if (!fee_tracker_->class_fees_active()) offer_mgr_->clear_cancel_fees();
+        }
+    }
+    const auto cpc = comp_pid_config_from(config_.strategy);
+    for (auto& [name, pid] : comp_pid_state_) pid.set_config(cpc);
+
+    // -- External price clients: rebuilt only when their section changed ---
+    // Both are used only from Step 1 of the heartbeat, which has not run yet
+    // this cycle, so no request is in flight on the client being replaced.
+    if (coingecko_changed) {
+        if (coingecko_) coingecko_->close();
+        coingecko_.reset();
+        // The cached prices came from the old section (other coin ids, or a
+        // feed now switched off): fair values must not stay anchored to
+        // them. A rebuilt client refetches on this heartbeat's Step 1.
+        coingecko_prices_.clear();
+        coingecko_fx_usd_.clear();
+        coingecko_last_success_at_ = {};
+        if (config_.coingecko.enabled) {
+            coingecko_ = std::make_shared<rpc::CoinGeckoClient>(ioc_, config_.coingecko);
+            coingecko_->open();
+            coingecko_last_fetch_ = {};
+        }
+        spdlog::info("[Engine] [LIVECFG] CoinGecko client {} from the saved config",
+                     config_.coingecko.enabled ? "rebuilt" : "switched off");
+    }
+    if (tibetswap_changed) {
+        if (tibetswap_) tibetswap_->close();
+        tibetswap_.reset();
+        // As with CoinGecko: the reserves and the AMM observations came from
+        // the old section. Left in place, a feed switched off would keep
+        // feeding the fair-value solve (forever with
+        // fair_value_amm_max_age_sec 0). A rebuilt client refetches below.
+        if (arb_detector_) arb_detector_->set_tibetswap_reserves({});
+        tibetswap_reserves_at_      = Timestamp{};
+        tibetswap_reserves_pending_ = false;
+        if (market_data_) {
+            for (const auto& pair : config_.pairs) {
+                market_data_->clear_amm_observation(pair.name);
+            }
+        }
+        if (config_.tibetswap.enabled) {
+            tibetswap_ = std::make_shared<rpc::TibetSwapClient>(ioc_, config_.tibetswap);
+            tibetswap_->open();
+            tibetswap_fetch_attempted_ = false;
+        }
+        spdlog::info("[Engine] [LIVECFG] TibetSwap client {} from the saved config",
+                     config_.tibetswap.enabled ? "rebuilt" : "switched off");
+    }
+}
+
+// [LIVECFG] data/config_reload.result.json: the GUI's answer to "did my
+// save reach the engine, and what still needs a restart?". Written with a
+// temp file + rename so the GUI never reads half a file.
+void Engine::write_reload_result(const std::string& status,
+                                 const std::string& error,
+                                 const std::vector<std::string>& restart_required)
+{
+    if (config_reload_result_path_.empty()) return;
+    try {
+        nlohmann::json j;
+        j["status"]           = status;
+        j["error"]            = error;
+        j["restart_required"] = restart_required;
+        j["config_file"]      = config_file_path_;
+        j["request_id"]       = reload_request_id_;
+        j["pid"]              = process_identity_.pid;
+        j["processed_at"]     = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const auto tmp = config_reload_result_path_.string() + ".tmp";
+        {
+            std::ofstream out(tmp, std::ios::trunc);
+            out << j.dump(2) << '\n';
+            if (!out) throw std::runtime_error("write failed");
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, config_reload_result_path_, ec);
+        if (ec) {
+            std::filesystem::remove(config_reload_result_path_, ec);
+            std::filesystem::rename(tmp, config_reload_result_path_, ec);
+        }
+        if (ec) throw std::runtime_error(ec.message());
+    } catch (const std::exception& e) {
+        spdlog::warn("[Engine] [LIVECFG] could not write {}: {} -- the GUI "
+                     "cannot show this reload's outcome",
+                     config_reload_result_path_.string(), e.what());
+    }
 }
 
 // ---------------------------------------------------------------------------

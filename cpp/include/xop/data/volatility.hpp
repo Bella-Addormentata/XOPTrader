@@ -257,7 +257,9 @@ public:
     std::uint32_t get_regime_duration_blocks() const noexcept;
 
     /// Read-only access to the configuration.
-    const VolatilityEstimatorConfig& config() const noexcept;
+    /// A copy taken under the shared lock: [LIVECFG] set_tunables() and
+    /// set_block_time_seconds() change it while the engine runs.
+    VolatilityEstimatorConfig config() const noexcept;
 
     /// [T4-15] Update the assumed block time (seconds) used for annualisation.
     ///
@@ -268,6 +270,15 @@ public:
     /// @param seconds  New estimated mean inter-block interval; clamped
     ///                 to [10.0, 300.0] for safety.
     void set_block_time_seconds(double seconds) noexcept;
+
+    /// [LIVECFG] Adopt the operator-tunable fields of a saved config --
+    /// lookback, Yang-Zhang alpha and candle aggregation -- keeping the
+    /// candle history and the adaptive block time (set_block_time_seconds).
+    /// A shorter lookback trims the oldest candles. A different candle
+    /// aggregation restarts the window: candles of another period would
+    /// mis-state sigma until they rolled out.
+    void set_tunables(std::uint32_t lookback_blocks, double yz_alpha,
+                      std::uint32_t candle_aggregation_blocks) noexcept;
 
 private:
     // -- Yang-Zhang computation helpers --------------------------------------

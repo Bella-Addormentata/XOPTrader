@@ -209,6 +209,10 @@ class OrderBookWidget(QWidget):
         # Build the complete widget tree.
         self._build_ui()
 
+    def set_show_grid(self, show: bool) -> None:
+        """[LIVECFG] Settings > Appearance > Show grid lines, applied live."""
+        self._plot_widget.showGrid(x=show, y=show, alpha=0.15)
+
     # -----------------------------------------------------------------
     # UI construction
     # -----------------------------------------------------------------

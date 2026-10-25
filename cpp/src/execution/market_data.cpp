@@ -698,6 +698,18 @@ void MarketDataFeed::withdraw_reference_and_mid(const std::string& pair_name)
     publish_snapshot(ps);
 }
 
+void MarketDataFeed::clear_amm_observation(const std::string& pair_name)
+{
+    std::unique_lock lock(mtx_pairs_);
+    const auto it = pairs_.find(pair_name);
+    if (it == pairs_.end()) return;
+    PairState& ps = it->second;
+    ps.amm_mid        = 0.0;
+    ps.amm_pool_usd   = 0.0;
+    ps.amm_updated_at = Timestamp{};
+    publish_snapshot(ps);
+}
+
 void MarketDataFeed::ingest_cex_reference(const std::string& pair_name,
                                            double             cex_mid,
                                            Timestamp          observed_at,
@@ -1081,6 +1093,12 @@ bool MarketDataFeed::is_stale(const std::string& pair_name) const {
 }
 
 double MarketDataFeed::get_staleness_fraction(const std::string& pair_name) const {
+    // Read before mtx_pairs_: mtx_config_ is never held with another lock,
+    // and set_config() may replace config_ from a reload.
+    const auto stale_threshold = [&] {
+        std::shared_lock lk(mtx_config_);
+        return config_.stale_threshold;
+    }();
     std::shared_lock lock(mtx_pairs_);
 
     auto it = pairs_.find(pair_name);
@@ -1103,7 +1121,7 @@ double MarketDataFeed::get_staleness_fraction(const std::string& pair_name) cons
 
     const auto age = std::chrono::duration_cast<std::chrono::seconds>(now - best_ts);
     const auto threshold_s = std::chrono::duration_cast<std::chrono::seconds>(
-        config_.stale_threshold);
+        stale_threshold);
     if (threshold_s.count() <= 0) return 0.0;
 
     return static_cast<double>(age.count()) / static_cast<double>(threshold_s.count());
@@ -1228,6 +1246,85 @@ void MarketDataFeed::set_arb_threshold_bps(double threshold_bps) {
         config_.arb_threshold_bps = threshold_bps;
     }
     spdlog::info("Arbitrage threshold updated to {:.1f} bps", threshold_bps);
+}
+
+void MarketDataFeed::set_config(const MarketDataConfig& cfg)
+{
+    bool bucket_size_changed = false;
+    bool window_shrank       = false;
+    bool ofi_window_shrank   = false;
+    bool whale_changed       = false;
+    {
+        std::unique_lock lock(mtx_config_);
+        bucket_size_changed = cfg.vpin_bucket_size != config_.vpin_bucket_size;
+        window_shrank = cfg.vpin_window_buckets < config_.vpin_window_buckets;
+        ofi_window_shrank = cfg.ofi_window_size < config_.ofi_window_size;
+        whale_changed =
+            cfg.whale_trade_threshold != config_.whale_trade_threshold
+            || cfg.whale_volume_fraction != config_.whale_volume_fraction
+            || cfg.whale_window_blocks != config_.whale_window_blocks
+            || cfg.whale_max_spread_multiplier != config_.whale_max_spread_multiplier;
+        config_ = cfg;
+    }
+    // As the individual whale setters do: the cached multipliers were made
+    // with the old window and cap.
+    if (whale_changed) recompute_all_whale_metrics();
+    // Completed VPIN buckets are imbalances of the OLD size; divided by the
+    // new one they mis-state toxicity until they roll out. Start over.
+    // (mtx_config_ is released first: it is never held with another lock.)
+    if (bucket_size_changed) {
+        {
+            std::unique_lock lock(mtx_vpin_);
+            vpin_state_.clear();
+        }
+        std::unique_lock lock(mtx_vpin_metrics_);
+        vpin_metrics_.clear();
+    } else if (window_shrank) {
+        // A shorter window: the buckets past it would hold VPIN where it was
+        // until a whole new bucket completes. Trim them and recompute now.
+        std::vector<std::string> trimmed;
+        {
+            std::unique_lock lock(mtx_vpin_);
+            for (auto& [name, vs] : vpin_state_) {
+                if (vs.completed.size() <= cfg.vpin_window_buckets) continue;
+                while (vs.completed.size() > cfg.vpin_window_buckets) {
+                    vs.completed.pop_front();
+                }
+                trimmed.push_back(name);
+            }
+        }
+        if (cfg.vpin_window_buckets == 0) {
+            // A window of zero keeps no bucket, and recompute_vpin() leaves
+            // the metric of an empty window alone: drop it, or nothing would
+            // ever replace it.
+            std::unique_lock lock(mtx_vpin_metrics_);
+            vpin_metrics_.clear();
+        } else {
+            for (const auto& name : trimmed) recompute_vpin(name);
+        }
+    }
+    if (ofi_window_shrank) {
+        // Likewise for OFI, which keeps window + 1 book snapshots. A window
+        // of zero keeps one, from which recompute_ofi() makes no delta and
+        // never replaces the cached value: drop the metrics instead.
+        std::vector<std::string> trimmed;
+        {
+            std::unique_lock lock(mtx_ofi_);
+            for (auto& [name, snaps] : ofi_snapshots_) {
+                if (snaps.size() <= cfg.ofi_window_size + 1) continue;
+                while (snaps.size() > cfg.ofi_window_size + 1) {
+                    snaps.pop_front();
+                }
+                trimmed.push_back(name);
+            }
+        }
+        if (cfg.ofi_window_size == 0) {
+            std::unique_lock lock(mtx_ofi_metrics_);
+            ofi_metrics_.clear();
+        } else {
+            for (const auto& name : trimmed) recompute_ofi(name);
+        }
+    }
 }
 
 // MEDIUM-6 FIX: Protect arb_callback_ write with mtx_config_ to prevent a
@@ -1461,7 +1558,7 @@ double MarketDataFeed::compute_mid(const PairState& ps,
     // When AMM is available, we re-normalise so all active weights sum to 1.0.
     double w_dex = kDexWeight;
     double w_cex = kCexWeight;
-    double w_amm = config_.amm_blend_weight;
+    double w_amm = cfg.amm_blend_weight;
 
     // Determine AMM availability + freshness.
     double amm_mid = 0.0;
@@ -2791,7 +2888,11 @@ std::optional<CompetitorMetrics> MarketDataFeed::compute_competitor_metrics(
 std::optional<CompetitorMetrics> MarketDataFeed::get_competitor_metrics(
     const std::string& pair_name) const
 {
-    if (!config_.enable_competitor_tracking) {
+    const bool tracking = [&] {
+        std::shared_lock lk(mtx_config_);
+        return config_.enable_competitor_tracking;
+    }();
+    if (!tracking) {
         return std::nullopt;
     }
 

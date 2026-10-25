@@ -2073,6 +2073,9 @@ struct CoinGeckoConfig {
 
     /// User-Agent header.
     std::string user_agent{"XOPTrader-CoinGecko/1.0"};
+
+    /// [LIVECFG] Lets a config reload tell whether the client must be rebuilt.
+    bool operator==(const CoinGeckoConfig&) const = default;
 };
 
 // ---------------------------------------------------------------------------
@@ -2133,6 +2136,9 @@ struct TibetSwapConfig {
 
     /// User-Agent header.
     std::string user_agent{"XOPTrader-TibetSwap/1.0"};
+
+    /// [LIVECFG] Lets a config reload tell whether the client must be rebuilt.
+    bool operator==(const TibetSwapConfig&) const = default;
 };
 
 // ---------------------------------------------------------------------------
@@ -2861,6 +2867,14 @@ struct AppConfig {
 // ---------------------------------------------------------------------------
 AppConfig load_config(const std::string& path,
                       const std::string& secrets_path = {});
+
+// The cross-section checks load_config() runs after parsing every section
+// (USD anchor, observable pegs, per-pair concentration limits, an enabled
+// feed's rate limit, pace, the expire-mode TTL rule and the Revive safety
+// envelope).
+// Throws xop::ConfigError. Exposed for the engine's live reload, which must
+// hold the merged config it adopts to the same rules.
+void validate_config_relations(const AppConfig& cfg);
 
 } // namespace xop
 

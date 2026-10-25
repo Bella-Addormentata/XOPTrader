@@ -560,6 +560,10 @@ public:
     /// Read-only access to the active configuration.
     const ArbitrageConfig& config() const noexcept;
 
+    /// [LIVECFG] Adopt a saved configuration. Market inputs fed through the
+    /// set_* methods above (prices, reserves, the stablecoin set) are kept.
+    void set_config(const ArbitrageConfig& cfg) noexcept { cfg_ = cfg; }
+
 private:
     // -- Helper: compute confidence based on depth and settlement time ------
     double compute_confidence(double available_depth,
