@@ -19,6 +19,7 @@
 #include "xop/execution/offer_manager.hpp"
 #include "xop/execution/market_data.hpp"
 #include "xop/data/volatility.hpp"
+#include "xop/data/adverse_selection.hpp"
 #include "xop/state.hpp"
 
 #include <algorithm>
@@ -118,6 +119,18 @@ TEST(ConfigLiveApply, connections_keep_their_running_values_and_are_named)
               running.risk.watchdog_stall_seconds);
     // ...and the rest of the same save still applies.
     EXPECT_DOUBLE_EQ(plan.merged.strategy.gamma, saved.strategy.gamma);
+}
+
+TEST(ConfigLiveApply, startup_analysis_length_waits_for_the_next_start)
+{
+    // The observe-before-quoting phase ran once, before the first heartbeat.
+    const auto running = running_config();
+    auto saved = running;
+    saved.strategy.startup_analysis_blocks = running.strategy.startup_analysis_blocks + 5;
+    const auto plan = xop::plan_live_config(running, saved);
+    EXPECT_TRUE(lists(plan.restart_required, "strategy.startup_analysis_blocks"));
+    EXPECT_EQ(plan.merged.strategy.startup_analysis_blocks,
+              running.strategy.startup_analysis_blocks);
 }
 
 TEST(ConfigLiveApply, a_disable_applies_an_enable_waits)
@@ -286,6 +299,21 @@ TEST(ConfigLiveApplySetters, vpin_starts_over_on_a_new_bucket_size)
     feed.set_config(mc);
     EXPECT_FALSE(feed.get_vpin_metrics(pair).has_value())
         << "buckets of the old size would read one-sided flow as ~0.1";
+}
+
+TEST(ConfigLiveApplySetters, adverse_selection_priors_apply_without_a_new_fill)
+{
+    xop::AdverseSelectionConfig ac;
+    ac.prior_alpha = 1.0;
+    ac.prior_beta  = 9.0;
+    xop::AdverseSelectionEstimator est{ac};
+    const double before = est.get_pin();
+
+    ac.prior_alpha = 5.0;
+    ac.prior_beta  = 5.0;
+    est.set_config(ac);
+    EXPECT_GT(est.get_pin(), before)
+        << "a quiet pair must not wait for its next fill to see new priors";
 }
 
 TEST(ConfigLiveApplySetters, kappa_default_moves_until_fills_take_over)

@@ -21,6 +21,9 @@
 //   * risk.watchdog_stall_seconds
 //                             -- read by the dead man's switch thread, which
 //                                is armed (or not) once at startup.
+//   * strategy.startup_analysis_blocks
+//                             -- the observe-before-quoting phase runs once,
+//                                before the first heartbeat.
 //   * a pair being ENABLED, ADDED or REMOVED, or a pair's asset ids or
 //                                units changing -- per-pair strategy objects,
 //                                estimators and seats exist only for pairs
@@ -139,6 +142,12 @@ inline bool pair_identity_differs(const PairConfig& a, const PairConfig& b)
         running.risk.watchdog_stall_seconds != saved.risk.watchdog_stall_seconds,
         "risk.watchdog_stall_seconds");
     m.risk.watchdog_stall_seconds = running.risk.watchdog_stall_seconds;
+
+    detail::note_restart(rr,
+        running.strategy.startup_analysis_blocks
+            != saved.strategy.startup_analysis_blocks,
+        "strategy.startup_analysis_blocks");
+    m.strategy.startup_analysis_blocks = running.strategy.startup_analysis_blocks;
 
     // -- Pairs: the running set, in the running order -----------------------
     plan.pairs = diff_pair_enables(running.pairs, saved.pairs);

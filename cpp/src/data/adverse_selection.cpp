@@ -61,9 +61,13 @@ void AdverseSelectionEstimator::set_config(const AdverseSelectionConfig& cfg)
 {
     validate_config(cfg);
     std::unique_lock lock(mtx_);
-    // The posterior is rebuilt from the history (with the new priors and
-    // decay) on the next record_fill(); until then alpha_/beta_ stand.
     cfg_ = cfg;
+    // Rebuild the posterior from the kept history NOW, with the new priors,
+    // decay and window: a quiet pair may not record another fill for days.
+    while (history_.size() > cfg_.max_history) {
+        history_.pop_front();
+    }
+    recompute_posterior();
 }
 
 // ===========================================================================

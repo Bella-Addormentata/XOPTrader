@@ -25961,10 +25961,19 @@ asio::awaitable<void> Engine::check_config_reload_flag()
     }
     reload_flag_stuck_mtime_.reset();
 
-    // [LIVECFG] "reload <id>": the id is echoed in the result file.
+    // [LIVECFG] Claim the flag by renaming it, THEN read it: a save that
+    // lands while this one is processed writes a fresh flag, which the next
+    // heartbeat answers, instead of being deleted with this one unanswered.
+    fs::path claimed_path = config_reload_flag_path_;
+    claimed_path += ".claimed";
+    std::error_code mv_ec;
+    fs::rename(config_reload_flag_path_, claimed_path, mv_ec);
+    const fs::path& flag_to_read = mv_ec ? config_reload_flag_path_ : claimed_path;
+
+    // "reload <id>": the id is echoed in the result file.
     reload_request_id_.clear();
     {
-        std::ifstream flag_in(config_reload_flag_path_);
+        std::ifstream flag_in(flag_to_read);
         std::string line;
         if (flag_in && std::getline(flag_in, line)) {
             const std::string prefix = "reload ";
@@ -25983,8 +25992,9 @@ asio::awaitable<void> Engine::check_config_reload_flag()
     // Consume FIRST: a poison config must trigger one loud failure, not a
     // failure every heartbeat until someone deletes a file by hand.
     std::error_code rm_ec;
-    fs::remove(config_reload_flag_path_, rm_ec);
-    if (rm_ec) {
+    fs::remove(flag_to_read, rm_ec);
+    if (rm_ec && mv_ec) {
+        // Neither renamed nor deleted: the flag itself is stuck.
         spdlog::warn("[Engine] [RELOAD] could not delete {} ({}) -- this "
                      "reload still runs; further heartbeats skip the stuck "
                      "flag until the file changes",
@@ -26305,6 +26315,15 @@ void Engine::apply_live_config(const AppConfig& m)
                                  config_.monitoring.telegram_chat_id);
     }
     if (market_allocator_) market_allocator_->set_config(config_.market_allocator);
+    // Recovery switched off mid-recovery: step_xch_recovery() returns before
+    // its exit check, so the latch would hold Steps 7-8 off for good.
+    if (!config_.recovery.enabled && xch_recovery_mode_) {
+        xch_recovery_mode_      = false;
+        xch_recovery_cancelled_ = false;
+        spdlog::warn("[Engine] [LIVECFG] recovery disabled in the saved config "
+                     "while XCH Recovery Mode was active -- leaving it; normal "
+                     "quoting resumes this heartbeat");
+    }
     if (coin_mgr_) coin_mgr_->reconfigure(config_);
     if (offer_mgr_) offer_mgr_->reconfigure(config_);
     const auto cpc = comp_pid_config_from(config_.strategy);
@@ -26316,6 +26335,12 @@ void Engine::apply_live_config(const AppConfig& m)
     if (coingecko_changed) {
         if (coingecko_) coingecko_->close();
         coingecko_.reset();
+        // The cached prices came from the old section (other coin ids, or a
+        // feed now switched off): fair values must not stay anchored to
+        // them. A rebuilt client refetches on this heartbeat's Step 1.
+        coingecko_prices_.clear();
+        coingecko_fx_usd_.clear();
+        coingecko_last_success_at_ = {};
         if (config_.coingecko.enabled) {
             coingecko_ = std::make_shared<rpc::CoinGeckoClient>(ioc_, config_.coingecko);
             coingecko_->open();

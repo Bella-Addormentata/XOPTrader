@@ -140,8 +140,9 @@ public:
     /// Throws std::invalid_argument.
     static void validate_config(const AdverseSelectionConfig& cfg);
 
-    /// [LIVECFG] Adopt a saved configuration, keeping the fill history.
-    /// Throws (and changes nothing) when the config is invalid.
+    /// [LIVECFG] Adopt a saved configuration, keeping the fill history
+    /// (trimmed to the new max_history) and rebuilding the posterior from it
+    /// at once. Throws (and changes nothing) when the config is invalid.
     void set_config(const AdverseSelectionConfig& cfg);
 
     // -- Primary interface ---------------------------------------------------

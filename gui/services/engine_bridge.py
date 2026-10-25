@@ -779,8 +779,12 @@ class EngineBridge(QObject):
             request_id = uuid.uuid4().hex
             self._reload_request_id = request_id
             self._reload_deferred_reported = False
-            with open(flag_path, "w", encoding="utf-8") as fh:
+            # Whole payload to a temp file, then one atomic replace: the
+            # engine never sees an empty or half-written flag.
+            tmp_path = flag_path.with_name(flag_path.name + ".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as fh:
                 fh.write("reload " + request_id + chr(10))
+            os.replace(tmp_path, flag_path)
             _log.info("Config reload requested via %s", flag_path)
         except OSError as exc:
             self._reload_request_id = None
