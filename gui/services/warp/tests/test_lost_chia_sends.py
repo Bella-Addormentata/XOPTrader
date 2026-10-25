@@ -1293,11 +1293,12 @@ def test_exclusions_accumulate_across_replacements():
     assert st["burn_tx_id_prior"] == ["burn-a", "burn-b", "burn-c"]
     assert st["burn_tx_id_prior_removals"] == {
         "burn-a": [RID], "burn-b": [RID2], "burn-c": ["f" * 64]}
-    assert st["burn_tx_id_prior_dead"] == ["burn-b", "burn-c"]
-    # burn-a was never judged by this job (a legacy prior): retained.
-    assert st["burn_tx_id_exclude"] == [RID]
+    # burn-a, a legacy prior, was re-judged on the tick that sent C and
+    # proven dead there ([review]); nothing is left to exclude.
+    assert st["burn_tx_id_prior_dead"] == ["burn-b", "burn-a", "burn-c"]
+    assert st["burn_tx_id_exclude"] is None
     engine.step()
-    assert ctx.wallet.cat_spend_excludes == [[RID]]
+    assert ctx.wallet.cat_spend_excludes == [[]]
 
 
 def test_retry_of_a_burning_job_that_never_made_its_toll_key_resets_nothing():
@@ -2183,3 +2184,69 @@ def test_delivery_is_recorded_before_the_fallible_settlement_lookups(monkeypatch
     after = store.get_job(job.id)
     assert after.state["delivered_by"] == "our relay"
     assert after.bridge_tx_hash == "0x" + "77" * 32
+
+
+# --------------------------------------------------------------------------- #
+# Review round 23.
+# --------------------------------------------------------------------------- #
+
+def test_a_retained_orphans_coins_are_released_once_it_is_proven_dead(monkeypatch):
+    """[review] Retry retired an orphan with its coins excluded; a later
+    conflicting spend proves it dead before the replacement goes out, so
+    the replacement may use its surviving coins."""
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store, funding_tx_id="fund-a", funding_amount=EXPECTED,
+                        funding_tx_id_removals=[RID, "a" * 64])
+    ctx.coinset.records[RID] = _rec(spent=False)
+    ctx.coinset.records["a" * 64] = _rec(spent=False)
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     expected_status=JobStatus.FUNDING_CLAIM,
+                     state_patch={"failed_from": JobStatus.FUNDING_CLAIM})
+    engine.job_action(job.id, "retry")
+    assert store.get_job(job.id).state["funding_tx_id_exclude"] == sorted([RID, "a" * 64])
+    ctx.coinset.records[RID] = _rec(spent=True)              # one input went elsewhere
+    ctx.coinset.peak = PEAK
+    engine.step()                                            # the replacement
+    assert ctx.wallet.sent_excludes[-1] == [], "the dead orphan's coins are free"
+    st = store.get_active_job().state
+    assert st["funding_tx_id_prior_dead"] == ["fund-a"]
+    assert st["funding_tx_id_prior_removals"] == {"fund-a": [RID, "a" * 64]}
+
+
+def test_an_unnamed_current_attempt_is_identified_from_the_history_for_settlement():
+    """[review] Its coin appeared before the tick that would have adopted the
+    id: the wallet history names it, its coins decide, and the marker is
+    persisted under that name."""
+    from gui.services.warp import chia_send as cs
+
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    ph = claim_mod.security_coin_puzzle_hash(engine._load_ephemeral_sk(job)).hex()
+    store.update_job(job.id, state_patch={
+        "funding_tx_id": S._FUNDING_TX_UNKNOWN, "funding_tx_id_removals": None})
+    removal = {"parent_coin_info": "d4" * 32, "puzzle_hash": "11" * 32,
+               "amount": 499_005_000_000}
+    rid = cs.coin_id("d4" * 32, "11" * 32, 499_005_000_000)
+    ctx.wallet.txs = [{"name": "toll-x", "confirmed": True, "removals": [removal],
+                       "additions": [{"puzzle_hash": ph, "amount": NET.chia_toll_mojos}]}]
+    ctx.wallet.tx_records["toll-x"] = {"confirmed": True, "removals": [removal]}
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID] = _rec(spent=True)              # toll-a: dead
+    ctx.coinset.records[rid] = _rec(spent=True)              # toll-x landed...
+    ctx.coinset.by_ph = [SimpleNamespace(                    # ...its coin spent at depth
+        coin=SimpleNamespace(parent_coin_info=rid, puzzle_hash=ph,
+                             amount=NET.chia_toll_mojos),
+        spent=True, confirmed_block_index=PEAK - 50, spent_block_index=PEAK - 40)]
+    assert engine._prior_sends_settled(store.get_active_job())[0]
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id"] == "toll-x"
+    assert st["funding_tx_id_removals"] == [rid]
+    # Unidentifiable: still not ruled out.
+    store.update_job(job.id, state_patch={
+        "funding_tx_id": S._FUNDING_TX_UNKNOWN, "funding_tx_id_removals": None})
+    ctx.wallet.txs = []
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "not known" in note

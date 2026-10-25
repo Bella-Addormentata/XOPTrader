@@ -1715,8 +1715,11 @@ class WarpEngine:
         )
         self._wallet.log_in()
         address = cu.encode_puzzle_hash(security_ph, net.chia_prefix)
-        exclude = [c for c in (resend.get("funding_tx_id_exclude")
-                               or job.state.get("funding_tx_id_exclude") or [])
+        resend = {**resend, **self._refresh_exclusions(
+            job, tx_key="funding_tx_id", out_ph_hex=security_ph.hex(),
+            out_amount=expected, pending=resend)}
+        exclude = [c for c in ((resend if "funding_tx_id_exclude" in resend
+                               else job.state).get("funding_tx_id_exclude") or [])
                    if c]
         record = self._send_reserved(
             job, tx_key="funding_tx_id",
@@ -2275,6 +2278,88 @@ class WarpEngine:
         return ((lambda: self._wallet.get_transaction_or_none(tx_id)),
                 (lambda: self._coinset.get_mempool_item_by_tx_id(tx_id)))
 
+    def _identify_unnamed_funding(self, out_ph_hex: str, out_amount: int, *,
+                                  exclude_ids: Sequence[str]) -> Optional[tuple]:
+        """``(tx_id, removals)`` for a funding send the daemon never named,
+        read back from the wallet history ([review]: its coin may have
+        appeared before the next tick, leaving the sentinel with no coins);
+        ``None`` when nothing identifies it or the scan could not run."""
+        from . import chia_send as cs
+
+        try:
+            found = self._find_existing_funding(
+                out_ph_hex, int(out_amount), exclude_ids=exclude_ids)
+            if not found:
+                return None
+            rec = self._wallet.get_transaction_or_none(str(found))
+        except Exception:  # noqa: BLE001 -- unidentified, not proof
+            return None
+        return str(found), [_hx(c) for c in cs.removal_ids(rec)] if rec else []
+
+    def _identify_unnamed_burn(self, job: WarpJob, out_ph_hex: str, out_amount: int, *,
+                               exclude_ids: Sequence[str]) -> Optional[tuple]:
+        """The cat_spend counterpart of :meth:`_identify_unnamed_funding`."""
+        from . import chia_send as cs
+
+        try:
+            found = self._find_existing_burn(
+                int(job.state["cat_wallet_id"]), out_ph_hex, int(out_amount),
+                exclude_ids=exclude_ids)
+            if not found:
+                return None
+            tx_id = found[0]
+            rec = self._wallet.get_transaction_or_none(str(tx_id))
+        except Exception:  # noqa: BLE001
+            return None
+        return str(tx_id), [_hx(c) for c in cs.removal_ids(rec)] if rec else []
+
+    def _refresh_exclusions(self, job: WarpJob, *, tx_key: str, out_ph_hex: str,
+                            out_amount: int, pending: Dict[str, Any]) -> Dict[str, Any]:
+        """Re-judge the retained replaced attempts on the tick that sends.
+
+        [review] An orphan retired by Retry keeps its coins excluded; if a
+        later conflicting spend proves it dead, those coins are released
+        here -- otherwise its surviving input, were it the only coin large
+        enough, would starve every replacement.  Returns the state to merge
+        (the dead list and the refreshed exclusions), or {} when nothing
+        changed or the chain could not be read.
+        """
+        from . import chia_send as cs
+
+        st = {**job.state, **pending}
+        prior_key, prior_removals_key, dead_key, exclude_key = (
+            f"{tx_key}_prior", f"{tx_key}_prior_removals",
+            f"{tx_key}_prior_dead", f"{tx_key}_exclude")
+        priors = [t for t in (st.get(prior_key) or []) if t]
+        prior_removals = dict(st.get(prior_removals_key) or {})
+        dead = [t for t in (st.get(dead_key) or []) if t]
+        retained = [t for t in priors if t not in dead and prior_removals.get(t)]
+        if not retained:
+            return {}
+        try:
+            outputs = list(self._coinset.get_coin_records_by_puzzle_hash(
+                out_ph_hex, include_spent=True))
+        except Exception:  # noqa: BLE001 -- keep the exclusions as they are
+            return {}
+        min_depth = int(self._net.chia_confirmation_min_height)
+        changed = False
+        for tx_id in retained:
+            probe_wallet, probe_mempool = self._send_probes(tx_id)
+            ev = cs.gather(
+                wallet_record=probe_wallet, mempool_item=probe_mempool,
+                coin_spent=self._coin_spent_depth, outputs_at=lambda: outputs,
+                known_removals=prior_removals.get(tx_id) or [],
+                out_amount=int(out_amount), unique_output=False, min_depth=min_depth,
+            )
+            if cs.judge(ev)[0] is cs.Verdict.DEAD:
+                dead.append(tx_id)
+                changed = True
+        if not changed:
+            return {}
+        exclude = sorted({c for t, cs_ in prior_removals.items()
+                          if t not in dead for c in cs_ if c})
+        return {dead_key: dead or None, exclude_key: exclude or None}
+
     def _unnamed_attempt_key(self, job: WarpJob, tx_key: str) -> str:
         """A distinct key for the unnamed attempt being retired, so each
         is settled on its own evidence ([review]: merged under one key, one
@@ -2422,26 +2507,42 @@ class WarpEngine:
             prior_removals.setdefault(
                 current, list(st.get(f"{tx_key}_removals") or []))
         min_depth = int(self._net.chia_confirmation_min_height)
+        named = [t for t in attempts if not self._unnamed(t)]
         for tx_id in attempts:
-            if self._unnamed(tx_id) and not prior_removals.get(tx_id):
+            probe_id, coins = tx_id, list(prior_removals.get(tx_id) or [])
+            if self._unnamed(tx_id) and not coins:
                 # [review] With its coins recorded it is judged like any
                 # other attempt (dead once they are spent elsewhere, landed
-                # by its output's parent); without them nothing can rule it
-                # out.
-                return False, ("a send the wallet never named, whose coins are "
-                               "not known, cannot be ruled out; Sweep again "
-                               "later or Abandon")
+                # by its output's parent).  Without them the wallet history
+                # may still name it -- its coin appeared before the tick
+                # that would have adopted the id -- and the current marker is
+                # then persisted under that name; otherwise nothing can rule
+                # it out.
+                ident = self._identify_unnamed_funding(ph, amount, exclude_ids=named)
+                if not ident or not ident[1]:
+                    return False, ("a send the wallet never named, whose coins are "
+                                   "not known, cannot be ruled out; Sweep again "
+                                   "later or Abandon")
+                probe_id, coins = ident
+                if tx_id == f"{_FUNDING_TX_UNKNOWN}#current":
+                    try:
+                        self._store.update_job(
+                            job.id, expected_status=job.status,
+                            state_patch={tx_key: probe_id, f"{tx_key}_removals": coins})
+                    except Exception as exc:  # noqa: BLE001 -- judged anyway
+                        _log.debug("warp job %s: could not persist the identified "
+                                   "send (%s)", job.id, exc)
             # unique_output=False: the key holds other attempts' coins too,
             # so an output is THIS send's only when its parent is one of the
             # coins this send spent.  A send whose coins are unknown can
             # therefore never read as landed.
-            probe_wallet, probe_mempool = self._send_probes(tx_id)
+            probe_wallet, probe_mempool = self._send_probes(probe_id)
             ev = cs.gather(
                 wallet_record=probe_wallet,
                 mempool_item=probe_mempool,
                 coin_spent=self._coin_spent_depth,
                 outputs_at=lambda: outputs,
-                known_removals=prior_removals.get(tx_id) or [],
+                known_removals=coins,
                 out_amount=amount, unique_output=False, min_depth=min_depth,
             )
             verdict, why = cs.judge(ev)
@@ -2500,17 +2601,22 @@ class WarpEngine:
             ph, include_spent=True))
         prior_removals = st.get("burn_tx_id_prior_removals") or {}
         min_depth = int(self._net.chia_confirmation_min_height)
+        named = [t for t in priors if not self._unnamed(t)]
         for tx_id in priors:
-            if self._unnamed(tx_id) and not prior_removals.get(tx_id):
-                return False, ("an earlier cat_spend the wallet never named, "
-                               "whose coins are not known, cannot be ruled out")
-            probe_wallet, probe_mempool = self._send_probes(tx_id)
+            probe_id, coins = tx_id, list(prior_removals.get(tx_id) or [])
+            if self._unnamed(tx_id) and not coins:
+                ident = self._identify_unnamed_burn(job, ph, amount, exclude_ids=named)
+                if not ident or not ident[1]:
+                    return False, ("an earlier cat_spend the wallet never named, "
+                                   "whose coins are not known, cannot be ruled out")
+                probe_id, coins = ident
+            probe_wallet, probe_mempool = self._send_probes(probe_id)
             ev = cs.gather(
                 wallet_record=probe_wallet,
                 mempool_item=probe_mempool,
                 coin_spent=self._coin_spent_depth,
                 outputs_at=lambda: outputs,
-                known_removals=prior_removals.get(tx_id) or [],
+                known_removals=coins,
                 out_amount=amount, unique_output=False, min_depth=min_depth,
             )
             verdict, why = cs.judge(ev)
@@ -3642,8 +3748,11 @@ class WarpEngine:
             context="cat_spend (its fee, then the toll coin and its fee)",
         )
         self._wallet.log_in()
-        exclude = [c for c in (resend.get("burn_tx_id_exclude")
-                               or job.state.get("burn_tx_id_exclude") or []) if c]
+        resend = {**resend, **self._refresh_exclusions(
+            job, tx_key="burn_tx_id", out_ph_hex=burn_cat_ph,
+            out_amount=amount, pending=resend)}
+        exclude = [c for c in ((resend if "burn_tx_id_exclude" in resend
+                               else job.state).get("burn_tx_id_exclude") or []) if c]
         record = self._send_reserved(
             job, tx_key="burn_tx_id", reserve_patch=resend,
             send=lambda: self._wallet.cat_spend(
@@ -3787,8 +3896,11 @@ class WarpEngine:
             self._require_wallet_synced("toll funding")
             self._require_spendable_xch(toll + fee, context="toll funding")
             self._wallet.log_in()
-            exclude = [c for c in (resend.get("funding_tx_id_exclude")
-                                   or job.state.get("funding_tx_id_exclude") or [])
+            resend = {**resend, **self._refresh_exclusions(
+                job, tx_key="funding_tx_id", out_ph_hex=ph.hex(),
+                out_amount=toll, pending=resend)}
+            exclude = [c for c in ((resend if "funding_tx_id_exclude" in resend
+                                   else job.state).get("funding_tx_id_exclude") or [])
                        if c]
             record = self._send_reserved(
                 job, tx_key="funding_tx_id",
