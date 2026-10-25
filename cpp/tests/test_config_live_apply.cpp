@@ -430,6 +430,27 @@ TEST(ConfigLiveApplySetters, vpin_recomputes_over_a_shorter_window)
         << "the five buckets kept are balanced: VPIN must say so now";
 }
 
+TEST(ConfigLiveApplySetters, a_lower_whale_cap_applies_without_a_new_whale)
+{
+    xop::MarketDataConfig mc;
+    mc.whale_trade_threshold       = 50LL * xop::kMojosPerXch;
+    mc.whale_volume_fraction       = 0.05;
+    mc.whale_window_blocks         = 10;
+    mc.whale_max_spread_multiplier = 3.0;
+    xop::State state;
+    xop::MarketDataFeed feed{mc, state};
+    const std::string pair = "XCH/wUSDC";
+    feed.ingest_dexie(pair, 2.70, 2.75, 2.725, 1'000'000.0);
+    feed.ingest_block_height(100);
+    feed.ingest_trade(pair, xop::Side::Bid, 200LL * xop::kMojosPerXch, 100);
+    ASSERT_GT(feed.get_whale_spread_multiplier(pair), 1.0);
+
+    mc.whale_max_spread_multiplier = 1.0;
+    feed.set_config(mc);
+    EXPECT_DOUBLE_EQ(feed.get_whale_spread_multiplier(pair), 1.0)
+        << "the cached multiplier was made with the old cap";
+}
+
 TEST(ConfigLiveApplySetters, adverse_selection_priors_apply_without_a_new_fill)
 {
     xop::AdverseSelectionConfig ac;

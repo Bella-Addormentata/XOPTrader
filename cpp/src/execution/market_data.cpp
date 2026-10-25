@@ -1252,12 +1252,21 @@ void MarketDataFeed::set_config(const MarketDataConfig& cfg)
 {
     bool bucket_size_changed = false;
     bool window_shrank       = false;
+    bool whale_changed       = false;
     {
         std::unique_lock lock(mtx_config_);
         bucket_size_changed = cfg.vpin_bucket_size != config_.vpin_bucket_size;
         window_shrank = cfg.vpin_window_buckets < config_.vpin_window_buckets;
+        whale_changed =
+            cfg.whale_trade_threshold != config_.whale_trade_threshold
+            || cfg.whale_volume_fraction != config_.whale_volume_fraction
+            || cfg.whale_window_blocks != config_.whale_window_blocks
+            || cfg.whale_max_spread_multiplier != config_.whale_max_spread_multiplier;
         config_ = cfg;
     }
+    // As the individual whale setters do: the cached multipliers were made
+    // with the old window and cap.
+    if (whale_changed) recompute_all_whale_metrics();
     // Completed VPIN buckets are imbalances of the OLD size; divided by the
     // new one they mis-state toxicity until they roll out. Start over.
     // (mtx_config_ is released first: it is never held with another lock.)

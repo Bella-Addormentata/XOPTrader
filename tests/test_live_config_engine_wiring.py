@@ -128,3 +128,14 @@ def test_a_peg_no_longer_enforced_releases_its_latch():
     assert "publish_peg_status();" in body, (
         "the reload must republish the peg gauges so dropped rows go"
     )
+
+
+def test_a_pair_leaving_isolated_revive_drops_its_crash_state():
+    body = _definition(APPLY)
+    assert "revive_crash_state_.erase(it)" in body, (
+        "a Crash or Recovery left in revive_crash_state_ for a pair no "
+        "longer isolated is never advanced, and keeps its quotes suppressed"
+    )
+    assert body.find("revive_crash_state_") > body.find("config_.strategy=m.strategy;"), (
+        "the isolation flag must be read from the SAVED strategy section"
+    )

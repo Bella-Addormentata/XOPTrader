@@ -26296,6 +26296,21 @@ void Engine::apply_live_config(const AppConfig& m)
                       config_.pairs.size(), m.pairs.size());
     }
 
+    // A pair that leaves isolated Revive (Revive off for it, or
+    // revive_isolate_flash_crash off) rejoins the global crash state. Its own
+    // state is no longer advanced, so a Crash or Recovery left here would
+    // keep suppressing its quotes (the post-pass after the global machine
+    // in on_new_block_coro).
+    for (auto it = revive_crash_state_.begin(); it != revive_crash_state_.end();) {
+        const PairConfig* pc = find_pair_config(it->first);
+        if (pc != nullptr && pc->revive_market
+            && config_.strategy.revive_isolate_flash_crash) {
+            ++it;
+            continue;
+        }
+        it = revive_crash_state_.erase(it);
+    }
+
     // -- Subsystems that cached a value at construction ---------------------
     max_drawdown_frac_ = config_.risk.max_drawdown_frac;
     // The drawdown grace is a window counted from startup: a shorter saved
