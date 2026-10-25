@@ -689,19 +689,36 @@ class EngineBridge(QObject):
             _log.error("Failed to create pause flag: %s", exc)
             self.error.emit(f"Could not pause trading: {exc}")
 
-    def _sync_warp_engine_home(self) -> None:
-        """[review] Tell the warp worker which config the engine WE launched is
-        running (None when none is).  Its job store follows that config while
-        the engine runs: the engine's stuck-transaction guard reads the store
-        beside ITS config, not beside whatever config the GUI switched to, and
-        a send recorded elsewhere would be unprotected.  Cheap; called at every
-        engine start and stop, on a config switch, and from the master tick
-        (an engine that died on its own is noticed there)."""
-        launched = self.launched_config_path if self.engine_running_locally else None
+    def _configured_warp_db(self) -> Optional[str]:
+        """[review] The jobs database an engine launched on the CURRENT config
+        guards: ``warp.jobs_db`` resolved against the config's directory, as
+        the engine resolves it (config.cpp follow_warp_jobs_db) and as the
+        warp worker does (service._job_db_path)."""
         try:
-            self._warp_svc.set_engine_home(Path(launched).parent if launched else None)
+            from gui.services.warp.service import _job_db_path
+
+            return str(_job_db_path(self._config_svc.get_full_config(),
+                                    anchor=self._config_path.parent))
+        except Exception as exc:  # noqa: BLE001 -- unknown: the worker follows the GUI
+            _log.debug("could not resolve the warp jobs database (%s)", exc)
+            return None
+
+    def _sync_warp_engine_store(self) -> None:
+        """[review] Tell the warp worker which jobs database the engine WE
+        launched guards (None when none runs): the one resolved from the
+        LAUNCHED config at launch (_launched_warp_db) -- directory and
+        warp.jobs_db both, since the GUI's current config may name another
+        file.  The worker records there while that engine runs; a send
+        recorded elsewhere would be unprotected from its stuck-transaction
+        cleanup.  Cheap; called at every engine start and stop, on a config
+        switch, and from the master tick (an engine that died on its own is
+        noticed there)."""
+        running = self.engine_running_locally and self.launched_config_path is not None
+        store = getattr(self, "_launched_warp_db", None) if running else None
+        try:
+            self._warp_svc.set_engine_store(store)
         except Exception as exc:  # noqa: BLE001 -- never break the caller
-            _log.debug("warp engine-home sync failed: %s", exc)
+            _log.debug("warp engine-store sync failed: %s", exc)
 
     @property
     def launched_config_path(self):
@@ -1069,10 +1086,11 @@ class EngineBridge(QObject):
             # stuck-transaction guard -- both must move together, or a live
             # warp send is recorded where the engine does not look.  While
             # an engine of ours still runs on the PREVIOUS config, the worker
-            # keeps recording beside that one (_sync_warp_engine_home): the
-            # running engine's guard reads nothing else.
+            # keeps recording in THAT engine's jobs database
+            # (_sync_warp_engine_store): the running engine's guard reads
+            # nothing else.
             self._warp_svc.set_secrets_path(resolved.parent / "secrets.yaml")
-            self._sync_warp_engine_home()
+            self._sync_warp_engine_store()
         if success:
             _log.info("Config path updated and reloaded.")
         else:
@@ -1177,7 +1195,7 @@ class EngineBridge(QObject):
         # warp is disabled or has no active job; overlapping ticks are
         # dropped by the service's in-flight guard.
         if self._tick_count % 6 == 5:
-            self._sync_warp_engine_home()
+            self._sync_warp_engine_store()
             self._warp_svc.tick()
 
         # [LIVECFG] The engine's answer to a Settings save, once it lands.
@@ -1442,6 +1460,12 @@ class EngineBridge(QObject):
                 self._launched_config_path = (
                     self._config_path if self._config_path.is_file() else None
                 )
+                # [review] ...and the jobs database it guards, resolved NOW
+                # from this config: the GUI may switch to a config naming
+                # another one while this engine runs.
+                self._launched_warp_db = (
+                    self._configured_warp_db() if self._launched_config_path else None
+                )
                 # [LIVECFG] A reload still waiting was addressed to the
                 # engine this one replaces, and this one loads the saved file
                 # whole at startup. An answer the old engine left behind
@@ -1452,7 +1476,7 @@ class EngineBridge(QObject):
                               self._reload_request_id)
                 self._reload_request_id = None
                 self._reload_deferred_reported = False
-                self._sync_warp_engine_home()
+                self._sync_warp_engine_store()
                 self._engine_keep_supported = keep_supported
                 self._engine_binary_path = engine_path
                 self._engine_keep_reprobed = False
@@ -1477,7 +1501,7 @@ class EngineBridge(QObject):
                 self._engine_process = None
                 self._engine_keep_supported = False
                 self._engine_binary_path = None
-                self._sync_warp_engine_home()
+                self._sync_warp_engine_store()
 
         return False
 
@@ -1579,7 +1603,7 @@ class EngineBridge(QObject):
         self._engine_launch_dir = None
         self._engine_keep_supported = False
         self._engine_binary_path = None
-        self._sync_warp_engine_home()
+        self._sync_warp_engine_store()
         return outcome
 
     def _stop_running_engine(

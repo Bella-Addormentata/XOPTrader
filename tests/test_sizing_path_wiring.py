@@ -91,20 +91,23 @@ def test_switching_config_moves_the_database_path(app, tmp_path):
         )
         # [review] The warp worker's anchor (its jobs database) moves too.
         assert bridge._warp_svc.secrets_path == second.parent / "secrets.yaml"
-        # [review] ...while the store the worker RECORDS in follows the
-        # config of the engine this GUI launched for as long as it runs: the
-        # engine's stuck-transaction guard reads the store beside that one.
-        assert bridge._warp_svc.engine_home is None
+        # [review] ...while the store the worker RECORDS in follows the jobs
+        # database of the engine this GUI launched for as long as it runs --
+        # the one its stuck-transaction guard reads, resolved from the
+        # LAUNCHED config (directory and warp.jobs_db) at launch time.
+        assert bridge._warp_svc.engine_store is None
+        assert bridge._configured_warp_db() == str(second.parent / "data" / "warp_jobs.db")
         bridge._engine_process = SimpleNamespace(poll=lambda: None, pid=1)
         bridge._launched_config_path = first
-        bridge._sync_warp_engine_home()
-        assert bridge._warp_svc.engine_home == first.parent
+        bridge._launched_warp_db = str(first.parent / "data" / "old.db")   # first's jobs_db
+        bridge._sync_warp_engine_store()
+        assert bridge._warp_svc.engine_store == str(first.parent / "data" / "old.db")
         bridge.update_config_path(str(first))                 # back and forth: unchanged
         bridge.update_config_path(str(second))
-        assert bridge._warp_svc.engine_home == first.parent
+        assert bridge._warp_svc.engine_store == str(first.parent / "data" / "old.db")
         bridge._engine_process = None                        # the engine stopped
-        bridge._sync_warp_engine_home()
-        assert bridge._warp_svc.engine_home is None
+        bridge._sync_warp_engine_store()
+        assert bridge._warp_svc.engine_store is None
     finally:
         bridge.deleteLater()
         app.processEvents()

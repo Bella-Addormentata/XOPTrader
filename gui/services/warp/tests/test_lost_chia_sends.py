@@ -3621,23 +3621,44 @@ def test_the_burn_cats_parent_marks_the_cat_spend_landed_for_the_guard():
     assert store.get_active_job().state.get("burn_tx_id_landed") is True
 
 
-def test_the_worker_follows_the_running_engines_config(tmp_path):
+def test_the_worker_follows_the_running_engines_store(tmp_path):
     """[review] While an engine of ours runs, its stuck-transaction guard
-    reads the store beside ITS config: the worker records there, whatever
-    config the GUI switched to; with no engine running, beside the GUI's."""
+    reads ITS resolved jobs database -- directory AND warp.jobs_db: the
+    worker records there, whatever config (and jobs_db) the GUI switched to;
+    with no engine running, the GUI's config decides."""
+    from gui.services.warp.jobs import WarpJobStore
+
     closed = []
     worker = S._WarpWorker(secrets_path=tmp_path / "one" / "secrets.yaml")
+    worker._config = {"warp": {"enabled": True, "jobs_db": "data/old.db"}}
     worker._engine = SimpleNamespace(close=lambda: closed.append(1))
-    worker.set_engine_home(tmp_path / "one")                  # the same home: nothing
-    assert closed == [] and worker._config_home() == tmp_path / "one"
-    worker.set_secrets_path(tmp_path / "two" / "secrets.yaml")  # the GUI switched...
-    assert worker._config_home() == tmp_path / "one", "...but the engine still runs on one"
+    one_old = str(tmp_path / "one" / "data" / "old.db")
+    assert worker._wanted_store_path() == one_old
+    worker.set_engine_store(one_old)                          # the same store: nothing
+    assert closed == [] and worker._wanted_store_path() == one_old
+    # The GUI switched to a config in another directory naming another file.
+    worker.set_secrets_path(tmp_path / "two" / "secrets.yaml")
+    worker._config = {"warp": {"enabled": True, "jobs_db": "data/new.db"}}
+    assert worker._wanted_store_path() == one_old, "the engine still reads one/data/old.db"
+    assert worker._store_path_in_use() == one_old and not worker._store_hold
+    two_new = str(tmp_path / "two" / "data" / "new.db")
+    assert not Path(two_new + S._RETAINED_POINTER_SUFFIX).exists()
+    # The engine stopped: the GUI's config decides -- and open work in the
+    # engine's store keeps it, with the pointer beside the configured one.
+    with WarpJobStore(one_old) as s:
+        s.create_job("mainnet", status=JobStatus.FUNDING_CLAIM, state={})
+    worker._store_path = one_old
     worker._engine = SimpleNamespace(close=lambda: closed.append(2))
-    worker.set_engine_home(None)                              # the engine stopped
-    assert worker._config_home() == tmp_path / "two" and closed[-1] == 2
+    worker.set_engine_store(None)
+    assert closed[-1] == 2 and worker._wanted_store_path() == two_new
+    assert worker._store_path_in_use() == one_old and "job 1" in worker._store_hold
+    pointer = Path(two_new + S._RETAINED_POINTER_SUFFIX)
+    assert pointer.read_text(encoding="utf-8").strip() == str(Path(one_old).resolve())
+    # Restarted on a third config: its store, whatever the GUI's says.
     worker._engine = SimpleNamespace(close=lambda: closed.append(3))
-    worker.set_engine_home(tmp_path / "three")                # restarted on a third
-    assert worker._config_home() == tmp_path / "three" and closed[-1] == 3
+    three = str(tmp_path / "three" / "data" / "warp_jobs.db")
+    worker.set_engine_store(three)
+    assert closed[-1] == 3 and worker._wanted_store_path() == three
 
 
 def test_a_store_with_open_work_is_kept_across_a_switch(tmp_path):
@@ -3665,7 +3686,7 @@ def test_a_store_with_open_work_is_kept_across_a_switch(tmp_path):
     # an engine started on this config guards both, so sends go on.
     pointer = Path(wanted + S._RETAINED_POINTER_SUFFIX)
     assert pointer.read_text(encoding="utf-8").strip() == str(old.resolve())
-    worker._engine_home = tmp_path / "two"
+    worker._engine_store = wanted                             # an engine runs on two
     assert worker._send_hold_reason() is None, "the engine guards the kept store too"
     # ...unless the pointer could not be written: then new sends wait.
     worker._retained_ok = False
@@ -3706,5 +3727,5 @@ def test_a_pointer_that_cannot_be_written_holds_new_sends(tmp_path, monkeypatch)
     monkeypatch.setattr(S, "_write_retained_pointer", refuse)
     assert worker._store_path_in_use() == str(old)
     assert worker._send_hold_reason() is None                 # no engine of ours runs
-    worker._engine_home = tmp_path / "two"
+    worker._engine_store = str(S._job_db_path(worker._config, anchor=tmp_path / "two"))
     assert "could not be written" in worker._send_hold_reason()

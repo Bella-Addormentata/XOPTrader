@@ -45,7 +45,10 @@ file beside the configured store names the kept one, so an engine started
 on the new config guards both and a GUI restarted on it finds the kept work
 again. An `unknown` take is released only
 after a day of unreadable trade-record lookups counted from the last pending
-read, never from its age.
+read, never from its age. While an engine this GUI launched runs, the
+bridge records in the jobs database that engine was launched with -- its
+config's directory and `warp.jobs_db` both -- whatever the GUI's current
+config names.
 
 ## [0.10.31] — 2026-10-24 — a Wallet Link page for the Chia wallet and Sage
 

@@ -6577,12 +6577,12 @@ class _WarpWorker(QObject):
         # (_config_home).  Set before moveToThread; changed afterwards only
         # through the set_secrets_path slot, on this thread.
         self._secrets_path: Optional[Path] = secrets_path
-        # [review] The directory of the config the RUNNING engine (ours) was
-        # launched with, or None: while it runs, its stuck-transaction guard
-        # reads the jobs database beside THAT config, so that is where this
-        # worker's sends are recorded -- whatever config the GUI has since
-        # switched to (EngineBridge keeps it current).
-        self._engine_home: Optional[Path] = None
+        # [review] The jobs database the RUNNING engine (ours) reads for its
+        # stuck-transaction guard -- resolved from the config it was launched
+        # with, directory AND warp.jobs_db -- or None: while it runs, that is
+        # where this worker's sends are recorded, whatever config the GUI has
+        # since switched to (EngineBridge keeps it current).
+        self._engine_store: Optional[str] = None
         # The jobs database last opened, and why it is kept when the
         # configured one differs (open work must not vanish from monitoring).
         self._store_path: Optional[str] = None
@@ -6650,21 +6650,22 @@ class _WarpWorker(QObject):
         self._engine_error = None
 
     @Slot(object)
-    def set_engine_home(self, path: object) -> None:
-        """[review] Follow the config the RUNNING engine reads (EngineBridge):
-        its stuck-transaction guard protects the sends recorded in the jobs
-        database beside that config, so while it runs this worker records
-        there -- not beside whatever config the GUI switched to meanwhile.
-        None when no engine of ours is running: the GUI's config anchors the
-        store again.  Delivered on the worker thread."""
-        new = Path(str(path)) if path else None
-        if new == self._engine_home:
+    def set_engine_store(self, path: object) -> None:
+        """[review] Follow the jobs database the RUNNING engine (ours) reads
+        for its stuck-transaction guard -- EngineBridge resolves it from the
+        config the engine was launched with, directory AND warp.jobs_db, as
+        the engine does: while it runs this worker records there, whatever
+        config (and jobs_db) the GUI switched to meanwhile.  None when no
+        engine of ours is running: the GUI's config decides again.
+        Delivered on the worker thread."""
+        new = str(path) if path else None
+        if new == self._engine_store:
             return
-        before = self._config_home()
-        self._engine_home = new
-        if self._config_home() != before:
-            _log.info("warp: the job store's anchor follows %s",
-                      f"the running engine's config in {new}" if new
+        before = self._wanted_store_path()
+        self._engine_store = new
+        if self._wanted_store_path() != before:
+            _log.info("warp: the job store follows %s",
+                      f"the running engine's ({new})" if new
                       else "the GUI's config (no engine of ours is running)")
             self._drop_engine()
             self._engine_error = None
@@ -6677,14 +6678,20 @@ class _WarpWorker(QObject):
 
     def _config_home(self) -> Optional[Path]:
         """The directory the config/secrets live in -- the anchor for
-        relative data paths: the RUNNING engine's config directory while one
-        of ours runs (set_engine_home), else the GUI's.  None only when no
-        secrets path was wired (tests), which preserves the old CWD-relative
-        behaviour there."""
-        engine_home = getattr(self, "_engine_home", None)
-        if engine_home is not None:
-            return engine_home
+        relative data paths. None only when no secrets path was wired
+        (tests), which preserves the old CWD-relative behaviour there."""
         return self._secrets_path.parent if self._secrets_path else None
+
+    def _wanted_store_path(self) -> str:
+        """[review] The jobs database the configuration calls for: the one the
+        RUNNING engine (ours) guards while it runs (set_engine_store --
+        directory and warp.jobs_db both, since the GUI's current config may
+        name another file), else warp.jobs_db of the GUI's config anchored at
+        its directory."""
+        engine_store = getattr(self, "_engine_store", None)
+        if engine_store:
+            return engine_store
+        return str(_job_db_path(self._config, anchor=self._config_home()))
 
     def _store_path_in_use(self) -> str:
         """[review] The jobs database to open: the configured one, unless the
@@ -6694,7 +6701,7 @@ class _WarpWorker(QObject):
         work closes, so no bridge job or take vanishes from monitoring, and
         the banner says so; a store that cannot be read is kept too (fail
         closed).  The move is made once nothing is open."""
-        wanted = str(_job_db_path(self._config, anchor=self._config_home()))
+        wanted = self._wanted_store_path()
         pointer = _retained_pointer(wanted)
         held = getattr(self, "_store_path", None)
         if not held and pointer is not None and pointer.is_file():
@@ -6750,12 +6757,12 @@ class _WarpWorker(QObject):
         engine guards both stores and the held store's job may finish (a
         Retry's send included); with no engine of ours running nothing
         cleans the wallet."""
-        if (getattr(self, "_engine_home", None) is None
+        if (not getattr(self, "_engine_store", None)
                 or not getattr(self, "_store_hold", "")
                 or getattr(self, "_retained_ok", True)):
             return None
-        return ("the engine's stuck-transaction guard reads the job store beside its "
-                f"config ({self._engine_home}), and the pointer that would make it guard "
+        return ("the engine's stuck-transaction guard reads its own job store "
+                f"({self._engine_store}), and the pointer that would make it guard "
                 f"this job's store ({self._store_path}) too could not be written; restart "
                 "the engine on the config this job was started under, or close the job "
                 "(Sweep / Abandon) first")
@@ -6764,9 +6771,8 @@ class _WarpWorker(QObject):
 
     def _relay_state_path(self) -> Optional[Path]:
         try:
-            return Path(_job_db_path(self._config, anchor=self._config_home())).with_name(
-                "warp_relay_state.json"
-            )
+            # Beside the jobs database the configuration calls for.
+            return Path(self._wanted_store_path()).with_name("warp_relay_state.json")
         except Exception:  # noqa: BLE001 -- no path is a safe "don't persist"
             return None
 
@@ -8003,7 +8009,7 @@ class WarpService(QObject):
     _trigger_action = Signal(int, str)
     _trigger_wallet = Signal(str, dict)
     _trigger_secrets = Signal(object)
-    _trigger_engine_home = Signal(object)
+    _trigger_engine_store = Signal(object)
 
     def __init__(
         self,
@@ -8017,7 +8023,7 @@ class WarpService(QObject):
         self._snapshot: dict = {}
         self._tick_in_flight: bool = False
         self._secrets_path: Optional[Path] = Path(secrets_path) if secrets_path else None
-        self._engine_home: Optional[Path] = None
+        self._engine_store: Optional[str] = None
 
         self._thread = QThread(self)
         self._thread.setObjectName("WarpWorkerThread")
@@ -8035,7 +8041,7 @@ class WarpService(QObject):
         self._trigger_action.connect(self._worker.job_action)
         self._trigger_wallet.connect(self._worker.wallet_action)
         self._trigger_secrets.connect(self._worker.set_secrets_path)
-        self._trigger_engine_home.connect(self._worker.set_engine_home)
+        self._trigger_engine_store.connect(self._worker.set_engine_store)
 
         self._trigger_params.emit(dict(config or {}))
 
@@ -8082,21 +8088,23 @@ class WarpService(QObject):
         self._trigger_secrets.emit(new)
 
     @property
-    def engine_home(self) -> Optional[Path]:
-        """The directory of the config the running engine was launched with
-        (EngineBridge), or None: the worker's job store follows it."""
-        return self._engine_home
+    def engine_store(self) -> Optional[str]:
+        """The jobs database the engine this GUI launched reads for its guard
+        (EngineBridge resolves it at launch), or None: the worker's job store
+        follows it while that engine runs."""
+        return self._engine_store
 
-    def set_engine_home(self, path: Optional[Path]) -> None:
-        """[review] Tell the worker which config the engine WE launched runs
-        (None when none does): its job store follows that config while the
-        engine runs, since the engine's stuck-transaction guard reads the
-        store beside it, not beside whatever config the GUI switched to."""
-        new = Path(path) if path else None
-        if new == self._engine_home:
+    def set_engine_store(self, path: Optional[str]) -> None:
+        """[review] Tell the worker which jobs database the engine WE launched
+        guards (None when none runs): the worker records there while that
+        engine runs, since its stuck-transaction guard reads that file --
+        directory and warp.jobs_db of the LAUNCHED config, not of whatever
+        config the GUI switched to."""
+        new = str(path) if path else None
+        if new == self._engine_store:
             return
-        self._engine_home = new
-        self._trigger_engine_home.emit(new)
+        self._engine_store = new
+        self._trigger_engine_store.emit(new)
 
     def tick(self) -> None:
         """Trigger one bridge step on the worker thread (dropped if in flight)."""
