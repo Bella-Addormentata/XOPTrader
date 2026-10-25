@@ -20975,9 +20975,32 @@ void Engine::refresh_warp_send_guard(BlockHeight block_height, bool fresh)
     warp_send_guard_ = read_warp_send_guard(acc.bridge_jobs_db_path,
                                             acc.bridge_asset_id,
                                             acc.warp_enabled);
+    std::error_code ec;
+    const bool missing = !acc.bridge_jobs_db_path.empty()
+        && !std::filesystem::exists(acc.bridge_jobs_db_path, ec) && !ec;
+    if (missing && acc.warp_enabled) {
+        // [review] Fail closed while the GUI could still be about to create
+        // the file; a headless engine never sees one, and must not lose its
+        // cleanup for good.
+        if (warp_db_missing_heartbeats_ < kWarpDbMissingGraceHeartbeats) {
+            ++warp_db_missing_heartbeats_;
+        } else {
+            warp_send_guard_.readable = true;   // read as "no warp" from here on
+            if (!warp_db_missing_warned_) {
+                warp_db_missing_warned_ = true;
+                spdlog::warn("[Engine] warp.enabled is true but warp_jobs.db ({}) "
+                             "has not appeared in {} heartbeats; reading that as "
+                             "no warp jobs and resuming the stuck-transaction "
+                             "cleanup -- a headless engine should set "
+                             "warp.enabled: false",
+                             acc.bridge_jobs_db_path, kWarpDbMissingGraceHeartbeats);
+            }
+        }
+    } else {
+        warp_db_missing_heartbeats_ = 0;
+        warp_db_missing_warned_     = false;
+    }
     if (!warp_send_guard_.readable) {
-        std::error_code ec;
-        const bool missing = !std::filesystem::exists(acc.bridge_jobs_db_path, ec) && !ec;
         spdlog::warn("[Engine] warp_jobs.db ({}) {} -- every wallet's "
                      "unconfirmed transactions are left alone this heartbeat "
                      "in case a warp send is among them",

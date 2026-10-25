@@ -68,6 +68,10 @@ def test_every_destructive_rpc_re_reads_the_guard_first():
     assert delete - fresh < 900
     assert "continue;" in text[fresh:delete]
     assert "void Engine::refresh_warp_send_guard(BlockHeight block_height, bool fresh)" in text
+    # [review] A headless engine (warp enabled, no database ever) regains its
+    # cleanup after a bounded grace instead of failing closed for good.
+    assert "kWarpDbMissingGraceHeartbeats" in text
+    assert "warp_db_missing_heartbeats_ < kWarpDbMissingGraceHeartbeats" in text
     assert "if (!fresh && warp_send_guard_read_" in text
 
 

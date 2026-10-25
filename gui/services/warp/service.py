@@ -1768,15 +1768,58 @@ class WarpEngine:
             message=f"funded {expected} mojos to the security coin (fee {fee})",
         )
 
+    def _security_coin_for(self, job: WarpJob, sk: bytes, expected: int):
+        """The job's security coin: the one ``security_coin_id`` pins while it
+        is unspent, else the key's first unspent coin of the funded amount.
+
+        [review] Two coins at the key is now a designed state (a replaced
+        funding send landing beside its replacement), and the coinset's
+        listing order is not stable: without the pin, consecutive ticks
+        could build the claim around different coins -- a second bundle
+        conflicting on the message coin, our own claim later read as a
+        third party's.  A pinned coin not indexed yet falls back to the
+        scan (it may simply predate the index); a spent one returns None,
+        which the callers read as "awaiting the final CAT coin".
+        """
+        from . import claim, drivers
+
+        pinned = _hx(job.state.get("security_coin_id") or "")
+        if pinned:
+            try:
+                rec = self._coinset.get_coin_record_by_name(pinned)
+            except Exception:  # noqa: BLE001 -- the scan below decides
+                rec = None
+            if rec is not None:
+                # The record must BE the pinned coin (a by-name lookup that
+                # answered with something else is not evidence about it).
+                from . import clvm_utils as cu
+
+                try:
+                    same = cu.coin_name(
+                        bytes.fromhex(_hx(rec.coin.parent_coin_info)),
+                        bytes.fromhex(_hx(rec.coin.puzzle_hash)),
+                        int(rec.coin.amount)).hex() == pinned
+                except Exception:  # noqa: BLE001 -- malformed: not evidence
+                    same = False
+                if not same:
+                    rec = None
+            if rec is not None:
+                if rec.spent:
+                    return None
+                return drivers.Coin(
+                    bytes.fromhex(_hx(rec.coin.parent_coin_info)),
+                    bytes.fromhex(_hx(rec.coin.puzzle_hash)),
+                    int(rec.coin.amount),
+                )
+        return claim.find_security_coin(self._coinset, sk, expected)
+
     def _h_claim_funded(self, job: WarpJob) -> _Step:
         """Wait for the security coin to reach the Chia confirmation depth."""
-        from . import claim
-
         net = self._net
         sk = self._load_ephemeral_sk(job)
         expected = self._funded_amount(job)
 
-        coin = claim.find_security_coin(self._coinset, sk, expected)
+        coin = self._security_coin_for(job, sk, expected)
         if coin is None:
             raise WarpPending("security coin not yet on chain")
         depth = self._chia_depth(coin.name().hex())
@@ -1904,7 +1947,7 @@ class WarpEngine:
                              message=f"a replaced funding send landed -- {status}")
             return _stay(message=f"third-party claim paid the receiver; {note}")
 
-        coin = claim.find_security_coin(self._coinset, sk, expected)
+        coin = self._security_coin_for(job, sk, expected)
         if coin is None:
             sec_id = job.state.get("security_coin_id")
             if sec_id and claim.security_coin_spent(
@@ -2641,12 +2684,43 @@ class WarpEngine:
             _log.debug("warp job %s: could not persist the identified attempt (%s)",
                        job.id, exc)
 
-    def _unobservable_settled(self, job: WarpJob, tx_key: str, tx_id: str) -> tuple:
-        """``(settled, note)`` for a RETIRED attempt nothing can observe: no
-        recorded coins, no wallet record, no mempool item.  Presumed gone
-        once ``_UNOBSERVABLE_ATTEMPT_GRACE_S`` has passed since it was
-        retired (an attempt retired before the clock existed starts it now);
-        until then it keeps the job open."""
+    def _mark_attempts_dead(self, job: WarpJob, tx_key: str, ids: Sequence[str], *,
+                            presumed: bool = False) -> None:
+        """[review] Record retired attempts proven dead -- or presumed gone
+        after the grace -- in ``<tx_key>_prior_dead``, from the latest books:
+        the engine's guard protects only attempts not listed there, the
+        replacement exclusions skip them, and Abandon's record names only the
+        rest.  A verdict found during settlement must not be forgotten by
+        the next tick.  Best effort."""
+        new = [t for t in ids if t]
+        if not new:
+            return
+        key = f"{tx_key}_prior_dead"
+        try:
+            fresh = self._store.get_job(job.id)
+            dead = [t for t in (fresh.state.get(key) or []) if t]
+            add = [t for t in new if t not in dead]
+            if not add:
+                return
+            self._store.update_job(fresh.id, expected_status=fresh.status,
+                                   state_patch={key: dead + add})
+            _log.info("warp job %s: attempt(s) %s %s", job.id,
+                      ", ".join(t[:16] for t in add),
+                      "presumed gone after the grace" if presumed else "proven dead")
+        except Exception as exc:  # noqa: BLE001 -- judged this tick regardless
+            _log.debug("warp job %s: could not record dead attempts (%s)", job.id, exc)
+
+    def _unobservable_settled(self, job: WarpJob, tx_key: str, tx_id: str, *,
+                              coins_known: bool = False) -> tuple:
+        """``(settled, note)`` for a RETIRED attempt that is nowhere: no
+        wallet record, no mempool item, and either no recorded coins or
+        coins still unspent (an orphan).  Presumed gone once
+        ``_UNOBSERVABLE_ATTEMPT_GRACE_S`` has passed since it was retired (an
+        attempt retired before the clock existed starts it now); until then
+        it keeps the job open.  [review] An orphan with coins is bounded the
+        same way: unbounded, a finished claim would sit in CLAIMING until the
+        operator abandoned it; its coins stay on the books, so were it to
+        land after all, Sweep (available on a COMPLETED job) recovers it."""
         key = f"{tx_key}_prior_retired_at"
         stamps = dict(job.state.get(key) or {})
         since = stamps.get(tx_id)
@@ -2662,13 +2736,19 @@ class WarpEngine:
             since = now
         waited = now - float(since)
         hours = _UNOBSERVABLE_ATTEMPT_GRACE_S // 3600
+        what = ("its coins unspent" if coins_known else "no coins on record")
         if waited >= _UNOBSERVABLE_ATTEMPT_GRACE_S:
-            _log.warning("warp job %s: attempt %s has had no coins, no wallet record "
-                         "and no mempool item for %.1fh; presumed gone",
-                         job.id, tx_id[:16], waited / 3600.0)
+            _log.warning("warp job %s: attempt %s has had no wallet record and no "
+                         "mempool item for %.1fh (%s); presumed gone",
+                         job.id, tx_id[:16], waited / 3600.0, what)
             return True, ""
-        return False, (f"attempt {tx_id[:16]}... has no coins on record and is "
-                       f"nowhere to be seen; presumed gone after {hours}h "
+        if coins_known:
+            return False, (f"attempt {tx_id[:16]}... could still land (its coins are "
+                           "unspent, though it is in no wallet record and no mempool); "
+                           f"presumed gone after {hours}h ({waited / 3600.0:.1f}h so far) "
+                           "-- Sweep again later")
+        return False, (f"attempt {tx_id[:16]}... is nowhere to be seen (no coins on "
+                       f"record); presumed gone after {hours}h "
                        f"({waited / 3600.0:.1f}h so far) -- Sweep again later")
 
     def _prior_sends_settled(self, job: WarpJob,
@@ -2822,15 +2902,20 @@ class WarpEngine:
                 else:
                     self._persist_identified_attempt(job, tx_key, tx_id, tx_id, learned)
                 coins = learned
-            if (verdict is cs.Verdict.ORPHAN and not ev.removals
-                    and tx_id != current):
-                # [review] Named, retired, nowhere, and with no coins on
-                # record (a send recorded before coins were kept whose
-                # record the wallet has since deleted): nothing can ever
-                # prove it either way, so it is presumed gone after the
-                # grace rather than keeping the job open for good.
-                gone, note = self._unobservable_settled(job, tx_key, tx_id)
+            if verdict is cs.Verdict.ORPHAN and tx_id != current:
+                # [review] Retired and nowhere -- wallet and mempool both
+                # answered "no".  With no coins on record (a send recorded
+                # before coins were kept whose record the wallet has since
+                # deleted) nothing can ever prove it either way; with coins
+                # still unspent it could in principle still land, but no
+                # node holds a transaction for hours without including it.
+                # Either way it is presumed gone after the grace rather than
+                # keeping a finished job open for good; its coins stay on
+                # the books, so a landing after all is still sweepable.
+                gone, note = self._unobservable_settled(
+                    job, tx_key, tx_id, coins_known=bool(ev.removals))
                 if gone:
+                    self._mark_attempts_dead(job, tx_key, [tx_id], presumed=True)
                     continue
                 return False, note
             if verdict is cs.Verdict.DEAD:
@@ -2839,6 +2924,11 @@ class WarpEngine:
                     return False, ("unnamed funding sends share one record; not "
                                    "every coin of theirs is spent yet; Sweep "
                                    "again later")
+                if tx_id != current and tx_id not in dead:
+                    # [review] A verdict found here is kept: the guard and the
+                    # exclusions read <tx_key>_prior_dead.
+                    self._mark_attempts_dead(job, tx_key, [tx_id])
+                    dead.append(tx_id)
                 continue
             # [review] Landed ON CHAIN (its own output exists and, by the
             # check above, is spent -- at depth, or the recovery could yet be
@@ -2936,11 +3026,24 @@ class WarpEngine:
                 # record taught are kept in the attempt's book.
                 self._persist_identified_attempt(
                     job, "burn_tx_id", tx_id, tx_id, [_hx(c) for c in ev.removals])
+            if verdict is cs.Verdict.ORPHAN:
+                # [review] A retired cat_spend that is nowhere: the same
+                # bounded grace as the funding sends (a retired burn is
+                # DEAD-only by construction, so this is a legacy shape).
+                gone, note = self._unobservable_settled(
+                    job, "burn_tx_id", tx_id, coins_known=bool(ev.removals))
+                if gone:
+                    self._mark_attempts_dead(job, "burn_tx_id", [tx_id], presumed=True)
+                    continue
+                return False, note
             if verdict is cs.Verdict.DEAD:
                 if (tx_id == _FUNDING_TX_UNKNOWN and len(ev.removals) > 1
                         and not self._unnamed_group_dead(ev.removals, min_depth)):
                     return False, ("unnamed cat_spends share one record; not "
                                    "every coin of theirs is spent yet")
+                if tx_id not in dead:
+                    self._mark_attempts_dead(job, "burn_tx_id", [tx_id])
+                    dead.append(tx_id)
                 continue
             if verdict is cs.Verdict.LANDED and ev.output_landed:
                 if (tx_id == _FUNDING_TX_UNKNOWN and len(ev.removals) > 1
@@ -4193,6 +4296,12 @@ class WarpEngine:
                 raise WarpPending(
                     "pinned toll coin is spent; awaiting the bridging coin index"
                 )
+            else:
+                # [review] Not indexed yet: wait.  Re-electing another coin
+                # of the amount here (a replaced toll send that landed too)
+                # would rebuild the bundle around a different bridging coin
+                # than the nonce the job polls.
+                raise WarpPending("pinned toll coin is not indexed yet; awaiting it")
         if sec is None:
             sec = claim.find_security_coin(self._coinset, sk, toll)
         if sec is None:
@@ -5534,8 +5643,10 @@ class WarpEngine:
                     settled, _note = self._prior_sends_settled(job)
                     if settled:
                         resolved, status = True, (
-                            "every funding attempt is proven dead on chain; "
-                            "nothing was funded, nothing to sweep")
+                            "every funding attempt is settled on chain (proven "
+                            "dead, presumed gone, or landed and already spent) "
+                            "and no coin of the funded amount remains; nothing "
+                            "to sweep")
             else:
                 coin_id = coin.name().hex()
                 resolved, status = self._sweep_security(job, coin, sk)

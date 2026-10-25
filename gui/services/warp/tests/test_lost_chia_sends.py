@@ -50,6 +50,14 @@ COIN = (b"\x5a" * 32).hex()               # the FakeCoin every sweep test uses
 PEAK = 9_478_613                       # 837 blocks past the conflicting spend
 
 
+@pytest.fixture(autouse=True)
+def _grace_out_of_reach(monkeypatch):
+    """The default test clock jumps 100,000 s per call (test_warp_service
+    big_clock), which would run out the six-hour absence grace between two
+    ticks; tests about the grace set the real value themselves."""
+    monkeypatch.setattr(S, "_UNOBSERVABLE_ATTEMPT_GRACE_S", 10 ** 9)
+
+
 def _last_message(store, job_id) -> str:
     """The newest audit event's message (the step result carries none)."""
     events = store.get_events(job_id, limit=5000)
@@ -2488,6 +2496,7 @@ def test_an_unobservable_retired_attempt_is_presumed_gone_after_the_grace(monkey
     """A retired send with no coins on record, no wallet record and no
     mempool item can never be proven anything; it keeps the job open for the
     grace, then settles as gone -- never for good."""
+    monkeypatch.setattr(S, "_UNOBSERVABLE_ATTEMPT_GRACE_S", 6 * 3600)
     store = new_store()
     engine, ctx = build_unwrap(store, params=params_with_cap())
     job = _job_with_a_landed_replaced_toll(store)
@@ -2866,7 +2875,7 @@ def test_learned_removals_of_a_named_retired_attempt_are_persisted(monkeypatch):
 
     ctx.wallet.tx_records.clear()                            # the record vanishes again
     settled, note = engine._prior_sends_settled(store.get_active_job())
-    assert not settled and "could still land" in note and "presumed gone" not in note
+    assert not settled and "could still land" in note and "no coins on record" not in note
     ctx.coinset.records[rid] = _rec(spent=True)              # ...until proven dead
     assert engine._prior_sends_settled(store.get_active_job())[0]
 
@@ -2875,6 +2884,7 @@ def test_an_attempt_identified_without_coins_is_probed_before_any_absence_rule(m
     """[review] The history names the send but its record vanished before
     the by-id lookup: the id is kept and probed next pass -- a bundle still
     in the mempool keeps the job open however old the retirement is."""
+    monkeypatch.setattr(S, "_UNOBSERVABLE_ATTEMPT_GRACE_S", 6 * 3600)
     k1 = S._FUNDING_TX_UNKNOWN + "#1"
     store = new_store()
     engine, ctx = build_unwrap(store, params=params_with_cap())
@@ -2902,3 +2912,103 @@ def test_an_attempt_identified_without_coins_is_probed_before_any_absence_rule(m
     del ctx.coinset.mempool["toll-x"]                        # nowhere, no coins: grace (10h)
     ctx.wallet.txs = []
     assert engine._prior_sends_settled(store.get_active_job())[0]
+
+
+# --------------------------------------------------------------------------- #
+# Second independent review.
+# --------------------------------------------------------------------------- #
+
+def test_an_orphaned_retired_attempt_with_coins_settles_after_the_grace(monkeypatch):
+    """A retired send whose coins are known but unspent, absent from wallet
+    and mempool: bounded like the unobservable case, and recorded as
+    presumed gone so the engine guard and the exclusions release it."""
+    monkeypatch.setattr(S, "_UNOBSERVABLE_ATTEMPT_GRACE_S", 6 * 3600)
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    now = 1_000_000.0
+    monkeypatch.setattr(engine, "_now", lambda: now)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior_retired_at": {"toll-a": now - 3600.0}})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    ctx.coinset.records[RID] = _rec(spent=False)             # toll-a: an orphan
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "its coins are unspent" in note and "presumed gone after 6h" in note
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior_retired_at": {"toll-a": now - 7 * 3600.0}})
+    assert engine._prior_sends_settled(store.get_active_job())[0]
+    assert store.get_job(job.id).state["funding_tx_id_prior_dead"] == ["toll-a"]
+
+
+def test_dead_verdicts_found_during_settlement_are_persisted():
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID] = _rec(spent=True)              # toll-a: dead
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    assert engine._prior_sends_settled(store.get_active_job())[0]
+    assert store.get_job(job.id).state["funding_tx_id_prior_dead"] == ["toll-a"]
+
+
+def test_the_claim_prefers_the_pinned_security_coin():
+    """Two coins at the key (a replaced funding send landed beside its
+    replacement): the claim is built around the pinned coin, whatever the
+    coinset lists first."""
+    from gui.services.warp import drivers
+
+    store = new_store()
+    engine, ctx = build(store)
+    job = seed(store, JobStatus.CLAIM_FUNDED,
+               columns={"receiver_ph": "ab" * 32, "post_tip_mojos": 4985})
+    blob, _sk = make_ephemeral_blob(job.id)
+    sk = engine._load_ephemeral_sk(store.get_active_job()) if False else None
+    ours = drivers.Coin(b"\x5a" * 32, b"\x5b" * 32, EXPECTED)
+    other = drivers.Coin(b"\x6a" * 32, b"\x5b" * 32, EXPECTED)
+    store.update_job(job.id, state_patch={
+        "ephemeral_blob": blob, "funding_amount": EXPECTED,
+        "security_coin_id": ours.name().hex()})
+
+    def rec(coin, spent=False):
+        return SimpleNamespace(
+            coin=SimpleNamespace(parent_coin_info=coin.parent_coin_info.hex(),
+                                 puzzle_hash=coin.puzzle_hash.hex(), amount=coin.amount),
+            spent=spent, confirmed_block_index=PEAK - 100, spent_block_index=0)
+
+    ctx.coinset.records[ours.name().hex()] = rec(ours)
+    ctx.coinset.records[other.name().hex()] = rec(other)
+    ctx.coinset.by_ph = [rec(other), rec(ours)]                 # the other first
+    ctx.coinset.peak = PEAK
+    out = engine.step()
+    assert out["status"] == JobStatus.COLLECTING_SIGS
+    assert store.get_active_job().state["security_coin_id"] == ours.name().hex()
+    # Spent: the callers read None as "awaiting the final CAT coin".
+    ctx.coinset.records[ours.name().hex()] = rec(ours, spent=True)
+    assert engine._security_coin_for(store.get_active_job(), b"\x01" * 32, EXPECTED) is None
+
+
+def test_burning_waits_for_an_unindexed_pinned_toll_coin(monkeypatch):
+    """A pinned toll coin the index does not show yet is awaited, never
+    replaced by another coin of the amount at the key."""
+    from gui.services.warp import drivers
+    from .test_warp_service import seed, make_ephemeral_blob
+
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = seed(store, JobStatus.BURNING, columns={"amount_mojos": AMOUNT},
+               state={"direction": "out", "receiver_evm": "ab" * 20,
+                      "burn_cat_ph": "bb" * 32, "cat_wallet_id": 3})
+    blob, _sk = make_ephemeral_blob(job.id)
+    pinned = drivers.Coin(b"\x5a" * 32, b"\x5b" * 32, NET.chia_toll_mojos)
+    store.update_job(job.id, state_patch={
+        "ephemeral_blob": blob, "security_coin_id": pinned.name().hex(),
+        "unwrap_nonce": "cd" * 32})
+    other = drivers.Coin(b"\x6a" * 32, b"\x5b" * 32, NET.chia_toll_mojos)
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: other)
+    built = []
+    monkeypatch.setattr(drivers, "build_burn_bundle",
+                        lambda req: built.append(req) or (_ for _ in ()).throw(S.WarpPending("x")))
+    out = engine.step()
+    assert out["status"] == JobStatus.BURNING and built == []
+    assert "not indexed yet" in _last_message(store, job.id)

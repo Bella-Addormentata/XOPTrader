@@ -2958,6 +2958,14 @@ private:
     execution::WarpSendGuard warp_send_guard_{};
     BlockHeight warp_send_guard_block_{0};
     bool        warp_send_guard_read_{false};
+    /// [review] warp.enabled with no warp_jobs.db fails closed (the GUI may
+    /// be writing a file this process cannot see), but a HEADLESS engine --
+    /// no GUI, so no file ever -- must not lose its stuck-transaction
+    /// cleanup for good: after this many heartbeats of a missing file the
+    /// absence is read as "no warp", with one warning naming the way out.
+    static constexpr std::uint32_t kWarpDbMissingGraceHeartbeats = 60;
+    std::uint32_t warp_db_missing_heartbeats_{0};
+    bool          warp_db_missing_warned_{false};
     void refresh_warp_send_guard(BlockHeight block_height, bool fresh = false);
     /// @p fresh re-reads warp_jobs.db instead of using this heartbeat's
     /// cached read: the GUI may have reserved a send since (it writes the
