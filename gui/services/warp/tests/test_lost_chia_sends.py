@@ -603,3 +603,100 @@ def test_the_cat_spend_waits_until_the_toll_and_both_fees_are_covered():
                               "spendable_balance": toll + 2 * fee}
     engine.step()
     assert len(ctx.wallet.cat_spends) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Review round 3.
+# --------------------------------------------------------------------------- #
+
+def test_the_marker_is_reserved_before_the_wallet_rpc(monkeypatch):
+    """[review] The engine's guard reads the marker; it must exist while
+    the send is being made, not only once the daemon has answered."""
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store)
+    seen = {}
+    real = ctx.wallet.send_transaction
+
+    def observe(*a, **k):
+        seen["during"] = store.get_job(job.id).state.get("funding_tx_id")
+        return real(*a, **k)
+
+    ctx.wallet.send_transaction = observe
+    engine.step()
+    assert seen["during"] == S._FUNDING_TX_UNKNOWN
+    assert store.get_active_job().state["funding_tx_id"] == "funding-tx-1"
+
+
+def test_a_daemon_refusal_releases_the_reservation(monkeypatch):
+    from gui.services.warp.wallet import WalletError
+
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store)
+    calls = []
+
+    def refuse(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise WalletError("send_transaction failed: insufficient funds")
+        return {"name": "funding-tx-2"}
+
+    ctx.wallet.send_transaction = refuse
+    out = engine.step()
+    assert out["retry_count"] == 1
+    assert store.get_job(job.id).state.get("funding_tx_id") is None
+    store.update_job(job.id, columns={"next_retry_at": None})
+    engine.step()
+    assert store.get_active_job().state["funding_tx_id"] == "funding-tx-2"
+
+
+def test_a_transport_failure_keeps_the_reservation_for_the_history_scan(
+        monkeypatch):
+    """[review] A timed-out RPC may have broadcast: the reservation stands,
+    and the next tick adopts the id the wallet history shows."""
+    from gui.services.warp.wallet import WalletError
+
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store)
+
+    def timeout(*a, **k):
+        raise WalletError("send_transaction request failed: timed out")
+
+    ctx.wallet.send_transaction = timeout
+    engine.step()
+    assert store.get_job(job.id).state["funding_tx_id"] == S._FUNDING_TX_UNKNOWN
+    ctx.wallet.txs = [{"name": "broadcast-after-all", "additions": [
+        {"puzzle_hash": SECURITY_PH.hex(), "amount": EXPECTED}]}]
+    store.update_job(job.id, columns={"next_retry_at": None})
+    engine.step()
+    assert store.get_active_job().state["funding_tx_id"] == "broadcast-after-all"
+
+
+def test_g10_budgets_each_spend_at_its_own_cost():
+    """[review] toll + the cat_spend's fee + the XCH send's fee, each from
+    the node's estimate for THAT spend's cost."""
+    toll = NET.chia_toll_mojos
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap(offer_fee_mojos=10_000_000))
+    ctx.coinset.fee_estimates_by_cost = {S._COST_CAT_SPEND: [40_000_000],
+                                         S._COST_XCH_SEND: [12_000_000]}
+    assert engine._unwrap_xch_budget() == toll + 40_000_000 + 12_000_000
+
+
+def test_the_jobs_db_path_expands_env_refs_and_tilde_like_the_engine(monkeypatch):
+    monkeypatch.setenv("XOP_JOBS_DIR", "/srv/xop")
+    assert S._job_db_path({"warp": {"jobs_db": "${XOP_JOBS_DIR}/jobs.db"}},
+                          anchor="/cfg").replace("\\", "/") == "/srv/xop/jobs.db"
+    assert S._job_db_path({"warp": {"jobs_db": "${NOPE_UNSET:-data}/j.db"}},
+                          anchor="/cfg").replace("\\", "/") == "/cfg/data/j.db"
+    monkeypatch.setenv("HOME", "/home/op")
+    monkeypatch.setenv("USERPROFILE", "/home/op")
+    assert S._job_db_path({"warp": {"jobs_db": "~/warp_jobs.db"}},
+                          anchor="/cfg").replace("\\", "/") == "/home/op/warp_jobs.db"
+    with pytest.raises(S.WarpError):
+        S._job_db_path({"warp": {"jobs_db": "${NOPE_UNSET}/j.db"}}, anchor="/cfg")

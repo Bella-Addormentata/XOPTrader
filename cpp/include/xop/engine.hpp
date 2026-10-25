@@ -2909,9 +2909,13 @@ private:
     execution::WarpSendGuard warp_send_guard_{};
     BlockHeight warp_send_guard_block_{0};
     bool        warp_send_guard_read_{false};
-    void refresh_warp_send_guard(BlockHeight block_height);
+    void refresh_warp_send_guard(BlockHeight block_height, bool fresh = false);
+    /// @p fresh re-reads warp_jobs.db instead of using this heartbeat's
+    /// cached read: the GUI may have reserved a send since (it writes the
+    /// marker BEFORE its wallet RPC), so every destructive RPC asks again
+    /// immediately before it runs.
     bool wallet_holds_warp_send(std::int64_t wallet_id,
-                                BlockHeight block_height);
+                                BlockHeight block_height, bool fresh = false);
 
     // -- Wallet unsync auto-recovery [WALLET-RESTART-LIVELOCK 2026-09-22] --
     // Step 8 restarts the wallet service only when

@@ -28,6 +28,17 @@
 // FAIL CLOSED.  A database that exists but cannot be read protects EVERY
 // wallet for that heartbeat: a delayed cleanup costs nothing, a deleted warp
 // send costs the operator a two-hour stall and a manual retry.
+//
+// THE RACE, AND WHAT IS LEFT OF IT.  The GUI writes its marker BEFORE the
+// wallet RPC that sends (a durable reservation; service.py _send_reserved),
+// and the engine re-reads this database immediately before each delete
+// instead of trusting the heartbeat's cached read.  What remains is the
+// GUI reserving between the engine's final read and the delete RPC
+// completing -- a window of one SQLite read plus one wallet RPC, and the
+// periodic prune HOLDS when any fresh unconfirmed row exists anyway.  A
+// shared lock across the two processes would close it entirely; the two
+// databases are separate and the wallet RPC is not transactional, so that
+// is left as a follow-up.
 
 #pragma once
 

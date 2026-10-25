@@ -13866,6 +13866,18 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                 && block_height >= last_stuck_tx_prune_block_
                                                    + kStuckTxPruneInterval) {
                                 last_stuck_tx_prune_block_ = block_height;
+                                // [WARP-LOST-SEND] Asked again, fresh, on
+                                // the tick that deletes: the GUI reserves
+                                // a send in warp_jobs.db before its RPC,
+                                // and this heartbeat's read may predate it.
+                                if (wallet_holds_warp_send(sb.wid, block_height,
+                                                           /*fresh=*/true)) {
+                                    spdlog::info("[Engine] Step 8: prune of "
+                                                 "wallet {} skipped -- a warp "
+                                                 "send was reserved on it since "
+                                                 "this heartbeat's read",
+                                                 sb.label);
+                                } else
                                 try {
                                     auto pruned = co_await
                                         offer_mgr_->prune_stuck_transactions(
@@ -13916,6 +13928,18 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                     // its kForceDeletePendingBlocks count.
                                     if (!wallet_step_may_run("Step 8 force-delete")) {
                                         co_return;
+                                    }
+                                    // [WARP-LOST-SEND] Fresh, right before
+                                    // the delete (see the prune above).
+                                    if (wallet_holds_warp_send(pw, block_height,
+                                                               /*fresh=*/true)) {
+                                        spdlog::info("[Engine] Step 8: force-"
+                                                     "delete of wallet {} "
+                                                     "skipped -- a warp send "
+                                                     "was reserved on it since "
+                                                     "this heartbeat's read",
+                                                     pw);
+                                        continue;
                                     }
                                     try {
                                         co_await wallet_->
@@ -20851,9 +20875,10 @@ std::vector<accounting::BridgeJobRow> read_bridge_job_rows(
 
 // [WARP-LOST-SEND 2026-10-25] One warp_jobs.db read per heartbeat (and one
 // at startup, block 0, before the stuck-transaction prune).
-void Engine::refresh_warp_send_guard(BlockHeight block_height)
+void Engine::refresh_warp_send_guard(BlockHeight block_height, bool fresh)
 {
-    if (warp_send_guard_read_ && warp_send_guard_block_ == block_height) {
+    if (!fresh && warp_send_guard_read_
+        && warp_send_guard_block_ == block_height) {
         return;
     }
     warp_send_guard_read_  = true;
@@ -20878,9 +20903,9 @@ void Engine::refresh_warp_send_guard(BlockHeight block_height)
 // the database could not be read (fail closed: a delayed cleanup is cheap,
 // a deleted warp send is a two-hour stall and an operator retry).
 bool Engine::wallet_holds_warp_send(std::int64_t wallet_id,
-                                    BlockHeight block_height)
+                                    BlockHeight block_height, bool fresh)
 {
-    refresh_warp_send_guard(block_height);
+    refresh_warp_send_guard(block_height, fresh);
     const auto& g = warp_send_guard_;
     if (!g.readable) return true;
     if (!offer_mgr_) return g.any();

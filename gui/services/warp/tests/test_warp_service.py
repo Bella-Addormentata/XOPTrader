@@ -214,6 +214,7 @@ class FakeCoinset:
         self.records: dict = {}        # coin id -> record, consulted before .record
         self.mempool: dict = {}        # tx id -> mempool item
         self.fee_estimates: list = []  # get_fee_estimate's answer
+        self.fee_estimates_by_cost: dict = {}   # ...or per cost, when set
         self.peak = 0
         self.by_ph: list = []
 
@@ -229,6 +230,8 @@ class FakeCoinset:
         return self.mempool.get(key[2:] if key.startswith("0x") else key)
 
     def get_fee_estimate(self, *, cost, target_times):
+        if self.fee_estimates_by_cost:
+            return list(self.fee_estimates_by_cost.get(int(cost), []))
         return list(self.fee_estimates)
 
     def get_peak_height(self):

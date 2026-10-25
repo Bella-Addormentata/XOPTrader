@@ -237,6 +237,23 @@ warp:
     EXPECT_EQ(cfg2.accounting.bridge_jobs_db_path, "custom/jobs.db");
 }
 
+TEST(ConfigParserTest, BridgeJobsDbPath_FromWarpExpandsTilde) {
+    const char* home = std::getenv("HOME");
+#ifdef _WIN32
+    if (!home) home = std::getenv("USERPROFILE");
+#endif
+    if (!home) GTEST_SKIP() << "no home directory in this environment";
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+warp:
+  enabled: false
+  jobs_db: ~/warp_jobs.db
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path,
+              std::string(home) + "/warp_jobs.db");
+}
+
 TEST(ConfigParserTest, BridgeJobsDbPath_ExplicitEngineKeyWins) {
     std::string yaml = std::string(kMinimalValidYaml) + R"(
 accounting:

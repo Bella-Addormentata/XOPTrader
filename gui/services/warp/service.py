@@ -55,6 +55,7 @@ Error taxonomy (raised by handlers, classified by the dispatcher):
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -1704,9 +1705,12 @@ class WarpEngine:
         self._wallet.log_in()
         address = cu.encode_puzzle_hash(security_ph, net.chia_prefix)
         exclude = resend.pop("_exclude_coin_ids", None)
-        record = self._wallet.send_transaction(
-            1, expected, address, fee_mojos=fee,
-            **({"exclude_coin_ids": list(exclude)} if exclude else {}),
+        record = self._send_reserved(
+            job, tx_key="funding_tx_id",
+            send=lambda: self._wallet.send_transaction(
+                1, expected, address, fee_mojos=fee,
+                **({"exclude_coin_ids": list(exclude)} if exclude else {}),
+            ),
         )
         # [WARP-DUP-FUND 2026-08-08] send_transaction returned, so the coin is
         # on its way whether or not the wallet named the transaction. Persisting
@@ -2079,10 +2083,12 @@ class WarpEngine:
 
     def _unwrap_xch_budget(self) -> int:
         """The spendable XCH an unwrap needs (G10): the toll plus the fee
-        its cat_spend and toll funding send will each pay."""
-        fee = self._chia_send_fee(
-            self._params.unwrap_chia_fee_mojos, cost=_COST_CAT_SPEND)
-        return _unwrap_xch_need(self._net, fee)
+        its cat_spend will pay plus the fee its toll funding send will pay,
+        each estimated at its own spend's cost."""
+        configured = self._params.unwrap_chia_fee_mojos
+        return int(self._net.chia_toll_mojos) + (
+            self._chia_send_fee(configured, cost=_COST_CAT_SPEND)
+            + self._chia_send_fee(configured, cost=_COST_XCH_SEND))
 
     def _sweep_fee_for(self, job: WarpJob) -> int:
         """A sweep's fee, taken from the recovered coin: the automatic fee,
@@ -2093,6 +2099,39 @@ class WarpEngine:
         except Exception:  # noqa: BLE001 -- no amount, no fee
             return 0
         return min(self._chia_send_fee(0, cost=_COST_XCH_SEND), max(0, amount // 2))
+
+    def _send_reserved(self, job: WarpJob, *, tx_key: str,
+                       send: Callable[[], dict]) -> dict:
+        """Run *send* (one wallet RPC) with a DURABLE reservation first.
+
+        The engine's stuck-transaction guard reads this job's markers from
+        warp_jobs.db; a marker written only after the RPC returns leaves the
+        send unprotected while it is being made (and while the engine may be
+        mid-heartbeat).  So *tx_key* is set to _FUNDING_TX_UNKNOWN before
+        the RPC and replaced with the real id by the caller.  A daemon
+        refusal (``... failed: ...``) means nothing was sent, and the
+        reservation is released; a transport failure (``request failed``)
+        may have broadcast, so the reservation stands and the history scan
+        decides on the next tick (the _FUNDING_TX_UNKNOWN path).
+        """
+        from .wallet import WalletError
+
+        self._store.update_job(
+            job.id, expected_status=job.status,
+            state_patch={tx_key: _FUNDING_TX_UNKNOWN,
+                         f"{tx_key}_orphan_polls": 0},
+        )
+        try:
+            return send()
+        except Exception as exc:
+            refused = (isinstance(exc, WalletError)
+                       and "request failed" not in str(exc).lower())
+            if refused:
+                self._store.update_job(
+                    job.id, expected_status=job.status,
+                    state_patch={tx_key: None},
+                )
+            raise
 
     def _require_wallet_synced(self, context: str) -> None:
         """Pend until the Chia wallet reports synced and not syncing.
@@ -3053,11 +3092,14 @@ class WarpEngine:
             context="cat_spend (its fee, then the toll coin and its fee)",
         )
         self._wallet.log_in()
-        record = self._wallet.cat_spend(
-            int(job.state["cat_wallet_id"]),
-            amount,
-            job.state["burn_address"],
-            fee_mojos=fee,
+        record = self._send_reserved(
+            job, tx_key="burn_tx_id",
+            send=lambda: self._wallet.cat_spend(
+                int(job.state["cat_wallet_id"]),
+                amount,
+                job.state["burn_address"],
+                fee_mojos=fee,
+            ),
         )
         tx_id = record.get("name") or record.get("transaction_id")
         if not tx_id:
@@ -3193,10 +3235,13 @@ class WarpEngine:
             self._require_spendable_xch(toll + fee, context="toll funding")
             self._wallet.log_in()
             exclude = resend.pop("_exclude_coin_ids", None)
-            record = self._wallet.send_transaction(
-                1, toll, cu.encode_puzzle_hash(ph, net.chia_prefix),
-                fee_mojos=fee,
-                **({"exclude_coin_ids": list(exclude)} if exclude else {}),
+            record = self._send_reserved(
+                job, tx_key="funding_tx_id",
+                send=lambda: self._wallet.send_transaction(
+                    1, toll, cu.encode_puzzle_hash(ph, net.chia_prefix),
+                    fee_mojos=fee,
+                    **({"exclude_coin_ids": list(exclude)} if exclude else {}),
+                ),
             )
             tx_id = (record.get("name") or record.get("transaction_id")
                      or _FUNDING_TX_UNKNOWN)
@@ -4601,10 +4646,44 @@ def _job_db_path(
     of the CWD-relative-default class fixed for installed mode.
     """
     warp = (config or {}).get("warp") or {}
-    raw = Path(str(warp.get("jobs_db") or (Path("data") / jobs.DB_FILENAME)))
+    # [WARP-LOST-SEND] Expanded as the engine expands its own copy of this
+    # path (config.cpp expand_env_vars + expand_tilde): ``${VAR}`` and
+    # ``${VAR:-default}`` references, then a leading ``~``.  The two
+    # processes must open the SAME file, or the engine's stuck-transaction
+    # guard protects a database no job is written to.
+    text = _expand_config_path(
+        str(warp.get("jobs_db") or (Path("data") / jobs.DB_FILENAME)))
+    raw = Path(text)
     if raw.is_absolute() or anchor is None:
         return str(raw)
     return str(Path(anchor) / raw)
+
+
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _expand_config_path(text: str) -> str:
+    """``${VAR}`` / ``${VAR:-default}`` from the environment, then ``~`` to
+    the home directory -- the engine's reading of a configured path.  An
+    unset ``${VAR}`` with no default is a config error, as it is there."""
+    import os
+
+    def _ref(m: "re.Match[str]") -> str:
+        value = os.environ.get(m.group(1))
+        if value is None:
+            if m.group(2) is not None:
+                return m.group(2)
+            raise WarpError(
+                f"warp.jobs_db references ${{{m.group(1)}}}, which is not set")
+        return value
+
+    expanded = _ENV_REF.sub(_ref, text)
+    if expanded.startswith("~"):
+        home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+        if home:
+            return home + expanded[1:]
+        return os.path.expanduser(expanded)
+    return expanded
 
 
 def _coinset_url(config: Optional[dict], net: constants.WarpNet) -> str:

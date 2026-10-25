@@ -54,6 +54,22 @@ def test_the_force_delete_iterates_only_unprotected_wallets():
     assert loop > insert
 
 
+def test_every_destructive_rpc_re_reads_the_guard_first():
+    """[review] The GUI reserves a send before its RPC; the engine asks
+    again, fresh, immediately before the prune and the force-delete."""
+    text = _engine()
+    prune = text.index("offer_mgr_->prune_stuck_transactions(\n"
+                       "                                            {sb.wid}")
+    assert "wallet_holds_warp_send(sb.wid, block_height,\n"
+    assert "/*fresh=*/true" in text[prune - 900:prune]
+    delete = text.index("delete_unconfirmed_transactions(pw);")
+    fresh = text.rindex("wallet_holds_warp_send(pw, block_height,", 0, delete)
+    assert delete - fresh < 900
+    assert "continue;" in text[fresh:delete]
+    assert "void Engine::refresh_warp_send_guard(BlockHeight block_height, bool fresh)" in text
+    assert "if (!fresh && warp_send_guard_read_" in text
+
+
 def test_the_startup_prune_skips_protected_wallets():
     text = _engine()
     boot = text.index("std::vector<std::int64_t> prune_candidates;")
