@@ -1706,7 +1706,7 @@ class WarpEngine:
         address = cu.encode_puzzle_hash(security_ph, net.chia_prefix)
         exclude = resend.pop("_exclude_coin_ids", None)
         record = self._send_reserved(
-            job, tx_key="funding_tx_id",
+            job, tx_key="funding_tx_id", reserve_patch=resend,
             send=lambda: self._wallet.send_transaction(
                 1, expected, address, fee_mojos=fee,
                 **({"exclude_coin_ids": list(exclude)} if exclude else {}),
@@ -2101,36 +2101,47 @@ class WarpEngine:
         return min(self._chia_send_fee(0, cost=_COST_XCH_SEND), max(0, amount // 2))
 
     def _send_reserved(self, job: WarpJob, *, tx_key: str,
-                       send: Callable[[], dict]) -> dict:
+                       send: Callable[[], dict],
+                       reserve_patch: Optional[Dict[str, Any]] = None) -> dict:
         """Run *send* (one wallet RPC) with a DURABLE reservation first.
 
         The engine's stuck-transaction guard reads this job's markers from
         warp_jobs.db; a marker written only after the RPC returns leaves the
         send unprotected while it is being made (and while the engine may be
         mid-heartbeat).  So *tx_key* is set to _FUNDING_TX_UNKNOWN before
-        the RPC and replaced with the real id by the caller.  A daemon
-        refusal (``... failed: ...``) means nothing was sent, and the
-        reservation is released; a transport failure (``request failed``)
-        may have broadcast, so the reservation stands and the history scan
-        decides on the next tick (the _FUNDING_TX_UNKNOWN path).
+        the RPC and replaced with the real id by the caller.
+
+        *reserve_patch* is what a REPLACEMENT send has already decided (the
+        dead id joining ``<tx_key>_prior``, the cleared removals and output
+        pin); it is persisted with the reservation, atomically, so an RPC
+        that times out after broadcasting leaves a state the unnamed-send
+        path can finish from.  A daemon refusal (``... failed: ...``) means
+        nothing was sent: the marker and poll count the tick started with
+        are restored, so a replacement is judged again next tick (and keeps
+        its coin exclusions) while a first-ever send reverts to no marker.
+        A transport failure (``request failed``) may have broadcast, so the
+        reservation stands and the history scan decides next tick.
         """
         from .wallet import WalletError
 
-        self._store.update_job(
-            job.id, expected_status=job.status,
-            state_patch={tx_key: _FUNDING_TX_UNKNOWN,
-                         f"{tx_key}_orphan_polls": 0},
-        )
+        polls_key = f"{tx_key}_orphan_polls"
+        patch = {**{k: v for k, v in (reserve_patch or {}).items()
+                    if not k.startswith("_")},
+                 tx_key: _FUNDING_TX_UNKNOWN, polls_key: 0}
+        # Everything the reservation changes, as the tick found it: a refusal
+        # puts it ALL back (the marker, its polls, removals, priors and pin),
+        # so the next tick judges the same send with the same evidence.
+        previous = {key: job.state.get(key) for key in patch}
+        self._store.update_job(job.id, expected_status=job.status,
+                               state_patch=patch)
         try:
             return send()
         except Exception as exc:
             refused = (isinstance(exc, WalletError)
                        and "request failed" not in str(exc).lower())
             if refused:
-                self._store.update_job(
-                    job.id, expected_status=job.status,
-                    state_patch={tx_key: None},
-                )
+                self._store.update_job(job.id, expected_status=job.status,
+                                       state_patch=previous)
             raise
 
     def _require_wallet_synced(self, context: str) -> None:
@@ -2225,7 +2236,7 @@ class WarpEngine:
                          job.id, label, tx_id, why)
             patch: Dict[str, Any] = {
                 tx_key: None, polls_key: 0, removals_key: None,
-                prior_key: priors + [tx_id],
+                prior_key: priors + ([tx_id] if tx_id not in priors else []),
                 **{key: None for key in also_clear},
             }
             if exclude:
@@ -2356,7 +2367,8 @@ class WarpEngine:
             priors = [t for t in (job.state.get("burn_tx_id_prior") or []) if t]
             cleared = {"burn_tx_id": None, "burn_tx_id_orphan_polls": 0,
                        "burn_tx_id_removals": None, "burn_cat_coin_id": None,
-                       "burn_tx_id_prior": priors + [tx_id]}
+                       "burn_tx_id_prior": priors + (
+                           [tx_id] if tx_id not in priors else [])}
             if tx_id == _FUNDING_TX_UNKNOWN:
                 found = self._find_existing_burn(
                     int(job.state["cat_wallet_id"]), job.state["burn_cat_ph"],
@@ -3093,7 +3105,7 @@ class WarpEngine:
         )
         self._wallet.log_in()
         record = self._send_reserved(
-            job, tx_key="burn_tx_id",
+            job, tx_key="burn_tx_id", reserve_patch=resend,
             send=lambda: self._wallet.cat_spend(
                 int(job.state["cat_wallet_id"]),
                 amount,
@@ -3236,7 +3248,7 @@ class WarpEngine:
             self._wallet.log_in()
             exclude = resend.pop("_exclude_coin_ids", None)
             record = self._send_reserved(
-                job, tx_key="funding_tx_id",
+                job, tx_key="funding_tx_id", reserve_patch=resend,
                 send=lambda: self._wallet.send_transaction(
                     1, toll, cu.encode_puzzle_hash(ph, net.chia_prefix),
                     fee_mojos=fee,

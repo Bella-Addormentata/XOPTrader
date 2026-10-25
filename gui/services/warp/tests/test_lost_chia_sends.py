@@ -700,3 +700,79 @@ def test_the_jobs_db_path_expands_env_refs_and_tilde_like_the_engine(monkeypatch
                           anchor="/cfg").replace("\\", "/") == "/home/op/warp_jobs.db"
     with pytest.raises(S.WarpError):
         S._job_db_path({"warp": {"jobs_db": "${NOPE_UNSET}/j.db"}}, anchor="/cfg")
+
+
+# --------------------------------------------------------------------------- #
+# Review round 4.
+# --------------------------------------------------------------------------- #
+
+def test_a_refused_replacement_restores_the_marker_and_keeps_its_exclusions(
+        monkeypatch):
+    """[review] A refused replacement must not leave the job markerless: the
+    next tick would then send fresh, without excluding the orphan's coins."""
+    from gui.services.warp.wallet import WalletError
+
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store, funding_tx_id=DEAD_TX, funding_tx_id_removals=[RID],
+                        funding_tx_id_orphan_polls=LIMIT - 1)
+    ctx.coinset.records[RID] = _rec(spent=False)          # an orphan, at the limit
+    calls = []
+    real = ctx.wallet.send_transaction
+
+    def refuse_once(*a, **k):
+        calls.append(k.get("exclude_coin_ids"))
+        if len(calls) == 1:
+            raise WalletError("send_transaction failed: insufficient funds")
+        return real(*a, **k)
+
+    ctx.wallet.send_transaction = refuse_once
+    out = engine.step()
+    assert out["retry_count"] == 1
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id"] == DEAD_TX, "the marker the tick started with"
+    assert st["funding_tx_id_orphan_polls"] == LIMIT - 1
+    store.update_job(job.id, columns={"next_retry_at": None})
+    engine.step()
+    assert calls == [[RID], [RID]], "both attempts excluded the orphan's coin"
+    st = store.get_active_job().state
+    assert st["funding_tx_id"] == "funding-tx-1"
+    assert st["funding_tx_id_prior"] == [DEAD_TX]
+
+
+def test_a_replacement_cat_spend_that_times_out_keeps_its_metadata():
+    """[review] The dead id, the cleared pin and removals are persisted WITH
+    the reservation, so an uncertain broadcast leaves a state the unnamed-
+    send path can finish from."""
+    from gui.services.warp.wallet import WalletError
+
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _to_burn_sent(store, engine)
+    store.update_job(job.id, state_patch={
+        "burn_tx_id": "burn-dead", "burn_tx_id_removals": [RID],
+        "burn_cat_coin_id": "aa" * 32})
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = PEAK
+
+    def timeout(*a, **k):
+        raise WalletError("cat_spend request failed: timed out")
+
+    ctx.wallet.cat_spend = timeout
+    engine.step()
+    st = store.get_job(job.id).state
+    assert st["burn_tx_id"] == S._FUNDING_TX_UNKNOWN
+    assert st["burn_tx_id_prior"] == ["burn-dead"]
+    assert st["burn_cat_coin_id"] is None
+    assert st["burn_tx_id_removals"] is None
+    # The wallet history then shows the replacement: adopted, pin still clear.
+    burn_ph = st["burn_cat_ph"]
+    ctx.wallet.cat_txs = [{"name": "burn-replacement", "additions": [
+        {"puzzle_hash": burn_ph, "amount": AMOUNT,
+         "parent_coin_info": "77" * 32}]}]
+    store.update_job(job.id, columns={"next_retry_at": None})
+    engine.step()
+    st = store.get_job(job.id).state
+    assert st["burn_tx_id"] == "burn-replacement"
+    assert st["burn_tx_id_prior"] == ["burn-dead"]
