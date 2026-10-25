@@ -274,6 +274,71 @@ def test_an_unknown_take_settles_for_real_once_its_record_reads(monkeypatch):
     assert eng._store.get_take(OUR_TID).status == J.TAKE_CONFIRMED
 
 
+def test_a_readable_pending_unknown_take_is_never_released(monkeypatch):
+    """[review] PENDING_* is positive evidence the take is live: it stays
+    open (protected) past the release age, until confirmed or failed."""
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    w._maybe_rebalance(eng)
+    real = eng._wallet.get_offer
+
+    def lost(trade_id):
+        raise RuntimeError("trade not found")
+
+    eng._wallet.get_offer = lost
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_FAIL_S + 1)
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+    eng._wallet.get_offer = real
+    eng._wallet.trade_status = "PENDING_CONFIRM"
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_RELEASE_S + 1)
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+    eng._wallet.trade_status = "CONFIRMED"
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_CONFIRMED
+
+
+def test_unknown_takes_select_the_configured_key_first(monkeypatch):
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    w._maybe_rebalance(eng)
+    eng._wallet.get_offer = lambda tid: (_ for _ in ()).throw(RuntimeError("lost"))
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_FAIL_S + 1)
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+    calls = []
+    eng._wallet.log_in = lambda: calls.append(1) or (_ for _ in ()).throw(
+        RuntimeError("daemon unreachable"))
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_RELEASE_S + 1)
+    with pytest.raises(RuntimeError):
+        w._settle_dexie_takes(eng)
+    assert calls and eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+
+
+def test_settlement_without_an_engine_still_processes_unknown_takes(monkeypatch):
+    """[review] With Warp disabled, only the engine-less path settles or
+    releases an unknown take; its gate must see them."""
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    w._maybe_rebalance(eng)
+    eng._wallet.get_offer = lambda tid: (_ for _ in ()).throw(RuntimeError("lost"))
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_FAIL_S + 1)
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+    seen = []
+    monkeypatch.setattr(w, "_settle_dexie_takes", lambda e: seen.append(e))
+    monkeypatch.setattr(S, "_job_db_path", lambda cfg, anchor=None: "x.db")
+    monkeypatch.setattr(S.Path, "is_file", lambda self: True)
+    monkeypatch.setattr(S, "WarpJobStore", lambda p: eng._store)
+    monkeypatch.setattr(w, "_chia_wallet_client", lambda: eng._wallet)
+    monkeypatch.setattr(w, "_config_home", lambda: ".")
+    msgs = []
+    monkeypatch.setattr(S._log, "debug", lambda *a, **k: msgs.append(a))
+    w._settle_takes_without_engine()
+    assert len(seen) == 1, msgs
+
+
 def test_takes_settle_even_with_the_source_switched_off(monkeypatch):
     """Unticking the source must not strand a submitted take unbooked."""
     _http(monkeypatch)

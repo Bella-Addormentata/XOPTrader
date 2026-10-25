@@ -5897,9 +5897,12 @@ class _WarpWorker(QObject):
             if not path.is_file():
                 return
             with WarpJobStore(str(path)) as store:
+                # [review] "unknown" takes too: they settle for real, or are
+                # released, only through this path when no engine is built.
                 if not (store.list_takes(status=jobs.TAKE_SUBMITTED, limit=1)
                         or store.list_takes(status=jobs.TAKE_SUBMITTING,
-                                            limit=1)):
+                                            limit=1)
+                        or store.list_takes(status=jobs.TAKE_UNKNOWN, limit=1)):
                     return
                 from types import SimpleNamespace
 
@@ -6015,11 +6018,18 @@ class _WarpWorker(QObject):
         unknown = engine._store.list_takes(status=jobs.TAKE_UNKNOWN)
         if not unknown:
             return
+        # [review] The configured key first, outside the per-take handler: a
+        # lookup against another client's selected fingerprint reads as "no
+        # record", and a login failure must defer settlement, never count
+        # toward the release.
+        engine._wallet.log_in()
         for take in unknown:
             status = None
+            readable = False
             try:
                 record = engine._wallet.get_offer(take.trade_id)
                 status = _trade_status_name(record.get("status"))
+                readable = True
             except Exception as exc:  # noqa: BLE001 -- still unknown
                 _log.debug("Dexie take %s: still unknown (%s)", take.trade_id, exc)
             if status == "CONFIRMED":
@@ -6034,6 +6044,12 @@ class _WarpWorker(QObject):
                 engine._store.settle_take(
                     take.trade_id, jobs.TAKE_FAILED,
                     error=f"wallet reports {status}")
+            elif readable:
+                # [review] A record that reads PENDING_* is positive evidence
+                # the take is live: it stays protected however old it is,
+                # until the wallet calls it confirmed or failed.
+                _log.debug("Dexie take %s: wallet reports %s; still open",
+                           take.trade_id, status)
             elif _age_s(take.created_at) > _TAKE_UNKNOWN_RELEASE_S:
                 engine._store.settle_take(
                     take.trade_id, jobs.TAKE_FAILED,
