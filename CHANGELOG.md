@@ -33,7 +33,9 @@ node's estimate when the mempool demands it. Sends wait for a synced wallet.
 **The engine leaves warp's sends alone.** It reads the bridge's job database
 (`warp.jobs_db`, anchored at the config file's directory) each heartbeat and
 excludes any wallet with a warp send in flight -- or a Dexie take whose
-outcome is not yet readable (the new `unknown` take status) -- from its
+outcome is not yet readable (the new `unknown` take status; the store adds
+its new columns to an older file under one immediate transaction, so two
+openers never race the migration) -- from its
 stuck-transaction cleanup, fails closed when the database cannot be read,
 and keeps that protection across a config switch. The current attempt
 protects its wallet in every active status -- an earlier attempt's coin may

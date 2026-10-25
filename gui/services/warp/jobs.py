@@ -401,6 +401,13 @@ class WarpJobStore:
 
     def _init_schema(self) -> None:
         with self._lock, self._conn:
+            # [review] One opener at a time: the GUI and its worker (or two
+            # GUIs) may open the same older file together, and both would
+            # see a column missing and race the ALTER.  BEGIN IMMEDIATE takes
+            # the write lock first (the other waits on busy_timeout), so the
+            # second opener inspects a finished migration; a duplicate column
+            # is tolerated regardless -- the end state is what matters.
+            self._conn.execute("BEGIN IMMEDIATE")
             self._conn.execute(_CREATE_JOBS)
             self._conn.execute(_CREATE_ACTIVE_INDEX)
             self._conn.execute(_CREATE_EVENTS)
@@ -410,9 +417,14 @@ class WarpJobStore:
             have = {str(r["name"]) for r in self._conn.execute(
                 "PRAGMA table_info(dexie_takes)").fetchall()}
             for name, decl in _DEXIE_TAKE_COLUMNS_ADDED:
-                if name not in have:
+                if name in have:
+                    continue
+                try:
                     self._conn.execute(
                         f"ALTER TABLE dexie_takes ADD COLUMN {name} {decl}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
             row = self._conn.execute(
                 "SELECT value FROM warp_meta WHERE key = 'schema_version'"
             ).fetchone()
