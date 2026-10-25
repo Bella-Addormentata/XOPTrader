@@ -1903,3 +1903,35 @@ def test_an_unnamed_cat_spend_found_in_history_keeps_its_output_pin():
     assert st["burn_cat_coin_id"] == cu.coin_name(
         bytes.fromhex(RID), bytes.fromhex(burn_ph), AMOUNT).hex()
     assert ctx.wallet.cat_spends == []
+
+
+# --------------------------------------------------------------------------- #
+# Review round 16.
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("status", [JobStatus.AWAITING_EXTERNAL_RELAY, JobStatus.RELAYING])
+def test_a_delivered_unwrap_resumes_settlement_without_relay_prerequisites(status):
+    """[review] A threshold change must not send an already-delivered
+    message back to signature collection while replaced toll sends settle."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = seed(store, status, columns={"amount_mojos": AMOUNT},
+               state={"direction": "out", "receiver_evm": "ab" * 20,
+                      "post_tip_base_units": 4_985_000, "delivered_by": "our relay",
+                      "relay_threshold": 6, "relay_raw": "02ee"})
+    blob, _sk = make_ephemeral_blob(job.id)
+    store.update_job(job.id, state_patch={
+        "ephemeral_blob": blob, "funding_amount": NET.chia_toll_mojos,
+        "funding_tx_id": "toll-b", "funding_tx_id_removals": [RID2],
+        "funding_tx_id_prior": ["toll-a"],
+        "funding_tx_id_prior_removals": {"toll-a": [RID]}})
+    ctx.evm.threshold = 7                                    # changed since collection
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    ctx.coinset.records[RID] = _rec(spent=False)             # toll-a could still land
+    out = engine.step()
+    assert out["status"] == status
+    assert "could still land" in _last_message(store, job.id)
+    ctx.coinset.records[RID] = _rec(spent=True)
+    out = engine.step()
+    assert out["status"] == JobStatus.COMPLETED

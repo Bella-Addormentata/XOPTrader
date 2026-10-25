@@ -3886,6 +3886,12 @@ class WarpEngine:
         from . import evm
 
         net = self._net
+        # [WARP-LOST-SEND] Delivered already: settlement resumes directly,
+        # with no re-signing and no threshold check (see the external path).
+        if job.state.get("delivered_by"):
+            return self._unwrap_delivered(
+                job, by=str(job.state["delivered_by"]), tx_hash=job.bridge_tx_hash)
+
         nonce = bytes.fromhex(job.bridge_nonce)
 
         raw = job.state.get("relay_raw")
@@ -3992,6 +3998,14 @@ class WarpEngine:
         from . import evm
 
         net = self._net
+
+        # [WARP-LOST-SEND] Delivered already (the job waits only for replaced
+        # toll sends to settle): no relay prerequisite applies any more, and
+        # a threshold change must not send a delivered message back to
+        # signature collection.  Settlement resumes directly.
+        if job.state.get("delivered_by"):
+            return self._unwrap_delivered(
+                job, by=str(job.state["delivered_by"]), tx_hash=job.bridge_tx_hash)
 
         # Threshold drift invalidates the packed blob exactly as in RELAYING;
         # signatures never expire, so bouncing back to collection is lossless.
