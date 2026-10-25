@@ -332,18 +332,25 @@ def _unwrap_xch_need(net: Any, fee_mojos: int) -> int:
     return int(net.chia_toll_mojos) + 2 * max(0, int(fee_mojos))
 
 
+_DEFAULT_OFFER_FEE_MOJOS: int = 10_000_000
+
+
 def _offer_fee_floor_mojos(config: Optional[dict]) -> int:
     """strategy.offer_fee_mojos as the engine reads it (default 10,000,000),
     the floor of warp's automatic Chia fees.  Garbage reads as the default:
-    a typo there must not make warp send fee-less."""
+    a typo there must not make warp send fee-less.  [review] Nor may a zero
+    or negative value: the engine refuses those at startup
+    (config.cpp: "offer_fee_mojos must be > 0"), and here a zero floor would
+    cap even a positive node estimate at zero."""
     strat = (config or {}).get("strategy") or {}
-    raw = strat.get("offer_fee_mojos", 10_000_000)
+    raw = strat.get("offer_fee_mojos", _DEFAULT_OFFER_FEE_MOJOS)
     if isinstance(raw, bool):
-        return 10_000_000
+        return _DEFAULT_OFFER_FEE_MOJOS
     try:
-        return max(0, int(raw))
+        value = int(raw)
     except (TypeError, ValueError):
-        return 10_000_000
+        return _DEFAULT_OFFER_FEE_MOJOS
+    return value if value > 0 else _DEFAULT_OFFER_FEE_MOJOS
 
 
 def _top_up_withdraw_short(eth_wei: int, max_fee_per_gas: int) -> bool:

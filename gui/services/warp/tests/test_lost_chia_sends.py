@@ -417,6 +417,13 @@ def test_the_offer_fee_floor_is_read_from_the_strategy_section():
     assert S._offer_fee_floor_mojos({}) == 10_000_000
     assert S._offer_fee_floor_mojos({"strategy": {"offer_fee_mojos": "abc"}}) == 10_000_000
     assert S._offer_fee_floor_mojos({"strategy": {"offer_fee_mojos": True}}) == 10_000_000
+    # [review] Zero or negative (the engine refuses both at startup) must not
+    # disable the automatic fee: a zero floor would cap any estimate at zero.
+    assert S._offer_fee_floor_mojos({"strategy": {"offer_fee_mojos": 0}}) == 10_000_000
+    assert S._offer_fee_floor_mojos({"strategy": {"offer_fee_mojos": -5}}) == 10_000_000
+    assert S.warp_params_from_config(
+        {"warp": {"enabled": False}, "strategy": {"offer_fee_mojos": 0}}
+    ).offer_fee_mojos == 10_000_000
     assert S.warp_params_from_config(
         {"warp": {"enabled": False}, "strategy": {"offer_fee_mojos": 15_000_000}}
     ).offer_fee_mojos == 15_000_000
