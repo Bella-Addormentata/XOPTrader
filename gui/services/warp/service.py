@@ -59,7 +59,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Iterable
 
 from PySide6.QtCore import (
     QMutex,
@@ -6545,6 +6545,42 @@ def _drop_retained_pointer(pointer: Optional[Path]) -> None:
         _log.debug("warp: could not remove %s (%s)", pointer, exc)
 
 
+def publish_retained_pointer(wanted: str, candidates: Iterable[str]) -> Optional[str]:
+    """[review] BEFORE an engine that guards *wanted* starts (and as the GUI
+    switches to the config naming it): name beside *wanted* the first store
+    among *candidates* that still holds open work, so the engine's startup
+    cleanup already guards that store -- the worker publishes the same
+    pointer on its own thread, but that update is queued, and a send aged
+    past the prune threshold must not sit unguarded in the window between
+    the launch and it.  Returns the store named, or None.  Never raises (a
+    launch must not fail on it); a store that cannot be read counts as
+    holding work (fail closed), a missing one as holding none."""
+    pointer = _retained_pointer(wanted)
+    if pointer is None:
+        return None
+    for cand in candidates:
+        cand = str(cand or "")
+        if not cand or cand == wanted or _same_path(cand, wanted):
+            continue
+        if not Path(cand).is_file():
+            continue
+        try:
+            with WarpJobStore(cand) as store:
+                work = store.open_work_summary()
+        except Exception as exc:  # noqa: BLE001 -- unreadable: kept
+            work = f"work that could not be read ({exc})"
+        if not work:
+            continue
+        try:
+            _write_retained_pointer(pointer, cand)
+        except Exception as exc:  # noqa: BLE001 -- the worker's hold then waits
+            _log.warning("warp: could not write %s naming %s (%s)", pointer, cand, exc)
+            return None
+        _log.info("warp: %s names %s (%s) for the engine's guard", pointer, cand, work)
+        return cand
+    return None
+
+
 class _WarpWorker(QObject):
     """Background worker that owns the :class:`WarpEngine` and ticks it.
 
@@ -6616,6 +6652,7 @@ class _WarpWorker(QObject):
         self._config = dict(config or {})
         self._drop_engine()
         self._engine_error = None
+        self._refresh_store_hold()
         # Fail-closed rebalance parse: a malformed block disables the
         # rebalancer WITH a banner, never a silently-defaulted band.
         try:
@@ -6648,6 +6685,17 @@ class _WarpWorker(QObject):
         self._secrets_path = new
         self._drop_engine()
         self._engine_error = None
+        self._refresh_store_hold()
+
+    def _refresh_store_hold(self) -> None:
+        """[review] Re-evaluate the store in use the moment the configured
+        store changes, not lazily at the next engine build: the pointer the
+        engine's guard reads and the banner's notice are published as the
+        paths diverge.  Never raises."""
+        try:
+            self._store_path_in_use()
+        except Exception as exc:  # noqa: BLE001 -- evaluated again at the build
+            _log.debug("warp: store hold not refreshed (%s)", exc)
 
     @Slot(object)
     def set_engine_store(self, path: object) -> None:
@@ -6669,6 +6717,7 @@ class _WarpWorker(QObject):
                       else "the GUI's config (no engine of ours is running)")
             self._drop_engine()
             self._engine_error = None
+            self._refresh_store_hold()
 
     def _drop_engine(self) -> None:
         """Discard the engine, closing its sqlite connection first."""
@@ -7612,6 +7661,10 @@ class _WarpWorker(QObject):
             snap["wallet_notice"] = self._last_wallet_notice
         if getattr(self, "_store_hold", ""):
             snap["store_notice"] = self._store_hold
+        if getattr(self, "_store_path", None):
+            # [review] EngineBridge reads it back before a launch: the store
+            # the worker records in may need naming beside the new engine's.
+            snap["store_path"] = self._store_path
         if self._rebalance_params.enabled or self._rebalance_error:
             snap["rebalance"] = {
                 "enabled": self._rebalance_params.enabled,

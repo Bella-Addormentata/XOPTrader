@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -108,6 +109,23 @@ def test_switching_config_moves_the_database_path(app, tmp_path):
         bridge._engine_process = None                        # the engine stopped
         bridge._sync_warp_engine_store()
         assert bridge._warp_svc.engine_store is None
+        # [review] Before an engine starts here (and as the GUI switched
+        # here), a previous engine's store with open work is named beside
+        # this config's store, synchronously -- the engine's startup cleanup
+        # must find the pointer, not race the worker's queued update.
+        from gui.services.warp.jobs import WarpJobStore
+        from gui.services.warp.service import _RETAINED_POINTER_SUFFIX
+
+        old = first.parent / "data" / "old.db"
+        with WarpJobStore(old) as store:
+            store.create_job("mainnet", status="FUNDING_CLAIM", state={})
+        bridge._publish_retained_warp_store()
+        pointer = Path(bridge._configured_warp_db() + _RETAINED_POINTER_SUFFIX)
+        assert pointer.read_text(encoding="utf-8").strip() == str(old.resolve())
+        src = inspect.getsource(EngineBridge.start_engine)
+        assert src.index("_publish_retained_warp_store()") < src.index("_start_engine_process()")
+        src = inspect.getsource(EngineBridge.update_config_path)
+        assert "_publish_retained_warp_store()" in src
     finally:
         bridge.deleteLater()
         app.processEvents()

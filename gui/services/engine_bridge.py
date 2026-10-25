@@ -635,6 +635,10 @@ class EngineBridge(QObject):
         # [LIVECFG] The settings a running engine cannot adopt take effect
         # for the GUI at the same moment as for the engine: now.
         self._follow_restart_only_settings()
+        # [review] BEFORE the launch: the engine's startup cleanup runs
+        # against the store beside this config, and a store the warp worker
+        # still records in elsewhere must already be named there.
+        self._publish_retained_warp_store()
         if self._start_engine_process():
             _log.info("Engine started via start_engine().")
             self.engine_launched.emit()
@@ -702,6 +706,28 @@ class EngineBridge(QObject):
         except Exception as exc:  # noqa: BLE001 -- unknown: the worker follows the GUI
             _log.debug("could not resolve the warp jobs database (%s)", exc)
             return None
+
+    def _publish_retained_warp_store(self) -> None:
+        """[review] Synchronously, before an engine starts on the current
+        config and as the GUI switches to it: if the store the warp worker
+        has been recording in -- the one the previous engine was launched
+        with, or the one the worker last reported -- still holds open work
+        and is not the one the new engine guards, name it beside the new one
+        NOW (service.publish_retained_pointer), so the engine's first cleanup
+        already guards it.  The worker publishes the same pointer on its own
+        thread; that update is queued, and this closes the window between
+        the launch and it."""
+        wanted = self._configured_warp_db()
+        if not wanted:
+            return
+        snap = self._warp_svc.get_snapshot() or {}
+        candidates = [getattr(self, "_launched_warp_db", None), snap.get("store_path")]
+        try:
+            from gui.services.warp.service import publish_retained_pointer
+
+            publish_retained_pointer(wanted, [c for c in candidates if c])
+        except Exception as exc:  # noqa: BLE001 -- never break a launch
+            _log.debug("retained warp store not published: %s", exc)
 
     def _sync_warp_engine_store(self) -> None:
         """[review] Tell the warp worker which jobs database the engine WE
@@ -1091,6 +1117,10 @@ class EngineBridge(QObject):
             # nothing else.
             self._warp_svc.set_secrets_path(resolved.parent / "secrets.yaml")
             self._sync_warp_engine_store()
+            # [review] The previous engine's store may hold open work: name
+            # it beside this config's store now, so an engine started here
+            # later -- or a GUI reopened here -- finds it at once.
+            self._publish_retained_warp_store()
         if success:
             _log.info("Config path updated and reloaded.")
         else:

@@ -3686,6 +3686,7 @@ def test_a_store_with_open_work_is_kept_across_a_switch(tmp_path):
     # an engine started on this config guards both, so sends go on.
     pointer = Path(wanted + S._RETAINED_POINTER_SUFFIX)
     assert pointer.read_text(encoding="utf-8").strip() == str(old.resolve())
+    assert worker._snapshot_or_error()["store_path"] == str(old)
     worker._engine_store = wanted                             # an engine runs on two
     assert worker._send_hold_reason() is None, "the engine guards the kept store too"
     # ...unless the pointer could not be written: then new sends wait.
@@ -3729,3 +3730,52 @@ def test_a_pointer_that_cannot_be_written_holds_new_sends(tmp_path, monkeypatch)
     assert worker._send_hold_reason() is None                 # no engine of ours runs
     worker._engine_store = str(S._job_db_path(worker._config, anchor=tmp_path / "two"))
     assert "could not be written" in worker._send_hold_reason()
+
+
+def test_the_pointer_is_published_as_the_paths_diverge_not_at_the_next_build(tmp_path):
+    """[review] A switch publishes the pointer (and the notice) the moment
+    the configured store changes -- on the worker's slots, not lazily when
+    an engine is next built -- so an engine started meanwhile guards the
+    kept store from its first cleanup."""
+    from gui.services.warp.jobs import WarpJobStore
+
+    old = tmp_path / "one" / "data" / "warp_jobs.db"
+    with WarpJobStore(old) as s:
+        s.create_job("mainnet", status=JobStatus.FUNDING_CLAIM, state={})
+    worker = S._WarpWorker(secrets_path=tmp_path / "one" / "secrets.yaml")
+    worker._config = {"warp": {"enabled": True}}
+    worker._store_path = str(old)
+    worker.set_secrets_path(tmp_path / "two" / "secrets.yaml")
+    wanted = str(S._job_db_path(worker._config, anchor=tmp_path / "two"))
+    pointer = Path(wanted + S._RETAINED_POINTER_SUFFIX)
+    assert pointer.read_text(encoding="utf-8").strip() == str(old.resolve())
+    assert "job 1" in worker._store_hold
+    # The engine's store pin moving away does the same.
+    pointer.unlink()
+    worker.set_engine_store(str(old))
+    assert not pointer.exists()
+    worker.set_engine_store(None)
+    assert pointer.is_file()
+
+
+def test_publish_retained_pointer_names_the_store_with_open_work(tmp_path):
+    """[review] EngineBridge's pre-launch publish: the first candidate store
+    holding open work is named beside the store the new engine guards; a
+    missing or idle store is skipped; nothing to name returns None."""
+    from gui.services.warp.jobs import WarpJobStore
+
+    wanted = str(tmp_path / "two" / "data" / "warp_jobs.db")
+    idle = tmp_path / "idle" / "warp_jobs.db"
+    with WarpJobStore(idle):
+        pass
+    busy = tmp_path / "one" / "data" / "old.db"
+    with WarpJobStore(busy) as s:
+        s.record_take(trade_id="aa" * 32, asset_id="bb" * 32, cat_mojos=1,
+                      xch_mojos=2, fee_mojos=3)
+    pointer = Path(wanted + S._RETAINED_POINTER_SUFFIX)
+    assert S.publish_retained_pointer(wanted, [None, str(idle), wanted]) is None
+    assert not pointer.exists()
+    assert S.publish_retained_pointer(
+        wanted, [str(tmp_path / "missing.db"), str(idle), str(busy)]) == str(busy)
+    assert pointer.read_text(encoding="utf-8").strip() == str(busy.resolve())
+    assert S.publish_retained_pointer(":memory:", [str(busy)]) is None
