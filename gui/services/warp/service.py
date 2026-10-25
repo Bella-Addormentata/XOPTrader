@@ -2250,13 +2250,43 @@ class WarpEngine:
         rec = self._coinset.get_coin_record_by_name(coin_id_hex)
         if rec is None:
             return None
+        return self._record_spent_depth(rec)
+
+    def _record_spent_depth(self, rec: Any) -> Optional[int]:
+        """Confirmations of a coin record's spend: 0 when unspent, None when
+        the peak or the spend height is unknown."""
         if not rec.spent:
             return 0
         peak = int(self._coinset.get_peak_height() or 0)
-        spent_at = int(rec.spent_block_index or 0)
+        spent_at = int(getattr(rec, "spent_block_index", 0) or 0)
         if peak <= 0 or spent_at <= 0 or peak < spent_at:
             return None
         return peak - spent_at + 1
+
+    def _outputs_settled(self, outputs: Sequence[Any], *, amount: int,
+                         removals: Sequence[str], min_depth: int) -> tuple:
+        """``(settled, why)`` for a landed send's own outputs: every spent
+        one must be spent at the network's confirmation depth.
+
+        [review] A recovery spend (a sweep, a claim) one block deep can still
+        be reorged out; a job closed on it would leave the coin at the key
+        with Sweep gone.  An unspent output is the caller's business (Sweep
+        again, or the completion scan); an unknown depth is not proof.
+        """
+        mine = {_hx(r) for r in removals if r}
+        for rec in outputs:
+            coin = getattr(rec, "coin", None)
+            if coin is None or int(getattr(coin, "amount", -1)) != int(amount):
+                continue
+            if _hx(getattr(coin, "parent_coin_info", "")) not in mine:
+                continue
+            depth = self._record_spent_depth(rec)
+            if depth is None:
+                return False, "the depth of its coin's spend is unknown"
+            if 0 < depth < int(min_depth):
+                return False, (f"its coin's spend has {depth}/{min_depth} "
+                               "confirmations")
+        return True, ""
 
     def _replacement_patch(self, job: WarpJob, *, tx_key: str, tx_id: str,
                            removals: Sequence[str],
@@ -2356,9 +2386,16 @@ class WarpEngine:
             if verdict is cs.Verdict.DEAD:
                 continue
             # [review] Landed ON CHAIN (its own output exists and, by the
-            # check above, is spent); the wallet's word alone keeps waiting.
+            # check above, is spent -- at depth, or the recovery could yet be
+            # reorged out); the wallet's word alone keeps waiting.
             if verdict is cs.Verdict.LANDED and ev.output_landed:
-                continue
+                deep, depth_why = self._outputs_settled(
+                    outputs, amount=amount, removals=ev.removals,
+                    min_depth=min_depth)
+                if deep:
+                    continue
+                return False, (f"funding send {tx_id[:16]}... landed and "
+                               f"{depth_why}; Sweep again later")
             return False, (f"funding send {tx_id[:16]}... could still land "
                            f"({why}); Sweep again later")
         return True, ""
@@ -2407,7 +2444,13 @@ class WarpEngine:
             if verdict is cs.Verdict.DEAD:
                 continue
             if verdict is cs.Verdict.LANDED and ev.output_landed:
-                continue
+                deep, depth_why = self._outputs_settled(
+                    outputs, amount=amount, removals=ev.removals,
+                    min_depth=min_depth)
+                if deep:
+                    continue
+                return False, (f"an earlier cat_spend {tx_id[:16]}... landed "
+                               f"and {depth_why}")
             return False, (f"an earlier cat_spend {tx_id[:16]}... could still "
                            f"land ({why})")
         return True, ""

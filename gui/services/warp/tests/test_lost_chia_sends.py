@@ -1199,7 +1199,9 @@ def test_a_self_claim_sweeps_a_replaced_send_that_landed(monkeypatch):
     out = engine.step()
     assert out["status"] == JobStatus.CLAIMING and swept == [1]
     assert "landed too" in _last_message(store, job.id)
-    orphan_coin.spent = True                               # the sweep mined
+    orphan_coin.spent = True                               # the sweep mined...
+    orphan_coin.spent_block_index = PEAK - 40              # ...at depth
+    ctx.coinset.peak = PEAK
     out = engine.step()
     assert out["status"] == JobStatus.COMPLETED
 
@@ -1460,7 +1462,8 @@ def test_an_unwrap_completes_only_once_replaced_toll_sends_are_ruled_out(monkeyp
     step = engine._unwrap_delivered(job, by="our relay")
     assert step.next_status is None and swept == [1]
 
-    ctx.coinset.by_ph[0].spent = True                        # the sweep mined
+    ctx.coinset.by_ph[0].spent = True                        # the sweep mined...
+    ctx.coinset.by_ph[0].spent_block_index = PEAK - 40       # ...at depth
     monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
     step = engine._unwrap_delivered(job, by="our relay")
     assert step.next_status == JobStatus.COMPLETED
@@ -1494,3 +1497,67 @@ def test_retry_after_delivery_keeps_the_mined_relay():
     assert after.status == JobStatus.RELAYING
     assert after.state["relay_raw"] == "02ee"
     assert after.state["relay_tx_hash"] == "0x" + "77" * 32
+
+
+# --------------------------------------------------------------------------- #
+# Review round 11.
+# --------------------------------------------------------------------------- #
+
+def _job_with_a_landed_replaced_toll(store):
+    job = seed(store, JobStatus.RELAYING, columns={"amount_mojos": AMOUNT},
+               state={"direction": "out", "receiver_evm": "ab" * 20})
+    blob, _sk = make_ephemeral_blob(job.id)
+    store.update_job(job.id, state_patch={
+        "ephemeral_blob": blob, "funding_amount": NET.chia_toll_mojos,
+        "funding_tx_id": "toll-b", "funding_tx_id_removals": [RID2],
+        "funding_tx_id_prior": ["toll-a"],
+        "funding_tx_id_prior_removals": {"toll-a": [RID]}})
+    return store.get_active_job()
+
+
+def test_a_recovered_coins_spend_settles_only_at_depth():
+    """[review] A one-block-deep sweep or claim can be reorged out; the job
+    would then be closed with XCH at the key and no Sweep."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID] = _rec(spent=True)              # A landed...
+    ctx.coinset.records[RID2] = _rec(spent=True)             # B dead
+    swept = SimpleNamespace(                                 # ...its coin swept
+        coin=SimpleNamespace(parent_coin_info=RID, puzzle_hash="5b" * 32,
+                             amount=NET.chia_toll_mojos),
+        spent=True, confirmed_block_index=PEAK - 3, spent_block_index=PEAK)
+    ctx.coinset.by_ph = [swept]
+
+    settled, note = engine._prior_sends_settled(job)         # 1 confirmation
+    assert not settled and "1/32 confirmations" in note
+
+    swept.spent_block_index = 0                              # depth unknown
+    settled, note = engine._prior_sends_settled(job)
+    assert not settled and "unknown" in note
+
+    swept.spent_block_index = PEAK - 40                      # 41 confirmations
+    settled, _note = engine._prior_sends_settled(job)
+    assert settled
+
+
+def test_an_earlier_burns_spent_cat_settles_only_at_depth():
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _to_burn_sent(store, engine)
+    burn_ph = store.get_active_job().state["burn_cat_ph"]
+    store.update_job(job.id, state_patch={
+        "burn_tx_id_prior": ["burn-a"],
+        "burn_tx_id_prior_removals": {"burn-a": [RID]}})
+    job = store.get_active_job()
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID] = _rec(spent=True)
+    cat = SimpleNamespace(
+        coin=SimpleNamespace(parent_coin_info=RID, puzzle_hash=burn_ph, amount=AMOUNT),
+        spent=True, confirmed_block_index=PEAK - 3, spent_block_index=PEAK)
+    ctx.coinset.by_ph = [cat]
+    settled, note = engine._burn_priors_settled(job)
+    assert not settled and "1/32 confirmations" in note
+    cat.spent_block_index = PEAK - 40
+    assert engine._burn_priors_settled(job)[0]
