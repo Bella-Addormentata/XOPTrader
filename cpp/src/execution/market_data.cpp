@@ -1230,6 +1230,12 @@ void MarketDataFeed::set_arb_threshold_bps(double threshold_bps) {
     spdlog::info("Arbitrage threshold updated to {:.1f} bps", threshold_bps);
 }
 
+void MarketDataFeed::set_config(const MarketDataConfig& cfg)
+{
+    std::unique_lock lock(mtx_config_);
+    config_ = cfg;
+}
+
 // MEDIUM-6 FIX: Protect arb_callback_ write with mtx_config_ to prevent a
 // data race with check_arbitrage() which reads arb_callback_ concurrently.
 // ISO/IEC 5055 -- CWE-362 (data race) elimination via RAII locking.

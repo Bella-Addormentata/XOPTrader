@@ -235,6 +235,19 @@ public:
                  std::shared_ptr<State>                    state,
                  const AppConfig&                          config);
 
+    /// [LIVECFG] The constructor's refusals (tier array lengths, offer
+    /// expiry against the hard TTL), as a check a reload can run BEFORE it
+    /// changes anything. Throws std::invalid_argument.
+    static void validate_config(const AppConfig& config);
+
+    /// [LIVECFG] Adopt a saved config on a running engine: the strategy and
+    /// risk sections, Dexie reward claiming and every pair's settings. The
+    /// Dexie endpoint is restart-only (config_live_apply.hpp) and is kept.
+    /// A changed strategy.offer_fee_mojos becomes the current fee; the fee
+    /// controller, when on, overrides it again through set_dynamic_fee().
+    /// Throws -- and changes nothing -- when validate_config() would.
+    void reconfigure(const AppConfig& config);
+
     ~OfferManager() = default;
 
     // Non-copyable, non-movable -- owned by the engine via unique_ptr.

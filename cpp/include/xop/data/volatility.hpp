@@ -269,6 +269,13 @@ public:
     ///                 to [10.0, 300.0] for safety.
     void set_block_time_seconds(double seconds) noexcept;
 
+    /// [LIVECFG] Adopt the operator-tunable fields of a saved config --
+    /// lookback, Yang-Zhang alpha and candle aggregation -- keeping the
+    /// candle history and the adaptive block time (set_block_time_seconds).
+    /// A shorter lookback trims the oldest candles on the next update.
+    void set_tunables(std::uint32_t lookback_blocks, double yz_alpha,
+                      std::uint32_t candle_aggregation_blocks) noexcept;
+
 private:
     // -- Yang-Zhang computation helpers --------------------------------------
 

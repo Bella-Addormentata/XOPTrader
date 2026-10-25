@@ -325,8 +325,11 @@ def _continuation(shutdown: str) -> str:
 def test_shutdown_resolves_the_policy_once_through_the_table():
     code = _shutdown()
     assert code.count("util::plan_stop_offers(") == 1
+    # [LIVECFG] engine.shutdown_offers is read through its atomic copy: a
+    # live config reload assigns config_ on the engine thread, and a signal
+    # can deliver shutdown() on any other.
     assert ("util::plan_stop_offers(stop_offers_request_.load(std::memory_order_acquire),"
-            "config_.engine.shutdown_offers,dry_run_);") in code, (
+            "shutdown_offers_policy_.load(std::memory_order_acquire),dry_run_);") in code, (
         "shutdown() must resolve the request's policy against "
         "engine.shutdown_offers and dry run through util::plan_stop_offers")
     _in_order(code, [

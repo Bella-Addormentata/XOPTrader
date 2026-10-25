@@ -91,6 +91,31 @@ public:
         state_[pair.name] = DepegPairState{};
     }
 
+    // [LIVECFG] A saved config reached the running engine.  The global
+    // switch and defaults are replaced; a pair's thresholds are refreshed
+    // WITHOUT resetting its depeg state (a streak in progress keeps counting
+    // against the new thresholds), a newly stablecoin pair starts fresh, and
+    // a pair no longer marked stablecoin stops being monitored.
+    void set_global_config(const DepegConfig& global_cfg) { global_cfg_ = global_cfg; }
+
+    void sync_pair(const PairConfig& pair)
+    {
+        if (!pair.is_stablecoin) {
+            thresholds_.erase(pair.name);
+            state_.erase(pair.name);
+            return;
+        }
+        if (state_.find(pair.name) == state_.end()) {
+            register_pair(pair);
+            return;
+        }
+        PairThresholds& t = thresholds_[pair.name];
+        t.peg_target       = pair.peg_target;
+        t.warn_pct         = pair.depeg_warn_pct;
+        t.bail_pct         = pair.depeg_bail_pct;
+        t.sustained_blocks = pair.depeg_sustained_blocks;
+    }
+
     // Update with the latest mid-price for a pair.  Call once per block.
     // Returns the new DepegStatus for the pair.
     DepegStatus update(const std::string& pair_name,

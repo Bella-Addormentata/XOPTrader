@@ -277,6 +277,20 @@ const VolatilityEstimatorConfig& VolatilityEstimator::config() const noexcept
 }
 
 // ---------------------------------------------------------------------------
+// [LIVECFG] Saved-config tunables.
+// ---------------------------------------------------------------------------
+
+void VolatilityEstimator::set_tunables(std::uint32_t lookback_blocks,
+                                       double        yz_alpha,
+                                       std::uint32_t candle_aggregation_blocks) noexcept
+{
+    std::unique_lock lock(mtx_);
+    cfg_.lookback_blocks           = lookback_blocks;
+    cfg_.yz_alpha                  = yz_alpha;
+    cfg_.candle_aggregation_blocks = candle_aggregation_blocks;
+}
+
+// ---------------------------------------------------------------------------
 // [T4-15] Adaptive block-time setter.
 // ---------------------------------------------------------------------------
 

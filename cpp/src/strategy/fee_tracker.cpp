@@ -50,6 +50,23 @@ strategy::fee::ControllerConfig fee_controller_config_from(const FeeConfig& cfg)
     return out;
 }
 
+bool FeeTracker::set_config(const FeeConfig& cfg)
+{
+    const bool controller_changed =
+        !(fee_controller_config_from(cfg) == fee_controller_config_from(cfg_))
+        || cfg.min_fee_mojos != cfg_.min_fee_mojos
+        || cfg.max_fee_mojos != cfg_.max_fee_mojos;
+    cfg_ = cfg;
+    if (controller_changed) {
+        controller_ = strategy::fee::Controller(
+            fee_controller_config_from(cfg), cfg.min_fee_mojos, cfg.max_fee_mojos);
+        spdlog::info("[FeeTracker] [LIVECFG] fee controller inputs changed -- "
+                     "controller restarted from its anchor (enabled={})",
+                     controller_.enabled());
+    }
+    return controller_changed;
+}
+
 FeeTracker::FeeTracker(const FeeConfig& cfg)
     : cfg_(cfg)
     , controller_(fee_controller_config_from(cfg), cfg.min_fee_mojos, cfg.max_fee_mojos)

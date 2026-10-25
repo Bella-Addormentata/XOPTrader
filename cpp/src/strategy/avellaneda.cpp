@@ -336,6 +336,26 @@ std::string AvellanedaStoikov::name() const
     return name_;
 }
 
+void AvellanedaStoikov::set_risk_params(double gamma, double kappa,
+                                        double q_max, double min_margin_bps)
+{
+    if (!(gamma > 0.0)) {
+        throw std::invalid_argument("AvellanedaConfig: gamma must be strictly positive");
+    }
+    if (!(kappa > 0.0)) {
+        throw std::invalid_argument("AvellanedaConfig: kappa must be strictly positive");
+    }
+    if (!(q_max > 0.0)) {
+        throw std::invalid_argument("AvellanedaConfig: q_max must be strictly positive");
+    }
+    std::unique_lock lock(mtx_);
+    cfg_.gamma          = gamma;
+    cfg_.kappa          = kappa;
+    cfg_.q_max          = q_max;
+    cfg_.min_margin_bps = min_margin_bps;
+    min_margin_bps_     = min_margin_bps;
+}
+
 void AvellanedaStoikov::set_cost_basis(double cost_basis,
                                        double min_margin_bps)
 {

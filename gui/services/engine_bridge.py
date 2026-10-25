@@ -60,6 +60,39 @@ _DEFAULT_CONFIG_PATH: Final[str] = "config.yaml"
 _DEFAULT_DB_PATH: Final[str] = "data/xop_trader.db"
 _DEFAULT_METRICS_URL: Final[str] = "http://localhost:9090/metrics"
 
+
+def read_reload_result(path: Path, *, not_before: float) -> Optional[dict[str, Any]]:
+    """[LIVECFG] Parse the engine's config_reload.result.json.
+
+    Returns None unless the file exists, parses, and was processed at or after
+    *not_before* (a time.time() value; the engine stamps whole seconds, so a
+    one-second slack is allowed). The keys are normalised so callers can rely
+    on ``status`` (str), ``error`` (str) and ``restart_required`` (list[str]).
+    """
+    import json  # noqa: WPS433 -- only this helper needs it
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        processed_at = float(raw.get("processed_at", 0))
+    except (TypeError, ValueError):
+        return None
+    if processed_at + 1.0 < not_before:
+        return None
+    restart = raw.get("restart_required") or []
+    if not isinstance(restart, list):
+        restart = []
+    return {
+        "status": str(raw.get("status", "")),
+        "error": str(raw.get("error", "") or ""),
+        "restart_required": [str(item) for item in restart],
+        "config_file": str(raw.get("config_file", "") or ""),
+    }
+
 # [shutdown-flag-race] How long _stop_engine_process waits for the engine to
 # honour its addressed shutdown.flag before terminating it.
 _GRACEFUL_STOP_WAIT_S: Final[int] = 30
@@ -152,6 +185,11 @@ class EngineBridge(QObject):
     ready = Signal()
     error = Signal(str)
     engine_start_failed = Signal(str)
+    #: [LIVECFG] The running engine processed a Settings save. Payload is
+    #: data/config_reload.result.json: ``status`` ("applied", "deferred" or
+    #: "rejected"), ``error``, ``restart_required`` (settings the save
+    #: changed that wait for an engine restart) and ``config_file``.
+    config_reload_result = Signal(dict)
 
     def __init__(
         self,
@@ -177,6 +215,14 @@ class EngineBridge(QObject):
             else (self._config_path.parent / _DEFAULT_DB_PATH).resolve()
         )
         self._metrics_url: str = metrics_url or _DEFAULT_METRICS_URL
+        # [LIVECFG] True when the URL above is the operator's own (--metrics
+        # URL); False when it follows monitoring.prometheus_port, in which
+        # case an engine (re)start re-reads the port from the saved config.
+        self._metrics_url_user_supplied: bool = (
+            metrics_url is not None and metrics_url != _DEFAULT_METRICS_URL)
+        # [LIVECFG] time.time() of the last reload request still waiting for
+        # the engine's answer in config_reload.result.json; None when none.
+        self._reload_requested_at: Optional[float] = None
 
         # -- Child services -------------------------------------------------
         self._config_svc: ConfigService = ConfigService(
@@ -331,15 +377,7 @@ class EngineBridge(QObject):
         # Step 2 -- Start metrics poller.  The URL may be overridden by
         # config if config loaded successfully.
         if config_ok:
-            prom_port = self._config_svc.get_int("monitoring", "prometheus_port", 9090)
-            # Only override if the user did not pass an explicit URL.
-            if self._metrics_url == _DEFAULT_METRICS_URL:
-                self._metrics_url = f"http://localhost:{prom_port}/metrics"
-                # Update the worker's URL via the public service API.
-                self._metrics_svc.set_url(self._metrics_url)
-                _log.info("Metrics URL overridden from config: %s", self._metrics_url)
-            else:
-                _log.info("Metrics URL kept (user-supplied): %s", self._metrics_url)
+            self._sync_metrics_url_from_config()
 
         self._metrics_svc.start()
 
@@ -581,6 +619,9 @@ class EngineBridge(QObject):
             _log.info("Engine already running (PID %d).", self._engine_process.pid)
             return
 
+        # [LIVECFG] The settings a running engine cannot adopt take effect
+        # for the GUI at the same moment as for the engine: now.
+        self._follow_restart_only_settings()
         if self._start_engine_process():
             _log.info("Engine started via start_engine().")
         else:
@@ -721,18 +762,26 @@ class EngineBridge(QObject):
 
         Same channel as the pause and the peg re-enable: a flag file beside
         the database, consumed and deleted by the engine on its next
-        heartbeat. The engine applies pair DISABLES live (and cancels their
-        resting offers); everything else it logs as restart-required. With
-        no engine running the flag is consumed harmlessly at the next
-        startup, when the file is the config being loaded anyway.
+        heartbeat. [LIVECFG] The engine adopts the whole saved file except
+        a short restart-only list (connections, database path, metrics port,
+        a pair being enabled/added/removed -- cpp/include/xop/
+        config_live_apply.hpp) and answers in config_reload.result.json,
+        which the master tick picks up and re-emits as
+        :attr:`config_reload_result`. With no engine running the flag is
+        consumed harmlessly at the next startup, when the file is the config
+        being loaded anyway.
         """
         flag_path = self._db_path.parent / "config_reload.flag"
         try:
             flag_path.parent.mkdir(parents=True, exist_ok=True)
+            # Stamped BEFORE the flag exists: an answer the engine writes
+            # after this moment is the answer to this request.
+            self._reload_requested_at = time.time()
             with open(flag_path, "w", encoding="utf-8") as fh:
                 fh.write("reload" + chr(10))
             _log.info("Config reload requested via %s", flag_path)
         except OSError as exc:
+            self._reload_requested_at = None
             _log.error("Could not write config reload flag %s: %s",
                        flag_path, exc)
             # A silent failure here would leave the Settings label promising
@@ -740,6 +789,56 @@ class EngineBridge(QObject):
             self.error.emit(
                 "Could not signal the engine to reload config -- the "
                 "running engine will NOT pick up this save. See gui.log.")
+
+    @property
+    def config_reload_result_path(self) -> Path:
+        """[LIVECFG] Where the engine answers a reload request."""
+        return self._db_path.parent / "config_reload.result.json"
+
+    def read_config_reload_result(self) -> Optional[dict[str, Any]]:
+        """[LIVECFG] The engine's answer to the last reload, or None.
+
+        None while no answer newer than the last request exists (the engine
+        has not reached its next heartbeat yet), when no request is pending,
+        or when the file cannot be read. Reading it clears the pending
+        request, so each answer is reported once.
+        """
+        requested = self._reload_requested_at
+        if requested is None:
+            return None
+        result = read_reload_result(self.config_reload_result_path,
+                                    not_before=requested)
+        if result is not None:
+            self._reload_requested_at = None
+        return result
+
+    def set_refresh_interval_ms(self, interval_ms: int) -> None:
+        """[LIVECFG] Settings > Appearance > Chart Update, applied live: how
+        often the dashboard, charts and status bar are refreshed."""
+        interval = max(1_000, int(interval_ms))
+        if self._master_timer.interval() != interval:
+            self._master_timer.setInterval(interval)
+            _log.info("Refresh interval set to %d ms", interval)
+
+    def _sync_metrics_url_from_config(self) -> None:
+        """Point the metrics poller at monitoring.prometheus_port.
+
+        Only for a URL that follows the config; an operator-supplied URL is
+        never overridden. [LIVECFG] Called at startup and again whenever this
+        GUI (re)starts the engine: the port is bound by the engine at startup,
+        so a saved port change takes effect -- for both sides -- exactly when
+        the engine is restarted, and not before.
+        """
+        if self._metrics_url_user_supplied:
+            _log.info("Metrics URL kept (user-supplied): %s", self._metrics_url)
+            return
+        prom_port = self._config_svc.get_int("monitoring", "prometheus_port", 9090)
+        url = f"http://localhost:{prom_port}/metrics"
+        if url != self._metrics_url:
+            self._metrics_url = url
+            # Update the worker's URL via the public service API.
+            self._metrics_svc.set_url(self._metrics_url)
+            _log.info("Metrics URL overridden from config: %s", self._metrics_url)
 
     def reenable_peg(self, asset_id: str) -> None:
         """[PEGSUSPEND] Ask the engine to re-enable a suspended peg.
@@ -1030,6 +1129,11 @@ class EngineBridge(QObject):
         data = self.get_all_data()
         self._last_data = data
         self.data_updated.emit(data)
+
+        # [LIVECFG] The engine's answer to a Settings save, once it lands.
+        reload_result = self.read_config_reload_result()
+        if reload_result is not None:
+            self.config_reload_result.emit(reload_result)
 
     @Slot(dict)
     def _on_config_loaded(self, config: dict[str, Any]) -> None:
@@ -1568,6 +1672,20 @@ class EngineBridge(QObject):
         # invalidate so the next tick re-queries the new database.
         self._last_trade_cache_ts = 0.0
         self._last_trade_request_ts = 0.0
+
+    def _follow_restart_only_settings(self) -> None:
+        """[LIVECFG] Before an engine start: re-read the two saved settings
+        the GUI shares with the engine and that only a start can change --
+        database.path (where the DB and every flag file live) and
+        monitoring.prometheus_port (where metrics are served)."""
+        previous_db = self._db_path
+        self._apply_configured_database_path()
+        if self._db_path != previous_db:
+            # The replacement service is not started by its constructor.
+            if not self._database_svc.start():
+                _log.warning("Database open failed for %s; DB features "
+                             "disabled.", self._db_path)
+        self._sync_metrics_url_from_config()
 
     def _resolve_config_relative_path(self, raw_path: str) -> Path:
         """Resolve config paths relative to the config file directory."""

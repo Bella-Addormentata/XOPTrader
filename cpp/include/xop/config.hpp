@@ -2073,6 +2073,9 @@ struct CoinGeckoConfig {
 
     /// User-Agent header.
     std::string user_agent{"XOPTrader-CoinGecko/1.0"};
+
+    /// [LIVECFG] Lets a config reload tell whether the client must be rebuilt.
+    bool operator==(const CoinGeckoConfig&) const = default;
 };
 
 // ---------------------------------------------------------------------------
@@ -2133,6 +2136,9 @@ struct TibetSwapConfig {
 
     /// User-Agent header.
     std::string user_agent{"XOPTrader-TibetSwap/1.0"};
+
+    /// [LIVECFG] Lets a config reload tell whether the client must be rebuilt.
+    bool operator==(const TibetSwapConfig&) const = default;
 };
 
 // ---------------------------------------------------------------------------

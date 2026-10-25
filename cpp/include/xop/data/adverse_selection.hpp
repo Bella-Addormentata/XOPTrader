@@ -136,6 +136,14 @@ public:
     /// hyperparameters (alpha, beta must be > 0).
     explicit AdverseSelectionEstimator(const AdverseSelectionConfig& cfg);
 
+    /// [LIVECFG] Validate a configuration exactly as the constructor does.
+    /// Throws std::invalid_argument.
+    static void validate_config(const AdverseSelectionConfig& cfg);
+
+    /// [LIVECFG] Adopt a saved configuration, keeping the fill history.
+    /// Throws (and changes nothing) when the config is invalid.
+    void set_config(const AdverseSelectionConfig& cfg);
+
     // -- Primary interface ---------------------------------------------------
 
     /// Record a fill and classify it based on subsequent price observations.

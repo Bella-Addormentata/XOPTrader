@@ -161,6 +161,10 @@ public:
                      Mojo              total_capital_mojos,
                      bool              no_loss_constraint);
 
+    /// [LIVECFG] Adopt the limit fractions of a saved risk config, keeping
+    /// every position, cost basis and allocation.
+    void set_risk_limits(const RiskConfig& risk_cfg);
+
     // -- Cost Basis Tracking ------------------------------------------------
 
     /// Record a purchase of `qty` mojos of `asset_id` at `fill_price` mojos

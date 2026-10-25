@@ -182,6 +182,13 @@ public:
     // cfg_ is immutable after construction; no lock required.
     const AvellanedaConfig& config() const { return cfg_; }
 
+    /// [LIVECFG] Adopt the per-pair values the engine derives from a saved
+    /// config (gamma, kappa, q_max, the no-loss margin), keeping the price
+    /// buffer, regime and fill clock. Throws std::invalid_argument -- and
+    /// changes nothing -- on a value the constructor would also refuse.
+    void set_risk_params(double gamma, double kappa, double q_max,
+                         double min_margin_bps);
+
     // -- Shared regime detector (T3-01) -------------------------------------
 
     /// Set a shared RegimeDetector instance.  When set, the strategy

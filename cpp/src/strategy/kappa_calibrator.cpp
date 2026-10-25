@@ -130,6 +130,15 @@ double KappaCalibrator::calibrate()
     return kappa_;
 }
 
+void KappaCalibrator::set_default_kappa(double kappa) noexcept
+{
+    std::unique_lock lock(mtx_);
+    if (kappa_ == cfg_.default_kappa) {
+        kappa_ = kappa;
+    }
+    cfg_.default_kappa = kappa;
+}
+
 double KappaCalibrator::current_kappa() const noexcept
 {
     std::shared_lock lock(mtx_);

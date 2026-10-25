@@ -123,6 +123,10 @@ public:
     [[nodiscard]] TriArbResult compute_tri_arb_edge() const;
 
     /// Read-only access to config.
+    /// [LIVECFG] Adopt a saved configuration, keeping the score history and
+    /// the evaluation clock. Turning `enabled` off stops evaluation at once.
+    void set_config(const MarketAllocatorConfig& cfg) noexcept { cfg_ = cfg; }
+
     [[nodiscard]] const MarketAllocatorConfig& config() const noexcept {
         return cfg_;
     }

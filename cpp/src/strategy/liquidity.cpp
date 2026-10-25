@@ -531,6 +531,11 @@ const std::string& LiquidityEngine::pair_name() const noexcept {
     return pair_name_;
 }
 
+void LiquidityEngine::set_config(const LiquidityConfig& cfg) {
+    validate_config(cfg);
+    cfg_ = cfg;
+}
+
 const LiquidityConfig& LiquidityEngine::config() const noexcept {
     return cfg_;
 }

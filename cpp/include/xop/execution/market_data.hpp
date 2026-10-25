@@ -1274,6 +1274,12 @@ public:
     /// with concurrent set_*() mutations (ISO/IEC 5055 -- CWE-362).
     MarketDataConfig config() const;
 
+    /// [LIVECFG] Replace the whole configuration at runtime -- a GUI Save the
+    /// running engine adopts. Every field is read under mtx_config_ at use
+    /// time, so the next refresh() runs on the new values; nothing is sized
+    /// from the config at construction.
+    void set_config(const MarketDataConfig& cfg);
+
     /// Update the arbitrage threshold at runtime (e.g. from ML tuner).
     void set_arb_threshold_bps(double threshold_bps);
 

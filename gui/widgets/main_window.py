@@ -617,6 +617,19 @@ class MainWindow(QMainWindow):
             self._settings_widget.config_saved.connect(
                 self._nudge_engine_config_reload
             )
+        # [LIVECFG] The engine's answer to that nudge, the one-click restart
+        # for whatever it could not adopt, and the Appearance preferences.
+        if hasattr(bridge, "config_reload_result"):
+            bridge.config_reload_result.connect(self._on_config_reload_result)
+        settings_page = self._unwrap(self._settings_widget)
+        if settings_page is not None:
+            if hasattr(settings_page, "engine_restart_requested"):
+                settings_page.engine_restart_requested.connect(
+                    self._on_restart_engine_for_settings)
+            if hasattr(settings_page, "appearance_saved"):
+                settings_page.appearance_saved.connect(self._apply_appearance)
+            if hasattr(settings_page, "appearance_prefs"):
+                self._apply_appearance(settings_page.appearance_prefs())
         wallet_widget = self._unwrap(self._wallet_balances)
         if (wallet_widget is not None
             and hasattr(wallet_widget, "allocation_targets_applied")
@@ -2271,16 +2284,99 @@ class MainWindow(QMainWindow):
         except OSError:
             same = False
         if same:
-            _note("pair disables apply live; other changes need an engine "
-                  "restart")
+            # [LIVECFG] The engine answers in config_reload.result.json and
+            # _on_config_reload_result replaces this with what it did.
+            _note("sent to the running engine -- it applies the save at its "
+                  "next heartbeat (usually within a minute)")
         else:
-            log.warning(
+            _log.warning(
                 "[RELOAD] save went to %s but the engine was launched with "
                 "%s -- the save does NOT reach the running engine",
                 saved_path, launched)
             _note(f"engine is running a DIFFERENT config ({launched}) -- "
                   "this save does NOT reach it; restart the engine on this "
                   "file")
+
+    def _on_config_reload_result(self, result: dict) -> None:
+        """[LIVECFG] Tell the Settings page what the engine did with a save.
+
+        *result* is EngineBridge.read_config_reload_result(): ``status``
+        "applied" / "deferred" / "rejected", ``error`` and
+        ``restart_required``, the saved settings the running engine could
+        not adopt.
+        """
+        settings = self._unwrap(self._settings_widget)
+        if settings is None:
+            return
+        status = str(result.get("status", ""))
+        restart = [str(item) for item in result.get("restart_required", [])]
+        if status == "rejected":
+            text = ("the engine REJECTED this save and kept its previous "
+                    "settings: " + (str(result.get("error", "")) or "see the "
+                    "engine log"))
+            restart = []
+        elif status == "deferred":
+            text = ("the engine applies this save once the Cancel All in "
+                    "progress finishes")
+        elif restart:
+            text = "applied live, except the settings listed below"
+        else:
+            text = "applied live by the running engine"
+        if hasattr(settings, "note_reload_state"):
+            settings.note_reload_state(text)
+        if hasattr(settings, "note_restart_required"):
+            settings.note_restart_required(restart)
+        _log.info("[LIVECFG] engine reload result: %s%s", status,
+                 f" (restart-required: {', '.join(restart)})" if restart else "")
+
+    def _on_restart_engine_for_settings(self) -> None:
+        """[LIVECFG] Settings' Restart Engine button: stop this GUI's engine
+        through the usual stop prompt (keep or cancel the resting offers),
+        then start it on the saved config."""
+        bridge = self._bridge
+        if bridge is None:
+            return
+        if not self._engine_stop_is_ours():
+            QMessageBox.information(
+                self, "Restart Engine",
+                "This GUI did not start the running engine, so it cannot "
+                "restart it. Restart it where it was started.")
+            return
+        decision = self._decide_engine_stop(closing=False)
+        if not decision.proceed:
+            return
+        if decision.policy is not None:
+            bridge.stop_engine(offers_policy=decision.policy)
+        else:
+            bridge.stop_engine()
+        if getattr(bridge, "engine_running_locally", False):
+            # stop_engine() already reported why; do not start a second one.
+            return
+        bridge.start_engine()
+        self._bot_running = bool(getattr(bridge, "engine_running_locally", True))
+        self._bot_paused = False
+        self._style_start_stop_button()
+        self._style_pause_resume_button()
+        settings = self._unwrap(self._settings_widget)
+        if settings is not None and hasattr(settings, "note_restart_required"):
+            settings.note_restart_required([])
+        if settings is not None and hasattr(settings, "note_reload_state"):
+            settings.note_reload_state("engine restarted on the saved config")
+
+    def _apply_appearance(self, prefs: dict) -> None:
+        """[LIVECFG] Settings > Appearance, applied the moment it is saved."""
+        bridge = self._bridge
+        interval_s = prefs.get("chart_interval_s")
+        if bridge is not None and interval_s and hasattr(
+                bridge, "set_refresh_interval_ms"):
+            bridge.set_refresh_interval_ms(int(interval_s) * 1000)
+        if "show_grid" in prefs:
+            show = bool(prefs["show_grid"])
+            for widget in (getattr(self, "_chart", None),
+                           getattr(self, "_order_book", None)):
+                target = self._unwrap(widget)
+                if target is not None and hasattr(target, "set_show_grid"):
+                    target.set_show_grid(show)
 
     def _push_sizing_paths(self) -> None:
         """Hand the advisory calculator the bridge's CURRENT paths.

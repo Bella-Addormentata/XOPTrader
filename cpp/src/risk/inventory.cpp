@@ -133,6 +133,16 @@ InventoryTracker::InventoryTracker(const RiskConfig& risk_cfg,
     }
 }
 
+void InventoryTracker::set_risk_limits(const RiskConfig& risk_cfg)
+{
+    std::unique_lock lock(mtx_capital_);
+    soft_limit_pct_           = risk_cfg.soft_limit_pct;
+    hard_limit_pct_           = risk_cfg.hard_limit_pct;
+    single_cat_cap_pct_       = risk_cfg.single_cat_cap_pct;
+    kelly_fraction_           = risk_cfg.kelly_fraction;
+    max_capital_per_pair_pct_ = risk_cfg.max_capital_per_pair_pct;
+}
+
 // ===========================================================================
 // Cost Basis Tracking
 // ===========================================================================

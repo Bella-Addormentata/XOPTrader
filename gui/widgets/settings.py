@@ -491,6 +491,13 @@ class SettingsWidget(QWidget):
     #: switch and the nav entry -- because this page knows nothing about
     #: either. Emitted only on a genuine operator change, never on load.
     permuto_enabled_changed = Signal(bool)
+    #: [LIVECFG] The operator asked for an engine restart so the settings the
+    #: running engine reported as restart-only take effect. MainWindow owns
+    #: the stop prompt (keep or cancel the resting offers) and the restart.
+    engine_restart_requested = Signal()
+    #: [LIVECFG] Emitted after every successful save with the Appearance
+    #: preferences (appearance_prefs()), so MainWindow applies them live.
+    appearance_saved = Signal(dict)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -649,6 +656,27 @@ class SettingsWidget(QWidget):
         status_row.addWidget(self._last_saved_label)
         root.addLayout(status_row)
 
+        # -- [LIVECFG] What the running engine could NOT adopt --
+        # Hidden until the engine answers a save with a restart-only list
+        # (note_restart_required); the button then restarts it in one click.
+        restart_row = QHBoxLayout()
+        self._restart_label = QLabel("")
+        self._restart_label.setWordWrap(True)
+        self._restart_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._restart_label.setStyleSheet(
+            f"color: {_C.WARNING_YELLOW}; font-size: 9pt;"
+        )
+        self._restart_btn = QPushButton("Restart Engine")
+        self._restart_btn.setToolTip(
+            "Stop the engine (you choose whether its resting offers are kept "
+            "or cancelled) and start it again on the saved config"
+        )
+        self._restart_btn.clicked.connect(self.engine_restart_requested.emit)
+        restart_row.addWidget(self._restart_label, stretch=1)
+        restart_row.addWidget(self._restart_btn)
+        root.addLayout(restart_row)
+        self.note_restart_required([])
+
     # -------------------------------------------------------------------
     # Connection tab
     # -------------------------------------------------------------------
@@ -659,6 +687,17 @@ class SettingsWidget(QWidget):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
+
+        # [LIVECFG] Everything on this page is a connection the engine opens
+        # once, at startup -- the one page where a save cannot go live.
+        restart_note = QLabel(
+            "Connections are opened when the engine starts: a change on this "
+            "page applies after an engine restart. Settings offers one after "
+            "Save. Every other page applies to the running engine."
+        )
+        restart_note.setWordWrap(True)
+        restart_note.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        layout.addWidget(restart_note)
 
         # -- Node Mode --
         mode_group = QGroupBox("Node Mode")
@@ -1197,7 +1236,10 @@ class SettingsWidget(QWidget):
         self._prom_port = QSpinBox()
         self._prom_port.setRange(1, 65535)
         self._prom_port.setValue(9090)
-        self._prom_port.setToolTip("TCP port to expose Prometheus /metrics endpoint")
+        self._prom_port.setToolTip(
+            "TCP port to expose Prometheus /metrics endpoint.  Bound when the "
+            "engine starts: a change applies after an engine restart."
+        )
         prom_form.addRow("Metrics Port:", self._prom_port)
 
         layout.addWidget(prom_group)
@@ -1455,6 +1497,8 @@ class SettingsWidget(QWidget):
         self._theme_combo.setToolTip(
             "Visual theme.  Additional themes coming in future releases."
         )
+        # [LIVECFG] Only one theme exists, so there is nothing to choose.
+        self._theme_combo.setEnabled(False)
         form.addRow("Theme:", self._theme_combo)
 
         # -- Font size --
@@ -1462,7 +1506,14 @@ class SettingsWidget(QWidget):
         self._font_size_spin.setRange(8, 24)
         self._font_size_spin.setValue(12)
         self._font_size_spin.setSuffix(" pt")
-        self._font_size_spin.setToolTip("Base font size for the GUI (points)")
+        # [LIVECFG] Not wired yet: every widget sets its own font size, so
+        # this value has never changed anything. Disabled rather than left
+        # looking like it works.
+        self._font_size_spin.setToolTip(
+            "Base font size for the GUI (points).  Not available yet: the "
+            "GUI does not use this value."
+        )
+        self._font_size_spin.setEnabled(False)
         form.addRow("Font Size:", self._font_size_spin)
 
         # -- Chart update interval --
@@ -1471,7 +1522,8 @@ class SettingsWidget(QWidget):
         self._chart_interval.setValue(5)
         self._chart_interval.setSuffix(" s")
         self._chart_interval.setToolTip(
-            "How often chart data refreshes (seconds)"
+            "How often the charts, dashboard and status bar refresh "
+            "(seconds).  Applies immediately on Save."
         )
         form.addRow("Chart Update:", self._chart_interval)
 
@@ -1480,21 +1532,30 @@ class SettingsWidget(QWidget):
         self._dash_interval.setRange(1, 60)
         self._dash_interval.setValue(10)
         self._dash_interval.setSuffix(" s")
+        # [LIVECFG] There is one refresh clock for the whole window; the
+        # dashboard follows Chart Update. Disabled rather than left looking
+        # like a separate control.
         self._dash_interval.setToolTip(
-            "How often the dashboard summary refreshes (seconds)"
+            "The dashboard refreshes together with the charts: set Chart "
+            "Update instead."
         )
+        self._dash_interval.setEnabled(False)
         form.addRow("Dashboard Refresh:", self._dash_interval)
 
         # -- Show grid lines --
         self._show_grid = QCheckBox("Show grid lines on charts")
         self._show_grid.setChecked(True)
+        self._show_grid.setToolTip("Applies immediately on Save.")
         form.addRow("", self._show_grid)
 
         # -- Monospace font picker --
         self._mono_font_combo = QComboBox()
+        # [LIVECFG] Not wired yet, like Font Size above.
         self._mono_font_combo.setToolTip(
-            "Monospaced font used for numeric / data display"
+            "Monospaced font used for numeric / data display.  Not available "
+            "yet: the GUI does not use this value."
         )
+        self._mono_font_combo.setEnabled(False)
         self._populate_monospace_fonts()
         form.addRow("Mono Font:", self._mono_font_combo)
 
@@ -1767,7 +1828,8 @@ class SettingsWidget(QWidget):
 
         self._db_path = self._make_path_row(
             db_form, "DB Path:", "database_path",
-            "Path to the SQLite database file",
+            "Path to the SQLite database file.  Opened when the engine "
+            "starts: a change applies after an engine restart.",
             "SQLite Files (*.db *.sqlite *.sqlite3);;All Files (*)",
         )
         layout.addWidget(db_group)
@@ -2305,8 +2367,8 @@ class SettingsWidget(QWidget):
             "The engine's sell offers always leave at least this much "
             "wmilliETH.b in the wallet, so there is some to unwrap for gas. "
             "1 wmilliETH.b = 0.001 ETH. Replaces Min Reserve Balance for this "
-            "coin (strategy.asset_reserve_units). Takes effect when the "
-            "engine restarts."
+            "coin (strategy.asset_reserve_units). Applies to the running "
+            "engine at its next heartbeat after Save."
         )
         wm_form.addRow("Keep Unsold:", self._wm_gas_reserve)
 
@@ -4306,6 +4368,13 @@ class SettingsWidget(QWidget):
         # with the indicator, so only the small box would toggle the row.
         cb = HitTargetCheckBox()
         cb.setChecked(_pair_flag(pair, "enabled", True))
+        cb.setToolTip(
+            "Quote this pair.  Unticking it applies to the running engine "
+            "at its next heartbeat after Save (its resting offers are "
+            "cancelled).  Ticking a pair that was off when the engine "
+            "started, adding a pair or removing one needs an engine "
+            "restart: Settings offers one after Save."
+        )
         cb.stateChanged.connect(lambda _s, ti=1: self._mark_dirty(ti))
         cb_container = QWidget()
         cb_layout = QHBoxLayout(cb_container)
@@ -4391,7 +4460,8 @@ class SettingsWidget(QWidget):
             "alone does not satisfy that gate.  A coin without one (BYC) "
             "gets a synthetic price from its Dexie trades, the engine's "
             "estimate and its last known price, quoted wider the less "
-            "certain it is.  Requires an engine restart to take effect."
+            "certain it is.  Applies to the running engine at its next "
+            "heartbeat after Save."
         )
         revive_cb.stateChanged.connect(lambda _s, ti=1: self._mark_dirty(ti))
         revive_container = QWidget()
@@ -4413,8 +4483,8 @@ class SettingsWidget(QWidget):
             "pair then keeps quoting through a depeg, inside the revive "
             "limits (spread floor, offer size, daily loss budget).  Only "
             "takes effect when Revive is also ticked.  Depeg alerts "
-            "still fire and every other pair stays guarded.  Requires an "
-            "engine restart to take effect."
+            "still fire and every other pair stays guarded.  Applies to the "
+            "running engine at its next heartbeat after Save."
         )
         guard_cb.stateChanged.connect(lambda _s, ti=1: self._mark_dirty(ti))
         guard_container = QWidget()
@@ -5262,8 +5332,9 @@ class SettingsWidget(QWidget):
                 "Settings save: strategy.ratio_target_by_pair %s", line
             )
 
-        # Persist GUI-only appearance settings separately.
+        # Persist GUI-only appearance settings separately, and apply them.
         self._save_appearance_settings()
+        self.appearance_saved.emit(self.appearance_prefs())
 
         # Update state.  Stash the merged dict (what actually hit disk)
         # so subsequent saves keep preserving unmanaged keys.
@@ -5294,6 +5365,29 @@ class SettingsWidget(QWidget):
         self.config_saved.emit(str(resolved))
         log.info("Settings saved to %s", resolved)
         return True
+
+    def note_restart_required(self, items: list[str]) -> None:
+        """[LIVECFG] Show (or clear) the settings that wait for a restart.
+
+        *items* are the engine's own names for the saved settings it could not
+        adopt live (cpp/include/xop/config_live_apply.hpp). Empty hides the
+        row: everything saved is live.
+        """
+        if items:
+            self._restart_label.setText(
+                "Saved, but the running engine applies these only after a "
+                "restart: " + ", ".join(items))
+        else:
+            self._restart_label.setText("")
+        self._restart_label.setVisible(bool(items))
+        self._restart_btn.setVisible(bool(items))
+
+    def appearance_prefs(self) -> dict[str, Any]:
+        """[LIVECFG] The Appearance preferences MainWindow applies live."""
+        return {
+            "chart_interval_s": int(self._chart_interval.value()),
+            "show_grid": bool(self._show_grid.isChecked()),
+        }
 
     def note_reload_state(self, text: str) -> None:
         """[RELOAD] Append MainWindow's verdict on what the save reached.

@@ -292,6 +292,11 @@ public:
     /// If bot_token or chat_id is empty, alerts are disabled (log-only mode).
     void init(const std::string& bot_token, const std::string& chat_id);
 
+    /// [LIVECFG] Replace the Telegram credentials on a running engine (a GUI
+    /// Save). Empty token or chat id switches delivery off, as in init().
+    /// Messages already queued go out with the NEW credentials.
+    void set_credentials(const std::string& bot_token, const std::string& chat_id);
+
     /// True if Telegram delivery is enabled (both token and chat_id are set).
     bool is_enabled() const noexcept;
 
@@ -396,7 +401,7 @@ private:
     // Telegram credentials (SECRET -- never logged).
     std::string bot_token_;
     std::string chat_id_;
-    bool        enabled_{false};
+    std::atomic<bool> enabled_{false};
 
     // Per-tier rate-limit cooldowns.
     std::chrono::seconds cooldown_critical_{60};

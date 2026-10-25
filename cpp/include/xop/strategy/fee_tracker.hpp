@@ -81,6 +81,14 @@ public:
     /// Construct from the fee configuration section.
     explicit FeeTracker(const FeeConfig& cfg);
 
+    /// [LIVECFG] Adopt a saved fees section, keeping the fee history and the
+    /// mempool estimate. The closed-loop controller keeps its learned level
+    /// unless one of ITS inputs (gains, target, class costs, the fee bounds)
+    /// changed -- then it restarts from its anchor, exactly as at boot, since
+    /// a level learned under other bounds means nothing under the new ones.
+    /// Returns true when the controller was restarted.
+    bool set_config(const FeeConfig& cfg);
+
     // -- Fee recording ------------------------------------------------------
 
     /// Record a fee payment (after an offer is posted or cancelled).

@@ -91,6 +91,11 @@ public:
     /// Read-only access to the config.
     const KappaCalibratorConfig& config() const noexcept;
 
+    /// [LIVECFG] A saved strategy.kappa. Replaces the fallback used while
+    /// there is too little fill data; a kappa already FITTED from fills is
+    /// kept, because it is the data's answer, not the default's.
+    void set_default_kappa(double kappa) noexcept;
+
 private:
     /// Map a half-spread (bps) to a bucket index (clamped).
     std::size_t bucket_index(double half_spread_bps) const noexcept;
