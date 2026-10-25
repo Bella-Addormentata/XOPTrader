@@ -2525,6 +2525,9 @@ def test_an_unobservable_retired_attempt_is_presumed_gone_after_the_grace(monkey
     store.update_job(job.id, state_patch={
         "funding_tx_id_prior_retired_at": {k1: now - 7 * 3600.0}})
     assert engine._prior_sends_settled(store.get_active_job())[0]
+    # [review] ...and it is on the presumed-gone record, so Sweep stays
+    # available on the closed job should it land after all.
+    assert k1 in store.get_job(job.id).state["funding_tx_id_prior_presumed"]
 
 
 def test_the_current_attempt_never_settles_by_time_alone():
@@ -3287,3 +3290,30 @@ def test_a_third_party_claim_closes_as_completed_under_sweep_and_abandon(monkeyp
         assert out["status"] == JobStatus.COMPLETED, action
         note = store.get_events(job.id, limit=5000)[-1].message
         assert "third party" in note and "never claimed" not in note, note
+
+
+def test_abandon_judges_completion_once(monkeypatch):
+    """[review] The record and the closing status come from ONE lookup: a
+    second lookup that times out must not write CANCELLED over a claim the
+    record calls completed."""
+    store = new_store()
+    engine, ctx = build(store)
+    job = seed(store, JobStatus.FAILED,
+               columns={"bridge_nonce": "cd" * 32, "post_tip_mojos": 4985,
+                        "receiver_ph": "ab" * 32},
+               state={"failed_from": JobStatus.CLAIMING, "final_cat_coin_id": "f2" * 32})
+    calls = []
+    real = ctx.coinset.get_coin_record_by_name
+
+    def flaky(name):
+        calls.append(name)
+        if len(calls) > 1:
+            raise RuntimeError("coinset timed out")
+        return _rec(spent=False)
+
+    ctx.coinset.get_coin_record_by_name = flaky
+    out = engine.job_action(job.id, "abandon")
+    assert out["status"] == JobStatus.COMPLETED
+    note = store.get_events(job.id, limit=5000)[-1].message
+    assert "the claim completed" in note
+    assert len(calls) == 1, "one lookup, reused"

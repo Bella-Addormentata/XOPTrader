@@ -2998,9 +2998,11 @@ class WarpEngine:
                                    f"{found_id[:16]}...; its coins are being read")
                 if not ident or not ident[1]:
                     if tx_id != current:
-                        # [review] Retired and unobservable: the grace clock.
+                        # [review] Retired and unobservable: the grace clock,
+                        # and the presumed-gone record Sweep access relies on.
                         gone, note = self._unobservable_settled(job, tx_key, tx_id)
                         if gone:
+                            self._mark_attempts_dead(job, tx_key, [tx_id], presumed=True)
                             continue
                         return False, note
                     return False, ("a send the wallet never named, whose coins are "
@@ -5520,14 +5522,19 @@ class WarpEngine:
         # not be ruled out; the record must say so, not that the message
         # was never claimed.
         unsettled = self._unsettled_attempts_note(job)
-        if job.state.get("delivered_by"):
+        # [review] Completion is judged ONCE and reused for the record and the
+        # closing status: two lookups could disagree (the second timing out)
+        # and write CANCELLED over a claim the record calls completed.
+        delivered = bool(job.state.get("delivered_by"))
+        claim_done = bool(job.bridge_nonce) and self._claim_completed(job)
+        if delivered:
             detail = (f"the unwrap was delivered ({job.state['delivered_by']}); "
                       f"closed by the operator{unsettled}")
         elif job.bridge_nonce and job.state.get("third_party_claim"):
             detail = (f"a third party's claim paid the attested receiver (message "
                       f"nonce {job.bridge_nonce} is consumed); closed by the "
                       f"operator{unsettled}")
-        elif job.bridge_nonce and self._claim_completed(job):
+        elif claim_done:
             detail = (f"the claim completed (final CAT coin "
                       f"{job.state.get('final_cat_coin_id')}); closed by the "
                       f"operator{unsettled}")
@@ -5559,8 +5566,7 @@ class WarpEngine:
         # [review] A delivered unwrap or a landed claim is a completed bridge:
         # closed as COMPLETED (the engine's accounting books the inbound mint
         # from that event), with the abandonment on the record.
-        done = bool(job.state.get("delivered_by")) or (
-            bool(job.bridge_nonce) and self._claim_completed(job))
+        done = delivered or claim_done
         self._store.update_job(
             job.id,
             status=JobStatus.COMPLETED if done else JobStatus.CANCELLED,
