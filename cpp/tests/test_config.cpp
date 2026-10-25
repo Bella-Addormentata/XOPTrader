@@ -36,8 +36,9 @@
 // as the GUI anchors warp.jobs_db.
 static std::string anchored(const std::string& config_path, const char* rel)
 {
-    return (std::filesystem::path(config_path).parent_path() / rel)
-        .lexically_normal().string();
+    const auto base = std::filesystem::path(config_path).parent_path();
+    if (base.empty()) return rel;          // a bare file name: CWD-relative stays as given
+    return (base / rel).lexically_normal().string();
 }
 
 namespace {
@@ -273,6 +274,35 @@ warp:
     TempYaml tmp(yaml.c_str());
     auto cfg = xop::load_config(tmp.path());
     EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, anchored(tmp.path(), "elsewhere/jobs.db"));
+}
+
+TEST(ConfigParserTest, BridgeJobsDbPath_AnchorsAtTheConfigDirectory) {
+    // [review] The GUI anchors a relative warp.jobs_db at the config file's
+    // directory; the engine must open the same file from any CWD.
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path("test_config_anchor_dir");
+    fs::create_directories(dir);
+    const fs::path file = dir / "config.yaml";
+    {
+        std::ofstream ofs(file.string());
+        ofs << kMinimalValidYaml << R"(
+warp:
+  enabled: false
+  jobs_db: custom/jobs.db
+)";
+    }
+    auto cfg = xop::load_config(file.string());
+    fs::remove_all(dir);
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path,
+              (dir / "custom/jobs.db").lexically_normal().string());
+    // An absolute path is left alone.
+    const fs::path abs_db = fs::absolute(fs::path("abs_jobs.db"));
+    std::string yaml = std::string(kMinimalValidYaml)
+                       + "\nwarp:\n  enabled: false\n  jobs_db: "
+                       + abs_db.generic_string() + "\n";
+    TempYaml tmp(yaml.c_str());
+    EXPECT_EQ(xop::load_config(tmp.path()).accounting.bridge_jobs_db_path,
+              abs_db.generic_string());
 }
 
 TEST(ConfigParserTest, WarpEnabledIsReadForTheGuard) {
