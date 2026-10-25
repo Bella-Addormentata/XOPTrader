@@ -2122,3 +2122,64 @@ def test_the_third_party_checkpoint_survives_a_failing_settlement_check(monkeypa
     out = engine.step()                                      # resumes from the checkpoint
     assert out["status"] == JobStatus.CLAIMING
     assert "could still land" in _last_message(store, job.id)
+
+
+# --------------------------------------------------------------------------- #
+# Review round 22.
+# --------------------------------------------------------------------------- #
+
+def test_only_the_daemons_own_not_found_reads_as_absence():
+    """[review] A transport 404 is not the daemon saying "gone"."""
+    from gui.services.warp.wallet import WalletClient, WalletError
+
+    client = WalletClient.__new__(WalletClient)
+    answers = {}
+    client._post = lambda endpoint, body: (_ for _ in ()).throw(answers["exc"])
+    answers["exc"] = WalletError("get_transaction failed: Transaction 0xab not found")
+    assert client.get_transaction_or_none("ab" * 32) is None
+    answers["exc"] = WalletError("get_transaction request failed: HTTP 404 Not Found")
+    with pytest.raises(WalletError):
+        client.get_transaction_or_none("ab" * 32)
+    answers["exc"] = WalletError("get_transaction request failed: timed out")
+    with pytest.raises(WalletError):
+        client.get_transaction_or_none("ab" * 32)
+
+
+def test_the_history_lookup_for_provenance_selects_the_configured_key_first():
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _to_burn_sent(store, engine)
+    burn_ph = store.get_active_job().state["burn_cat_ph"]
+    store.update_job(job.id, state_patch={
+        "burn_tx_id": "burn-b", "burn_tx_id_removals": None,
+        "burn_cat_coin_id": None, "burn_tx_id_prior": ["burn-a"],
+        "burn_tx_id_prior_removals": {"burn-a": [RID]},
+        "burn_tx_id_prior_dead": ["burn-a"]})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.by_ph = [SimpleNamespace(
+        coin=SimpleNamespace(parent_coin_info="dd" * 32, puzzle_hash=burn_ph,
+                             amount=AMOUNT),
+        spent=False, confirmed_block_index=PEAK - 2, spent_block_index=0)]
+    ctx.wallet.cat_txs = [{"name": "burn-b", "additions": [
+        {"puzzle_hash": burn_ph, "amount": AMOUNT, "parent_coin_info": "dd" * 32}]}]
+    order = []
+    real_login, real_txs = ctx.wallet.log_in, ctx.wallet.get_transactions
+    ctx.wallet.log_in = lambda: order.append("log_in") or real_login()
+    ctx.wallet.get_transactions = lambda *a, **k: order.append("history") or real_txs(*a, **k)
+    out = engine.step()
+    assert out["status"] == JobStatus.BURNING
+    assert order.index("log_in") < order.index("history")
+
+
+def test_delivery_is_recorded_before_the_fallible_settlement_lookups(monkeypatch):
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    monkeypatch.setattr(engine, "_prior_sends_settled",
+                        lambda j, *a, **k: (_ for _ in ()).throw(RuntimeError("wallet down")))
+    with pytest.raises(RuntimeError):
+        engine._unwrap_delivered(job, by="our relay", tx_hash="0x" + "77" * 32)
+    after = store.get_job(job.id)
+    assert after.state["delivered_by"] == "our relay"
+    assert after.bridge_tx_hash == "0x" + "77" * 32

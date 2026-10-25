@@ -14,6 +14,7 @@ private self-signed CA).
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Optional
 
 # (url, json_body) -> parsed JSON dict.
@@ -245,7 +246,16 @@ class WalletClient:
             data = self._post(
                 "get_transaction", {"transaction_id": str(transaction_id)})
         except WalletError as exc:
-            if "not found" in str(exc).lower():
+            # [review] Only the DAEMON's own answer means "gone": its
+            # success=false form is "<endpoint> failed: <error>".  A transport
+            # failure ("<endpoint> request failed: HTTP 404 Not Found", a
+            # timeout) is re-raised -- an unanswered lookup is not absence,
+            # and reading it as one would let Retry replace a send whose
+            # record was never checked.
+            text = str(exc)
+            low = text.lower()
+            if (re.match(r"^\S+ failed: ", text) and "not found" in low
+                    and "request failed" not in low):
                 return None
             raise
         tx = data.get("transaction")

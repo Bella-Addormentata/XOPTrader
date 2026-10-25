@@ -3519,8 +3519,12 @@ class WarpEngine:
             known_ids: set = set()
             if attempted and not job.state.get("burn_tx_id_removals"):
                 # The current attempt's inputs are unknown: the wallet
-                # history is the only way to name its output.
+                # history is the only way to name its output.  [review] The
+                # configured fingerprint first: another client may have
+                # switched the daemon's key, and another wallet's same-amount
+                # burn must not read as ours.
                 try:
+                    self._wallet.log_in()
                     found = self._find_existing_burn(
                         int(job.state["cat_wallet_id"]), burn_cat_ph, amount)
                 except Exception:  # noqa: BLE001 -- then nothing is adopted here
@@ -4129,9 +4133,18 @@ class WarpEngine:
             # landed is swept here first.
             from . import claim
 
+            columns = {"bridge_tx_hash": tx_hash} if tx_hash else None
+            # [review] Delivery is on disk BEFORE the fallible lookups below:
+            # were they to keep failing until the state's deadline, Retry
+            # would otherwise clear the mined relay and prepare another,
+            # which can only revert "!nonce".
+            if (job.state.get("delivered_by") != by
+                    or (tx_hash and job.bridge_tx_hash != tx_hash)):
+                self._store.update_job(job.id, expected_status=job.status,
+                                       columns=columns,
+                                       state_patch={"delivered_by": by})
             settled, note = self._prior_sends_settled(job)
             if not settled:
-                columns = {"bridge_tx_hash": tx_hash} if tx_hash else None
                 sk = self._load_ephemeral_sk(job)
                 extra = claim.find_security_coin(
                     self._coinset, sk, int(self._funded_amount(job)))
