@@ -2596,9 +2596,16 @@ class WarpEngine:
             found_id = found[0] if isinstance(found, tuple) else found
             if found_id:
                 # The coins it spent are re-learned from the record itself.
+                adopted = {tx_key: str(found_id), polls_key: 0, removals_key: None}
+                # [review] The burn scan also names the output coin: pinned,
+                # as the dedupe branch pins it, so a later unpinned scan
+                # cannot adopt an unrelated CAT of the same receiver and
+                # amount in its place.
+                if (isinstance(found, tuple) and len(found) > 1 and found[1]
+                        and also_clear):
+                    adopted[also_clear[0]] = str(found[1])
                 return _stay(
-                    state={tx_key: str(found_id), polls_key: 0,
-                           removals_key: None},
+                    state=adopted,
                     message=(f"{label} identified as {found_id} in the wallet "
                              "history; awaiting the coin"),
                 ), {}
@@ -4260,6 +4267,13 @@ class WarpEngine:
         # have reached a node, and a later definitive rejection must not
         # reprice over a bundle that could be pending there.  Only a push
         # that no earlier submission precedes may release the pin.
+        # [review] The destination is resolved first: its wallet lookup can
+        # fail without any bundle going out, and that must not read as a
+        # possible broadcast (it would keep a rejected fee pinned for good).
+        try:
+            destination_ph = self._sweep_destination_ph()
+        except Exception as exc:  # noqa: BLE001 -- nothing was submitted
+            return False, f"sweep failed: {exc}"
         prior_push = pushed.get(cid)
         if not prior_push:
             pushed[cid] = "uncertain"
@@ -4274,7 +4288,7 @@ class WarpEngine:
                 self._coinset,
                 self._net,
                 security_coin=coin,
-                destination_puzzle_hash=self._sweep_destination_ph(),
+                destination_puzzle_hash=destination_ph,
                 ephemeral_sk=sk,
                 sweep_fee=int(fee),
             )

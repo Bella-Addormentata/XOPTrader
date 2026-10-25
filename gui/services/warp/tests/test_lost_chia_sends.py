@@ -1849,3 +1849,57 @@ def test_an_uncertain_sweep_push_keeps_its_fee_pin_through_a_later_rejection(
     outcome["error"] = None
     engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5a" * 32), b"\x01" * 32)
     assert store.get_job(job.id).state["sweep_pushed_by_coin"] == {COIN: True}
+
+
+# --------------------------------------------------------------------------- #
+# Review round 15.
+# --------------------------------------------------------------------------- #
+
+def test_a_failed_destination_lookup_records_no_sweep_submission(monkeypatch):
+    """[review] No bundle went out, so a later fee rejection may still
+    release the pin and reprice."""
+    from gui.services.warp.coinset import CoinsetError
+
+    fees = []
+
+    def push(coinset, net, *, security_coin, destination_puzzle_hash,
+             ephemeral_sk, sweep_fee=0):
+        fees.append(sweep_fee)
+        raise CoinsetError("push_tx failed: [INVALID_FEE_LOW_FEE] Failed to include")
+
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep", push)
+    store = new_store()
+    engine, ctx = build(store, params=default_params(offer_fee_mojos=10_000_000))
+    job = _seed_funding(store, funding_amount=EXPECTED)
+    real = engine._sweep_destination_ph
+    monkeypatch.setattr(engine, "_sweep_destination_ph",
+                        lambda: (_ for _ in ()).throw(RuntimeError("wallet down")))
+    resolved, status = engine._sweep_security(job, FakeCoin(b"\x5a" * 32), b"\x01" * 32)
+    assert not resolved and "wallet down" in status and fees == []
+    st = store.get_job(job.id).state
+    assert not (st.get("sweep_pushed_by_coin") or {})
+    monkeypatch.setattr(engine, "_sweep_destination_ph", real)
+    resolved, status = engine._sweep_security(store.get_job(job.id),
+                                              FakeCoin(b"\x5a" * 32), b"\x01" * 32)
+    assert "repriced" in status
+    assert store.get_job(job.id).state["sweep_fee_by_coin"] == {}
+
+
+def test_an_unnamed_cat_spend_found_in_history_keeps_its_output_pin():
+    """[review] The history scan names the burn CAT too; pinned, a later
+    scan cannot adopt an unrelated CAT of the same receiver and amount."""
+    from gui.services.warp import clvm_utils as cu
+
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _to_burn_sent(store, engine)
+    burn_ph = store.get_active_job().state["burn_cat_ph"]
+    store.update_job(job.id, state_patch={"burn_tx_id": S._FUNDING_TX_UNKNOWN})
+    ctx.wallet.cat_txs = [{"name": "hist-burn", "additions": [
+        {"puzzle_hash": burn_ph, "amount": AMOUNT, "parent_coin_info": RID}]}]
+    engine.step()
+    st = store.get_active_job().state
+    assert st["burn_tx_id"] == "hist-burn"
+    assert st["burn_cat_coin_id"] == cu.coin_name(
+        bytes.fromhex(RID), bytes.fromhex(burn_ph), AMOUNT).hex()
+    assert ctx.wallet.cat_spends == []
