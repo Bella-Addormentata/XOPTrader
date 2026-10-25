@@ -2252,6 +2252,29 @@ class WarpEngine:
             return None
         return self._record_spent_depth(rec)
 
+    @staticmethod
+    def _unnamed(tx_id: str) -> bool:
+        """Whether *tx_id* is a send the daemon accepted but never named:
+        the live sentinel, or a retired attempt's ``<sentinel>#n`` key."""
+        return str(tx_id or "").startswith(_FUNDING_TX_UNKNOWN)
+
+    def _unnamed_attempt_key(self, job: WarpJob, tx_key: str) -> str:
+        """A distinct key for the unnamed attempt being retired, so each
+        is settled on its own evidence ([review]: merged under one key, one
+        attempt's dead input would have settled them all)."""
+        priors = [t for t in (job.state.get(f"{tx_key}_prior") or []) if t]
+        n = 1 + sum(1 for t in priors if self._unnamed(t))
+        return f"{_FUNDING_TX_UNKNOWN}#{n}"
+
+    def _unnamed_group_dead(self, coins: Sequence[str], min_depth: int) -> bool:
+        """A legacy entry that merged several unnamed attempts' coins under
+        the bare sentinel is dead only when EVERY coin is spent at depth."""
+        for cid in coins:
+            depth = self._coin_spent_depth(cid)
+            if depth is None or depth < int(min_depth):
+                return False
+        return True
+
     def _record_spent_depth(self, rec: Any) -> Optional[int]:
         """Confirmations of a coin record's spend: 0 when unspent, None when
         the peak or the spend height is unknown."""
@@ -2362,12 +2385,12 @@ class WarpEngine:
             # [review] The current attempt too: a replaced send that landed
             # first and was swept must not close the job over it.
             attempts.append(current)
-            if current != _FUNDING_TX_UNKNOWN:
-                prior_removals.setdefault(
-                    current, list(st.get(f"{tx_key}_removals") or []))
+            # [review] The current attempt's OWN coins, named or not.
+            prior_removals.setdefault(
+                current, list(st.get(f"{tx_key}_removals") or []))
         min_depth = int(self._net.chia_confirmation_min_height)
         for tx_id in attempts:
-            if tx_id == _FUNDING_TX_UNKNOWN and not prior_removals.get(tx_id):
+            if self._unnamed(tx_id) and not prior_removals.get(tx_id):
                 # [review] With its coins recorded it is judged like any
                 # other attempt (dead once they are spent elsewhere, landed
                 # by its output's parent); without them nothing can rule it
@@ -2389,6 +2412,11 @@ class WarpEngine:
             )
             verdict, why = cs.judge(ev)
             if verdict is cs.Verdict.DEAD:
+                if (tx_id == _FUNDING_TX_UNKNOWN and len(ev.removals) > 1
+                        and not self._unnamed_group_dead(ev.removals, min_depth)):
+                    return False, ("unnamed funding sends share one record; not "
+                                   "every coin of theirs is spent yet; Sweep "
+                                   "again later")
                 continue
             # [review] Landed ON CHAIN (its own output exists and, by the
             # check above, is spent -- at depth, or the recovery could yet be
@@ -2434,7 +2462,7 @@ class WarpEngine:
         prior_removals = st.get("burn_tx_id_prior_removals") or {}
         min_depth = int(self._net.chia_confirmation_min_height)
         for tx_id in priors:
-            if tx_id == _FUNDING_TX_UNKNOWN and not prior_removals.get(tx_id):
+            if self._unnamed(tx_id) and not prior_removals.get(tx_id):
                 return False, ("an earlier cat_spend the wallet never named, "
                                "whose coins are not known, cannot be ruled out")
             ev = cs.gather(
@@ -2447,6 +2475,10 @@ class WarpEngine:
             )
             verdict, why = cs.judge(ev)
             if verdict is cs.Verdict.DEAD:
+                if (tx_id == _FUNDING_TX_UNKNOWN and len(ev.removals) > 1
+                        and not self._unnamed_group_dead(ev.removals, min_depth)):
+                    return False, ("unnamed cat_spends share one record; not "
+                                   "every coin of theirs is spent yet")
                 continue
             if verdict is cs.Verdict.LANDED and ev.output_landed:
                 deep, depth_why = self._outputs_settled(
@@ -2533,6 +2565,27 @@ class WarpEngine:
                              "history; awaiting the coin"),
                 ), {}
             polls += 1
+            recorded = [c for c in (st.get(removals_key) or []) if c]
+            if recorded:
+                # [review] The daemon listed the coins it spent: the chain
+                # can still prove the send dead (a coin spent elsewhere at
+                # depth, no output of ours), and then it is sent again under
+                # its own retired key; anything short of that waits.
+                verdict, why, ev = self._recorded_send_verdict(
+                    job, tx_key=tx_key, out_ph_hex=out_ph_hex,
+                    out_amount=out_amount, unique_output=unique_output)
+                if verdict is cs.Verdict.DEAD:
+                    _log.warning("warp job %s: unnamed %s is dead (%s); sending again",
+                                 job.id, label, why)
+                    return None, self._replacement_patch(
+                        job, tx_key=tx_key,
+                        tx_id=self._unnamed_attempt_key(job, tx_key),
+                        removals=recorded, also_clear=also_clear)
+                return _stay(
+                    state={polls_key: polls},
+                    message=(f"{label} unnamed by the wallet and absent from its "
+                             f"history (poll {polls}): {why}; waiting"),
+                ), {}
             hint = (("its coins are unknown, so it can never be proven dead; "
                      "Abandon closes the job if it never lands")
                     if tx_key == "burn_tx_id"
@@ -2749,17 +2802,31 @@ class WarpEngine:
             self._wallet.log_in()
             found = scan(priors)
             found_id = found[0] if isinstance(found, tuple) else found
-            if found_id or burn:
+            if found_id:
                 return {}
             # [review] The daemon may have named no transaction yet listed
-            # the coins it spent; those are the replacement's exclusions and
-            # the attempt's handle for Sweep's accounting.  Every unnamed
-            # attempt shares the sentinel key, so their coins accumulate.
-            recorded = list(job.state.get(f"{tx_key}_removals") or [])
-            earlier = (job.state.get(f"{tx_key}_prior_removals") or {}).get(tx_id) or []
-            removals = sorted({_hx(c) for c in [*earlier, *recorded] if c})
+            # the coins it spent: they are the replacement's exclusions and
+            # the attempt's own handle for the settlement accounting, kept
+            # under a key of its own.  With them the send is judged like a
+            # named one (a cat_spend still only replaced when dead); without
+            # them only an XCH funding send may be sent again.
+            recorded = sorted({_hx(c) for c in (job.state.get(f"{tx_key}_removals") or []) if c})
+            key = self._unnamed_attempt_key(job, tx_key)
+            if recorded:
+                verdict, _why, ev = self._recorded_send_verdict(
+                    job, tx_key=tx_key, out_ph_hex=out_ph, out_amount=out_amount,
+                    unique_output=unique)
+                allowed = ((cs.Verdict.DEAD,) if burn
+                           else (cs.Verdict.DEAD, cs.Verdict.ORPHAN))
+                if verdict in allowed:
+                    return self._replacement_patch(
+                        job, tx_key=tx_key, tx_id=key, removals=recorded,
+                        also_clear=also_clear)
+                return {}
+            if burn:
+                return {}
             return self._replacement_patch(
-                job, tx_key=tx_key, tx_id=tx_id, removals=removals,
+                job, tx_key=tx_key, tx_id=key, removals=[],
                 also_clear=also_clear)
         verdict, _why, ev = self._recorded_send_verdict(
             job, tx_key=tx_key, out_ph_hex=out_ph, out_amount=out_amount,

@@ -234,7 +234,7 @@ def test_an_unnamed_send_the_history_never_shows_waits_for_retry(monkeypatch):
     assert len(ctx.wallet.sent) == 1
     st = store.get_active_job().state
     assert st["funding_tx_id"] == "funding-tx-1"
-    assert st["funding_tx_id_prior"] == [S._FUNDING_TX_UNKNOWN]
+    assert st["funding_tx_id_prior"] == [S._FUNDING_TX_UNKNOWN + "#1"]
 
 
 def test_an_unanswered_probe_changes_nothing(monkeypatch):
@@ -1572,6 +1572,7 @@ def test_retry_keeps_the_coins_an_unnamed_send_spent(monkeypatch):
     engine, ctx = build(store)
     job = _seed_funding(store, funding_tx_id=S._FUNDING_TX_UNKNOWN,
                         funding_amount=EXPECTED, funding_tx_id_removals=[RID])
+    ctx.coinset.records[RID] = _rec(spent=False)             # an orphan, by its coins
     store.update_job(job.id, status=JobStatus.FAILED,
                      expected_status=JobStatus.FUNDING_CLAIM,
                      state_patch={"failed_from": JobStatus.FUNDING_CLAIM})
@@ -1579,20 +1580,25 @@ def test_retry_keeps_the_coins_an_unnamed_send_spent(monkeypatch):
     st = store.get_job(job.id).state
     assert st["funding_tx_id"] is None
     assert st["funding_tx_id_exclude"] == [RID]
-    assert st["funding_tx_id_prior_removals"] == {S._FUNDING_TX_UNKNOWN: [RID]}
+    k1, k2 = S._FUNDING_TX_UNKNOWN + "#1", S._FUNDING_TX_UNKNOWN + "#2"
+    assert st["funding_tx_id_prior"] == [k1]
+    assert st["funding_tx_id_prior_removals"] == {k1: [RID]}
 
     engine.step()                                            # the replacement
     assert ctx.wallet.sent_excludes[-1] == [RID]
     job = store.get_active_job()
-    # A second unnamed attempt adds its coins to the same sentinel entry.
+    # [review] A second unnamed attempt is retired under its OWN key, so
+    # each is settled on its own evidence; only the exclusions are pooled.
     store.update_job(job.id, state_patch={"funding_tx_id": S._FUNDING_TX_UNKNOWN,
                                           "funding_tx_id_removals": [RID2]})
+    ctx.coinset.records[RID2] = _rec(spent=False)
     store.update_job(job.id, status=JobStatus.FAILED,
                      expected_status=JobStatus.FUNDING_CLAIM,
                      state_patch={"failed_from": JobStatus.FUNDING_CLAIM})
     engine.job_action(job.id, "retry")
     st = store.get_job(job.id).state
-    assert st["funding_tx_id_prior_removals"] == {S._FUNDING_TX_UNKNOWN: sorted([RID, RID2])}
+    assert st["funding_tx_id_prior"] == [k1, k2]
+    assert st["funding_tx_id_prior_removals"] == {k1: [RID], k2: [RID2]}
     assert st["funding_tx_id_exclude"] == sorted([RID, RID2])
 
 
@@ -1611,3 +1617,101 @@ def test_an_unnamed_attempt_with_known_coins_is_judged_for_settlement():
     store.update_job(job.id, state_patch={"funding_tx_id_prior_removals": None})
     settled, note = engine._prior_sends_settled(store.get_active_job())
     assert not settled and "not known" in note
+
+
+# --------------------------------------------------------------------------- #
+# Review round 12.
+# --------------------------------------------------------------------------- #
+
+def test_unnamed_attempts_settle_independently():
+    """[review] One attempt's dead input must not settle another that could
+    still land; a legacy entry that merged several is dead only when every
+    coin is spent at depth."""
+    k1, k2 = S._FUNDING_TX_UNKNOWN + "#1", S._FUNDING_TX_UNKNOWN + "#2"
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": [k1, k2],
+        "funding_tx_id_prior_removals": {k1: [RID], k2: [RID2]}})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID] = _rec(spent=True)              # #1 dead
+    ctx.coinset.records[RID2] = _rec(spent=False)            # #2 could land
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "could still land" in note
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    assert engine._prior_sends_settled(store.get_active_job())[0]
+
+    # A merged legacy entry: conservative.
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": [S._FUNDING_TX_UNKNOWN],
+        "funding_tx_id_prior_removals": {S._FUNDING_TX_UNKNOWN: [RID, RID2]}})
+    ctx.coinset.records[RID2] = _rec(spent=False)
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "share one record" in note
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    assert engine._prior_sends_settled(store.get_active_job())[0]
+
+
+def test_the_current_unnamed_attempt_is_judged_by_its_own_coins():
+    k1 = S._FUNDING_TX_UNKNOWN + "#1"
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id": S._FUNDING_TX_UNKNOWN, "funding_tx_id_removals": [RID2],
+        "funding_tx_id_prior": [k1], "funding_tx_id_prior_removals": {k1: [RID]}})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.records[RID2] = _rec(spent=False)            # current could land
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "could still land" in note
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    assert engine._prior_sends_settled(store.get_active_job())[0]
+
+
+def test_an_unnamed_cat_spend_whose_coins_went_elsewhere_is_sent_again():
+    """[review] A history miss is not the end: the recorded coins, spent
+    elsewhere at depth with no burn CAT of its own, prove it dead."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _to_burn_sent(store, engine)
+    store.update_job(job.id, state_patch={"burn_tx_id": S._FUNDING_TX_UNKNOWN,
+                                          "burn_tx_id_removals": [RID]})
+    ctx.coinset.records[RID] = _rec(spent=False)
+    engine.step()
+    assert ctx.wallet.cat_spends == []
+    assert "waiting" in _last_message(store, job.id)
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = PEAK
+    engine.step()
+    assert len(ctx.wallet.cat_spends) == 1
+    assert ctx.wallet.cat_spend_excludes == [[RID]]
+    st = store.get_active_job().state
+    assert st["burn_tx_id"] == "burn-tx-1"
+    assert st["burn_tx_id_prior"] == [S._FUNDING_TX_UNKNOWN + "#1"]
+    assert st["burn_tx_id_prior_removals"] == {S._FUNDING_TX_UNKNOWN + "#1": [RID]}
+
+
+def test_retry_replaces_an_unnamed_cat_spend_only_when_dead():
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _to_burn_sent(store, engine)
+    store.update_job(job.id, state_patch={"burn_tx_id": S._FUNDING_TX_UNKNOWN,
+                                          "burn_tx_id_removals": [RID]})
+    ctx.coinset.records[RID] = _rec(spent=False)
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     expected_status=JobStatus.BURN_SENT,
+                     state_patch={"failed_from": JobStatus.BURN_SENT})
+    engine.job_action(job.id, "retry")
+    assert store.get_job(job.id).state["burn_tx_id"] == S._FUNDING_TX_UNKNOWN
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = PEAK
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     expected_status=JobStatus.BURN_SENT,
+                     state_patch={"failed_from": JobStatus.BURN_SENT})
+    engine.job_action(job.id, "retry")
+    st = store.get_job(job.id).state
+    assert st["burn_tx_id"] is None
+    assert st["burn_tx_id_exclude"] == [RID]
+    assert st["burn_tx_id_prior"] == [S._FUNDING_TX_UNKNOWN + "#1"]
