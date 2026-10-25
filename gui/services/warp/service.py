@@ -4657,10 +4657,27 @@ class WarpEngine:
         # [review] The destination is resolved first: its wallet lookup can
         # fail without any bundle going out, and that must not read as a
         # possible broadcast (it would keep a rejected fee pinned for good).
-        try:
-            destination_ph = self._sweep_destination_ph()
-        except Exception as exc:  # noqa: BLE001 -- nothing was submitted
-            return False, f"sweep failed: {exc}"
+        # And PERSISTED per coin before the first push: the bundle is a
+        # function of (coin, destination, fee), so a destination re-resolved
+        # after an engine rebuild (the wallet's receive address may have
+        # advanced) would make a DIFFERENT bundle that conflicts with the
+        # pending one instead of replaying it.
+        dests = dict(job.state.get("sweep_destination_by_coin") or {})
+        dest_hex = dests.get(cid)
+        if isinstance(dest_hex, str) and len(dest_hex) == 64:
+            destination_ph = bytes.fromhex(dest_hex)
+        else:
+            try:
+                destination_ph = self._sweep_destination_ph()
+            except Exception as exc:  # noqa: BLE001 -- nothing was submitted
+                return False, f"sweep failed: {exc}"
+            dests[cid] = _hx(destination_ph)
+            try:
+                self._store.update_job(job.id, expected_status=job.status,
+                                       state_patch={"sweep_destination_by_coin": dests})
+            except Exception as patch_exc:  # noqa: BLE001 -- then no push
+                return False, (f"could not record the sweep destination "
+                               f"({patch_exc}); not swept")
         prior_push = pushed.get(cid)
         if not prior_push:
             pushed[cid] = "uncertain"

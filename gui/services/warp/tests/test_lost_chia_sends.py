@@ -2634,3 +2634,35 @@ def test_the_worker_follows_a_config_switch(tmp_path):
     assert closed == [1] and worker._engine is None
     worker.set_secrets_path(tmp_path / "two" / "secrets.yaml")   # unchanged: no-op
     assert closed == [1]
+
+
+def test_the_sweep_destination_is_pinned_per_coin_across_rebuilds(monkeypatch):
+    """[review] The bundle is (coin, destination, fee): a destination
+    re-resolved after a rebuild would make a conflicting twin, so the first
+    one is persisted and reused."""
+    from gui.services.warp import clvm_utils as cu
+
+    seen = []
+
+    def push(coinset, net, *, security_coin, destination_puzzle_hash,
+             ephemeral_sk, sweep_fee=0):
+        seen.append(bytes(destination_puzzle_hash).hex())
+        return ("accepted", "ok")
+
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep", push)
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: False)
+    store = new_store()
+    engine, ctx = build(store, params=default_params(offer_fee_mojos=10_000_000))
+    job = _seed_funding(store, funding_amount=EXPECTED)
+    engine._sweep_security(job, FakeCoin(b"\x5a" * 32), b"\x01" * 32)
+    first = seen[-1]
+    assert store.get_job(job.id).state["sweep_destination_by_coin"] == {COIN: first}
+
+    # A rebuilt engine whose wallet now hands out a later receive address...
+    engine._sweep_dest_cache = None
+    ctx.wallet.next_address = cu.encode_puzzle_hash(b"\x66" * 32, NET.chia_prefix)
+    engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5a" * 32), b"\x01" * 32)
+    assert seen[-1] == first, "...replays the SAME bundle, not a conflicting twin"
+    # ...while another coin of the same job gets its own destination.
+    engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5c" * 32), b"\x01" * 32)
+    assert seen[-1] == (b"\x66" * 32).hex()
