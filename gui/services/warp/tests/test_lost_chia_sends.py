@@ -1787,3 +1787,65 @@ def test_a_dead_replacement_is_not_read_as_landed_by_a_swept_priors_coin(monkeyp
     st = store.get_active_job().state
     assert st["funding_tx_id"] == "funding-tx-1"
     assert st["funding_tx_id_prior"] == ["fund-a", "fund-b"]
+
+
+# --------------------------------------------------------------------------- #
+# Review round 14.
+# --------------------------------------------------------------------------- #
+
+def test_a_current_multi_input_unnamed_send_is_not_a_legacy_group():
+    """[review] One unnamed send that spent two coins is dead once either is
+    spent elsewhere at depth with no output; only a legacy entry that merged
+    several attempts needs every coin spent."""
+    k1 = S._FUNDING_TX_UNKNOWN + "#1"
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id": S._FUNDING_TX_UNKNOWN,
+        "funding_tx_id_removals": [RID, RID2],
+        "funding_tx_id_prior": [k1],
+        "funding_tx_id_prior_removals": {k1: ["f" * 64]}})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records["f" * 64] = _rec(spent=True)
+    ctx.coinset.records[RID] = _rec(spent=True)              # one input gone elsewhere
+    ctx.coinset.records[RID2] = _rec(spent=False)            # the other still unspent
+    assert engine._prior_sends_settled(store.get_active_job())[0]
+
+
+def test_an_uncertain_sweep_push_keeps_its_fee_pin_through_a_later_rejection(
+        monkeypatch):
+    """[review] A timed-out push may have reached a node; a later fee
+    rejection must not reprice over the bundle it may still hold."""
+    from gui.services.warp.coinset import CoinsetError
+
+    fees = []
+    outcome = {"error": "push_tx request failed: timed out"}
+
+    def push(coinset, net, *, security_coin, destination_puzzle_hash,
+             ephemeral_sk, sweep_fee=0):
+        fees.append(sweep_fee)
+        if outcome["error"]:
+            raise CoinsetError(outcome["error"])
+        return ("accepted", "ok")
+
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep", push)
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: False)
+    store = new_store()
+    engine, ctx = build(store, params=default_params(offer_fee_mojos=10_000_000))
+    job = _seed_funding(store, funding_amount=EXPECTED)
+    resolved, status = engine._sweep_security(job, FakeCoin(b"\x5a" * 32), b"\x01" * 32)
+    assert not resolved and "timed out" in status
+    st = store.get_job(job.id).state
+    assert st["sweep_fee_by_coin"] == {COIN: 10_000_000}
+    assert st["sweep_pushed_by_coin"] == {COIN: "uncertain"}
+
+    outcome["error"] = "push_tx failed: [INVALID_FEE_LOW_FEE] Failed to include transaction"
+    ctx.coinset.fee_estimates = [50_000_000]
+    engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5a" * 32), b"\x01" * 32)
+    assert fees == [10_000_000, 10_000_000], "the same bundle, not a repriced twin"
+    assert store.get_job(job.id).state["sweep_fee_by_coin"] == {COIN: 10_000_000}
+
+    outcome["error"] = None
+    engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5a" * 32), b"\x01" * 32)
+    assert store.get_job(job.id).state["sweep_pushed_by_coin"] == {COIN: True}

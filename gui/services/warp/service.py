@@ -2258,6 +2258,17 @@ class WarpEngine:
         the live sentinel, or a retired attempt's ``<sentinel>#n`` key."""
         return str(tx_id or "").startswith(_FUNDING_TX_UNKNOWN)
 
+    def _send_probes(self, tx_id: str) -> tuple:
+        """``(wallet_record, mempool_item)`` probes for *tx_id*.  An unnamed
+        send has no transaction id to ask the hash-based RPCs about (their
+        error would read as "could not tell" forever): the wallet is known
+        to hold no record of that name and no mempool item carries it, so
+        its recorded coins decide."""
+        if self._unnamed(tx_id):
+            return (lambda: None), (lambda: None)
+        return ((lambda: self._wallet.get_transaction_or_none(tx_id)),
+                (lambda: self._coinset.get_mempool_item_by_tx_id(tx_id)))
+
     def _unnamed_attempt_key(self, job: WarpJob, tx_key: str) -> str:
         """A distinct key for the unnamed attempt being retired, so each
         is settled on its own evidence ([review]: merged under one key, one
@@ -2384,8 +2395,13 @@ class WarpEngine:
         if current:
             # [review] The current attempt too: a replaced send that landed
             # first and was swept must not close the job over it.
+            # [review] The current attempt's OWN coins, named or not -- an
+            # unnamed one under a key of its own, so the legacy merged-group
+            # rule (the bare sentinel) never reads one multi-input send as a
+            # group of attempts.
+            if current == _FUNDING_TX_UNKNOWN:
+                current = f"{_FUNDING_TX_UNKNOWN}#current"
             attempts.append(current)
-            # [review] The current attempt's OWN coins, named or not.
             prior_removals.setdefault(
                 current, list(st.get(f"{tx_key}_removals") or []))
         min_depth = int(self._net.chia_confirmation_min_height)
@@ -2402,9 +2418,10 @@ class WarpEngine:
             # so an output is THIS send's only when its parent is one of the
             # coins this send spent.  A send whose coins are unknown can
             # therefore never read as landed.
+            probe_wallet, probe_mempool = self._send_probes(tx_id)
             ev = cs.gather(
-                wallet_record=lambda t=tx_id: self._wallet.get_transaction_or_none(t),
-                mempool_item=lambda t=tx_id: self._coinset.get_mempool_item_by_tx_id(t),
+                wallet_record=probe_wallet,
+                mempool_item=probe_mempool,
                 coin_spent=self._coin_spent_depth,
                 outputs_at=lambda: outputs,
                 known_removals=prior_removals.get(tx_id) or [],
@@ -2470,9 +2487,10 @@ class WarpEngine:
             if self._unnamed(tx_id) and not prior_removals.get(tx_id):
                 return False, ("an earlier cat_spend the wallet never named, "
                                "whose coins are not known, cannot be ruled out")
+            probe_wallet, probe_mempool = self._send_probes(tx_id)
             ev = cs.gather(
-                wallet_record=lambda t=tx_id: self._wallet.get_transaction_or_none(t),
-                mempool_item=lambda t=tx_id: self._coinset.get_mempool_item_by_tx_id(t),
+                wallet_record=probe_wallet,
+                mempool_item=probe_mempool,
                 coin_spent=self._coin_spent_depth,
                 outputs_at=lambda: outputs,
                 known_removals=prior_removals.get(tx_id) or [],
@@ -2512,18 +2530,10 @@ class WarpEngine:
 
         self._wallet.log_in()
         tx_id = str(job.state.get(tx_key) or "")
-        if self._unnamed(tx_id):
-            # [review] The sentinel is not a transaction id: the hash-based
-            # RPCs would answer with an error, which gather reads as "could
-            # not tell" and the send would never leave UNKNOWN.  The wallet
-            # history scan (run by the caller) is its only wallet handle;
-            # here it is known to hold no record and to be in no mempool
-            # item of that name, and its recorded coins decide.
-            wallet_record = lambda: None  # noqa: E731
-            mempool_item = lambda: None  # noqa: E731
-        else:
-            wallet_record = lambda: self._wallet.get_transaction_or_none(tx_id)  # noqa: E731
-            mempool_item = lambda: self._coinset.get_mempool_item_by_tx_id(tx_id)  # noqa: E731
+        # [review] An unnamed send is never asked about over the hash RPCs
+        # (_send_probes); the history scan the caller ran is its only wallet
+        # handle, and its recorded coins decide.
+        wallet_record, mempool_item = self._send_probes(tx_id)
         if job.state.get(f"{tx_key}_prior"):
             # [review] Once a send was replaced the key holds other attempts'
             # coins too: a replaced send that landed and was swept must not
@@ -4246,6 +4256,19 @@ class WarpEngine:
             except Exception as exc:  # noqa: BLE001 -- the push still proceeds
                 _log.warning("warp job %s: could not record the sweep fee (%s)",
                              job.id, exc)
+        # [review] Recorded BEFORE the push: a push that times out may still
+        # have reached a node, and a later definitive rejection must not
+        # reprice over a bundle that could be pending there.  Only a push
+        # that no earlier submission precedes may release the pin.
+        prior_push = pushed.get(cid)
+        if not prior_push:
+            pushed[cid] = "uncertain"
+            try:
+                self._store.update_job(job.id, expected_status=job.status,
+                                       state_patch={"sweep_pushed_by_coin": pushed})
+            except Exception as patch_exc:  # noqa: BLE001 -- the push still proceeds
+                _log.warning("warp job %s: could not record the sweep push (%s)",
+                             job.id, patch_exc)
         try:
             kind, status = claim.build_and_push_sweep(
                 self._coinset,
@@ -4265,19 +4288,21 @@ class WarpEngine:
             fee_rejected = ("request failed" not in low and any(
                 t in low for t in ("invalid_fee", "fee_too_low", "low_fee",
                                    "fee too low")))
-            if fee_rejected and not pushed.get(cid):
+            if fee_rejected and not prior_push:
                 pins.pop(cid, None)
+                pushed.pop(cid, None)
                 try:
                     self._store.update_job(
                         job.id, expected_status=job.status,
-                        state_patch={"sweep_fee_by_coin": pins})
+                        state_patch={"sweep_fee_by_coin": pins,
+                                     "sweep_pushed_by_coin": pushed or None})
                 except Exception as patch_exc:  # noqa: BLE001
                     _log.warning("warp job %s: could not release the sweep fee (%s)",
                                  job.id, patch_exc)
                 return False, (f"sweep rejected for its fee ({text}); it is "
                                "repriced on the next Sweep")
             return False, f"sweep failed: {text}"
-        if kind in ("accepted", "pending") and not pushed.get(cid):
+        if kind in ("accepted", "pending") and pushed.get(cid) is not True:
             pushed[cid] = True
             try:
                 self._store.update_job(job.id, expected_status=job.status,
