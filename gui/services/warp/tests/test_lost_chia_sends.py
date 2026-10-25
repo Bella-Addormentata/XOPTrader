@@ -776,3 +776,37 @@ def test_a_replacement_cat_spend_that_times_out_keeps_its_metadata():
     st = store.get_job(job.id).state
     assert st["burn_tx_id"] == "burn-replacement"
     assert st["burn_tx_id_prior"] == ["burn-dead"]
+
+
+# --------------------------------------------------------------------------- #
+# Review round 5.
+# --------------------------------------------------------------------------- #
+
+def test_the_funding_scan_reads_the_unconfirmed_set_before_the_window(monkeypatch):
+    """[review] The daemon sorts unconfirmed records last, so a busy wallet
+    pages a just-sent funding out of the 200-row window; a miss would be
+    counted toward sending again."""
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_funding(store, funding_tx_id=S._FUNDING_TX_UNKNOWN)
+    pending = {"name": "hidden-pending", "confirmed": False, "additions": [
+        {"puzzle_hash": SECURITY_PH.hex(), "amount": EXPECTED}]}
+
+    def history(wallet_id, start=0, end=200, reverse=True, confirmed=None):
+        # Only the explicit unconfirmed query shows it; the window does not.
+        return [pending] if confirmed is False else []
+
+    ctx.wallet.get_transactions = history
+    engine.step()
+    assert ctx.wallet.sent == []
+    assert store.get_active_job().state["funding_tx_id"] == "hidden-pending"
+
+    # The same for the dedupe before a first send.
+    store2 = new_store()
+    engine2, ctx2 = build(store2)
+    _seed_funding(store2)
+    ctx2.wallet.get_transactions = history
+    engine2.step()
+    assert ctx2.wallet.sent == []
+    assert store2.get_active_job().state["funding_tx_id"] == "hidden-pending"

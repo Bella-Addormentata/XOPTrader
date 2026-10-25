@@ -254,6 +254,18 @@ warp:
               std::string(home) + "/warp_jobs.db");
 }
 
+TEST(ConfigParserTest, BridgeJobsDbPath_FromWarpExpandsEnvRefs) {
+    // ${VAR:-default} needs no variable set, so this runs anywhere.
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+warp:
+  enabled: false
+  jobs_db: ${XOP_TEST_UNSET_JOBS_DIR:-elsewhere}/jobs.db
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, "elsewhere/jobs.db");
+}
+
 TEST(ConfigParserTest, BridgeJobsDbPath_ExplicitEngineKeyWins) {
     std::string yaml = std::string(kMinimalValidYaml) + R"(
 accounting:

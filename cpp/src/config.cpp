@@ -3383,7 +3383,9 @@ AccountingConfig parse_accounting(const YAML::Node& root)
             return;  // not a string: the GUI refuses it too
         }
         if (gui_path.empty()) return;
-        gui_path = expand_tilde(gui_path);
+        // The same two expansions read_string gives the engine's own key,
+        // in the same order: ${VAR} / ${VAR:-default} first, then ~.
+        gui_path = expand_tilde(expand_env_vars(gui_path));
         if (!explicit_engine_path) {
             cfg.bridge_jobs_db_path = gui_path;
             spdlog::info("accounting.bridge_jobs_db_path follows warp.jobs_db "

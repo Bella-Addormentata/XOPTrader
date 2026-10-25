@@ -2035,11 +2035,18 @@ class WarpEngine:
         ``last_error``, and crucially no send.
         """
         try:
-            # Keep the window wide. This bot's wallet is busy, so a funding tx
-            # can be pushed well down the history while the job waits on
-            # confirmations -- a short window would miss it and re-send. The
-            # timeout risk is handled by the client's timeout, not by looking
-            # at less evidence.
+            # [WARP-LOST-SEND] The UNCONFIRMED set first, explicitly: the
+            # daemon sorts unconfirmed records LAST, so on a busy wallet a
+            # just-sent funding pages out of any windowed scan (the hazard
+            # _find_existing_burn already guards against) -- and a miss here
+            # is what the unnamed-send path counts toward sending again.
+            pending = self._wallet.get_transactions(
+                1, start=0, end=200, reverse=True, confirmed=False)
+            # Then the wide mixed window.  This bot's wallet is busy, so a
+            # funding tx can be pushed well down the history while the job
+            # waits on confirmations -- a short window would miss it and
+            # re-send. The timeout risk is handled by the client's timeout,
+            # not by looking at less evidence.
             txs = self._wallet.get_transactions(1, start=0, end=200, reverse=True)
         except Exception as exc:  # noqa: BLE001 -- never read as "not funded"
             raise WarpRetryable(
@@ -2048,7 +2055,7 @@ class WarpEngine:
             ) from exc
         want = _hx(security_ph_hex)
         dead = {_hx(t) for t in exclude_ids if t}
-        for tx in txs or []:
+        for tx in list(pending or []) + list(txs or []):
             if _hx(tx.get("name") or tx.get("transaction_id") or "") in dead:
                 continue
             for add in tx.get("additions") or []:

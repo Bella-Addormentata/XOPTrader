@@ -370,13 +370,17 @@ def test_probe_done_updates_label_and_reenables(panel):
 # ===================================================================
 
 def test_expand_path_env_refs():
+    # Compared as paths, not strings: expand_path returns the platform's
+    # native form (Windows rewrites the separators), which every caller
+    # (requests, Path.is_file) accepts.  [WARP-LOST-SEND follow-up: this was
+    # the one test that failed on Windows.]
     env = {"CHIA_ROOT": "/srv/chia"}
-    assert wallet_link.expand_path(
+    assert Path(wallet_link.expand_path(
         "${CHIA_ROOT}/config/ssl/wallet/private_wallet.crt", env
-    ) == "/srv/chia/config/ssl/wallet/private_wallet.crt"
-    assert wallet_link.expand_path("${NOPE:-/d}/x.crt", env) == "/d/x.crt"
+    )) == Path("/srv/chia/config/ssl/wallet/private_wallet.crt")
+    assert Path(wallet_link.expand_path("${NOPE:-/d}/x.crt", env)) == Path("/d/x.crt")
     # unset, no default: left as written so the error shows it
-    assert wallet_link.expand_path("${NOPE}/x.crt", env) == "${NOPE}/x.crt"
+    assert Path(wallet_link.expand_path("${NOPE}/x.crt", env)) == Path("${NOPE}/x.crt")
 
 
 def test_probe_resolves_env_ref_cert_paths(tmp_path, monkeypatch):
