@@ -922,6 +922,12 @@ class EngineBridge(QObject):
             # pointing into the previous config's directory -- handing
             # consumers a new config paired with the old database.
             self._apply_configured_database_path()
+            # [review] The warp worker's anchor too: its jobs database is
+            # config-relative as well, and the C++ engine (restarted on the
+            # new config) reads the store beside THAT config for its
+            # stuck-transaction guard -- both must move together, or a live
+            # warp send is recorded where the engine does not look.
+            self._warp_svc.set_secrets_path(resolved.parent / "secrets.yaml")
         if success:
             _log.info("Config path updated and reloaded.")
         else:

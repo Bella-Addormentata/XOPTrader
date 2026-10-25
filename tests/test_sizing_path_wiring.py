@@ -88,6 +88,8 @@ def test_switching_config_moves_the_database_path(app, tmp_path):
         assert (tmp_path / "two") in after.parents, (
             f"db path {after} still points at the previous config's directory"
         )
+        # [review] The warp worker's anchor (its jobs database) moves too.
+        assert bridge._warp_svc.secrets_path == second.parent / "secrets.yaml"
     finally:
         bridge.deleteLater()
         app.processEvents()

@@ -5839,7 +5839,9 @@ class _WarpWorker(QObject):
         self._engine: Optional[WarpEngine] = None
         self._engine_error: Optional[str] = None
         # Base hot-wallet plumbing (independent of the engine -- see
-        # wallet_action). Set once before moveToThread, never mutated after.
+        # wallet_action), and the anchor of every config-relative path
+        # (_config_home).  Set before moveToThread; changed afterwards only
+        # through the set_secrets_path slot, on this thread.
         self._secrets_path: Optional[Path] = secrets_path
         self._last_wallet_notice: str = ""
         self._rebalance_params = rb.RebalanceParams()
@@ -5880,6 +5882,27 @@ class _WarpWorker(QObject):
             self._rebalance_params = rb.RebalanceParams()
             self._rebalance_error = str(exc)
             _log.error("rebalance disabled: %s", exc)
+
+    def set_secrets_path(self, path: object) -> None:
+        """Follow a config switch (EngineBridge.update_config_path).
+
+        [review] The secrets path anchors the jobs database (_config_home):
+        left at the directory fixed at construction, a switched config
+        would have this worker recording live sends in the OLD directory's
+        store while the C++ engine, restarted on the new config, reads an
+        empty store in the new one -- and cleans up a wallet with a warp
+        send in flight.  The engine is rebuilt against the new directory's
+        store on the next tick.  Delivered on the worker thread.
+        """
+        new = Path(str(path)) if path else None
+        if new == self._secrets_path:
+            return
+        _log.info("warp: config home changed (%s -> %s); reopening the job store there",
+                  self._secrets_path.parent if self._secrets_path else None,
+                  new.parent if new else None)
+        self._secrets_path = new
+        self._drop_engine()
+        self._engine_error = None
 
     def _drop_engine(self) -> None:
         """Discard the engine, closing its sqlite connection first."""
@@ -7098,6 +7121,7 @@ class WarpService(QObject):
     _trigger_unwrap = Signal(int, str, bool, str)
     _trigger_action = Signal(int, str)
     _trigger_wallet = Signal(str, dict)
+    _trigger_secrets = Signal(object)
 
     def __init__(
         self,
@@ -7110,6 +7134,7 @@ class WarpService(QObject):
         self._mutex = QMutex()
         self._snapshot: dict = {}
         self._tick_in_flight: bool = False
+        self._secrets_path: Optional[Path] = Path(secrets_path) if secrets_path else None
 
         self._thread = QThread(self)
         self._thread.setObjectName("WarpWorkerThread")
@@ -7126,6 +7151,7 @@ class WarpService(QObject):
         self._trigger_unwrap.connect(self._worker.request_unwrap)
         self._trigger_action.connect(self._worker.job_action)
         self._trigger_wallet.connect(self._worker.wallet_action)
+        self._trigger_secrets.connect(self._worker.set_secrets_path)
 
         self._trigger_params.emit(dict(config or {}))
 
@@ -7155,6 +7181,21 @@ class WarpService(QObject):
 
     def update_config(self, config: dict) -> None:
         self._trigger_params.emit(dict(config or {}))
+
+    @property
+    def secrets_path(self) -> Optional[Path]:
+        """The secrets file beside the active config: the anchor of the
+        worker's config-relative paths (the jobs database among them)."""
+        return self._secrets_path
+
+    def set_secrets_path(self, path: Optional[Path]) -> None:
+        """[review] Follow a config switch so the worker's job store moves
+        with the config, as the engine's does (EngineBridge.update_config_path)."""
+        new = Path(path) if path else None
+        if new == self._secrets_path:
+            return
+        self._secrets_path = new
+        self._trigger_secrets.emit(new)
 
     def tick(self) -> None:
         """Trigger one bridge step on the worker thread (dropped if in flight)."""

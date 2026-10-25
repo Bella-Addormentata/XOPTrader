@@ -2620,3 +2620,17 @@ def test_a_failed_history_lookup_never_starts_or_advances_the_grace(monkeypatch)
         "funding_tx_id_prior_retired_at": {k1: now - 48 * 3600.0}})
     settled, note = engine._prior_sends_settled(store.get_active_job())
     assert not settled and "could not be read" in note
+
+
+def test_the_worker_follows_a_config_switch(tmp_path):
+    """[review] A switched config moves the worker's job-store anchor with
+    it and rebuilds the engine there, as the C++ engine will read it."""
+    closed = []
+    worker = S._WarpWorker(secrets_path=tmp_path / "one" / "secrets.yaml")
+    worker._engine = SimpleNamespace(close=lambda: closed.append(1))
+    assert worker._config_home() == tmp_path / "one"
+    worker.set_secrets_path(tmp_path / "two" / "secrets.yaml")
+    assert worker._config_home() == tmp_path / "two"
+    assert closed == [1] and worker._engine is None
+    worker.set_secrets_path(tmp_path / "two" / "secrets.yaml")   # unchanged: no-op
+    assert closed == [1]
