@@ -20698,7 +20698,12 @@ execution::WarpSendGuard read_warp_send_guard(const std::string& db_path,
                 sqlite3_column_text(stmt, 1));
             auto state = nlohmann::json::parse(sj ? sj : "{}", nullptr,
                                                /*allow_exceptions=*/false);
-            if (state.is_discarded()) state = nlohmann::json::object();
+            if (state.is_discarded() || !state.is_object()) {
+                // An active job whose state cannot be read as an object: its
+                // send is unknown, so every wallet is protected (fail closed).
+                guard.readable = false;
+                continue;
+            }
             if (const auto send = execution::warp_job_chia_send(
                     st ? st : "", state, default_cat)) {
                 guard.add(*send);

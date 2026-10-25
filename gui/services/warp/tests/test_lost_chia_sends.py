@@ -1286,3 +1286,68 @@ def test_retry_of_a_burning_job_that_never_made_its_toll_key_resets_nothing():
     out = engine.job_action(job.id, "retry")
     assert out["status"] == JobStatus.BURNING
     assert store.get_job(job.id).state.get("funding_tx_id") is None
+
+
+# --------------------------------------------------------------------------- #
+# Review round 9.
+# --------------------------------------------------------------------------- #
+
+def test_a_top_up_is_not_cancelled_while_an_earlier_cat_spend_could_land():
+    """[review] CANCELLED is closed with no recovery: while a replaced
+    cat_spend could still land at the burn puzzle, the job waits."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _to_burn_sent(store, engine)
+    store.update_job(job.id, state_patch={
+        "rebalance_eth_target_wei": 10 ** 16, "rebalance": True,
+        "burn_tx_id_prior": ["burn-a"],
+        "burn_tx_id_prior_removals": {"burn-a": [RID]}})
+    ctx.evm.get_erc20_balance = lambda token, owner: 0
+    ctx.evm.eth = 10 ** 16                                  # target met: would cancel
+    ctx.coinset.records[RID] = _rec(spent=False)             # burn-a could still land
+    out = engine.step()
+    assert out["status"] == JobStatus.BURN_SENT
+    assert ctx.wallet.cat_spends == []
+    assert "could still land" in _last_message(store, job.id)
+    ctx.coinset.records[RID] = _rec(spent=True)              # ...until proven dead
+    ctx.coinset.peak = PEAK
+    out = engine.step()
+    assert out["status"] == JobStatus.CANCELLED
+
+
+def test_a_third_party_claim_completes_once_replaced_sends_are_ruled_out(monkeypatch):
+    """[review] After the sweep resolved with a replaced send still pending,
+    later ticks find no security coin; they must resume from the persisted
+    sweep, not pend on the missing coin."""
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _claiming_with_replaced_funding(store, ctx, prior_removals={DEAD_TX: [RID]},
+                                          final_hex="f3" * 32)
+    del ctx.coinset.records["f3" * 32]                      # no self-claim landed
+    store.update_job(job.id, state_patch={
+        "final_cat_coin_id": None, "third_party_claim": True, "swept": True,
+        "sweep_status": "ok"})
+    ctx.coinset.records[RID] = _rec(spent=False)            # the orphan could land
+    for _ in range(3):
+        out = engine.step()
+        assert out["status"] == JobStatus.CLAIMING
+        assert out["retry_count"] == 0
+    assert "could still land" in _last_message(store, job.id)
+    ctx.coinset.records[RID] = _rec(spent=True)             # ...until proven dead
+    out = engine.step()
+    assert out["status"] == JobStatus.COMPLETED
+
+
+def test_sweep_resolves_when_every_attempt_is_dead_and_nothing_was_funded(monkeypatch):
+    """[review] Both the original and its replacement proven dead, no coin
+    at the key: resolved, nothing to sweep, the slot is freed."""
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _failed_with_replaced_funding(store, ctx, prior_removals={DEAD_TX: [RID]})
+    ctx.coinset.records[RID] = _rec(spent=True)              # the fixture made RID2 dead
+    out = engine.job_action(job.id, "sweep")
+    assert out["status"] == JobStatus.CANCELLED
+    assert store.get_active_job() is None
+    assert "nothing to sweep" in store.get_job(job.id).state["sweep_status"]

@@ -1863,6 +1863,24 @@ class WarpEngine:
                 message=f"claim confirmed at {depth} confirmations",
             )
 
+        # [WARP-LOST-SEND] A third-party claim already paid the receiver and
+        # our funding was swept (persisted above): only the replaced funding
+        # sends remain to be ruled out.  A landed one is swept here; once all
+        # are settled the job completes.
+        if job.state.get("third_party_claim") and job.state.get("swept"):
+            settled, note = self._prior_sends_settled(job)
+            if settled:
+                return _advance(
+                    JobStatus.COMPLETED,
+                    message="third-party claim paid the receiver; funding swept back",
+                )
+            extra = claim.find_security_coin(self._coinset, sk, expected)
+            if extra is not None:
+                _resolved, status = self._sweep_security(job, extra, sk)
+                return _stay(state={"sweep_status": status},
+                             message=f"a replaced funding send landed -- {status}")
+            return _stay(message=f"third-party claim paid the receiver; {note}")
+
         coin = claim.find_security_coin(self._coinset, sk, expected)
         if coin is None:
             sec_id = job.state.get("security_coin_id")
@@ -1934,9 +1952,17 @@ class WarpEngine:
             if resolved:
                 # [WARP-LOST-SEND] ...and no replaced funding send of this job
                 # could still land: COMPLETED would leave its XCH no Sweep.
+                # The resolved sweep is PERSISTED, so later ticks -- which
+                # find no unspent security coin -- resume from it (below)
+                # instead of pending on a coin that is gone.
                 settled, note = self._prior_sends_settled(job)
                 if not settled:
-                    resolved, status = False, f"{status}; {note}"
+                    return _stay(
+                        state={"third_party_claim": True, "swept": True,
+                               "sweep_status": status},
+                        message=(f"third-party claim paid the receiver; funding "
+                                 f"swept back; {note}"),
+                    )
             if not resolved:
                 # The deposit landed, but our funding coin is still unspent and
                 # the node was unreachable. COMPLETED is a closed state, so
@@ -2317,6 +2343,46 @@ class WarpEngine:
                 continue
             return False, (f"funding send {tx_id[:16]}... could still land "
                            f"({why}); Sweep again later")
+        return True, ""
+
+    def _burn_priors_settled(self, job: WarpJob) -> tuple:
+        """``(settled, note)``: whether every REPLACED cat_spend of *job* is
+        ruled out.  A replaced burn is settled when the chain proves it dead,
+        or when its own burn CAT (an output at the burn puzzle whose parent
+        is one of the coins it spent) exists -- the completion scan then
+        carries the unwrap forward.  Anything else could still land."""
+        from . import chia_send as cs
+
+        st = job.state
+        priors = [t for t in (st.get("burn_tx_id_prior") or []) if t]
+        if not priors:
+            return True, ""
+        ph = str(st.get("burn_cat_ph") or "")
+        amount = int(job.amount_mojos)
+        self._wallet.log_in()
+        outputs = list(self._coinset.get_coin_records_by_puzzle_hash(
+            ph, include_spent=True))
+        prior_removals = st.get("burn_tx_id_prior_removals") or {}
+        min_depth = int(self._net.chia_confirmation_min_height)
+        for tx_id in priors:
+            if tx_id == _FUNDING_TX_UNKNOWN:
+                return False, ("an earlier cat_spend the wallet never named "
+                               "cannot be ruled out")
+            ev = cs.gather(
+                wallet_record=lambda t=tx_id: self._wallet.get_transaction_or_none(t),
+                mempool_item=lambda t=tx_id: self._coinset.get_mempool_item_by_tx_id(t),
+                coin_spent=self._coin_spent_depth,
+                outputs_at=lambda: outputs,
+                known_removals=prior_removals.get(tx_id) or [],
+                out_amount=amount, unique_output=False, min_depth=min_depth,
+            )
+            verdict, why = cs.judge(ev)
+            if verdict is cs.Verdict.DEAD:
+                continue
+            if verdict is cs.Verdict.LANDED and ev.output_landed:
+                continue
+            return False, (f"an earlier cat_spend {tx_id[:16]}... could still "
+                           f"land ({why})")
         return True, ""
 
     def _recorded_send_verdict(self, job: WarpJob, *, tx_key: str,
@@ -3245,6 +3311,18 @@ class WarpEngine:
         if eth_target:
             step, size = self._rebalance_millieth_trim(
                 job, amount, int(eth_target))
+            if step is not None or size < amount:
+                # [review] Never CANCELLED -- a closed job, with no recovery
+                # action -- while an earlier cat_spend of this job could
+                # still land at the burn puzzle.  It waits until each is
+                # proven dead; one that lands is picked up by the completion
+                # scan above and the unwrap proceeds.
+                settled, note = self._burn_priors_settled(job)
+                if not settled:
+                    return _stay(
+                        message=(f"top-up no longer needed as sized, but {note}; "
+                                 "waiting before cancelling"),
+                    )
             if step is not None:
                 return step
             if size < amount:
@@ -4533,6 +4611,15 @@ class WarpEngine:
             coin = claim.find_security_coin(self._coinset, sk, expected)
             if coin is None:
                 resolved, status = self._funding_provably_gone(job)
+                if not resolved and job.state.get("funding_tx_id_prior"):
+                    # [review] Replaced sends: when the chain proves EVERY
+                    # attempt dead and no coin of the funded amount exists,
+                    # nothing was ever funded -- resolved, nothing to sweep.
+                    settled, _note = self._prior_sends_settled(job)
+                    if settled:
+                        resolved, status = True, (
+                            "every funding attempt is proven dead on chain; "
+                            "nothing was funded, nothing to sweep")
             else:
                 coin_id = coin.name().hex()
                 resolved, status = self._sweep_security(job, coin, sk)
