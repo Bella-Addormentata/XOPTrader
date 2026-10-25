@@ -1252,11 +1252,13 @@ void MarketDataFeed::set_config(const MarketDataConfig& cfg)
 {
     bool bucket_size_changed = false;
     bool window_shrank       = false;
+    bool ofi_window_shrank   = false;
     bool whale_changed       = false;
     {
         std::unique_lock lock(mtx_config_);
         bucket_size_changed = cfg.vpin_bucket_size != config_.vpin_bucket_size;
         window_shrank = cfg.vpin_window_buckets < config_.vpin_window_buckets;
+        ofi_window_shrank = cfg.ofi_window_size < config_.ofi_window_size;
         whale_changed =
             cfg.whale_trade_threshold != config_.whale_trade_threshold
             || cfg.whale_volume_fraction != config_.whale_volume_fraction
@@ -1299,6 +1301,28 @@ void MarketDataFeed::set_config(const MarketDataConfig& cfg)
             vpin_metrics_.clear();
         } else {
             for (const auto& name : trimmed) recompute_vpin(name);
+        }
+    }
+    if (ofi_window_shrank) {
+        // Likewise for OFI, which keeps window + 1 book snapshots. A window
+        // of zero keeps one, from which recompute_ofi() makes no delta and
+        // never replaces the cached value: drop the metrics instead.
+        std::vector<std::string> trimmed;
+        {
+            std::unique_lock lock(mtx_ofi_);
+            for (auto& [name, snaps] : ofi_snapshots_) {
+                if (snaps.size() <= cfg.ofi_window_size + 1) continue;
+                while (snaps.size() > cfg.ofi_window_size + 1) {
+                    snaps.pop_front();
+                }
+                trimmed.push_back(name);
+            }
+        }
+        if (cfg.ofi_window_size == 0) {
+            std::unique_lock lock(mtx_ofi_metrics_);
+            ofi_metrics_.clear();
+        } else {
+            for (const auto& name : trimmed) recompute_ofi(name);
         }
     }
 }

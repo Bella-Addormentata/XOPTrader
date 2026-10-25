@@ -479,6 +479,40 @@ TEST(ConfigLiveApplySetters, a_vpin_window_of_zero_drops_the_metric)
     EXPECT_FALSE(feed.get_vpin_metrics(pair).has_value());
 }
 
+TEST(ConfigLiveApplySetters, ofi_follows_a_shorter_or_zero_window_at_once)
+{
+    xop::MarketDataConfig mc;
+    mc.ofi_window_size = 20;
+    xop::State state;
+    xop::MarketDataFeed feed{mc, state};
+    const std::string pair = "XCH/wUSDC";
+    // Ten rising bids, then a book that stops moving.
+    for (int i = 0; i < 10; ++i) {
+        feed.ingest_book_snapshot_for_ofi(pair, 2.70 + 0.01 * i, 100.0, 2.90, 100.0);
+    }
+    for (int i = 0; i < 2; ++i) {
+        feed.ingest_book_snapshot_for_ofi(pair, 2.79, 100.0, 2.90, 100.0);
+    }
+    ASSERT_GT(feed.get_ofi_metrics(pair)->normalized_ofi, 0.0);
+
+    mc.ofi_window_size = 2;
+    feed.set_config(mc);
+    ASSERT_TRUE(feed.get_ofi_metrics(pair).has_value());
+    EXPECT_DOUBLE_EQ(feed.get_ofi_metrics(pair)->normalized_ofi, 0.0)
+        << "the snapshots kept show a still book: OFI must say so now";
+
+    feed.ingest_book_snapshot_for_ofi(pair, 2.85, 100.0, 2.90, 100.0);
+    ASSERT_GT(feed.get_ofi_metrics(pair)->normalized_ofi, 0.0);
+    mc.ofi_window_size = 0;
+    feed.set_config(mc);
+    EXPECT_FALSE(feed.get_ofi_metrics(pair).has_value())
+        << "one snapshot is kept, so nothing would ever replace a cached OFI";
+    for (int i = 0; i < 3; ++i) {
+        feed.ingest_book_snapshot_for_ofi(pair, 2.85, 100.0, 2.90, 100.0);
+    }
+    EXPECT_FALSE(feed.get_ofi_metrics(pair).has_value());
+}
+
 TEST(ConfigLiveApplySetters, a_lower_whale_cap_applies_without_a_new_whale)
 {
     xop::MarketDataConfig mc;
