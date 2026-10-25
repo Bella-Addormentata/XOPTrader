@@ -21005,6 +21005,47 @@ void Engine::refresh_warp_send_guard(BlockHeight block_height, bool fresh)
         warp_db_missing_heartbeats_ = 0;
         warp_db_missing_warned_     = false;
     }
+    // [review] Work the GUI kept in ANOTHER store across a config switch
+    // (an open job or Dexie take there, which a switch must not strand):
+    // the GUI names that store in a one-line file beside this one
+    // (service.py _RETAINED_POINTER_SUFFIX), and its sends are guarded too.
+    // A pointer that cannot be read, an empty one, or a pointed-at store
+    // that cannot be read (or does not exist) fails closed: the GUI removes
+    // the pointer once nothing is kept there.
+    if (!guard_db.empty()) {
+        const std::string retained_ptr = guard_db + ".retained";
+        std::error_code pec;
+        const bool pointed = std::filesystem::exists(retained_ptr, pec);
+        if (pec) {
+            warp_send_guard_.readable = false;
+        } else if (pointed) {
+            std::string retained_db;
+            std::ifstream in(retained_ptr);
+            if (!in || !std::getline(in, retained_db)) retained_db.clear();
+            while (!retained_db.empty()
+                   && (retained_db.back() == '\r' || retained_db.back() == '\n'
+                       || retained_db.back() == ' ' || retained_db.back() == '\t')) {
+                retained_db.pop_back();
+            }
+            if (retained_db.empty()) {
+                warp_send_guard_.readable = false;
+                spdlog::warn("[Engine] {} names no job store; every wallet's "
+                             "unconfirmed transactions are left alone this "
+                             "heartbeat", retained_ptr);
+            } else {
+                const auto extra = read_warp_send_guard(retained_db,
+                                                        acc.bridge_asset_id,
+                                                        /*warp_enabled=*/true);
+                if (!extra.readable) warp_send_guard_.readable = false;
+                if (extra.xch) warp_send_guard_.xch = true;
+                warp_send_guard_.cat_asset_ids.insert(extra.cat_asset_ids.begin(),
+                                                      extra.cat_asset_ids.end());
+                spdlog::debug("[Engine] warp keeps work in {} (named by {}); "
+                              "guarding it too{}", retained_db, retained_ptr,
+                              extra.readable ? "" : " -- it could not be read");
+            }
+        }
+    }
     if (!warp_send_guard_.readable) {
         spdlog::warn("[Engine] warp_jobs.db ({}) {} -- every wallet's "
                      "unconfirmed transactions are left alone this heartbeat "

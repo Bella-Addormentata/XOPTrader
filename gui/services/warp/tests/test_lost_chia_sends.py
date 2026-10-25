@@ -13,6 +13,7 @@ alone, and every send now pays a fee -- the engine's offer fee at least.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -3660,12 +3661,50 @@ def test_a_store_with_open_work_is_kept_across_a_switch(tmp_path):
     assert wanted in worker._store_hold
     assert worker._send_hold_reason() is None, "no engine of ours runs: the job may finish"
     assert "store_notice" in worker._snapshot_or_error()
+    # [review] The pointer beside the configured store names the kept one:
+    # an engine started on this config guards both, so sends go on.
+    pointer = Path(wanted + S._RETAINED_POINTER_SUFFIX)
+    assert pointer.read_text(encoding="utf-8").strip() == str(old.resolve())
     worker._engine_home = tmp_path / "two"
-    assert "guard reads the job store beside its config" in worker._send_hold_reason()
-    # The work closes: the configured store is opened next, nothing held.
+    assert worker._send_hold_reason() is None, "the engine guards the kept store too"
+    # ...unless the pointer could not be written: then new sends wait.
+    worker._retained_ok = False
+    assert "could not be written" in worker._send_hold_reason()
+    worker._retained_ok = True
+    # A GUI restarted on this config finds the kept store through the pointer.
+    fresh = S._WarpWorker(secrets_path=tmp_path / "two" / "secrets.yaml")
+    fresh._config = {"warp": {"enabled": True}}
+    assert fresh._store_path_in_use() == str(old.resolve()) and fresh._store_hold
+    # The work closes: the configured store is opened next, nothing held,
+    # the pointer gone.
     with WarpJobStore(old) as s:
         s.settle_take("aa" * 32, S.jobs.TAKE_FAILED, error="x")
         s.update_job(1, status=JobStatus.CANCELLED, expected_status=JobStatus.FUNDING_CLAIM)
     assert worker._store_path_in_use() == wanted and worker._store_hold == ""
     assert worker._send_hold_reason() is None
     assert "store_notice" not in worker._snapshot_or_error()
+    assert not pointer.exists()
+    assert fresh._store_path_in_use() == wanted and not fresh._store_hold
+
+
+def test_a_pointer_that_cannot_be_written_holds_new_sends(tmp_path, monkeypatch):
+    """[review] Fail closed: with the pointer unwritable, an engine on the
+    configured store cannot be told about the kept one, so new sends wait
+    while such an engine runs -- and only then."""
+    from gui.services.warp.jobs import WarpJobStore
+
+    old = tmp_path / "one" / "data" / "warp_jobs.db"
+    with WarpJobStore(old) as s:
+        s.create_job("mainnet", status=JobStatus.FUNDING_CLAIM, state={})
+    worker = S._WarpWorker(secrets_path=tmp_path / "two" / "secrets.yaml")
+    worker._config = {"warp": {"enabled": True}}
+    worker._store_path = str(old)
+
+    def refuse(pointer, held):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(S, "_write_retained_pointer", refuse)
+    assert worker._store_path_in_use() == str(old)
+    assert worker._send_hold_reason() is None                 # no engine of ours runs
+    worker._engine_home = tmp_path / "two"
+    assert "could not be written" in worker._send_hold_reason()

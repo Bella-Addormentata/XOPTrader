@@ -117,3 +117,18 @@ def test_the_header_declares_the_guard_beside_the_escalation_counter():
     assert '#include "xop/execution/warp_send_guard.hpp"' in hpp
     counter = hpp.index("kForceDeletePendingBlocks{12}")
     assert "execution::WarpSendGuard warp_send_guard_{};" in hpp[counter:counter + 1500]
+
+
+def test_the_guard_follows_the_retained_store_pointer():
+    """[review] Work kept in another store across a config switch: the GUI
+    names that store in a pointer beside the configured one, and the engine
+    guards both (fail closed on a pointer or store it cannot read)."""
+    text = _engine()
+    refresh = text.index("void Engine::refresh_warp_send_guard(")
+    body = text[refresh:text.index("\n}\n", refresh)]
+    assert 'guard_db + ".retained"' in body
+    assert "read_warp_send_guard(retained_db" in body
+    assert "/*warp_enabled=*/true" in body, "a named store that is missing is unknown"
+    assert body.count("warp_send_guard_.readable = false") >= 3
+    from gui.services.warp import service as S
+    assert S._RETAINED_POINTER_SUFFIX == ".retained"

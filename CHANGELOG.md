@@ -39,9 +39,11 @@ and keeps that protection across a config switch. The current attempt
 protects its wallet in every active status -- an earlier attempt's coin may
 carry the job forward while it is still confirming -- until the wallet
 drops its record or its own output is on chain. The bridge records its jobs
-beside the config the running engine was launched with, a store move waits
-while a job or a Dexie take is open (the banner says so), and new sends wait
-while the engine guards another store. An `unknown` take is released only
+beside the config the running engine was launched with, and a store move
+waits while a job or a Dexie take is open (the banner says so): a pointer
+file beside the configured store names the kept one, so an engine started
+on the new config guards both and a GUI restarted on it finds the kept work
+again. An `unknown` take is released only
 after a day of unreadable trade-record lookups counted from the last pending
 read, never from its age.
 

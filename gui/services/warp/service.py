@@ -6510,6 +6510,41 @@ def _same_path(a: str, b: str) -> bool:
         return False
 
 
+# [review] Beside the CONFIGURED jobs database, a one-line file naming the
+# store the bridge kept open instead (work left there by a config switch).
+# The engine started on this config reads it with its own store
+# (engine.cpp refresh_warp_send_guard) and guards both, and a GUI restarted
+# on this config finds the kept store again.
+_RETAINED_POINTER_SUFFIX = ".retained"
+
+
+def _retained_pointer(wanted: str) -> Optional[Path]:
+    """The pointer file beside the configured store *wanted* (None for an
+    in-memory store)."""
+    if not wanted or wanted == ":memory:":
+        return None
+    return Path(wanted + _RETAINED_POINTER_SUFFIX)
+
+
+def _write_retained_pointer(pointer: Path, held: str) -> None:
+    """Name *held* in *pointer*, atomically (the engine may read it any
+    time); the configured store's directory is created for it."""
+    from gui.services.config_split import _atomic_write_text
+
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(pointer, str(Path(held).resolve()) + "\n", newline="\n")
+
+
+def _drop_retained_pointer(pointer: Optional[Path]) -> None:
+    """Remove *pointer* if it exists (best effort)."""
+    if pointer is None:
+        return
+    try:
+        pointer.unlink(missing_ok=True)
+    except OSError as exc:
+        _log.debug("warp: could not remove %s (%s)", pointer, exc)
+
+
 class _WarpWorker(QObject):
     """Background worker that owns the :class:`WarpEngine` and ticks it.
 
@@ -6552,6 +6587,7 @@ class _WarpWorker(QObject):
         # configured one differs (open work must not vanish from monitoring).
         self._store_path: Optional[str] = None
         self._store_hold: str = ""
+        self._retained_ok: bool = True
         self._last_wallet_notice: str = ""
         self._rebalance_params = rb.RebalanceParams()
         self._rebalance_error: str = ""
@@ -6659,9 +6695,21 @@ class _WarpWorker(QObject):
         the banner says so; a store that cannot be read is kept too (fail
         closed).  The move is made once nothing is open."""
         wanted = str(_job_db_path(self._config, anchor=self._config_home()))
+        pointer = _retained_pointer(wanted)
         held = getattr(self, "_store_path", None)
+        if not held and pointer is not None and pointer.is_file():
+            # [review] A GUI restarted on this config: the pointer left
+            # beside the configured store names the store kept open last
+            # time, so its open work is found again rather than forgotten.
+            try:
+                held = pointer.read_text(encoding="utf-8").strip() or None
+            except OSError as exc:
+                _log.warning("warp: could not read %s (%s)", pointer, exc)
+                held = None
         if not held or held == wanted or _same_path(held, wanted):
             self._store_hold = ""
+            self._retained_ok = True
+            _drop_retained_pointer(pointer)
             return wanted
         try:
             with WarpJobStore(held) as old:
@@ -6671,23 +6719,46 @@ class _WarpWorker(QObject):
         if not open_work:
             _log.info("warp: the job store moves %s -> %s (nothing open)", held, wanted)
             self._store_hold = ""
+            self._retained_ok = True
+            _drop_retained_pointer(pointer)
             return wanted
         self._store_hold = (f"the bridge keeps its job store {held} until {open_work} "
-                            f"closes; the configured store is {wanted}")
+                            f"closes; the configured store is {wanted} (an engine "
+                            "started on this config guards both)")
+        # [review] An engine started on this config guards the configured
+        # store; the pointer beside it names the held one, so the engine
+        # guards that too and the held job's already-submitted transactions
+        # (and the sends that finish it) are protected.  A pointer that could
+        # not be written holds new sends instead (fail closed).
+        if pointer is None:
+            self._retained_ok = True
+        else:
+            try:
+                _write_retained_pointer(pointer, held)
+                self._retained_ok = True
+            except Exception as exc:  # noqa: BLE001 -- then sends wait
+                self._retained_ok = False
+                _log.warning("warp: could not write %s (%s); new Chia sends wait "
+                             "while an engine runs on this config", pointer, exc)
         return held
 
     def _send_hold_reason(self) -> Optional[str]:
         """[review] Why a NEW Chia send must wait, or None: the store in use
-        is not the one beside the running engine's config, so the engine's
-        stuck-transaction guard would not see a send recorded in it.  With no
-        engine of ours running nothing cleans the wallet, and the held
-        store's job may finish (a Retry's send included)."""
-        if getattr(self, "_engine_home", None) is None or not getattr(self, "_store_hold", ""):
+        is not the one beside the running engine's config, and the pointer
+        that makes the engine guard it too could not be written, so a send
+        recorded here would be unprotected.  With the pointer in place the
+        engine guards both stores and the held store's job may finish (a
+        Retry's send included); with no engine of ours running nothing
+        cleans the wallet."""
+        if (getattr(self, "_engine_home", None) is None
+                or not getattr(self, "_store_hold", "")
+                or getattr(self, "_retained_ok", True)):
             return None
         return ("the engine's stuck-transaction guard reads the job store beside its "
-                f"config ({self._engine_home}), not this job's store "
-                f"({self._store_path}); restart the engine on the config this job "
-                "was started under, or close the job (Sweep / Abandon) first")
+                f"config ({self._engine_home}), and the pointer that would make it guard "
+                f"this job's store ({self._store_path}) too could not be written; restart "
+                "the engine on the config this job was started under, or close the job "
+                "(Sweep / Abandon) first")
 
     # -- altruistic-relay ledger persistence (survives process restart) ----- #
 
