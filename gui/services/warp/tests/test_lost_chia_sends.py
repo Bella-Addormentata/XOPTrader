@@ -45,7 +45,7 @@ DEAD_TX = "a7f5f64aae1c886e9eb47382aebc47c790e093f385049dc0d7c9601bdd83ef70"
 RID = "c4a91ced4257254eb8a1e7c166de014eb3daaedd0f8a8c0ef6f41cfc09847d3c"
 SECURITY_PH = b"\x5b" * 32
 EXPECTED = 4985 + 100_000_000          # post-tip + the default claim fee
-LIMIT = S._ORPHAN_POLLS_BEFORE_RESEND
+LIMIT = 20                             # polls a test waits to prove "never"
 PEAK = 9_478_613                       # 837 blocks past the conflicting spend
 
 
@@ -164,22 +164,33 @@ def S_coin_id(parent, ph, amount):
     return cs.coin_id(parent, ph, amount)
 
 
-def test_an_orphaned_funding_send_is_sent_again_after_the_wait(monkeypatch):
-    """Nowhere, coins unspent: it may still surface, so the handler waits
-    LIMIT polls, then sends again EXCLUDING the first send's coins so the
-    two can never conflict."""
+def test_an_orphaned_funding_send_waits_for_retry_then_resends_excluding_its_coins(
+        monkeypatch):
+    """Nowhere, coins unspent: it may still surface, and a replacement
+    spends other coins, so the handler never replaces it on its own.  The
+    operator's Retry does, EXCLUDING the first send's coins, and the first
+    send stays on the books (prior + its coins) for Sweep to account for."""
     _no_coin(monkeypatch)
     store = new_store()
     engine, ctx = build(store)
-    _seed_funding(store, funding_tx_id=DEAD_TX, funding_tx_id_removals=[RID])
+    job = _seed_funding(store, funding_tx_id=DEAD_TX, funding_tx_id_removals=[RID])
     ctx.coinset.records[RID] = _rec(spent=False)
 
-    for n in range(1, LIMIT):
+    for n in range(1, LIMIT + 1):
         engine.step()
         assert ctx.wallet.sent == [], f"poll {n}"
         job = store.get_active_job()
         assert job.state["funding_tx_id_orphan_polls"] == n
-        assert f"({n}/{LIMIT})" in _last_message(store, job.id)
+        assert "Retry" in _last_message(store, job.id)
+
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     expected_status=JobStatus.FUNDING_CLAIM,
+                     state_patch={"failed_from": JobStatus.FUNDING_CLAIM})
+    engine.job_action(job.id, "retry")
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id"] is None
+    assert st["funding_tx_id_exclude"] == [RID]
+    assert st["funding_tx_id_prior_removals"] == {DEAD_TX: [RID]}
 
     engine.step()
     assert len(ctx.wallet.sent) == 1
@@ -187,6 +198,7 @@ def test_an_orphaned_funding_send_is_sent_again_after_the_wait(monkeypatch):
     st = store.get_active_job().state
     assert st["funding_tx_id"] == "funding-tx-1"
     assert st["funding_tx_id_prior"] == [DEAD_TX]
+    assert st["funding_tx_id_exclude"] is None
 
 
 def test_an_unnamed_send_adopts_the_id_the_history_shows(monkeypatch):
@@ -203,15 +215,20 @@ def test_an_unnamed_send_adopts_the_id_the_history_shows(monkeypatch):
     assert store.get_active_job().state["funding_tx_id"] == "hist-1"
 
 
-def test_an_unnamed_send_the_history_never_shows_is_sent_again(monkeypatch):
+def test_an_unnamed_send_the_history_never_shows_waits_for_retry(monkeypatch):
     _no_coin(monkeypatch)
     store = new_store()
     engine, ctx = build(store)
-    _seed_funding(store, funding_tx_id=S._FUNDING_TX_UNKNOWN)
+    job = _seed_funding(store, funding_tx_id=S._FUNDING_TX_UNKNOWN)
 
-    for _ in range(LIMIT - 1):
+    for _ in range(LIMIT):
         engine.step()
     assert ctx.wallet.sent == []
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     expected_status=JobStatus.FUNDING_CLAIM,
+                     state_patch={"failed_from": JobStatus.FUNDING_CLAIM})
+    engine.job_action(job.id, "retry")
+    assert store.get_job(job.id).state["funding_tx_id"] is None
     engine.step()
     assert len(ctx.wallet.sent) == 1
     st = store.get_active_job().state
@@ -708,16 +725,21 @@ def test_the_jobs_db_path_expands_env_refs_and_tilde_like_the_engine(monkeypatch
 
 def test_a_refused_replacement_restores_the_marker_and_keeps_its_exclusions(
         monkeypatch):
-    """[review] A refused replacement must not leave the job markerless: the
-    next tick would then send fresh, without excluding the orphan's coins."""
+    """[review] A refused replacement must not lose what Retry decided: the
+    exclusions persist in state, so the next attempt still skips the
+    orphan's coins, and a refused DEAD replacement is judged again."""
     from gui.services.warp.wallet import WalletError
 
     _no_coin(monkeypatch)
     store = new_store()
     engine, ctx = build(store)
-    job = _seed_funding(store, funding_tx_id=DEAD_TX, funding_tx_id_removals=[RID],
-                        funding_tx_id_orphan_polls=LIMIT - 1)
-    ctx.coinset.records[RID] = _rec(spent=False)          # an orphan, at the limit
+    job = _seed_funding(store, funding_tx_id=DEAD_TX, funding_tx_id_removals=[RID])
+    ctx.coinset.records[RID] = _rec(spent=False)          # an orphan
+    engine.step()
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     expected_status=JobStatus.FUNDING_CLAIM,
+                     state_patch={"failed_from": JobStatus.FUNDING_CLAIM})
+    engine.job_action(job.id, "retry")                     # cleared, exclude [RID]
     calls = []
     real = ctx.wallet.send_transaction
 
@@ -731,14 +753,45 @@ def test_a_refused_replacement_restores_the_marker_and_keeps_its_exclusions(
     out = engine.step()
     assert out["retry_count"] == 1
     st = store.get_job(job.id).state
-    assert st["funding_tx_id"] == DEAD_TX, "the marker the tick started with"
-    assert st["funding_tx_id_orphan_polls"] == LIMIT - 1
+    assert st["funding_tx_id"] is None, "as Retry left it"
+    assert st["funding_tx_id_exclude"] == [RID], "the exclusions survive"
     store.update_job(job.id, columns={"next_retry_at": None})
     engine.step()
     assert calls == [[RID], [RID]], "both attempts excluded the orphan's coin"
     st = store.get_active_job().state
     assert st["funding_tx_id"] == "funding-tx-1"
     assert st["funding_tx_id_prior"] == [DEAD_TX]
+
+
+def test_a_refused_dead_replacement_is_judged_again(monkeypatch):
+    from gui.services.warp.wallet import WalletError
+
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store, funding_tx_id=DEAD_TX, funding_tx_id_removals=[RID])
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = PEAK
+    calls = []
+    real = ctx.wallet.send_transaction
+
+    def refuse_once(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise WalletError("send_transaction failed: insufficient funds")
+        return real(*a, **k)
+
+    ctx.wallet.send_transaction = refuse_once
+    engine.step()
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id"] == DEAD_TX, "the marker the tick started with"
+    assert not st.get("funding_tx_id_prior")
+    store.update_job(job.id, columns={"next_retry_at": None})
+    engine.step()
+    st = store.get_active_job().state
+    assert st["funding_tx_id"] == "funding-tx-1"
+    assert st["funding_tx_id_prior"] == [DEAD_TX]
+    assert st["funding_tx_id_prior_removals"] == {DEAD_TX: [RID]}
 
 
 def test_a_replacement_cat_spend_that_times_out_keeps_its_metadata():
@@ -810,3 +863,159 @@ def test_the_funding_scan_reads_the_unconfirmed_set_before_the_window(monkeypatc
     engine2.step()
     assert ctx2.wallet.sent == []
     assert store2.get_active_job().state["funding_tx_id"] == "hidden-pending"
+
+
+# --------------------------------------------------------------------------- #
+# Review round 6.
+# --------------------------------------------------------------------------- #
+
+def test_the_configured_key_is_selected_before_the_evidence_is_read(monkeypatch):
+    """[review] Another client may have switched the daemon's key; a login
+    failure propagates instead of reading as absence."""
+    from gui.services.warp.wallet import WalletError
+
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store, funding_tx_id=DEAD_TX, funding_tx_id_removals=[RID])
+    ctx.coinset.records[RID] = _rec(spent=False)
+
+    def refused():
+        raise WalletError("log_in failed: fingerprint not found")
+
+    ctx.wallet.log_in = refused
+    out = engine.step()
+    assert out["retry_count"] == 1
+    assert ctx.wallet.sent == []
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id"] == DEAD_TX
+    assert not st.get("funding_tx_id_orphan_polls")
+
+
+def test_the_sync_status_is_read_for_the_configured_key(monkeypatch):
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_funding(store)
+
+    def sync_status():
+        assert ctx.wallet.logged_in >= 1, "log_in must precede get_sync_status"
+        return {"synced": True, "syncing": False}
+
+    ctx.wallet.get_sync_status = sync_status
+    engine.step()
+    assert len(ctx.wallet.sent) == 1
+
+
+def test_the_funded_amount_is_reserved_with_the_marker(monkeypatch):
+    """[review] A timed-out funding RPC must leave the amount Sweep looks
+    for, not depend on the fee configuration of the day."""
+    from gui.services.warp.wallet import WalletError
+
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store)
+
+    def timeout(*a, **k):
+        raise WalletError("send_transaction request failed: timed out")
+
+    ctx.wallet.send_transaction = timeout
+    engine.step()
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id"] == S._FUNDING_TX_UNKNOWN
+    assert st["funding_amount"] == EXPECTED
+
+
+def test_a_definitively_rejected_sweep_fee_is_repriced_unless_already_pushed(
+        monkeypatch):
+    from gui.services.warp.coinset import CoinsetError
+
+    fees = []
+    outcome = {"raise": True}
+
+    def push(coinset, net, *, security_coin, destination_puzzle_hash,
+             ephemeral_sk, sweep_fee=0):
+        fees.append(sweep_fee)
+        if outcome["raise"]:
+            raise CoinsetError("push_tx failed: [INVALID_FEE_LOW_FEE] Failed to "
+                               "include transaction, error INVALID_FEE_LOW_FEE")
+        return ("accepted", "ok")
+
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep", push)
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: False)
+    store = new_store()
+    engine, ctx = build(store, params=default_params(offer_fee_mojos=10_000_000))
+    job = _seed_funding(store, funding_amount=EXPECTED)
+    resolved, status = engine._sweep_security(job, FakeCoin(b"\x5a" * 32), b"\x01" * 32)
+    assert not resolved and "repriced" in status
+    assert store.get_job(job.id).state["sweep_fee_mojos"] is None
+    ctx.coinset.fee_estimates = [30_000_000]              # the market asks more
+    outcome["raise"] = False
+    engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5a" * 32), b"\x01" * 32)
+    assert fees == [10_000_000, 30_000_000]
+    assert store.get_job(job.id).state["sweep_pushed"] is True
+    # Once pushed, a later fee rejection keeps the pin: a repriced twin
+    # would only conflict with the bundle a node already holds.
+    outcome["raise"] = True
+    ctx.coinset.fee_estimates = [50_000_000]
+    engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5a" * 32), b"\x01" * 32)
+    assert fees[-1] == 30_000_000
+    assert store.get_job(job.id).state["sweep_fee_mojos"] == 30_000_000
+
+
+def _failed_with_replaced_funding(store, *, prior_removals):
+    job = seed(store, JobStatus.FAILED,
+               columns={"receiver_ph": "ab" * 32, "post_tip_mojos": 4985},
+               state={"failed_from": JobStatus.FUNDING_CLAIM})
+    blob, _sk = make_ephemeral_blob(job.id)
+    store.update_job(job.id, state_patch={
+        "ephemeral_blob": blob, "funding_amount": EXPECTED,
+        "funding_tx_id": "replacement-tx", "funding_tx_id_prior": [DEAD_TX],
+        "funding_tx_id_prior_removals": prior_removals})
+    return store.get_active_job()
+
+
+def test_sweep_does_not_close_while_a_replaced_funding_send_could_land(monkeypatch):
+    """[review] A replacement spends other coins, so both sends can land;
+    the job closes only once every replaced send is proven dead."""
+    monkeypatch.setattr(claim_mod, "find_security_coin",
+                        lambda *a, **k: FakeCoin(b"\x5a" * 32))
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep",
+                        lambda *a, **k: ("accepted", "ok"))
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _failed_with_replaced_funding(store, prior_removals={DEAD_TX: [RID]})
+    ctx.coinset.records[RID] = _rec(spent=False)           # the orphan could land
+    out = engine.job_action(job.id, "sweep")
+    assert out["status"] == JobStatus.FAILED, "left open"
+    assert "could still land" in store.get_job(job.id).state["sweep_status"]
+
+    ctx.coinset.records[RID] = _rec(spent=True)            # ...until proven dead
+    ctx.coinset.peak = PEAK
+    out = engine.job_action(job.id, "sweep")
+    assert out["status"] == JobStatus.CANCELLED
+    assert store.get_active_job() is None
+
+
+def test_an_unspent_coin_from_a_replaced_send_asks_for_another_sweep(monkeypatch):
+    monkeypatch.setattr(claim_mod, "find_security_coin",
+                        lambda *a, **k: FakeCoin(b"\x5a" * 32))
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep",
+                        lambda *a, **k: ("accepted", "ok"))
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _failed_with_replaced_funding(store, prior_removals={DEAD_TX: [RID]})
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = PEAK
+    # The replaced send DID land: an unspent coin of the funded amount sits
+    # at the ephemeral key beside the one just swept.
+    ctx.coinset.by_ph = [SimpleNamespace(
+        coin=SimpleNamespace(parent_coin_info="d4" * 32, puzzle_hash="5b" * 32,
+                             amount=EXPECTED),
+        spent=False, confirmed_block_index=PEAK - 3, spent_block_index=0)]
+    out = engine.job_action(job.id, "sweep")
+    assert out["status"] == JobStatus.FAILED
+    assert "Sweep again" in store.get_job(job.id).state["sweep_status"]

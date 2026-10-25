@@ -208,12 +208,13 @@ _COST_XCH_SEND: int = 12_000_000
 _COST_CAT_SPEND: int = 40_000_000
 
 #: A recorded Chia send that is in no wallet and no mempool, with the coins it
-#: spent still unspent, MAY still surface from a peer.  An XCH funding send is
-#: sent again after this many consecutive polls (~5 min at the 15 s tick): the
-#: worst case is a second 0.0001 XCH coin at the ephemeral key, which Sweep
-#: recovers.  A cat_spend never is -- a second burn is a real loss -- so it
-#: waits for the operator's Retry.
-_ORPHAN_POLLS_BEFORE_RESEND: int = 20
+#: spent still unspent, MAY still surface from a peer.  It is never sent again
+#: on the handler's own authority (a replacement spends other coins, so both
+#: could land; a second burn is a real loss): the job waits, fails at its
+#: pending deadline, and the operator's Retry is the authority to send again
+#: (_retry_tx_reset).  Only a send the chain PROVES dead -- an input spent by
+#: another transaction, at confirmation depth, with no output of ours -- is
+#: replaced automatically.
 
 # The only two states whose behaviour depends on whether the job is a rehearsal.
 # Everywhere else the flag is never consulted, so a row that predates the freeze
@@ -1675,7 +1676,6 @@ class WarpEngine:
                 unique_output=True,
                 scan=lambda dead: self._find_existing_funding(
                     security_ph.hex(), expected, exclude_ids=dead),
-                resend_on_orphan=True,
             )
             if step is not None:
                 return step
@@ -1704,12 +1704,17 @@ class WarpEngine:
         )
         self._wallet.log_in()
         address = cu.encode_puzzle_hash(security_ph, net.chia_prefix)
-        exclude = resend.pop("_exclude_coin_ids", None)
+        exclude = [c for c in (resend.get("funding_tx_id_exclude")
+                               or job.state.get("funding_tx_id_exclude") or [])
+                   if c]
         record = self._send_reserved(
-            job, tx_key="funding_tx_id", reserve_patch=resend,
+            job, tx_key="funding_tx_id",
+            # funding_amount travels with the reservation: a timed-out RPC
+            # must leave the amount Sweep looks for, not today's config.
+            reserve_patch={**resend, "funding_amount": expected},
             send=lambda: self._wallet.send_transaction(
                 1, expected, address, fee_mojos=fee,
-                **({"exclude_coin_ids": list(exclude)} if exclude else {}),
+                **({"exclude_coin_ids": exclude} if exclude else {}),
             ),
         )
         # [WARP-DUP-FUND 2026-08-08] send_transaction returned, so the coin is
@@ -1735,7 +1740,8 @@ class WarpEngine:
             # The coins it spent let a later tick prove the send dead.
             state={**resend, "funding_tx_id": tx_id, "funding_amount": expected,
                    "funding_tx_id_removals": list(cs.removal_ids(record)) or None,
-                   "funding_tx_id_orphan_polls": 0, "funding_fee_mojos": fee},
+                   "funding_tx_id_orphan_polls": 0, "funding_fee_mojos": fee,
+                   "funding_tx_id_exclude": None},
             message=f"funded {expected} mojos to the security coin (fee {fee})",
         )
 
@@ -1908,6 +1914,12 @@ class WarpEngine:
             contents=self._claim_contents(job),
         ):
             resolved, status = self._sweep_security(job, coin, sk)
+            if resolved:
+                # [WARP-LOST-SEND] ...and no replaced funding send of this job
+                # could still land: COMPLETED would leave its XCH no Sweep.
+                settled, note = self._prior_sends_settled(job)
+                if not settled:
+                    resolved, status = False, f"{status}; {note}"
             if not resolved:
                 # The deposit landed, but our funding coin is still unspent and
                 # the node was unreachable. COMPLETED is a closed state, so
@@ -2160,6 +2172,9 @@ class WarpEngine:
         A send waits for a settled wallet.
         """
         try:
+            # The configured fingerprint first: the daemon answers for the
+            # key that is logged in, which another client may have changed.
+            self._wallet.log_in()
             status = self._wallet.get_sync_status()
         except Exception as exc:  # noqa: BLE001 -- unknown is not synced
             raise WarpRetryable(
@@ -2182,13 +2197,96 @@ class WarpEngine:
             return None
         return peak - spent_at + 1
 
+    def _replacement_patch(self, job: WarpJob, *, tx_key: str, tx_id: str,
+                           removals: Sequence[str],
+                           also_clear: Sequence[str] = ()) -> Dict[str, Any]:
+        """State that retires the send recorded as *tx_id* and prepares its
+        replacement: the marker and its polls cleared, the id added to
+        ``<tx_key>_prior`` with the coins it spent in
+        ``<tx_key>_prior_removals`` (Sweep asks whether it could still land
+        before closing the job), those coins in ``<tx_key>_exclude`` so the
+        replacement never reuses them, and *also_clear* (an output pin) set
+        to None."""
+        st = job.state
+        prior_key, prior_removals_key = (f"{tx_key}_prior",
+                                         f"{tx_key}_prior_removals")
+        priors = [t for t in (st.get(prior_key) or []) if t]
+        prior_removals = dict(st.get(prior_removals_key) or {})
+        coins = [c for c in removals if c]
+        if coins:
+            prior_removals[tx_id] = coins
+        return {
+            tx_key: None, f"{tx_key}_orphan_polls": 0,
+            f"{tx_key}_removals": None,
+            prior_key: priors + ([tx_id] if tx_id not in priors else []),
+            prior_removals_key: prior_removals or None,
+            f"{tx_key}_exclude": coins or None,
+            **{key: None for key in also_clear},
+        }
+
+    def _prior_sends_settled(self, job: WarpJob,
+                             tx_key: str = "funding_tx_id") -> tuple:
+        """``(settled, note)``: whether every REPLACED funding send of *job*
+        can be ruled out, so Sweep may close the job.
+
+        A replacement spends other coins, so a replaced send that was not
+        proven dead could still land after the job closes -- XCH at the
+        ephemeral key with no Sweep left to recover it.  A replaced send is
+        settled when the chain proves it dead, or when every coin of the
+        funded amount at the key is spent (swept or claimed).  An unspent
+        coin there means "Sweep again"; anything else means "wait".
+        """
+        from . import chia_send as cs, claim
+
+        st = job.state
+        priors = [t for t in (st.get(f"{tx_key}_prior") or []) if t]
+        if not priors:
+            return True, ""
+        try:
+            ph = claim.security_coin_puzzle_hash(self._load_ephemeral_sk(job)).hex()
+            amount = int(self._funded_amount(job))
+        except Exception as exc:  # noqa: BLE001 -- cannot judge: not settled
+            return False, f"a replaced funding send cannot be judged ({exc})"
+        self._wallet.log_in()
+        outputs = list(self._coinset.get_coin_records_by_puzzle_hash(
+            ph, include_spent=True))
+        unspent = [r for r in outputs
+                   if int(r.coin.amount) == amount and not r.spent]
+        if unspent:
+            return False, ("XCH from a replaced funding send is still at the "
+                           "ephemeral key; Sweep again")
+        prior_removals = st.get(f"{tx_key}_prior_removals") or {}
+        min_depth = int(self._net.chia_confirmation_min_height)
+        for tx_id in priors:
+            if tx_id == _FUNDING_TX_UNKNOWN:
+                return False, ("an earlier send the wallet never named cannot "
+                               "be ruled out; Sweep again later or Abandon")
+            ev = cs.gather(
+                wallet_record=lambda t=tx_id: self._wallet.get_transaction_or_none(t),
+                mempool_item=lambda t=tx_id: self._coinset.get_mempool_item_by_tx_id(t),
+                coin_spent=self._coin_spent_depth,
+                outputs_at=lambda: outputs,
+                known_removals=prior_removals.get(tx_id) or [],
+                out_amount=amount, unique_output=True, min_depth=min_depth,
+            )
+            verdict, why = cs.judge(ev)
+            if verdict is cs.Verdict.DEAD:
+                continue
+            if verdict is cs.Verdict.LANDED:
+                continue          # its coin is at the key and spent (above)
+            return False, (f"replaced funding send {tx_id[:16]}... could "
+                           f"still land ({why}); Sweep again later")
+        return True, ""
+
     def _recorded_send_verdict(self, job: WarpJob, *, tx_key: str,
                                out_ph_hex: str, out_amount: int,
                                unique_output: bool) -> tuple:
         """``(Verdict, reason, evidence)`` for the send recorded under
-        *tx_key* (chia_send.py)."""
+        *tx_key* (chia_send.py).  The configured fingerprint is selected
+        first; a login failure propagates (it is not absence)."""
         from . import chia_send as cs
 
+        self._wallet.log_in()
         tx_id = str(job.state.get(tx_key) or "")
         ev = cs.gather(
             wallet_record=lambda: self._wallet.get_transaction_or_none(tx_id),
@@ -2209,17 +2307,20 @@ class WarpEngine:
     def _judge_recorded_send(
         self, job: WarpJob, *, tx_key: str, label: str, out_ph_hex: str,
         out_amount: int, unique_output: bool, scan: Callable[[Sequence[str]], Any],
-        resend_on_orphan: bool, also_clear: Sequence[str] = (),
+        also_clear: Sequence[str] = (),
     ) -> tuple:
         """Judge the Chia send recorded under *tx_key* on this tick.
 
         Returns ``(step, patch)``.  A step means "return it" (the send is
-        alive, landed, or not yet given up on).  ``step is None`` means the
-        send is DEAD and the caller sends again, merging *patch* into the
-        state it records: the dead id joins ``<tx_key>_prior`` (so the
-        dedupe scans skip it), and ``_exclude_coin_ids`` -- not persisted --
-        names coins the replacement must not reuse, where the first send's
-        coins are still unspent.
+        alive, landed, orphaned, or undecided).  ``step is None`` means the
+        chain PROVED the send dead and the caller sends again, merging
+        *patch* into the state it records: the dead id joins
+        ``<tx_key>_prior`` (so the dedupe scans skip it) with the coins it
+        spent in ``<tx_key>_prior_removals`` (so Sweep can later tell whether
+        it could still land), and ``<tx_key>_exclude`` names coins the
+        replacement must not reuse.  The configured fingerprint is selected
+        first: another client may have switched the daemon's key, and the
+        configured wallet's own pending send must not read as absent.
 
         *scan* is the fail-closed wallet-history dedupe scan (given the ids
         already proven dead to skip; returns a tx id or falsy; raises when
@@ -2230,25 +2331,13 @@ class WarpEngine:
         """
         from . import chia_send as cs
 
+        self._wallet.log_in()
         st = job.state
         tx_id = str(st.get(tx_key) or "")
         polls_key, removals_key, prior_key = (
             f"{tx_key}_orphan_polls", f"{tx_key}_removals", f"{tx_key}_prior")
         polls = int(st.get(polls_key) or 0)
         priors = [t for t in (st.get(prior_key) or []) if t]
-        limit = _ORPHAN_POLLS_BEFORE_RESEND
-
-        def dead(why: str, exclude) -> tuple:
-            _log.warning("warp job %s: %s %s is dead (%s); sending again",
-                         job.id, label, tx_id, why)
-            patch: Dict[str, Any] = {
-                tx_key: None, polls_key: 0, removals_key: None,
-                prior_key: priors + ([tx_id] if tx_id not in priors else []),
-                **{key: None for key in also_clear},
-            }
-            if exclude:
-                patch["_exclude_coin_ids"] = [c for c in exclude if c]
-            return None, patch
 
         if tx_id == _FUNDING_TX_UNKNOWN:
             found = scan(priors)
@@ -2262,13 +2351,11 @@ class WarpEngine:
                              "history; awaiting the coin"),
                 ), {}
             polls += 1
-            if polls >= limit and resend_on_orphan:
-                return dead("the wallet never named it and its history does "
-                            f"not show it after {polls} polls", ())
             return _stay(
                 state={polls_key: polls},
                 message=(f"{label} unnamed by the wallet and absent from its "
-                         f"history ({polls}/{limit}); waiting"),
+                         f"history (poll {polls}); waiting -- the operator's "
+                         "Retry sends it again"),
             ), {}
 
         verdict, why, ev = self._recorded_send_verdict(
@@ -2278,16 +2365,18 @@ class WarpEngine:
         if ev.removals and not st.get(removals_key):
             learned[removals_key] = list(ev.removals)
         if verdict is cs.Verdict.DEAD:
-            return dead(why, ())
+            _log.warning("warp job %s: %s %s is dead (%s); sending again",
+                         job.id, label, tx_id, why)
+            return None, self._replacement_patch(
+                job, tx_key=tx_key, tx_id=tx_id,
+                removals=list(ev.removals) or (st.get(removals_key) or []),
+                also_clear=also_clear)
         if verdict is cs.Verdict.ORPHAN:
             polls += 1
-            if polls >= limit and resend_on_orphan:
-                return dead(f"{why} for {polls} polls", ev.removals)
-            hint = ("waiting before sending again" if resend_on_orphan
-                    else "waiting; the operator's Retry sends it again")
             return _stay(
                 state={**learned, polls_key: polls},
-                message=f"{label} {tx_id} is {why} ({polls}/{limit}); {hint}",
+                message=(f"{label} {tx_id} is {why} (poll {polls}); waiting -- "
+                         "the operator's Retry sends it again"),
             ), {}
         if verdict in (cs.Verdict.UNKNOWN, cs.Verdict.SHALLOW):
             return _stay(
@@ -2360,35 +2449,18 @@ class WarpEngine:
         still open the raw is kept and the retry just resumes polling it.
         """
         target = job.state.get("failed_from")
-        if target == JobStatus.BURN_SENT:
-            # [WARP-LOST-SEND 2026-10-25] A cat_spend that is nowhere -- not
+        if target in (JobStatus.BURN_SENT, JobStatus.FUNDING_CLAIM,
+                      JobStatus.BURNING):
+            # [WARP-LOST-SEND 2026-10-25] A Chia send that is nowhere -- not
             # in the wallet, not in the mempool, its coins unspent -- is never
-            # sent again on the handler's own authority: a second burn is a
-            # real loss if the first surfaces after all.  The operator's
-            # Retry is that authority.  The marker is cleared so the handler
-            # runs its fail-closed history scan and, finding nothing, sends.
-            # A cat_spend the wallet or the mempool still holds is kept.
-            tx_id = str(job.state.get("burn_tx_id") or "")
-            if not tx_id:
-                return {}
-            priors = [t for t in (job.state.get("burn_tx_id_prior") or []) if t]
-            cleared = {"burn_tx_id": None, "burn_tx_id_orphan_polls": 0,
-                       "burn_tx_id_removals": None, "burn_cat_coin_id": None,
-                       "burn_tx_id_prior": priors + (
-                           [tx_id] if tx_id not in priors else [])}
-            if tx_id == _FUNDING_TX_UNKNOWN:
-                found = self._find_existing_burn(
-                    int(job.state["cat_wallet_id"]), job.state["burn_cat_ph"],
-                    int(job.amount_mojos), exclude_ids=priors)
-                return {} if found else cleared
-            from . import chia_send as cs
-
-            verdict, _why, _ev = self._recorded_send_verdict(
-                job, tx_key="burn_tx_id", out_ph_hex=job.state["burn_cat_ph"],
-                out_amount=int(job.amount_mojos), unique_output=False)
-            if verdict in (cs.Verdict.DEAD, cs.Verdict.ORPHAN):
-                return cleared
-            return {}
+            # sent again on the handler's own authority: a replacement spends
+            # other coins, so both could land, and a second burn is a real
+            # loss.  The operator's Retry is that authority.  The marker is
+            # cleared (the coins it spent become the replacement's exclusions
+            # and are kept for Sweep's accounting), so the handler runs its
+            # fail-closed history scan and, finding nothing, sends.  A send
+            # the wallet or the mempool still holds is kept.
+            return self._release_recorded_send(job, target)
         if target == JobStatus.RELAYING:
             # Unconditional, and safe ONLY here: a relay re-signed at a
             # fresh nonce cannot double-deliver -- the second attempt
@@ -2437,6 +2509,51 @@ class WarpEngine:
                 "bridge_prior_hashes": None,
             }
         return {"approve_raw": None, "approve_tx_hash": None, "approve_status_polls": None}
+
+    def _release_recorded_send(self, job: WarpJob, target: str) -> Dict[str, Any]:
+        """Retry's reset for a job that failed waiting on a Chia send: the
+        replacement patch when the send is proven dead or orphaned, {} when
+        it is still alive somewhere (or landed)."""
+        from . import chia_send as cs, claim
+
+        if target == JobStatus.BURN_SENT:
+            tx_key, unique = "burn_tx_id", False
+            out_ph = str(job.state["burn_cat_ph"])
+            out_amount = int(job.amount_mojos)
+            also_clear: tuple = ("burn_cat_coin_id",)
+            wid = int(job.state["cat_wallet_id"])
+            scan = lambda dead: self._find_existing_burn(  # noqa: E731
+                wid, out_ph, out_amount, exclude_ids=dead)
+        else:
+            tx_key, unique, also_clear = "funding_tx_id", True, ()
+            out_ph = claim.security_coin_puzzle_hash(
+                self._load_ephemeral_sk(job)).hex()
+            out_amount = (int(self._net.chia_toll_mojos)
+                          if target == JobStatus.BURNING
+                          else int(self._funded_amount(job)))
+            scan = lambda dead: self._find_existing_funding(  # noqa: E731
+                out_ph, out_amount, exclude_ids=dead)
+        tx_id = str(job.state.get(tx_key) or "")
+        if not tx_id:
+            return {}
+        priors = [t for t in (job.state.get(f"{tx_key}_prior") or []) if t]
+        if tx_id == _FUNDING_TX_UNKNOWN:
+            self._wallet.log_in()
+            found = scan(priors)
+            found_id = found[0] if isinstance(found, tuple) else found
+            if found_id:
+                return {}
+            return self._replacement_patch(
+                job, tx_key=tx_key, tx_id=tx_id, removals=[],
+                also_clear=also_clear)
+        verdict, _why, ev = self._recorded_send_verdict(
+            job, tx_key=tx_key, out_ph_hex=out_ph, out_amount=out_amount,
+            unique_output=unique)
+        if verdict in (cs.Verdict.DEAD, cs.Verdict.ORPHAN):
+            return self._replacement_patch(
+                job, tx_key=tx_key, tx_id=tx_id, removals=list(ev.removals),
+                also_clear=also_clear)
+        return {}
 
     def _bridge_hashes(self, job: WarpJob) -> list:
         """Every hash this job's bridge nonce has been signed under, newest first."""
@@ -3042,7 +3159,6 @@ class WarpEngine:
                 out_ph_hex=burn_cat_ph, out_amount=amount, unique_output=False,
                 scan=lambda dead: self._find_existing_burn(
                     wid, burn_cat_ph, amount, exclude_ids=dead),
-                resend_on_orphan=False,
                 also_clear=("burn_cat_coin_id",),
             )
             if step is not None:
@@ -3229,7 +3345,6 @@ class WarpEngine:
                     out_ph_hex=ph.hex(), out_amount=toll, unique_output=True,
                     scan=lambda dead: self._find_existing_funding(
                         ph.hex(), toll, exclude_ids=dead),
-                    resend_on_orphan=True,
                 )
                 if step is not None:
                     return step
@@ -3253,13 +3368,16 @@ class WarpEngine:
             self._require_wallet_synced("toll funding")
             self._require_spendable_xch(toll + fee, context="toll funding")
             self._wallet.log_in()
-            exclude = resend.pop("_exclude_coin_ids", None)
+            exclude = [c for c in (resend.get("funding_tx_id_exclude")
+                                   or job.state.get("funding_tx_id_exclude") or [])
+                       if c]
             record = self._send_reserved(
-                job, tx_key="funding_tx_id", reserve_patch=resend,
+                job, tx_key="funding_tx_id",
+                reserve_patch={**resend, "funding_amount": toll},
                 send=lambda: self._wallet.send_transaction(
                     1, toll, cu.encode_puzzle_hash(ph, net.chia_prefix),
                     fee_mojos=fee,
-                    **({"exclude_coin_ids": list(exclude)} if exclude else {}),
+                    **({"exclude_coin_ids": exclude} if exclude else {}),
                 ),
             )
             tx_id = (record.get("name") or record.get("transaction_id")
@@ -3269,7 +3387,8 @@ class WarpEngine:
             return _stay(
                 state={**resend, "funding_tx_id": tx_id, "funding_amount": toll,
                        "funding_tx_id_removals": list(cs.removal_ids(record)) or None,
-                       "funding_tx_id_orphan_polls": 0, "funding_fee_mojos": fee},
+                       "funding_tx_id_orphan_polls": 0, "funding_fee_mojos": fee,
+                       "funding_tx_id_exclude": None},
                 message=f"funded {toll} mojos to the toll coin (fee {fee})",
             )
 
@@ -3753,7 +3872,33 @@ class WarpEngine:
                 sweep_fee=int(fee),
             )
         except Exception as exc:  # noqa: BLE001 -- operator can re-sweep later
-            return False, f"sweep failed: {exc}"
+            text = str(exc)
+            low = text.lower()
+            # A DEFINITIVE fee rejection of a bundle no node ever accepted:
+            # the pin is released so the next Sweep reprices from a fresh
+            # estimate.  Once a push was accepted or its outcome is unknown,
+            # the pin stays -- a repriced twin would only conflict with it.
+            fee_rejected = ("request failed" not in low and any(
+                t in low for t in ("invalid_fee", "fee_too_low", "low_fee",
+                                   "fee too low")))
+            if fee_rejected and not job.state.get("sweep_pushed"):
+                try:
+                    self._store.update_job(
+                        job.id, expected_status=job.status,
+                        state_patch={"sweep_fee_mojos": None})
+                except Exception as patch_exc:  # noqa: BLE001
+                    _log.warning("warp job %s: could not release the sweep fee (%s)",
+                                 job.id, patch_exc)
+                return False, (f"sweep rejected for its fee ({text}); it is "
+                               "repriced on the next Sweep")
+            return False, f"sweep failed: {text}"
+        if kind in ("accepted", "pending"):
+            try:
+                self._store.update_job(job.id, expected_status=job.status,
+                                       state_patch={"sweep_pushed": True})
+            except Exception as patch_exc:  # noqa: BLE001
+                _log.warning("warp job %s: could not record the sweep push (%s)",
+                             job.id, patch_exc)
 
         if kind == "conflict":
             # The coin is spent -- by our own claim, a prior sweep -- or a
@@ -4234,9 +4379,11 @@ class WarpEngine:
                     event=(
                         "retry",
                         f"operator retry -> {target}"
-                        + ((" (the vanished cat_spend is cleared; the burn "
-                            "will be sent again)")
-                           if reset and target == JobStatus.BURN_SENT
+                        + ((" (the vanished send is cleared; it will be sent "
+                            "again)")
+                           if reset and target in (JobStatus.BURN_SENT,
+                                                   JobStatus.FUNDING_CLAIM,
+                                                   JobStatus.BURNING)
                            else (" (re-signing: the previous nonce is spent)"
                                  if reset else "")),
                         None,
@@ -4344,7 +4491,14 @@ class WarpEngine:
         # where one exists; closing an outbound job is Abandon's job, which
         # writes the recovery blob first.
         outbound = job.state.get("direction") == "out"
-        close = resolved and job.status == JobStatus.FAILED and not outbound
+        # [WARP-LOST-SEND] A replaced funding send that could still land
+        # keeps the job open: closed, its XCH would have no Sweep.
+        settled, settled_note = (self._prior_sends_settled(job)
+                                 if resolved else (True, ""))
+        if resolved and not settled:
+            status = f"{status}; {settled_note}"
+        close = (resolved and settled and job.status == JobStatus.FAILED
+                 and not outbound)
         if outbound and resolved:
             status = (
                 f"{status}; outbound job left open -- Retry resumes it, "
