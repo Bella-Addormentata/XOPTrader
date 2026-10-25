@@ -159,24 +159,26 @@ TEST(WarpSendGuardTest, RetiredAttemptsProvenDeadProtectNothing) {
                      .has_value());
 }
 
-TEST(WarpSendGuardTest, AnOrphanedCurrentSendProtectsNothing) {
-    // The GUI's last judgement found the send in no wallet record and no
-    // mempool: nothing to protect.  A judgement that finds it again resets
-    // the count, and the count is only read as an integer.
-    const json orphan = {{"funding_tx_id", "x"}, {"funding_tx_id_orphan_polls", 480}};
-    EXPECT_FALSE(warp_job_chia_send("FUNDING_CLAIM", orphan, kUsdc).has_value());
+TEST(WarpSendGuardTest, ASendTheWalletDoesNotHoldProtectsNothing) {
+    // The GUI's last judgement found no wallet record: nothing to protect.
+    // The flag follows the record (an ORPHAN then SHALLOW with the record
+    // back reads false again), and only a boolean counts.
+    const json absent = {{"funding_tx_id", "x"}, {"funding_tx_id_wallet_absent", true}};
+    EXPECT_FALSE(warp_job_chia_send("FUNDING_CLAIM", absent, kUsdc).has_value());
     const json failed = {{"failed_from", "FUNDING_CLAIM"}, {"funding_tx_id", "x"},
-                         {"funding_tx_id_orphan_polls", 480}};
+                         {"funding_tx_id_wallet_absent", true}};
     EXPECT_FALSE(warp_job_chia_send("FAILED", failed, kUsdc).has_value());
-    const json seen = {{"funding_tx_id", "x"}, {"funding_tx_id_orphan_polls", 0}};
-    EXPECT_TRUE(warp_job_chia_send("FUNDING_CLAIM", seen, kUsdc).has_value());
-    const json burn = {{"burn_tx_id", "y"}, {"burn_tx_id_orphan_polls", 3}};
+    const json held = {{"funding_tx_id", "x"}, {"funding_tx_id_wallet_absent", false}};
+    EXPECT_TRUE(warp_job_chia_send("FUNDING_CLAIM", held, kUsdc).has_value());
+    const json unknown = {{"funding_tx_id", "x"}, {"funding_tx_id_wallet_absent", nullptr}};
+    EXPECT_TRUE(warp_job_chia_send("FUNDING_CLAIM", unknown, kUsdc).has_value());
+    const json burn = {{"burn_tx_id", "y"}, {"burn_tx_id_wallet_absent", true}};
     EXPECT_FALSE(warp_job_chia_send("BURN_SENT", burn, kUsdc).has_value());
-    const json odd = {{"funding_tx_id", "x"}, {"funding_tx_id_orphan_polls", "480"}};
+    const json odd = {{"funding_tx_id", "x"}, {"funding_tx_id_wallet_absent", "true"}};
     EXPECT_TRUE(warp_job_chia_send("FUNDING_CLAIM", odd, kUsdc).has_value())
-        << "a non-integer count is not evidence";
+        << "a non-boolean is not evidence";
     // A retained live prior still protects regardless.
-    const json prior = {{"funding_tx_id", "x"}, {"funding_tx_id_orphan_polls", 9},
+    const json prior = {{"funding_tx_id", "x"}, {"funding_tx_id_wallet_absent", true},
                         {"funding_tx_id_prior", json::array({"a"})}};
     EXPECT_TRUE(warp_job_chia_send("FUNDING_CLAIM", prior, kUsdc).has_value());
 }

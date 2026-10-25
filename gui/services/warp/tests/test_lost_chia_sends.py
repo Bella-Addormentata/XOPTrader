@@ -3155,3 +3155,33 @@ def test_a_completed_claims_deadline_names_the_funding_wait():
     plain = engine._pending_expired(SimpleNamespace(
         status=JobStatus.CLAIMING, state={"pending_polls": limit}))
     assert "the claim completed" not in plain
+
+
+def test_the_wallet_absence_flag_follows_the_wallets_answer(monkeypatch):
+    """[review] The engine guard reads the wallet's LAST answer: an orphan
+    tick sets the flag, a later tick that finds the record again (SHALLOW
+    here) clears it, and a replacement starts with no answer."""
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store, funding_tx_id=DEAD_TX, funding_tx_id_removals=[RID])
+    ctx.coinset.records[RID] = _rec(spent=False)             # nowhere: ORPHAN
+    engine.step()
+    assert store.get_active_job().state["funding_tx_id_wallet_absent"] is True
+
+    ctx.wallet.tx_records[DEAD_TX] = {"confirmed": False, "removals": []}   # the record is back
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = 9_477_776 + 3                         # ...and the spend is shallow
+    store.update_job(job.id, columns={"next_retry_at": None})
+    engine.step()
+    st = store.get_active_job().state
+    assert st["funding_tx_id"] == DEAD_TX
+    assert st["funding_tx_id_wallet_absent"] is False, "the wallet holds it again"
+
+    del ctx.wallet.tx_records[DEAD_TX]                       # gone, and now deep: DEAD
+    ctx.coinset.peak = PEAK
+    store.update_job(job.id, columns={"next_retry_at": None})
+    engine.step()
+    st = store.get_active_job().state
+    assert st["funding_tx_id"] == "funding-tx-1"
+    assert st["funding_tx_id_wallet_absent"] is None, "a new send has no answer yet"

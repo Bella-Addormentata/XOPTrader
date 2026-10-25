@@ -129,18 +129,20 @@ struct WarpChiaSend {
         }
         return false;
     };
-    // [review] <tx_key>_orphan_polls > 0 means the GUI's last judgement
-    // found the send in NO wallet record and no mempool item (a judgement
-    // that finds it again resets the count): there is nothing in the
-    // wallet for a cleanup to delete, so the current marker protects
+    // [review] <tx_key>_wallet_absent is the wallet's answer at the GUI's
+    // LAST judgement of the send: true when it held no record, false when
+    // it held one (whatever the verdict -- ORPHAN, then SHALLOW with the
+    // record back -- the flag follows the record), absent or null when no
+    // judgement has answered yet.  A record the wallet does not hold is
+    // nothing for a cleanup to delete, so the current marker protects
     // nothing then -- a FAILED job left over a weekend must not hold the
     // XCH wallet's own stuck-transaction cleanup for a record that is gone.
-    const auto orphaned = [&](const char* polls_key) -> bool {
-        if (!state.is_object() || !state.contains(polls_key)
-            || !state[polls_key].is_number_integer()) {
+    const auto wallet_absent = [&](const char* key) -> bool {
+        if (!state.is_object() || !state.contains(key)
+            || !state[key].is_boolean()) {
             return false;
         }
-        return state[polls_key].get<std::int64_t>() > 0;
+        return state[key].get<bool>();
     };
     const std::string status =
         status_in == "FAILED" ? text("failed_from") : status_in;
@@ -148,13 +150,13 @@ struct WarpChiaSend {
     bool any = false;
     if (status == "FUNDING_CLAIM" || status == "BURNING") {
         if (!text("funding_tx_id").empty()
-            && !orphaned("funding_tx_id_orphan_polls")) {
+            && !wallet_absent("funding_tx_id_wallet_absent")) {
             s.xch = true;
             any   = true;
         }
     }
     if (status == "BURN_SENT") {
-        if (!text("burn_tx_id").empty() && !orphaned("burn_tx_id_orphan_polls")) {
+        if (!text("burn_tx_id").empty() && !wallet_absent("burn_tx_id_wallet_absent")) {
             s.xch          = true;
             s.cat_asset_id = fingerprint_asset_id(text("asset_fingerprint"));
             if (s.cat_asset_id.empty()) s.cat_asset_id = default_cat_asset_id;

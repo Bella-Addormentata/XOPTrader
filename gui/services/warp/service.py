@@ -1790,7 +1790,7 @@ class WarpEngine:
             state={**resend, "funding_tx_id": tx_id, "funding_amount": expected,
                    "funding_tx_id_removals": list(cs.removal_ids(record)) or None,
                    "funding_tx_id_orphan_polls": 0, "funding_fee_mojos": fee,
-                   "funding_tx_id_exclude": None},
+                   "funding_tx_id_exclude": None, "funding_tx_id_wallet_absent": None},
             message=f"funded {expected} mojos to the security coin (fee {fee})",
         )
 
@@ -2386,7 +2386,8 @@ class WarpEngine:
         polls_key = f"{tx_key}_orphan_polls"
         patch = {**{k: v for k, v in (reserve_patch or {}).items()
                     if not k.startswith("_")},
-                 tx_key: _FUNDING_TX_UNKNOWN, polls_key: 0}
+                 tx_key: _FUNDING_TX_UNKNOWN, polls_key: 0,
+                 f"{tx_key}_wallet_absent": None}
         # Everything the reservation changes, as the tick found it: a refusal
         # puts it ALL back (the marker, its polls, removals, priors and pin),
         # so the next tick judges the same send with the same evidence.
@@ -2710,6 +2711,7 @@ class WarpEngine:
             dead_key: proven_dead or None,
             f"{tx_key}_prior_retired_at": retired_at or None,
             f"{tx_key}_exclude": exclude or None,
+            f"{tx_key}_wallet_absent": None,
             **seq_patch,
             **{key: None for key in also_clear},
         }
@@ -3271,6 +3273,15 @@ class WarpEngine:
         learned: Dict[str, Any] = {}
         if ev.removals and not st.get(removals_key):
             learned[removals_key] = list(ev.removals)
+        # [review] Whether the wallet holds the send, as of THIS judgement:
+        # the engine's guard protects a wallet record, so a send the wallet
+        # answered "no record" for protects nothing until the wallet holds it
+        # again -- whatever the verdict (ORPHAN, then SHALLOW with the record
+        # back).  Unanswered leaves the last answer standing.
+        if ev.wallet_known is True:
+            learned[f"{tx_key}_wallet_absent"] = False
+        elif ev.wallet_known is False:
+            learned[f"{tx_key}_wallet_absent"] = True
         if verdict is cs.Verdict.DEAD:
             _log.warning("warp job %s: %s %s is dead (%s); sending again",
                          job.id, label, tx_id, why)
@@ -4294,7 +4305,7 @@ class WarpEngine:
         patch = {**resend, "burn_tx_id": tx_id,
                  "burn_tx_id_removals": list(cs.removal_ids(record)) or None,
                  "burn_tx_id_orphan_polls": 0, "burn_fee_mojos": fee,
-                 "burn_tx_id_exclude": None}
+                 "burn_tx_id_exclude": None, "burn_tx_id_wallet_absent": None}
         for add in record.get("additions") or []:
             if _hx(str(add.get("puzzle_hash") or "")) == burn_cat_ph \
                     and int(add.get("amount") or 0) == amount:
@@ -4444,7 +4455,7 @@ class WarpEngine:
                 state={**resend, "funding_tx_id": tx_id, "funding_amount": toll,
                        "funding_tx_id_removals": list(cs.removal_ids(record)) or None,
                        "funding_tx_id_orphan_polls": 0, "funding_fee_mojos": fee,
-                       "funding_tx_id_exclude": None},
+                       "funding_tx_id_exclude": None, "funding_tx_id_wallet_absent": None},
                 message=f"funded {toll} mojos to the toll coin (fee {fee})",
             )
 
