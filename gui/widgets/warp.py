@@ -938,7 +938,7 @@ class WarpWidget(QWidget):
             tips = []
             last_error = job.get("last_error")
             if last_error:
-                tips.append(f"Last error: {last_error}")
+                tips.append(str(last_error))
             # [review] What Sweep found, and the Chia sends still being ruled
             # out: the reasons a FAILED or COMPLETED-looking job is still open.
             if job.get("sweep_status"):
