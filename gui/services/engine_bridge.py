@@ -689,6 +689,20 @@ class EngineBridge(QObject):
             _log.error("Failed to create pause flag: %s", exc)
             self.error.emit(f"Could not pause trading: {exc}")
 
+    def _sync_warp_engine_home(self) -> None:
+        """[review] Tell the warp worker which config the engine WE launched is
+        running (None when none is).  Its job store follows that config while
+        the engine runs: the engine's stuck-transaction guard reads the store
+        beside ITS config, not beside whatever config the GUI switched to, and
+        a send recorded elsewhere would be unprotected.  Cheap; called at every
+        engine start and stop, on a config switch, and from the master tick
+        (an engine that died on its own is noticed there)."""
+        launched = self.launched_config_path if self.engine_running_locally else None
+        try:
+            self._warp_svc.set_engine_home(Path(launched).parent if launched else None)
+        except Exception as exc:  # noqa: BLE001 -- never break the caller
+            _log.debug("warp engine-home sync failed: %s", exc)
+
     @property
     def launched_config_path(self):
         """[RELOAD] The --config this bridge launched the engine with, or
@@ -1053,8 +1067,12 @@ class EngineBridge(QObject):
             # config-relative as well, and the C++ engine (restarted on the
             # new config) reads the store beside THAT config for its
             # stuck-transaction guard -- both must move together, or a live
-            # warp send is recorded where the engine does not look.
+            # warp send is recorded where the engine does not look.  While
+            # an engine of ours still runs on the PREVIOUS config, the worker
+            # keeps recording beside that one (_sync_warp_engine_home): the
+            # running engine's guard reads nothing else.
             self._warp_svc.set_secrets_path(resolved.parent / "secrets.yaml")
+            self._sync_warp_engine_home()
         if success:
             _log.info("Config path updated and reloaded.")
         else:
@@ -1159,6 +1177,7 @@ class EngineBridge(QObject):
         # warp is disabled or has no active job; overlapping ticks are
         # dropped by the service's in-flight guard.
         if self._tick_count % 6 == 5:
+            self._sync_warp_engine_home()
             self._warp_svc.tick()
 
         # [LIVECFG] The engine's answer to a Settings save, once it lands.
@@ -1433,6 +1452,7 @@ class EngineBridge(QObject):
                               self._reload_request_id)
                 self._reload_request_id = None
                 self._reload_deferred_reported = False
+                self._sync_warp_engine_home()
                 self._engine_keep_supported = keep_supported
                 self._engine_binary_path = engine_path
                 self._engine_keep_reprobed = False
@@ -1457,6 +1477,7 @@ class EngineBridge(QObject):
                 self._engine_process = None
                 self._engine_keep_supported = False
                 self._engine_binary_path = None
+                self._sync_warp_engine_home()
 
         return False
 
@@ -1558,6 +1579,7 @@ class EngineBridge(QObject):
         self._engine_launch_dir = None
         self._engine_keep_supported = False
         self._engine_binary_path = None
+        self._sync_warp_engine_home()
         return outcome
 
     def _stop_running_engine(

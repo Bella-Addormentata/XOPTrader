@@ -2647,10 +2647,13 @@ def test_a_failed_history_lookup_never_starts_or_advances_the_grace(monkeypatch)
     # Even past the grace, an unanswered lookup settles nothing -- and it
     # drops the clock: absence was not established on this pass.
     store.update_job(job.id, state_patch={
-        "funding_tx_id_prior_absent_since": {k1: now - 48 * 3600.0}})
+        "funding_tx_id_prior": [k1, "toll-a"],
+        "funding_tx_id_prior_absent_since": {k1: now - 48 * 3600.0,
+                                             "toll-a": now - 48 * 3600.0}})
     settled, note = engine._prior_sends_settled(store.get_active_job())
     assert not settled and "could not be read" in note
-    assert not store.get_job(job.id).state.get("funding_tx_id_prior_absent_since")
+    assert not store.get_job(job.id).state.get("funding_tx_id_prior_absent_since"), \
+        "every clock: the attempt behind the failed read was not probed either"
 
 
 def test_the_worker_follows_a_config_switch(tmp_path):
@@ -3517,3 +3520,152 @@ def test_a_proven_dead_cat_spend_is_skipped_before_identification():
     st = store.get_active_job().state
     assert st["burn_tx_id_prior"] == [k1] and st["burn_tx_id_prior_dead"] == [k1]
     assert st["burn_tx_id"] == "new-burn" and st["burn_tx_id_removals"] == [yid, zid]
+
+
+# --------------------------------------------------------------------------- #
+# Review round 45.
+# --------------------------------------------------------------------------- #
+
+def test_a_shared_probe_failure_drops_every_absence_clock(monkeypatch):
+    """[review] The wallet login, or the key's coin records, failed: no
+    attempt was probed, so no absence clock survives the pass -- an outage
+    must not count toward any attempt's grace."""
+    monkeypatch.setattr(S, "_UNOBSERVABLE_ATTEMPT_GRACE_S", 6 * 3600)
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    now = 1_000_000.0
+    monkeypatch.setattr(engine, "_now", lambda: now)
+    key = "funding_tx_id_prior_absent_since"
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": ["toll-a", "toll-c"],
+        "funding_tx_id_prior_removals": {"toll-a": [RID], "toll-c": ["e3" * 32]},
+        key: {"toll-a": now - 5 * 3600.0, "toll-c": now - 5 * 3600.0}})
+
+    def down(*a, **k):
+        raise RuntimeError("wallet rpc down")
+
+    ctx.wallet.log_in = down
+    with pytest.raises(RuntimeError):
+        engine._prior_sends_settled(store.get_active_job())
+    assert not store.get_job(job.id).state.get(key)
+    # The key's coin records failing: the same.
+    del ctx.wallet.log_in
+    store.update_job(job.id, state_patch={key: {"toll-a": now - 5 * 3600.0}})
+    ctx.coinset.get_coin_records_by_puzzle_hash = down
+    with pytest.raises(RuntimeError):
+        engine._prior_sends_settled(store.get_active_job())
+    assert not store.get_job(job.id).state.get(key)
+
+
+def test_a_send_hold_pends_before_the_wallet_is_asked():
+    """[review] The worker's hold (the engine guards another job store)
+    pends a send with its reason, before any wallet RPC."""
+    store = new_store()
+    engine, ctx = build(store)
+    engine.send_hold = lambda: "the engine guards another store"
+    with pytest.raises(S.WarpPending, match="another store"):
+        engine._require_wallet_synced("claim security-coin funding")
+    assert ctx.wallet.logged_in == 0
+    engine.send_hold = lambda: None
+    engine._require_wallet_synced("claim security-coin funding")
+
+
+def _funding_advance_state(monkeypatch, parent_hex):
+    store = new_store()
+    engine, ctx = build(store)
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: SimpleNamespace(
+        name=lambda: b"\x5a" * 32, parent_coin_info=bytes.fromhex(parent_hex)))
+    _seed_funding(store, funding_tx_id="toll-b", funding_amount=EXPECTED,
+                  funding_tx_id_removals=["d4" * 32])
+    assert engine.step()["status"] == JobStatus.CLAIM_FUNDED
+    return store.get_active_job().state
+
+
+def test_the_current_attempts_own_coin_marks_it_landed_for_the_guard(monkeypatch):
+    """[review] The engine's guard protects the current attempt in every
+    status until the wallet drops its record or ITS OWN output is on chain:
+    the advance that finds the coin says which, by the coin's parent."""
+    assert _funding_advance_state(monkeypatch, "d4" * 32).get("funding_tx_id_landed") is True
+    # An EARLIER attempt's coin carried the job: the current one may still
+    # be confirming, so it stays protected (no flag).
+    assert "funding_tx_id_landed" not in _funding_advance_state(monkeypatch, "d9" * 32)
+
+
+def test_a_replacement_clears_the_landed_flag(monkeypatch):
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_funding(store, funding_tx_id=DEAD_TX, funding_amount=EXPECTED,
+                  funding_tx_id_removals=[RID], funding_tx_id_landed=True)
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = PEAK
+    engine.step()
+    st = store.get_active_job().state
+    assert st["funding_tx_id"] == "funding-tx-1" and st.get("funding_tx_id_landed") is None
+
+
+def test_the_burn_cats_parent_marks_the_cat_spend_landed_for_the_guard():
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _to_burn_sent(store, engine)
+    burn_ph = store.get_active_job().state["burn_cat_ph"]
+    x = "d4" * 32
+    store.update_job(job.id, state_patch={
+        "burn_tx_id": "burn-x", "burn_tx_id_removals": [x], "burn_cat_coin_id": "c1" * 32})
+    ctx.coinset.records["c1" * 32] = SimpleNamespace(
+        coin=SimpleNamespace(parent_coin_info=x, puzzle_hash=burn_ph, amount=AMOUNT),
+        spent=False, confirmed_block_index=PEAK - 3, spent_block_index=0)
+    assert engine.step()["status"] == JobStatus.BURNING
+    assert store.get_active_job().state.get("burn_tx_id_landed") is True
+
+
+def test_the_worker_follows_the_running_engines_config(tmp_path):
+    """[review] While an engine of ours runs, its stuck-transaction guard
+    reads the store beside ITS config: the worker records there, whatever
+    config the GUI switched to; with no engine running, beside the GUI's."""
+    closed = []
+    worker = S._WarpWorker(secrets_path=tmp_path / "one" / "secrets.yaml")
+    worker._engine = SimpleNamespace(close=lambda: closed.append(1))
+    worker.set_engine_home(tmp_path / "one")                  # the same home: nothing
+    assert closed == [] and worker._config_home() == tmp_path / "one"
+    worker.set_secrets_path(tmp_path / "two" / "secrets.yaml")  # the GUI switched...
+    assert worker._config_home() == tmp_path / "one", "...but the engine still runs on one"
+    worker._engine = SimpleNamespace(close=lambda: closed.append(2))
+    worker.set_engine_home(None)                              # the engine stopped
+    assert worker._config_home() == tmp_path / "two" and closed[-1] == 2
+    worker._engine = SimpleNamespace(close=lambda: closed.append(3))
+    worker.set_engine_home(tmp_path / "three")                # restarted on a third
+    assert worker._config_home() == tmp_path / "three" and closed[-1] == 3
+
+
+def test_a_store_with_open_work_is_kept_across_a_switch(tmp_path):
+    """[review] A config switch (or a warp.jobs_db change) must not make a
+    bridge job or an open Dexie take vanish from monitoring: the store in use
+    is kept until its work closes, the banner says so, and a NEW send waits
+    only while an engine of ours guards the other store."""
+    from gui.services.warp.jobs import WarpJobStore
+
+    old = tmp_path / "one" / "data" / "warp_jobs.db"
+    with WarpJobStore(old) as s:
+        s.create_job("mainnet", status=JobStatus.FUNDING_CLAIM, state={})
+        s.record_take(trade_id="aa" * 32, asset_id="bb" * 32, cat_mojos=1,
+                      xch_mojos=2, fee_mojos=3)
+    worker = S._WarpWorker(secrets_path=tmp_path / "two" / "secrets.yaml")
+    worker._config = {"warp": {"enabled": True}}
+    worker._store_path = str(old)
+    wanted = str(S._job_db_path(worker._config, anchor=tmp_path / "two"))
+    assert worker._store_path_in_use() == str(old)
+    assert "job 1 (FUNDING_CLAIM) and 1 open Dexie take(s)" in worker._store_hold
+    assert wanted in worker._store_hold
+    assert worker._send_hold_reason() is None, "no engine of ours runs: the job may finish"
+    assert "store_notice" in worker._snapshot_or_error()
+    worker._engine_home = tmp_path / "two"
+    assert "guard reads the job store beside its config" in worker._send_hold_reason()
+    # The work closes: the configured store is opened next, nothing held.
+    with WarpJobStore(old) as s:
+        s.settle_take("aa" * 32, S.jobs.TAKE_FAILED, error="x")
+        s.update_job(1, status=JobStatus.CANCELLED, expected_status=JobStatus.FUNDING_CLAIM)
+    assert worker._store_path_in_use() == wanted and worker._store_hold == ""
+    assert worker._send_hold_reason() is None
+    assert "store_notice" not in worker._snapshot_or_error()

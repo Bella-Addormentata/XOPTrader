@@ -620,6 +620,23 @@ class WarpJobStore:
             ).fetchone()
         return _row_to_job(row) if row is not None else None
 
+    def open_work_summary(self) -> str:
+        """[review] What keeps this store in use -- the active job and the
+        Dexie takes not yet settled -- as a phrase ("job 4 (CLAIMING) and 1
+        open Dexie take(s)"); "" when nothing is open.  A store with open
+        work is not left behind by a config switch."""
+        parts = []
+        job = self.get_active_job()
+        if job is not None:
+            parts.append(f"job {job.id} ({job.status})")
+        with self._lock:
+            open_takes = self._conn.execute(
+                "SELECT COUNT(*) FROM dexie_takes WHERE status IN (?, ?, ?)",
+                (TAKE_SUBMITTING, TAKE_SUBMITTED, TAKE_UNKNOWN)).fetchone()[0]
+        if open_takes:
+            parts.append(f"{int(open_takes)} open Dexie take(s)")
+        return " and ".join(parts)
+
     def list_jobs(self, limit: int = 50) -> list[WarpJob]:
         """Most-recent jobs first (open and closed), for the GUI table."""
         with self._lock:

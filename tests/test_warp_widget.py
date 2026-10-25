@@ -149,6 +149,14 @@ def test_disabled_snapshot_banner_and_controls(qapp):
     assert w._jobs_empty.isVisible()
 
 
+def test_a_store_notice_rides_the_banner(qapp):
+    """[review] A config switch that found open work keeps the job store in
+    use; the operator reads why, and what the switch waits for, here."""
+    w = _make(qapp, {"enabled": True, "dry_run": False, "jobs": [],
+                     "store_notice": "the bridge keeps its job store X until job 4 closes"})
+    assert "Job store:" in w._banner.text() and "job store X" in w._banner.text()
+
+
 def test_blocked_snapshot_surfaces_reason(qapp):
     w = _make(qapp, {"enabled": True, "error": "expected asset id mismatch"})
     text = w._banner.text().lower()

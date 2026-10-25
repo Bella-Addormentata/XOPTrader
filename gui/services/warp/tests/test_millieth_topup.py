@@ -355,8 +355,7 @@ VALUES ('aa', 'bb', 't0', 't0', 'cc', 1, 2, 3, 'submitted');
 """)
     conn.close()
     clock = ["t1"]
-    store = J.WarpJobStore(path, now=lambda: clock[0])
-    try:
+    with J.WarpJobStore(path, now=lambda: clock[0]) as store:
         take = store.get_take("aa")
         assert take.confirmed_height is None and take.unknown_since is None
         assert store.settle_take("aa", J.TAKE_UNKNOWN, error="lost").unknown_since == "t1"
@@ -366,8 +365,6 @@ VALUES ('aa', 'bb', 't0', 't0', 'cc', 1, 2, 3, 'submitted');
         assert done.unknown_since is None and done.confirmed_height == 5
         with pytest.raises(J.StaleJobError):
             store.take_still_live("aa")                      # not unknown any more
-    finally:
-        store.close()
 
 
 def test_unknown_takes_select_the_configured_key_first(monkeypatch):

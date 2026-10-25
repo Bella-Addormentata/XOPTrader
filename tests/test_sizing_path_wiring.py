@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -90,6 +91,20 @@ def test_switching_config_moves_the_database_path(app, tmp_path):
         )
         # [review] The warp worker's anchor (its jobs database) moves too.
         assert bridge._warp_svc.secrets_path == second.parent / "secrets.yaml"
+        # [review] ...while the store the worker RECORDS in follows the
+        # config of the engine this GUI launched for as long as it runs: the
+        # engine's stuck-transaction guard reads the store beside that one.
+        assert bridge._warp_svc.engine_home is None
+        bridge._engine_process = SimpleNamespace(poll=lambda: None, pid=1)
+        bridge._launched_config_path = first
+        bridge._sync_warp_engine_home()
+        assert bridge._warp_svc.engine_home == first.parent
+        bridge.update_config_path(str(first))                 # back and forth: unchanged
+        bridge.update_config_path(str(second))
+        assert bridge._warp_svc.engine_home == first.parent
+        bridge._engine_process = None                        # the engine stopped
+        bridge._sync_warp_engine_home()
+        assert bridge._warp_svc.engine_home is None
     finally:
         bridge.deleteLater()
         app.processEvents()

@@ -35,9 +35,15 @@ node's estimate when the mempool demands it. Sends wait for a synced wallet.
 excludes any wallet with a warp send in flight -- or a Dexie take whose
 outcome is not yet readable (the new `unknown` take status) -- from its
 stuck-transaction cleanup, fails closed when the database cannot be read,
-and keeps that protection across a config switch. An `unknown` take is
-released only after a day of unreadable trade-record lookups counted from
-the last pending read, never from its age.
+and keeps that protection across a config switch. The current attempt
+protects its wallet in every active status -- an earlier attempt's coin may
+carry the job forward while it is still confirming -- until the wallet
+drops its record or its own output is on chain. The bridge records its jobs
+beside the config the running engine was launched with, a store move waits
+while a job or a Dexie take is open (the banner says so), and new sends wait
+while the engine guards another store. An `unknown` take is released only
+after a day of unreadable trade-record lookups counted from the last pending
+read, never from its age.
 
 ## [0.10.31] — 2026-10-24 — a Wallet Link page for the Chia wallet and Sage
 

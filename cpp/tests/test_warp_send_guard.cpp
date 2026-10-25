@@ -81,7 +81,7 @@ TEST(WarpSendGuardTest, AnUnstampedCatSpendIsTheBridgeAsset) {
     EXPECT_EQ(t->cat_asset_id, kUsdc);
 }
 
-TEST(WarpSendGuardTest, AFailedJobIsReadByWhereItFailedFrom) {
+TEST(WarpSendGuardTest, AFailedJobKeepsItsMarkers) {
     // Job 4 after its two-hour timeout: FAILED, marker kept, slot kept --
     // and the send it recorded is still whatever it was.
     const json state = {{"failed_from", "FUNDING_CLAIM"},
@@ -93,12 +93,16 @@ TEST(WarpSendGuardTest, AFailedJobIsReadByWhereItFailedFrom) {
     const auto b = warp_job_chia_send("FAILED", burn, kUsdc);
     ASSERT_TRUE(b.has_value());
     EXPECT_EQ(b->cat_asset_id, kUsdc);
-    // Failed from a state with no wallet send, or with no record of where.
-    EXPECT_FALSE(warp_job_chia_send(
+    // [review] The marker rules wherever the job failed from, and with no
+    // record of where: a marker is a send the wallet may still hold.
+    EXPECT_TRUE(warp_job_chia_send(
         "FAILED", json{{"failed_from", "BRIDGING"}, {"funding_tx_id", "x"}},
         kUsdc).has_value());
-    EXPECT_FALSE(warp_job_chia_send("FAILED", json{{"funding_tx_id", "x"}},
-                                    kUsdc).has_value());
+    EXPECT_TRUE(warp_job_chia_send("FAILED", json{{"funding_tx_id", "x"}},
+                                   kUsdc).has_value());
+    // No marker at all: nothing to protect.
+    EXPECT_FALSE(warp_job_chia_send(
+        "FAILED", json{{"failed_from", "BRIDGING"}}, kUsdc).has_value());
 }
 
 TEST(WarpSendGuardTest, AReplacedSendKeepsProtectionInEveryActiveStatus) {
@@ -128,13 +132,59 @@ TEST(WarpSendGuardTest, AReplacedSendKeepsProtectionInEveryActiveStatus) {
     EXPECT_TRUE(warp_job_chia_send(
         "CLAIMING", json{{"funding_tx_id_prior", json::array({"a"})}}, kUsdc)
                     .has_value());
-    // No replacement, or an empty prior list: the status rules.
-    EXPECT_FALSE(warp_job_chia_send(
+    // [review] No replacement, or an empty prior list: the current marker
+    // protects itself in any status (TheCurrentAttemptProtectsItself...).
+    EXPECT_TRUE(warp_job_chia_send(
         "CLAIMING", json{{"funding_tx_id", "b"}}, kUsdc).has_value());
-    EXPECT_FALSE(warp_job_chia_send(
+    EXPECT_TRUE(warp_job_chia_send(
         "CLAIMING", json{{"funding_tx_id", "b"},
                          {"funding_tx_id_prior", json::array()}}, kUsdc)
-                     .has_value());
+                    .has_value());
+}
+
+TEST(WarpSendGuardTest, TheCurrentAttemptProtectsItselfInEveryActiveStatus) {
+    // [review] Orphan A presumed gone, replacement B still confirming; A
+    // lands after all and carries the job to CLAIM_FUNDED / CLAIMING.  B is
+    // in flight in the wallet, the GUI never retires a current attempt by
+    // age, and no live prior remains -- the marker alone must protect it.
+    const json state = {{"funding_tx_id", "b"},
+                        {"funding_tx_id_prior", json::array({"a"})},
+                        {"funding_tx_id_prior_presumed", json::array({"a"})}};
+    for (const char* st : {"FUNDING_CLAIM", "CLAIM_FUNDED", "COLLECTING_SIGS",
+                           "CLAIMING", "FAILED"}) {
+        const auto s = warp_job_chia_send(st, state, kUsdc);
+        ASSERT_TRUE(s.has_value()) << st;
+        EXPECT_TRUE(s->xch) << st;
+    }
+    // Released by the wallet's own "no record"...
+    json absent = state;
+    absent["funding_tx_id_wallet_absent"] = true;
+    EXPECT_FALSE(warp_job_chia_send("CLAIMING", absent, kUsdc).has_value());
+    // ...or by its OWN output on chain (the coin that carried the job
+    // forward descends from a coin B spent: B's record is confirmed).
+    json landed = state;
+    landed["funding_tx_id_landed"] = true;
+    EXPECT_FALSE(warp_job_chia_send("CLAIMING", landed, kUsdc).has_value());
+    EXPECT_FALSE(warp_job_chia_send("CLAIM_FUNDED", landed, kUsdc).has_value());
+    // Only a boolean counts.
+    landed["funding_tx_id_landed"] = "true";
+    EXPECT_TRUE(warp_job_chia_send("CLAIMING", landed, kUsdc).has_value());
+    // The cat_spend likewise, with its CAT wallet, through the unwrap.
+    const json burn = {{"burn_tx_id", "b"}, {"asset_fingerprint",
+                       "v1:0x" + std::string(40, 'a') + ":18:3:" + kMilli}};
+    for (const char* st : {"BURN_SENT", "BURNING", "COLLECTING_EVM_SIGS",
+                           "RELAYING", "AWAITING_EXTERNAL_RELAY"}) {
+        const auto b = warp_job_chia_send(st, burn, kUsdc);
+        ASSERT_TRUE(b.has_value()) << st;
+        EXPECT_TRUE(b->xch) << st;
+        EXPECT_EQ(b->cat_asset_id, kMilli) << st;
+    }
+    json burn_landed = burn;
+    burn_landed["burn_tx_id_landed"] = true;
+    EXPECT_FALSE(warp_job_chia_send("RELAYING", burn_landed, kUsdc).has_value());
+    // Terminal jobs never reach the guard; stated anyway.
+    EXPECT_FALSE(warp_job_chia_send("COMPLETED", state, kUsdc).has_value());
+    EXPECT_FALSE(warp_job_chia_send("CANCELLED", burn, kUsdc).has_value());
 }
 
 TEST(WarpSendGuardTest, RetiredAttemptsProvenDeadProtectNothing) {
@@ -154,13 +204,19 @@ TEST(WarpSendGuardTest, RetiredAttemptsProvenDeadProtectNothing) {
     const auto s = warp_job_chia_send("CLAIMING", one_live, kUsdc);
     ASSERT_TRUE(s.has_value());
     EXPECT_TRUE(s->xch);
-    // The current marker still rules in its own status.
+    // The current marker still rules, in every status ([review]: the
+    // replacement may still be confirming while another attempt's coin
+    // carried the job forward).
     const json dead_with_marker = {{"funding_tx_id", "c"},
                                    {"funding_tx_id_prior", json::array({"a"})},
                                    {"funding_tx_id_prior_dead", json::array({"a"})}};
     EXPECT_TRUE(warp_job_chia_send("FUNDING_CLAIM", dead_with_marker, kUsdc)
                     .has_value());
-    EXPECT_FALSE(warp_job_chia_send("CLAIMING", dead_with_marker, kUsdc)
+    EXPECT_TRUE(warp_job_chia_send("CLAIMING", dead_with_marker, kUsdc)
+                    .has_value());
+    json marker_landed = dead_with_marker;
+    marker_landed["funding_tx_id_landed"] = true;
+    EXPECT_FALSE(warp_job_chia_send("CLAIMING", marker_landed, kUsdc)
                      .has_value());
 }
 
@@ -188,13 +244,19 @@ TEST(WarpSendGuardTest, ASendTheWalletDoesNotHoldProtectsNothing) {
     EXPECT_TRUE(warp_job_chia_send("FUNDING_CLAIM", prior, kUsdc).has_value());
 }
 
-TEST(WarpSendGuardTest, OtherStatusesHoldNoWalletSend) {
-    const json state = {{"funding_tx_id", "x"}, {"burn_tx_id", "y"}};
+TEST(WarpSendGuardTest, AJobWithoutMarkersHoldsNoWalletSend) {
+    // [review] No marker in any status: nothing in flight.  Markers whose
+    // sends the wallet dropped, or whose own outputs are on chain, the same.
+    const json none = {{"receiver_ph", "ab"}};
+    const json spent = {{"funding_tx_id", "x"}, {"funding_tx_id_landed", true},
+                        {"burn_tx_id", "y"}, {"burn_tx_id_wallet_absent", true}};
     for (const char* st : {"AWAITING_DEPOSIT", "APPROVING", "BRIDGING",
-                           "CLAIM_FUNDED", "COLLECTING_SIGS", "CLAIMING",
-                           "UNWRAP_CHECKS", "COLLECTING_EVM_SIGS", "RELAYING",
+                           "FUNDING_CLAIM", "CLAIM_FUNDED", "COLLECTING_SIGS",
+                           "CLAIMING", "UNWRAP_CHECKS", "BURN_SENT", "BURNING",
+                           "COLLECTING_EVM_SIGS", "RELAYING",
                            "AWAITING_EXTERNAL_RELAY", "COMPLETED", "FAILED"}) {
-        EXPECT_FALSE(warp_job_chia_send(st, state, kUsdc).has_value()) << st;
+        EXPECT_FALSE(warp_job_chia_send(st, none, kUsdc).has_value()) << st;
+        EXPECT_FALSE(warp_job_chia_send(st, spent, kUsdc).has_value()) << st;
     }
 }
 

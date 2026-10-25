@@ -737,6 +737,14 @@ class WarpWidget(QWidget):
                 f"<br><span style='color:{TEXT_SECONDARY};'>"
                 f"{_html.escape(str(snap['action_notice']))}</span>"
             )
+        if snap.get("store_notice"):
+            # [review] A config switch found open work: the store in use is
+            # kept, and the operator reads here why and what the switch waits
+            # for.
+            text += (
+                f"<br><span style='color:{WARNING_YELLOW};'>Job store: "
+                f"{_html.escape(str(snap['store_notice']))}</span>"
+            )
         self._banner.setText(text + badge)
         self._banner.setStyleSheet(
             f"""

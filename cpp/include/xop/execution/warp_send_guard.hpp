@@ -86,12 +86,21 @@ struct WarpChiaSend {
 /// cat_spend (state.burn_tx_id) moves the job's CAT and pays any fee from
 /// XCH, so it touches both wallets; the CAT is the fingerprint's asset,
 /// else @p default_cat_asset_id (the wUSDC.b bridge asset, the only one
-/// jobs stamped before fingerprints could unwrap).  A FAILED job keeps the
-/// active slot AND its markers -- a confirmation timeout does not stop the
-/// send it recorded -- so it is read by the status it failed from
-/// (state.failed_from) until the operator retries or closes it.  Every
-/// other status either has no Chia send outstanding or pushes bundles the
-/// wallet never holds (the claim and burn bundles go straight to the node).
+/// jobs stamped before fingerprints could unwrap).  [review] The CURRENT
+/// attempt protects its wallets in EVERY active status, not only the one
+/// that sent it: an earlier attempt's coin may carry the job forward
+/// (FUNDING_CLAIM -> CLAIM_FUNDED -> CLAIMING) while the current one is
+/// still confirming, and the GUI never retires a current attempt by age --
+/// a record the engine deleted would keep that job open until the operator
+/// abandoned it.  The marker releases the wallet only when the GUI's last
+/// judgement found no wallet record for it (<key>_wallet_absent) or saw
+/// its own output on chain (<key>_landed: the coin that carried the job
+/// forward descends from a coin it spent, so its record is confirmed and
+/// no cleanup can touch it).  A FAILED job keeps the active slot AND its
+/// markers -- a confirmation timeout does not stop the send it recorded.
+/// COMPLETED and CANCELLED jobs never reach the guard (the engine reads
+/// active rows); the rule is stated here too.  The claim and burn bundles
+/// go straight to the node and never hold a wallet.
 [[nodiscard]] inline std::optional<WarpChiaSend> warp_job_chia_send(
     const std::string& status_in, const nlohmann::json& state,
     const std::string& default_cat_asset_id)
@@ -140,31 +149,31 @@ struct WarpChiaSend {
     // nothing for a cleanup to delete, so the current marker protects
     // nothing then -- a FAILED job left over a weekend must not hold the
     // XCH wallet's own stuck-transaction cleanup for a record that is gone.
-    const auto wallet_absent = [&](const char* key) -> bool {
+    // <tx_key>_landed is the GUI's word that the attempt's OWN output is on
+    // chain (its record is confirmed): nothing left to protect either.
+    // Only a boolean counts for both.
+    const auto flag = [&](const char* key) -> bool {
         if (!state.is_object() || !state.contains(key)
             || !state[key].is_boolean()) {
             return false;
         }
         return state[key].get<bool>();
     };
-    const std::string status =
-        status_in == "FAILED" ? text("failed_from") : status_in;
+    if (status_in == "COMPLETED" || status_in == "CANCELLED") return std::nullopt;
     WarpChiaSend s;
     bool any = false;
-    if (status == "FUNDING_CLAIM" || status == "BURNING") {
-        if (!text("funding_tx_id").empty()
-            && !wallet_absent("funding_tx_id_wallet_absent")) {
-            s.xch = true;
-            any   = true;
-        }
+    // [review] The current attempt, in every active status (see above).
+    if (!text("funding_tx_id").empty()
+        && !flag("funding_tx_id_wallet_absent") && !flag("funding_tx_id_landed")) {
+        s.xch = true;
+        any   = true;
     }
-    if (status == "BURN_SENT") {
-        if (!text("burn_tx_id").empty() && !wallet_absent("burn_tx_id_wallet_absent")) {
-            s.xch          = true;
-            s.cat_asset_id = fingerprint_asset_id(text("asset_fingerprint"));
-            if (s.cat_asset_id.empty()) s.cat_asset_id = default_cat_asset_id;
-            any = true;
-        }
+    if (!text("burn_tx_id").empty()
+        && !flag("burn_tx_id_wallet_absent") && !flag("burn_tx_id_landed")) {
+        s.xch          = true;
+        s.cat_asset_id = fingerprint_asset_id(text("asset_fingerprint"));
+        if (s.cat_asset_id.empty()) s.cat_asset_id = default_cat_asset_id;
+        any = true;
     }
     // A job that REPLACED a send keeps its wallets protected in every
     // active status until it closes: an earlier attempt's coin may have

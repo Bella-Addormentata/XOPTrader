@@ -816,6 +816,11 @@ class WarpEngine:
         self._relay_key = relay_key
         self._heartbeat_publisher = heartbeat_publisher
         self._relay_state_saver = relay_state_saver
+        # [review] Why a NEW Chia send must wait, or None (the worker wires
+        # it): the job store in use is not the one the running engine's
+        # stuck-transaction guard reads, so a send recorded here would be
+        # unprotected.  Consulted with the wallet-sync gate before every send.
+        self.send_hold: Optional[Callable[[], Optional[str]]] = None
         self._next_relay_sweep: float = 0.0
         self._relay_report: Dict[str, Any] = {}
         self._relay_activity: Dict[str, Any] = {}
@@ -1717,7 +1722,8 @@ class WarpEngine:
         if coin is not None:
             return _advance(
                 JobStatus.CLAIM_FUNDED,
-                state={"security_coin_id": coin.name().hex()},
+                state={"security_coin_id": coin.name().hex(),
+                       **self._landed_patch(job, "funding_tx_id", coin)},
                 message=f"security coin funded ({expected} mojos)",
             )
 
@@ -2402,7 +2408,7 @@ class WarpEngine:
         patch = {**{k: v for k, v in (reserve_patch or {}).items()
                     if not k.startswith("_")},
                  tx_key: _FUNDING_TX_UNKNOWN, polls_key: 0,
-                 f"{tx_key}_wallet_absent": None}
+                 f"{tx_key}_wallet_absent": None, f"{tx_key}_landed": None}
         # Everything the reservation changes, as the tick found it: a refusal
         # puts it ALL back (the marker, its polls, removals, priors and pin),
         # so the next tick judges the same send with the same evidence.
@@ -2442,6 +2448,9 @@ class WarpEngine:
         selected was one an offer created in the same window also used.
         A send waits for a settled wallet.
         """
+        hold = self.send_hold() if self.send_hold is not None else None
+        if hold:
+            raise WarpPending(f"{context}: {hold}")
         try:
             # The configured fingerprint first: the daemon answers for the
             # key that is logged in, which another client may have changed.
@@ -2452,6 +2461,21 @@ class WarpEngine:
                 f"{context}: wallet sync status unavailable ({exc})") from exc
         if status.get("synced") is not True or status.get("syncing") is True:
             raise WarpPending(f"{context}: the Chia wallet is syncing; waiting")
+
+    def _landed_patch(self, job: WarpJob, tx_key: str, coin: Any) -> Dict[str, Any]:
+        """[review] ``{<tx_key>_landed: True}`` when *coin* -- the coin that
+        carries the job forward -- descends from a coin the CURRENT attempt
+        spent: its own output is on chain, so its wallet record is confirmed
+        and the engine's guard may release the wallet.  ``{}`` when an earlier
+        attempt's coin carried the job (the current one may still be
+        confirming, and stays protected) or the attempt's coins are not
+        known.  Cleared by every new attempt (_send_reserved)."""
+        parent = getattr(coin, "parent_coin_info", None)
+        if parent is None:
+            return {}
+        phex = parent.hex() if isinstance(parent, (bytes, bytearray)) else _hx(str(parent))
+        mine = {_hx(c) for c in (job.state.get(f"{tx_key}_removals") or []) if c}
+        return {f"{tx_key}_landed": True} if phex and phex in mine else {}
 
     def _coin_spent_depth(self, coin_id_hex: str) -> Optional[int]:
         """Confirmations of the spend of a coin: 0 when unspent, None when
@@ -2764,6 +2788,7 @@ class WarpEngine:
             f"{tx_key}_prior_retired_at": retired_at or None,
             f"{tx_key}_exclude": exclude or None,
             f"{tx_key}_wallet_absent": None,
+            f"{tx_key}_landed": None,
             **seq_patch,
             **{key: None for key in also_clear},
         }
@@ -2922,6 +2947,24 @@ class WarpEngine:
             _log.debug("warp job %s: could not drop the absence clock of %s (%s)",
                        job.id, tx_id, exc)
 
+    def _absence_broken_all(self, job: WarpJob, tx_key: str) -> None:
+        """[review] A probe every attempt shares failed (the wallet login, the
+        key's coin records, or a history read the pass cannot go on without):
+        nothing was established about ANY attempt on this pass, so every
+        absence clock under *tx_key* is dropped -- an outage must not count
+        toward the grace.  Best effort."""
+        key = f"{tx_key}_prior_absent_since"
+        try:
+            fresh = self._store.get_job(job.id)
+            if not fresh.state.get(key):
+                return
+            self._store.update_job(fresh.id, expected_status=fresh.status,
+                                   state_patch={key: None})
+            _log.info("warp job %s: a shared probe failed; every %s absence clock "
+                      "restarts", job.id, tx_key)
+        except Exception as exc:  # noqa: BLE001 -- dropped on a later pass
+            _log.debug("warp job %s: could not drop the absence clocks (%s)", job.id, exc)
+
     def _prior_sends_settled(self, job: WarpJob,
                              tx_key: str = "funding_tx_id") -> tuple:
         """``(settled, note)``: once a funding send was REPLACED, whether
@@ -2949,10 +2992,17 @@ class WarpEngine:
             ph = claim.security_coin_puzzle_hash(self._load_ephemeral_sk(job)).hex()
             amount = int(self._funded_amount(job))
         except Exception as exc:  # noqa: BLE001 -- cannot judge: not settled
+            self._absence_broken_all(job, tx_key)
             return False, f"a replaced funding send cannot be judged ({exc})"
-        self._wallet.log_in()
-        outputs = list(self._coinset.get_coin_records_by_puzzle_hash(
-            ph, include_spent=True))
+        try:
+            self._wallet.log_in()
+            outputs = list(self._coinset.get_coin_records_by_puzzle_hash(
+                ph, include_spent=True))
+        except Exception:
+            # [review] Shared by every attempt: an outage here established
+            # nothing, and must not count toward any attempt's grace.
+            self._absence_broken_all(job, tx_key)
+            raise
         unspent = [r for r in outputs
                    if int(r.coin.amount) == amount and not r.spent]
         if unspent:
@@ -3007,7 +3057,7 @@ class WarpEngine:
                         job, tx_key, tx_id, coins, ph=ph, amount=amount, named=named,
                         live_coins=live_coins, recorded_sets=recorded_sets)
                 except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
-                    self._absence_broken(job, tx_key, tx_id)
+                    self._absence_broken_all(job, tx_key)
                     return False, (f"the wallet history could not be read ({exc}); "
                                    f"attempt {tx_id[:16]}... is not ruled out")
                 if found:
@@ -3026,7 +3076,7 @@ class WarpEngine:
                         ph, amount, exclude_ids=named, live_coins=live_coins,
                         recorded_sets=recorded_sets)
                 except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
-                    self._absence_broken(job, tx_key, tx_id)
+                    self._absence_broken_all(job, tx_key)
                     return False, (f"the wallet history could not be read ({exc}); "
                                    f"attempt {tx_id[:16]}... is not ruled out")
                 if ident and ident[0] and not ident[1]:
@@ -3194,9 +3244,14 @@ class WarpEngine:
             return True, ""
         ph = str(st.get("burn_cat_ph") or "")
         amount = int(job.amount_mojos)
-        self._wallet.log_in()
-        outputs = list(self._coinset.get_coin_records_by_puzzle_hash(
-            ph, include_spent=True))
+        try:
+            self._wallet.log_in()
+            outputs = list(self._coinset.get_coin_records_by_puzzle_hash(
+                ph, include_spent=True))
+        except Exception:
+            # [review] Shared by every attempt (see _prior_sends_settled).
+            self._absence_broken_all(job, "burn_tx_id")
+            raise
         prior_removals = st.get("burn_tx_id_prior_removals") or {}
         min_depth = int(self._net.chia_confirmation_min_height)
         named = [t for t in priors if not self._unnamed(t)]
@@ -3226,7 +3281,7 @@ class WarpEngine:
                         job, "burn_tx_id", tx_id, coins, ph=ph, amount=amount, named=named,
                         live_coins=live_coins, recorded_sets=recorded_sets)
                 except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
-                    self._absence_broken(job, "burn_tx_id", tx_id)
+                    self._absence_broken_all(job, "burn_tx_id")
                     return False, (f"the wallet history could not be read ({exc}); "
                                    "an earlier cat_spend is not ruled out")
                 if found:
@@ -3238,7 +3293,7 @@ class WarpEngine:
                         job, ph, amount, exclude_ids=named, live_coins=live_coins,
                         recorded_sets=recorded_sets)
                 except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
-                    self._absence_broken(job, "burn_tx_id", tx_id)
+                    self._absence_broken_all(job, "burn_tx_id")
                     return False, (f"the wallet history could not be read ({exc}); "
                                    f"an earlier cat_spend is not ruled out")
                 if ident and ident[0] and not ident[1]:
@@ -4289,7 +4344,8 @@ class WarpEngine:
             if rec is not None and not rec.spent:
                 return _advance(
                     JobStatus.BURNING,
-                    state={"burn_cat_parent": _hx(rec.coin.parent_coin_info)},
+                    state={"burn_cat_parent": _hx(rec.coin.parent_coin_info),
+                           **self._landed_patch(job, "burn_tx_id", rec.coin)},
                     message="burn CAT is on chain; the unwrap is now forward-only",
                 )
             # [WARP-LOST-SEND] The pin names a coin that never appeared (its
@@ -4354,7 +4410,8 @@ class WarpEngine:
                     continue                      # not provably this job's
                 return _advance(
                     JobStatus.BURNING,
-                    state={"burn_cat_parent": parent, "burn_cat_coin_id": coin_id},
+                    state={"burn_cat_parent": parent, "burn_cat_coin_id": coin_id,
+                           **self._landed_patch(job, "burn_tx_id", rec.coin)},
                     message="burn CAT is on chain; the unwrap is now forward-only",
                 )
 
@@ -4709,6 +4766,7 @@ class WarpEngine:
             state_patch={
                 "unwrap_nonce": out.nonce.hex(),
                 "security_coin_id": sec.name().hex(),
+                **self._landed_patch(job, "funding_tx_id", sec),
             },
         )
         kind, status = claim.push_burn_bundle(self._coinset, out.bundle)
@@ -6444,6 +6502,14 @@ class _SecretsFileIO:
 # Qt worker -- runs the blocking engine step on a background QThread.
 # ===================================================================== #
 
+def _same_path(a: str, b: str) -> bool:
+    """Whether two database paths name the same file."""
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except Exception:  # noqa: BLE001 -- unresolvable: not the same
+        return False
+
+
 class _WarpWorker(QObject):
     """Background worker that owns the :class:`WarpEngine` and ticks it.
 
@@ -6476,6 +6542,16 @@ class _WarpWorker(QObject):
         # (_config_home).  Set before moveToThread; changed afterwards only
         # through the set_secrets_path slot, on this thread.
         self._secrets_path: Optional[Path] = secrets_path
+        # [review] The directory of the config the RUNNING engine (ours) was
+        # launched with, or None: while it runs, its stuck-transaction guard
+        # reads the jobs database beside THAT config, so that is where this
+        # worker's sends are recorded -- whatever config the GUI has since
+        # switched to (EngineBridge keeps it current).
+        self._engine_home: Optional[Path] = None
+        # The jobs database last opened, and why it is kept when the
+        # configured one differs (open work must not vanish from monitoring).
+        self._store_path: Optional[str] = None
+        self._store_hold: str = ""
         self._last_wallet_notice: str = ""
         self._rebalance_params = rb.RebalanceParams()
         self._rebalance_error: str = ""
@@ -6537,6 +6613,26 @@ class _WarpWorker(QObject):
         self._drop_engine()
         self._engine_error = None
 
+    @Slot(object)
+    def set_engine_home(self, path: object) -> None:
+        """[review] Follow the config the RUNNING engine reads (EngineBridge):
+        its stuck-transaction guard protects the sends recorded in the jobs
+        database beside that config, so while it runs this worker records
+        there -- not beside whatever config the GUI switched to meanwhile.
+        None when no engine of ours is running: the GUI's config anchors the
+        store again.  Delivered on the worker thread."""
+        new = Path(str(path)) if path else None
+        if new == self._engine_home:
+            return
+        before = self._config_home()
+        self._engine_home = new
+        if self._config_home() != before:
+            _log.info("warp: the job store's anchor follows %s",
+                      f"the running engine's config in {new}" if new
+                      else "the GUI's config (no engine of ours is running)")
+            self._drop_engine()
+            self._engine_error = None
+
     def _drop_engine(self) -> None:
         """Discard the engine, closing its sqlite connection first."""
         engine, self._engine = self._engine, None
@@ -6545,9 +6641,53 @@ class _WarpWorker(QObject):
 
     def _config_home(self) -> Optional[Path]:
         """The directory the config/secrets live in -- the anchor for
-        relative data paths. None only when no secrets path was wired
-        (tests), which preserves the old CWD-relative behaviour there."""
+        relative data paths: the RUNNING engine's config directory while one
+        of ours runs (set_engine_home), else the GUI's.  None only when no
+        secrets path was wired (tests), which preserves the old CWD-relative
+        behaviour there."""
+        engine_home = getattr(self, "_engine_home", None)
+        if engine_home is not None:
+            return engine_home
         return self._secrets_path.parent if self._secrets_path else None
+
+    def _store_path_in_use(self) -> str:
+        """[review] The jobs database to open: the configured one, unless the
+        store last used (another directory's after a config switch, another
+        file after a warp.jobs_db change) still holds open work -- an active
+        job, or a Dexie take not yet settled.  That store is kept until the
+        work closes, so no bridge job or take vanishes from monitoring, and
+        the banner says so; a store that cannot be read is kept too (fail
+        closed).  The move is made once nothing is open."""
+        wanted = str(_job_db_path(self._config, anchor=self._config_home()))
+        held = getattr(self, "_store_path", None)
+        if not held or held == wanted or _same_path(held, wanted):
+            self._store_hold = ""
+            return wanted
+        try:
+            with WarpJobStore(held) as old:
+                open_work = old.open_work_summary()
+        except Exception as exc:  # noqa: BLE001 -- unreadable: keep it
+            open_work = f"work that could not be read ({exc})"
+        if not open_work:
+            _log.info("warp: the job store moves %s -> %s (nothing open)", held, wanted)
+            self._store_hold = ""
+            return wanted
+        self._store_hold = (f"the bridge keeps its job store {held} until {open_work} "
+                            f"closes; the configured store is {wanted}")
+        return held
+
+    def _send_hold_reason(self) -> Optional[str]:
+        """[review] Why a NEW Chia send must wait, or None: the store in use
+        is not the one beside the running engine's config, so the engine's
+        stuck-transaction guard would not see a send recorded in it.  With no
+        engine of ours running nothing cleans the wallet, and the held
+        store's job may finish (a Retry's send included)."""
+        if getattr(self, "_engine_home", None) is None or not getattr(self, "_store_hold", ""):
+            return None
+        return ("the engine's stuck-transaction guard reads the job store beside its "
+                f"config ({self._engine_home}), not this job's store "
+                f"({self._store_path}); restart the engine on the config this job "
+                "was started under, or close the job (Sweep / Abandon) first")
 
     # -- altruistic-relay ledger persistence (survives process restart) ----- #
 
@@ -6610,6 +6750,15 @@ class _WarpWorker(QObject):
             engine.refresh_relay_activity_if_due()
 
         snap = self._guarded(_run)
+        if getattr(self, "_store_hold", "") and self._engine is not None:
+            # [review] The held store's work closed: the configured store is
+            # opened on the next tick.
+            try:
+                if not self._engine._store.open_work_summary():
+                    self._drop_engine()
+                    self._engine_error = None
+            except Exception as exc:  # noqa: BLE001 -- checked again next tick
+                _log.debug("warp: could not re-check the held store (%s)", exc)
         if self._engine is None:
             # [review] Submitted Dexie takes settle whatever the switch that
             # authorises NEW warp work says: with warp disabled (or the
@@ -6986,7 +7135,7 @@ class _WarpWorker(QObject):
         store only when its file exists, and the wallet only when a take is
         still open. Contracted never to raise."""
         try:
-            path = Path(_job_db_path(self._config, anchor=self._config_home()))
+            path = Path(self._store_path_in_use())
             if not path.is_file():
                 return
             with WarpJobStore(str(path)) as store:
@@ -7384,6 +7533,8 @@ class _WarpWorker(QObject):
         snap["wallet_action_seq"] = self._wallet_action_seq
         if self._last_wallet_notice:
             snap["wallet_notice"] = self._last_wallet_notice
+        if getattr(self, "_store_hold", ""):
+            snap["store_notice"] = self._store_hold
         if self._rebalance_params.enabled or self._rebalance_error:
             snap["rebalance"] = {
                 "enabled": self._rebalance_params.enabled,
@@ -7449,12 +7600,16 @@ class _WarpWorker(QObject):
         # raise -- a missing hot-wallet key is the ordinary case. Without this,
         # each failed build leaked a connection, and _ensure_engine is retried
         # on every config reload.
-        store = WarpJobStore(_job_db_path(self._config, anchor=self._config_home()))
+        path = self._store_path_in_use()
+        store = WarpJobStore(path)
         try:
-            return self._build_engine_with(net, params, store)
+            engine = self._build_engine_with(net, params, store)
         except Exception:
             store.close()
             raise
+        self._store_path = path
+        engine.send_hold = self._send_hold_reason
+        return engine
 
     def _build_engine_with(
         self, net: Any, params: WarpParams, store: WarpJobStore
@@ -7658,7 +7813,7 @@ class _WarpWorker(QObject):
 
         if self._engine is not None:
             return self._engine._store.get_active_job()
-        db = Path(_job_db_path(self._config, anchor=self._config_home()))
+        db = Path(self._store_path_in_use())
         if not db.is_file():
             return None
         try:
@@ -7777,6 +7932,7 @@ class WarpService(QObject):
     _trigger_action = Signal(int, str)
     _trigger_wallet = Signal(str, dict)
     _trigger_secrets = Signal(object)
+    _trigger_engine_home = Signal(object)
 
     def __init__(
         self,
@@ -7790,6 +7946,7 @@ class WarpService(QObject):
         self._snapshot: dict = {}
         self._tick_in_flight: bool = False
         self._secrets_path: Optional[Path] = Path(secrets_path) if secrets_path else None
+        self._engine_home: Optional[Path] = None
 
         self._thread = QThread(self)
         self._thread.setObjectName("WarpWorkerThread")
@@ -7807,6 +7964,7 @@ class WarpService(QObject):
         self._trigger_action.connect(self._worker.job_action)
         self._trigger_wallet.connect(self._worker.wallet_action)
         self._trigger_secrets.connect(self._worker.set_secrets_path)
+        self._trigger_engine_home.connect(self._worker.set_engine_home)
 
         self._trigger_params.emit(dict(config or {}))
 
@@ -7851,6 +8009,23 @@ class WarpService(QObject):
             return
         self._secrets_path = new
         self._trigger_secrets.emit(new)
+
+    @property
+    def engine_home(self) -> Optional[Path]:
+        """The directory of the config the running engine was launched with
+        (EngineBridge), or None: the worker's job store follows it."""
+        return self._engine_home
+
+    def set_engine_home(self, path: Optional[Path]) -> None:
+        """[review] Tell the worker which config the engine WE launched runs
+        (None when none does): its job store follows that config while the
+        engine runs, since the engine's stuck-transaction guard reads the
+        store beside it, not beside whatever config the GUI switched to."""
+        new = Path(path) if path else None
+        if new == self._engine_home:
+            return
+        self._engine_home = new
+        self._trigger_engine_home.emit(new)
 
     def tick(self) -> None:
         """Trigger one bridge step on the worker thread (dropped if in flight)."""
