@@ -2869,3 +2869,36 @@ def test_learned_removals_of_a_named_retired_attempt_are_persisted(monkeypatch):
     assert not settled and "could still land" in note and "presumed gone" not in note
     ctx.coinset.records[rid] = _rec(spent=True)              # ...until proven dead
     assert engine._prior_sends_settled(store.get_active_job())[0]
+
+
+def test_an_attempt_identified_without_coins_is_probed_before_any_absence_rule(monkeypatch):
+    """[review] The history names the send but its record vanished before
+    the by-id lookup: the id is kept and probed next pass -- a bundle still
+    in the mempool keeps the job open however old the retirement is."""
+    k1 = S._FUNDING_TX_UNKNOWN + "#1"
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    ph = claim_mod.security_coin_puzzle_hash(engine._load_ephemeral_sk(job)).hex()
+    now = 1_000_000.0
+    monkeypatch.setattr(engine, "_now", lambda: now)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": [k1], "funding_tx_id_prior_removals": None,
+        "funding_tx_id_prior_retired_at": {k1: now - 10 * 3600.0}})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    # The history lists toll-x with no removals and the by-id lookup finds nothing.
+    ctx.wallet.txs = [{"name": "toll-x", "confirmed": False,
+                       "additions": [{"puzzle_hash": ph, "amount": NET.chia_toll_mojos}]}]
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "identified as toll-x" in note
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id_prior"] == ["toll-x"]
+
+    ctx.coinset.mempool["toll-x"] = {"removals": []}          # the bundle is in a mempool
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "mempool" in note and "presumed gone" not in note
+
+    del ctx.coinset.mempool["toll-x"]                        # nowhere, no coins: grace (10h)
+    ctx.wallet.txs = []
+    assert engine._prior_sends_settled(store.get_active_job())[0]

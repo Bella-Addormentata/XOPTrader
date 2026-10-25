@@ -2748,6 +2748,25 @@ class WarpEngine:
                 except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
                     return False, (f"the wallet history could not be read ({exc}); "
                                    f"attempt {tx_id[:16]}... is not ruled out")
+                if ident and ident[0] and not ident[1]:
+                    # [review] Identified, but its coins could not be read
+                    # (the record vanished between the scan and the by-id
+                    # lookup): keep the id now and PROBE it next pass -- the
+                    # wallet and the mempool answer for a named id -- rather
+                    # than fall into the absence rule on this tick.
+                    found_id = str(ident[0])
+                    if tx_id == current:
+                        try:
+                            self._store.update_job(
+                                job.id, expected_status=job.status,
+                                state_patch={tx_key: found_id})
+                        except Exception as exc:  # noqa: BLE001
+                            _log.debug("warp job %s: could not keep the identified "
+                                       "id (%s)", job.id, exc)
+                    else:
+                        self._persist_identified_attempt(job, tx_key, tx_id, found_id, [])
+                    return False, (f"attempt {tx_id[:16]}... identified as "
+                                   f"{found_id[:16]}...; its coins are being read")
                 if not ident or not ident[1]:
                     if tx_id != current:
                         # [review] Retired and unobservable: the grace clock.
@@ -2888,6 +2907,12 @@ class WarpEngine:
                 except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
                     return False, (f"the wallet history could not be read ({exc}); "
                                    f"an earlier cat_spend is not ruled out")
+                if ident and ident[0] and not ident[1]:
+                    # [review] Identified without coins: keep the id, probe it
+                    # next pass (see _prior_sends_settled).
+                    self._persist_identified_attempt(job, "burn_tx_id", tx_id, str(ident[0]), [])
+                    return False, (f"an earlier cat_spend identified as "
+                                   f"{str(ident[0])[:16]}...; its coins are being read")
                 if not ident or not ident[1]:
                     return False, ("an earlier cat_spend the wallet never named, "
                                    "whose coins are not known, cannot be ruled out")
