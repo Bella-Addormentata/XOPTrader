@@ -141,10 +141,12 @@ public:
 
     /// Compute the reservation price (inventory-adjusted mid) without
     /// posting quotes.  Useful for logging and diagnostics.
+    /// [LIVECFG] Shared lock: set_risk_params() may change gamma.
     double reservation_price(double mid, double sigma,
                              double q, double tau) const;
 
     /// Compute the optimal half-spread for current parameters.
+    /// [LIVECFG] Shared lock: set_risk_params() may change gamma and kappa.
     double optimal_half_spread(double sigma, double tau) const;
 
     /// Compute tau using exponential decay based on blocks since last fill.
@@ -178,9 +180,19 @@ public:
     /// lambda(delta) = A * exp(-kappa * delta)
     double fill_intensity(double delta) const;
 
-    /// Read-only access to the config.
-    // cfg_ is immutable after construction; no lock required.
-    const AvellanedaConfig& config() const { return cfg_; }
+    /// A copy of the config, taken under the shared lock: [LIVECFG]
+    /// set_risk_params() replaces some of it while the engine runs.
+    AvellanedaConfig config() const {
+        std::shared_lock lock(mtx_);
+        return cfg_;
+    }
+
+    /// [LIVECFG] Adopt the per-pair values the engine derives from a saved
+    /// config (gamma, kappa, q_max, the no-loss margin), keeping the price
+    /// buffer, regime and fill clock. Throws std::invalid_argument -- and
+    /// changes nothing -- on a value the constructor would also refuse.
+    void set_risk_params(double gamma, double kappa, double q_max,
+                         double min_margin_bps);
 
     // -- Shared regime detector (T3-01) -------------------------------------
 
@@ -224,6 +236,12 @@ private:
     /// Update regime classification.
     /// T3-01: delegates to the active RegimeDetector (shared or internal).
     void update_regime();
+
+    /// reservation_price() / optimal_half_spread() for a caller that
+    /// already holds mtx_ (compute_quotes).
+    double reservation_price_locked(double mid, double sigma,
+                                    double q, double tau) const;
+    double optimal_half_spread_locked(double sigma, double tau) const;
 
     // -- Thread safety (MEDIUM-1) --------------------------------------------
     // Mutable to allow shared (read) locking in const accessor methods.

@@ -136,6 +136,15 @@ public:
     /// hyperparameters (alpha, beta must be > 0).
     explicit AdverseSelectionEstimator(const AdverseSelectionConfig& cfg);
 
+    /// [LIVECFG] Validate a configuration exactly as the constructor does.
+    /// Throws std::invalid_argument.
+    static void validate_config(const AdverseSelectionConfig& cfg);
+
+    /// [LIVECFG] Adopt a saved configuration, keeping the fill history
+    /// (trimmed to the new max_history) and rebuilding the posterior from it
+    /// at once. Throws (and changes nothing) when the config is invalid.
+    void set_config(const AdverseSelectionConfig& cfg);
+
     // -- Primary interface ---------------------------------------------------
 
     /// Record a fill and classify it based on subsequent price observations.
@@ -217,8 +226,9 @@ public:
     /// shared container.
     std::deque<FillRecord> history() const noexcept;
 
-    /// Read-only access to the configuration.
-    const AdverseSelectionConfig& config() const noexcept;
+    /// A copy of the configuration, taken under the shared lock:
+    /// [LIVECFG] set_config() replaces it while the engine runs.
+    AdverseSelectionConfig config() const noexcept;
 
     // -- Cross-validation (T5-CR4) -------------------------------------------
 

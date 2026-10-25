@@ -562,6 +562,10 @@ private:
     prometheus::Gauge* stopdrain_failing_{nullptr};
     prometheus::Family<prometheus::Gauge>* peg_status_family_{nullptr};
     prometheus::Family<prometheus::Gauge>* peg_deviation_family_{nullptr};
+    /// [LIVECFG] The labelsets the last update_peg_status() published: an
+    /// asset a reloaded registry drops (or stops enforcing) is removed, so
+    /// the GUI's peg panel does not keep a stale row.
+    std::vector<prometheus::Labels> peg_labels_;
     prometheus::Gauge* fees_paid_24h_gauge_{nullptr};
     prometheus::Gauge* fees_controller_rate_gauge_{nullptr};
     prometheus::Gauge* fees_controller_level_gauge_{nullptr};

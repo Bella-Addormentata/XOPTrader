@@ -422,6 +422,14 @@ public:
     /// Return a const reference to the active configuration.
     const SpreadConfig& config() const noexcept;
 
+    /// [LIVECFG] Adopt the values the engine derives from a saved config
+    /// (gamma, the margin floor, the high-vol multiplier), keeping the
+    /// Thompson sampler and the spread-volatility history. Throws
+    /// std::invalid_argument -- and changes nothing -- on a value the
+    /// constructor would refuse.
+    void set_tunables(double gamma, double s_floor_bps,
+                      double high_vol_multiplier);
+
     /// [T5-CR15] Read-only access to the spread volatility tracker.
     const SpreadVolatilityTracker& spread_vol_tracker() const noexcept {
         return spread_vol_tracker_;

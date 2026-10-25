@@ -28,26 +28,46 @@ AdverseSelectionEstimator::AdverseSelectionEstimator(
     , alpha_(cfg.prior_alpha)
     , beta_(cfg.prior_beta)
 {
+    validate_config(cfg_);
+}
+
+// [LIVECFG] The constructor's checks, shared with set_config() so a saved
+// config the running engine adopts is held to the same rules.
+void AdverseSelectionEstimator::validate_config(const AdverseSelectionConfig& cfg)
+{
     // Validate hyperparameters.  Alpha and beta must be strictly positive
     // for the Beta distribution to be well-defined.
-    if (cfg_.prior_alpha <= 0.0) {
+    if (cfg.prior_alpha <= 0.0) {
         throw std::invalid_argument(
             "AdverseSelectionEstimator: prior_alpha must be > 0 (got "
-            + std::to_string(cfg_.prior_alpha) + ")");
+            + std::to_string(cfg.prior_alpha) + ")");
     }
-    if (cfg_.prior_beta <= 0.0) {
+    if (cfg.prior_beta <= 0.0) {
         throw std::invalid_argument(
             "AdverseSelectionEstimator: prior_beta must be > 0 (got "
-            + std::to_string(cfg_.prior_beta) + ")");
+            + std::to_string(cfg.prior_beta) + ")");
     }
     // Validate decay factor is in [0, 1).
-    if (cfg_.decay_factor < 0.0 || cfg_.decay_factor >= 1.0) {
-        if (cfg_.decay_factor != 0.0) {
+    if (cfg.decay_factor < 0.0 || cfg.decay_factor >= 1.0) {
+        if (cfg.decay_factor != 0.0) {
             throw std::invalid_argument(
                 "AdverseSelectionEstimator: decay_factor must be in [0, 1) (got "
-                + std::to_string(cfg_.decay_factor) + ")");
+                + std::to_string(cfg.decay_factor) + ")");
         }
     }
+}
+
+void AdverseSelectionEstimator::set_config(const AdverseSelectionConfig& cfg)
+{
+    validate_config(cfg);
+    std::unique_lock lock(mtx_);
+    cfg_ = cfg;
+    // Rebuild the posterior from the kept history NOW, with the new priors,
+    // decay and window: a quiet pair may not record another fill for days.
+    while (history_.size() > cfg_.max_history) {
+        history_.pop_front();
+    }
+    recompute_posterior();
 }
 
 // ===========================================================================
@@ -224,10 +244,10 @@ AdverseSelectionEstimator::history() const noexcept
     return history_;
 }
 
-const AdverseSelectionConfig&
+AdverseSelectionConfig
 AdverseSelectionEstimator::config() const noexcept
 {
-    // T2-02: Shared lock -- read-only access to config.
+    // T2-02: Shared lock, and a copy: a reference would outlive the lock.
     std::shared_lock lock(mtx_);
     return cfg_;
 }

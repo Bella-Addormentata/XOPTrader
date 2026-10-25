@@ -176,38 +176,21 @@ private:
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Constructor
+// [LIVECFG] validate_config -- the constructor's refusals, shared with
+// reconfigure() so a saved config the running engine adopts is held to the
+// same bounds.
 // ---------------------------------------------------------------------------
 
-OfferManager::OfferManager(asio::io_context&                    /*ioc*/,
-                           std::shared_ptr<rpc::ChiaWalletRPC>  wallet,
-                           std::shared_ptr<rpc::DexieClient>    dexie_client,
-                           std::shared_ptr<State>               state,
-                           const AppConfig&                     config)
-    : wallet_(std::move(wallet))
-    , dexie_client_(std::move(dexie_client))
-    , state_(std::move(state))
-    , strategy_cfg_(config.strategy)
-    , risk_cfg_(config.risk)
-    , dexie_cfg_(config.dexie)
-    , logger_(spdlog::default_logger()->clone("OfferMgr"))
-    , current_fee_mojos_(config.strategy.offer_fee_mojos)
+void OfferManager::validate_config(const AppConfig& config)
 {
     // Validate tier configuration arrays match declared tier count.
-    if (strategy_cfg_.tier_spacing_bps.size() != strategy_cfg_.num_tiers) {
+    if (config.strategy.tier_spacing_bps.size() != config.strategy.num_tiers) {
         throw std::invalid_argument(
             "tier_spacing_bps length must equal num_tiers");
     }
-    if (strategy_cfg_.tier_size_pct.size() != strategy_cfg_.num_tiers) {
+    if (config.strategy.tier_size_pct.size() != config.strategy.num_tiers) {
         throw std::invalid_argument(
             "tier_size_pct length must equal num_tiers");
-    }
-
-    // Build pair config lookup so evaluate_rebalance() can resolve
-    // base/quote asset IDs from a pair name without external help.
-    // ISO/IEC 5055: deterministic O(1) lookup, value-copy for safety.
-    for (const auto& pc : config.pairs) {
-        pair_config_map_.emplace(pc.name, pc);
     }
 
     // [OFFER-EXPIRY] An on-chain expiry MUST outlast the longest life this
@@ -229,31 +212,31 @@ OfferManager::OfferManager(asio::io_context&                    /*ioc*/,
         const auto check_expiry =
             [&](std::uint32_t secs, const std::string& who) {
                 if (expiry_outlasts_hard_ttl(
-                        secs, strategy_cfg_.offer_ttl_blocks,
+                        secs, config.strategy.offer_ttl_blocks,
                         kHardTtlMultiplier,
-                        strategy_cfg_.block_time_seconds)) {
+                        config.strategy.block_time_seconds)) {
                     return;
                 }
                 const auto floor_s = static_cast<std::int64_t>(
-                    hard_ttl_seconds(strategy_cfg_.offer_ttl_blocks,
+                    hard_ttl_seconds(config.strategy.offer_ttl_blocks,
                                      kHardTtlMultiplier,
-                                     strategy_cfg_.block_time_seconds)
+                                     config.strategy.block_time_seconds)
                     * kExpiryFloorMargin);
                 throw std::invalid_argument(
                     who + " offer_expiry_secs (" + std::to_string(secs)
                     + "s) must exceed " + std::to_string(floor_s)
                     + "s -- the hard TTL (offer_ttl_blocks "
-                    + std::to_string(strategy_cfg_.offer_ttl_blocks)
+                    + std::to_string(config.strategy.offer_ttl_blocks)
                     + " x " + std::to_string(kHardTtlMultiplier)
                     + " blocks at a configured "
-                    + std::to_string(strategy_cfg_.block_time_seconds)
+                    + std::to_string(config.strategy.block_time_seconds)
                     + "s/block) times a safety margin, because the real "
                       "block rate varies and an expiry inside the TTL would "
                       "let the chain expire offers this engine still tracks "
                       "as live");
             };
 
-        check_expiry(strategy_cfg_.offer_expiry_secs, "strategy");
+        check_expiry(config.strategy.offer_expiry_secs, "strategy");
         for (const auto& pc : config.pairs) {
             if (pc.offer_expiry_secs_override.has_value()) {
                 check_expiry(*pc.offer_expiry_secs_override,
@@ -261,12 +244,55 @@ OfferManager::OfferManager(asio::io_context&                    /*ioc*/,
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------------------------
+
+OfferManager::OfferManager(asio::io_context&                    /*ioc*/,
+                           std::shared_ptr<rpc::ChiaWalletRPC>  wallet,
+                           std::shared_ptr<rpc::DexieClient>    dexie_client,
+                           std::shared_ptr<State>               state,
+                           const AppConfig&                     config)
+    : wallet_(std::move(wallet))
+    , dexie_client_(std::move(dexie_client))
+    , state_(std::move(state))
+    , strategy_cfg_(config.strategy)
+    , risk_cfg_(config.risk)
+    , dexie_cfg_(config.dexie)
+    , logger_(spdlog::default_logger()->clone("OfferMgr"))
+    , current_fee_mojos_(config.strategy.offer_fee_mojos)
+{
+    validate_config(config);
+
+    // Build pair config lookup so evaluate_rebalance() can resolve
+    // base/quote asset IDs from a pair name without external help.
+    // ISO/IEC 5055: deterministic O(1) lookup, value-copy for safety.
+    for (const auto& pc : config.pairs) {
+        pair_config_map_.emplace(pc.name, pc);
+    }
 
     logger_->info("OfferManager initialised: {} tiers, TTL {} blocks, "
                   "{} pairs",
                   strategy_cfg_.num_tiers,
                   strategy_cfg_.offer_ttl_blocks,
                   pair_config_map_.size());
+}
+
+void OfferManager::reconfigure(const AppConfig& config)
+{
+    validate_config(config);
+    strategy_cfg_            = config.strategy;
+    risk_cfg_                = config.risk;
+    dexie_cfg_.claim_rewards = config.dexie.claim_rewards;
+    for (const auto& pc : config.pairs) {
+        pair_config_map_.insert_or_assign(pc.name, pc);
+    }
+    // The fee in force is the engine's to set (set_dynamic_fee, clamp_fees):
+    // with the FeeTracker on it is not strategy.offer_fee_mojos.
+    logger_->info("[LIVECFG] OfferManager reconfigured: {} tiers, TTL {} blocks",
+                  strategy_cfg_.num_tiers, strategy_cfg_.offer_ttl_blocks);
 }
 
 // ---------------------------------------------------------------------------
@@ -3447,6 +3473,19 @@ void OfferManager::set_cancel_fees(std::uint64_t xch_offered_mojos,
 void OfferManager::clear_cancel_fees() noexcept
 {
     cancel_fees_active_ = false;
+}
+
+void OfferManager::clamp_fees(std::uint64_t min_fee_mojos,
+                              std::uint64_t max_fee_mojos) noexcept
+{
+    const auto clamp = [&](std::uint64_t fee) {
+        return std::min(std::max(fee, min_fee_mojos), max_fee_mojos);
+    };
+    current_fee_mojos_ = clamp(current_fee_mojos_);
+    if (cancel_fees_active_) {
+        cancel_fee_xch_mojos_ = clamp(cancel_fee_xch_mojos_);
+        cancel_fee_cat_mojos_ = clamp(cancel_fee_cat_mojos_);
+    }
 }
 
 void OfferManager::set_cancel_observer(

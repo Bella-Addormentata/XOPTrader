@@ -130,6 +130,9 @@ public:
                 std::shared_ptr<rpc::ChiaWalletRPC>  wallet,
                 const AppConfig&                     config);
 
+    /// [LIVECFG] Adopt the split fee and XCH pool target of a saved config.
+    void reconfigure(const AppConfig& config) noexcept;
+
     ~CoinManager() = default;
 
     // Non-copyable, non-movable -- owned by the engine via unique_ptr.

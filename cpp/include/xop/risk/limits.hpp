@@ -322,6 +322,12 @@ public:
     explicit PreTradeCheck(const RiskConfig& cfg,
                            const StrategyConfig& strat_cfg);
 
+    /// [LIVECFG] A saved strategy.min_profit_margin_bps. The RiskConfig is
+    /// held by reference, so a reloaded risk section needs no call here.
+    /// Throws std::invalid_argument -- and changes nothing -- on a margin
+    /// the constructor would refuse.
+    void set_min_profit_margin_bps(double bps);
+
     // -- Core rule: NEVER SELL AT A LOSS ------------------------------------
 
     /// Enforce the never-sell-at-loss constraint on the ask price.

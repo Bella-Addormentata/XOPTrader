@@ -123,6 +123,22 @@ public:
     [[nodiscard]] TriArbResult compute_tri_arb_edge() const;
 
     /// Read-only access to config.
+    /// [LIVECFG] Adopt a saved configuration, keeping the score history and
+    /// the evaluation clock. Turning `enabled` off stops evaluation at once.
+    /// New min/max bounds drop the cached allocations and re-evaluate on the
+    /// next should_evaluate(): hysteresis and smoothing would otherwise blend
+    /// from allocations outside the new bounds and keep them there.
+    void set_config(const MarketAllocatorConfig& cfg) noexcept
+    {
+        const bool bounds_changed = cfg.min_alloc_pct != cfg_.min_alloc_pct
+                                 || cfg.max_alloc_pct != cfg_.max_alloc_pct;
+        cfg_ = cfg;
+        if (bounds_changed) {
+            allocations_.clear();
+            last_eval_block_ = 0;
+        }
+    }
+
     [[nodiscard]] const MarketAllocatorConfig& config() const noexcept {
         return cfg_;
     }

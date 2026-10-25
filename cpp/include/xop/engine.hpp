@@ -72,7 +72,7 @@
 #include "xop/risk/height_source.hpp"
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/peg_suspension.hpp"
-#include "xop/config_reload.hpp"
+#include "xop/config_live_apply.hpp"
 #include "xop/util/process_identity.hpp"
 #include "xop/util/stop_offers_policy.hpp"
 #include "xop/strategy/bbo_sanity.hpp"
@@ -1109,6 +1109,50 @@ private:
     asio::awaitable<void> check_config_reload_flag();
     asio::awaitable<bool> sweep_reload_disabled_offers();
 
+    // -- [LIVECFG 2026-10-25] The rest of the saved file, live --------------
+    //
+    // Beyond the disables above, a reload now adopts every setting except
+    // the restart-only list in config_live_apply.hpp: config_ is assigned in
+    // place (pairs element by element, so pair_config_map_ stays valid) and
+    // each subsystem that cached a value at construction is handed the new
+    // one. Validated in full BEFORE anything changes: a save one subsystem
+    // would refuse applies nothing, exactly like a save that fails to parse.
+
+    /// Throws std::invalid_argument naming the first refusal. Pure: builds
+    /// throwaway subsystems from `cfg`, touches no engine state.
+    static void validate_live_config(const AppConfig& cfg);
+
+    /// Assign `merged` (a plan_live_config() result) into config_ and push
+    /// it into the subsystems. Call only after validate_live_config().
+    void apply_live_config(const AppConfig& merged);
+
+    /// A plan whose apply was held back because an operator Cancel All was
+    /// walking the book (the detached cancel coroutine reads OfferManager
+    /// state across awaits). Applied on the first heartbeat after it clears.
+    std::optional<LiveConfigPlan> reload_deferred_plan_;
+    std::string reload_deferred_request_id_;   ///< its request id
+
+    /// Write data/config_reload.result.json for the GUI: what the last
+    /// processed save did. `status` is "applied", "deferred" or "rejected".
+    void write_reload_result(const std::string& status,
+                             const std::string& error,
+                             const std::vector<std::string>& restart_required);
+    std::filesystem::path config_reload_result_path_;
+    /// The request id the GUI wrote into the flag being answered ("reload
+    /// <id>"), echoed as request_id so the GUI matches answer to request
+    /// exactly. Empty for a flag without one.
+    std::string reload_request_id_;
+
+    /// [LIVECFG] risk.watchdog_stall_seconds as the dead man's switch was
+    /// armed with. The watchdog THREAD reads this, never config_.risk, which
+    /// a reload assigns on the engine thread.
+    std::uint32_t watchdog_stall_seconds_{0};
+
+    /// [LIVECFG] engine.shutdown_offers, readable from the signal thread that
+    /// may run shutdown(); a reload updates it with the rest of the file.
+    std::atomic<util::StopOffersPolicy> shutdown_offers_policy_{
+        util::StopOffersPolicy::Cancel};
+
     // -- [STOPDRAIN v0.10.7] Stopped means draining, never unmanaged -------
     //
     // The operator's OFF stops NEW offers immediately (pause flag) but no
@@ -1880,6 +1924,11 @@ private:
     /// could not establish this heartbeat: the balance gate suppresses
     /// every side that spends them.  Rebuilt at each Step 8.
     std::unordered_set<std::string> reserve_coins_unknown_;
+    /// [LIVECFG] The wallet each reserved asset's exclusion list was last
+    /// set on (Step 8).  A save that drops an asset from
+    /// strategy.asset_reserve_units clears that wallet's list through this,
+    /// so the coins stop being excluded even if the wallet map was rebuilt.
+    std::unordered_map<std::string, std::int64_t> reserve_wallet_ids_;
 
     /// [WARP-MILLIETH] Record that @p asset_id's tracked inventory was
     /// just SET from the wallet (startup seed, Step 8 recovery seed,

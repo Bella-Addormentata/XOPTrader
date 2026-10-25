@@ -323,6 +323,16 @@ PreTradeCheck::PreTradeCheck(const RiskConfig&     cfg,
     }
 }
 
+void PreTradeCheck::set_min_profit_margin_bps(double bps)
+{
+    const double fraction = bps / 10'000.0;
+    if (!(fraction >= 0.0 && fraction < 1.0)) {
+        throw std::invalid_argument(
+            "RiskConfig: min_profit_margin_bps yields margin_fraction outside [0, 1)");
+    }
+    margin_fraction_ = fraction;
+}
+
 // ---------------------------------------------------------------------------
 // enforce_no_loss -- CORE RULE: NEVER SELL AT A LOSS.
 //

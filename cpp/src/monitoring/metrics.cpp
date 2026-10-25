@@ -30,6 +30,7 @@
 #include <prometheus/histogram.h>
 #include <prometheus/registry.h>
 
+#include <algorithm>
 #include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
@@ -957,18 +958,26 @@ void MetricsExporter::update_peg_status(
             .Help("Last observed deviation from the declared peg, percent")
             .Register(*registry_);
     }
+    std::vector<prometheus::Labels> published;
+    published.reserve(rows.size());
     for (const auto& [key, status, dev] : rows) {
         const auto bar = key.find('|');
         const std::string symbol = key.substr(0, bar);
         const std::string asset = bar == std::string::npos
             ? std::string{} : key.substr(bar + 1);
-        auto& g = peg_status_family_->Add(
-            {{"symbol", symbol}, {"asset", asset}});
-        g.Set(static_cast<double>(status));
-        auto& d = peg_deviation_family_->Add(
-            {{"symbol", symbol}, {"asset", asset}});
-        d.Set(dev);
+        const prometheus::Labels labels{{"symbol", symbol}, {"asset", asset}};
+        peg_status_family_->Add(labels).Set(static_cast<double>(status));
+        peg_deviation_family_->Add(labels).Set(dev);
+        published.push_back(labels);
     }
+    for (const auto& old : peg_labels_) {
+        if (std::find(published.begin(), published.end(), old) != published.end()) {
+            continue;
+        }
+        peg_status_family_->Remove(&peg_status_family_->Add(old));
+        peg_deviation_family_->Remove(&peg_deviation_family_->Add(old));
+    }
+    peg_labels_ = std::move(published);
 }
 
 void MetricsExporter::update_watchdog_gate(bool fired)

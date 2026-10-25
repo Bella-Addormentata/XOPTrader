@@ -638,6 +638,11 @@ public:
     /// Read-only access to the active configuration.
     const LiquidityConfig& config() const noexcept;
 
+    /// [LIVECFG] Adopt a saved configuration, keeping the rebalance clock
+    /// and inventory memory. Validated exactly as the constructor validates;
+    /// throws std::invalid_argument and changes nothing when invalid.
+    void set_config(const LiquidityConfig& cfg);
+
     /// Total number of rebalance cycles completed.
     std::uint64_t rebalance_count() const noexcept;
 

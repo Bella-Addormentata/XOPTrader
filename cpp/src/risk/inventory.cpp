@@ -133,6 +133,23 @@ InventoryTracker::InventoryTracker(const RiskConfig& risk_cfg,
     }
 }
 
+void InventoryTracker::set_risk_limits(const RiskConfig& risk_cfg)
+{
+    std::unique_lock lock(mtx_capital_);
+    soft_limit_pct_           = risk_cfg.soft_limit_pct;
+    hard_limit_pct_           = risk_cfg.hard_limit_pct;
+    single_cat_cap_pct_       = risk_cfg.single_cat_cap_pct;
+    kelly_fraction_           = risk_cfg.kelly_fraction;
+    max_capital_per_pair_pct_ = risk_cfg.max_capital_per_pair_pct;
+}
+
+InventoryTracker::RiskLimits InventoryTracker::risk_limits() const
+{
+    std::shared_lock lock(mtx_capital_);
+    return {soft_limit_pct_, hard_limit_pct_, single_cat_cap_pct_,
+            kelly_fraction_, max_capital_per_pair_pct_};
+}
+
 // ===========================================================================
 // Cost Basis Tracking
 // ===========================================================================
@@ -444,10 +461,11 @@ double InventoryTracker::compute_kelly_size(double spread_bps,
     const double full_kelly = edge / sigma_sq_tau;
 
     // Apply the kelly_fraction scaling (default 0.5 = half-Kelly).
-    double sized = full_kelly * kelly_fraction_;
+    const RiskLimits lim = risk_limits();
+    double sized = full_kelly * lim.kelly_fraction;
 
     // Clamp to the per-pair capital limit from config.
-    sized = std::min(sized, max_capital_per_pair_pct_);
+    sized = std::min(sized, lim.max_capital_per_pair_pct);
 
     // Practical cap from strategy doc: ~2% of capital per pair per price level.
     static constexpr double kPracticalCapPerLevel = 0.02;
@@ -469,6 +487,7 @@ RiskStatus InventoryTracker::get_risk_status(
     // portfolio_concentration(), each of which acquired the same shared lock,
     // creating a nested-shared-lock hazard on non-recursive shared_mutex
     // implementations.
+    const RiskLimits lim = risk_limits();   // before mtx_records_, not inside
     std::shared_lock lock(mtx_records_);
 
     // Priority 1 (highest severity): Underwater.
@@ -516,11 +535,11 @@ RiskStatus InventoryTracker::get_risk_status(
         }
     }
 
-    if (concentration >= hard_limit_pct_) {
+    if (concentration >= lim.hard_limit_pct) {
         return RiskStatus::HardLimit;
     }
 
-    if (concentration >= soft_limit_pct_) {
+    if (concentration >= lim.soft_limit_pct) {
         return RiskStatus::SoftLimit;
     }
 
@@ -856,7 +875,7 @@ Mojo InventoryTracker::min_ask_price(const AssetId& asset_id) const
 
 double InventoryTracker::single_cat_cap() const noexcept
 {
-    return single_cat_cap_pct_;
+    return risk_limits().single_cat_cap_pct;
 }
 
 bool InventoryTracker::within_cat_cap(
@@ -869,6 +888,7 @@ bool InventoryTracker::within_cat_cap(
     // proposed quantity.  We do this by computing the current total portfolio
     // value and the current asset value, then adding the proposed increment
     // to both.
+    const double cap = risk_limits().single_cat_cap_pct;   // before mtx_records_
     std::shared_lock lock(mtx_records_);
 
     double asset_value = 0.0;
@@ -905,7 +925,7 @@ bool InventoryTracker::within_cat_cap(
         return true; // No capital deployed -- trivially within limits.
     }
 
-    return (asset_value / total_value) <= single_cat_cap_pct_;
+    return (asset_value / total_value) <= cap;
 }
 
 // ===========================================================================

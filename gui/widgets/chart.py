@@ -256,6 +256,12 @@ class ChartWidget(QWidget):
         self._build_toolbar(root)
         self._build_chart_area(root)
 
+    def set_show_grid(self, show: bool) -> None:
+        """[LIVECFG] Settings > Appearance > Show grid lines, applied live."""
+        alpha = 0.15
+        for plot in (self._price_plot, self._pnl_plot, self._vol_plot):
+            plot.showGrid(x=show, y=show, alpha=alpha)
+
     # =====================================================================
     # Private build helpers
     # =====================================================================

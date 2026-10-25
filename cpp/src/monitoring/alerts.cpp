@@ -207,9 +207,10 @@ void AlertManager::init(const std::string& bot_token,
 
     bot_token_ = bot_token;
     chat_id_   = chat_id;
-    enabled_   = !bot_token_.empty() && !chat_id_.empty();
+    enabled_.store(!bot_token_.empty() && !chat_id_.empty(),
+                   std::memory_order_release);
 
-    if (enabled_) {
+    if (enabled_.load(std::memory_order_relaxed)) {
         // Log confirmation without revealing the token value.
         spdlog::info("AlertManager: Telegram alerts enabled (chat configured)");
     } else {
@@ -222,11 +223,27 @@ void AlertManager::init(const std::string& bot_token,
     start_worker();
 }
 
+void AlertManager::set_credentials(const std::string& bot_token,
+                                   const std::string& chat_id)
+{
+    bool now_enabled = false;
+    {
+        std::lock_guard lock(mtx_);
+        if (bot_token == bot_token_ && chat_id == chat_id_) return;
+        bot_token_  = bot_token;
+        chat_id_    = chat_id;
+        now_enabled = !bot_token_.empty() && !chat_id_.empty();
+        enabled_.store(now_enabled, std::memory_order_release);
+    }
+    spdlog::info("AlertManager: Telegram credentials updated from the saved "
+                 "config -- alerts {}", now_enabled ? "enabled" : "disabled "
+                 "(log-only mode)");
+}
+
 bool AlertManager::is_enabled() const noexcept
 {
-    // No lock needed; enabled_ is only written during init() which
-    // precedes concurrent usage.
-    return enabled_;
+    // [LIVECFG] Atomic: set_credentials() may flip it on a running engine.
+    return enabled_.load(std::memory_order_acquire);
 }
 
 // ===================================================================
@@ -476,15 +493,9 @@ void AlertManager::start_worker()
         return;
     }
 
-    // Capture bot_token_ and chat_id_ by value so the worker does not
-    // access AlertManager members after destruction begins.  Both are
-    // stable after init() returns.
-    const std::string token = bot_token_;
-    const std::string chat  = chat_id_;
-
     send_stop_.store(false, std::memory_order_release);
 
-    send_worker_ = std::thread([this, token, chat]() {
+    send_worker_ = std::thread([this]() {
         spdlog::debug("AlertManager: send-worker thread started");
 
         while (true) {
@@ -507,6 +518,21 @@ void AlertManager::start_worker()
 
                 message = std::move(send_queue_.front());
                 send_queue_.pop();
+            }
+
+            // [LIVECFG] The credentials are read per message, under mtx_,
+            // because a saved config may replace them on a running engine
+            // (set_credentials). The destructor joins this thread before any
+            // member dies, so reading members here is safe.
+            std::string token;
+            std::string chat;
+            {
+                std::lock_guard cred_lock(mtx_);
+                token = bot_token_;
+                chat  = chat_id_;
+            }
+            if (token.empty() || chat.empty()) {
+                continue;   // Telegram switched off since this was queued.
             }
 
             // Perform the HTTP POST outside any lock.

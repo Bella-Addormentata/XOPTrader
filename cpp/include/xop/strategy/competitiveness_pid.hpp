@@ -79,6 +79,18 @@ public:
     explicit CompetitivenessPid(CompetitivenessPidConfig cfg = {})
         : cfg_{cfg} {}
 
+    /// [LIVECFG] Adopt saved gains and bounds, keeping the EMA, integral and
+    /// block count. The current offset is re-clamped into the new bounds at
+    /// once, and the integral into the new anti-windup limit.
+    void set_config(const CompetitivenessPidConfig& cfg) noexcept
+    {
+        cfg_ = cfg;
+        integral_error_ = std::clamp(integral_error_, -cfg_.integral_max,
+                                     cfg_.integral_max);
+        current_offset_ = std::clamp(current_offset_, cfg_.min_offset,
+                                     cfg_.max_offset);
+    }
+
     /// Update the EMA + PID state with one block's fill signal.
     /// Must be called exactly once per heartbeat for the owning pair.
     void observe_block(bool had_fill) noexcept

@@ -62,6 +62,7 @@ add_executable(xop_tests
     test_pace_wiring.cpp
     test_config.cpp
     test_config_reload.cpp
+    test_config_live_apply.cpp
     test_reconcile_verdict.cpp
     test_bbo_sanity.cpp
     test_book_side_quality.cpp

@@ -4545,6 +4545,35 @@ void validate_pair_concentration_overrides(const AppConfig& cfg)
     }
 }
 
+// [LIVECFG] An ENABLED CoinGecko or TibetSwap feed builds a sliding-window
+// rate limiter that refuses a zero capacity or a zero window (std::
+// invalid_argument from the client constructor). At startup that was an
+// unnamed engine crash; on a live reload the client is rebuilt only after
+// the running settings have moved, so the save would half-apply and lose the
+// feed. Refused here instead, with the key named. A disabled feed builds no
+// client, so its values are not judged.
+void validate_feed_rate_limits(const AppConfig& cfg)
+{
+    auto check = [](const char* sec, bool enabled, std::uint32_t max_requests,
+                    std::uint32_t window_ms) {
+        if (!enabled) return;
+        if (max_requests == 0) {
+            throw ConfigError(std::string(sec)
+                              + ".rate_limit_max_requests must be >= 1 while "
+                                "the feed is enabled");
+        }
+        if (window_ms == 0) {
+            throw ConfigError(std::string(sec)
+                              + ".rate_limit_window_ms must be >= 1 while "
+                                "the feed is enabled");
+        }
+    };
+    check("coingecko", cfg.coingecko.enabled,
+          cfg.coingecko.rate_limit_max_requests, cfg.coingecko.rate_limit_window_ms);
+    check("tibetswap", cfg.tibetswap.enabled,
+          cfg.tibetswap.rate_limit_max_requests, cfg.tibetswap.rate_limit_window_ms);
+}
+
 // [PACE 2026-09-13] Checks that need more than the strategy section; they
 // run only with pace enabled.
 //   * The CoinGecko feed age must be establishable: pace refuses a fair value
@@ -4806,146 +4835,17 @@ void validate_enforced_pegs_are_observable(const AppConfig& cfg)
     }
 }
 
-AppConfig load_config(const std::string& path,
-                      const std::string& secrets_path)
+// [LIVECFG] The checks that span sections (and so cannot live in a single
+// parse_*), shared by load_config() and the engine's live reload: a reload
+// merges the saved file with the running engine's restart-only values, and
+// that MERGED config must pass them too.
+void validate_config_relations(const AppConfig& cfg)
 {
-    // Attempt to load the YAML file.  yaml-cpp throws on I/O or parse errors;
-    // wrap them in ConfigError for a uniform exception type.
-    YAML::Node root;
-    try {
-        root = YAML::LoadFile(path);
-    } catch (const YAML::Exception& e) {
-        throw ConfigError("Failed to load configuration from '" + path + "': "
-                          + std::string(e.what()));
-    }
-
-    if (!root.IsMap()) {
-        throw ConfigError("Top-level YAML structure must be a map in '" + path + "'");
-    }
-
-    // Layer secrets on top of the base config (deep merge).
-    if (!secrets_path.empty()) {
-        try {
-            YAML::Node secrets = YAML::LoadFile(secrets_path);
-            if (secrets.IsMap()) {
-                deep_merge(root, secrets);
-                spdlog::info("Merged secrets from '{}'", secrets_path);
-            }
-        } catch (const YAML::Exception& e) {
-            throw ConfigError("Failed to load secrets from '" + secrets_path
-                              + "': " + std::string(e.what()));
-        }
-    }
-
-    // Parse each required section.  Individual parsers throw ConfigError on
-    // missing or invalid fields.
-    AppConfig cfg;
-    cfg.chia       = parse_chia(root);
-    cfg.dexie      = parse_dexie(root);
-    cfg.pairs      = parse_pairs(root);
-    cfg.pegged_assets = parse_pegged_assets(root);
-    cfg.strategy   = parse_strategy(root);
-    cfg.risk       = parse_risk(root);
-    cfg.volatility = parse_volatility(root);
-    cfg.monitoring = parse_monitoring(root);
-    cfg.database   = parse_database(root);
-    cfg.depeg      = parse_depeg(root);
-    cfg.arbitrage  = parse_arbitrage(root);
-    cfg.coingecko  = parse_coingecko(root);
-    // [PARANCHOR 2026-08-30] Declaring a non-USD peg is the request for
-    // its FX rate; the fetch must carry that currency or usd_par_value()
-    // will (correctly) refuse to anchor the asset.
-    cfg.coingecko.vs_currencies = rpc::vs_currencies_for(cfg.pegged_assets);
-    // An anchor pairing whose quadrature clears the max ceiling can never
-    // make a pair usable by itself -- warn per failing pairing, because
-    // that configuration reads as "anchored" while behaving as "blind".
-    // ([review] the original check tested only worst-par + feed and missed
-    // the two-par pairing, which the earlier 150bps default itself failed.)
-    {
-        const double sig[] = {cfg.strategy.fair_value_feed_sigma_bps,
-                              cfg.strategy.fair_value_par_sigma_bps,
-                              cfg.strategy.fair_value_par_market_sigma_bps};
-        const char* nm[] = {"feed", "par", "par_market"};
-        for (int i = 0; i < 3; ++i) {
-            for (int j = i; j < 3; ++j) {
-                const double combined =
-                    std::sqrt(sig[i] * sig[i] + sig[j] * sig[j]);
-                if (combined > cfg.strategy.fair_value_max_sigma_bps) {
-                    spdlog::warn(
-                        "[Config] fair_value {}+{} sigmas combine to "
-                        "{:.0f}bps, above the max ceiling {:.0f}bps -- a "
-                        "pair anchored only by that combination can never "
-                        "be usable",
-                        nm[i], nm[j], combined,
-                        cfg.strategy.fair_value_max_sigma_bps);
-                }
-            }
-        }
-    }
-    cfg.tibetswap  = parse_tibetswap(root);
-    cfg.fees       = parse_fees(root);
-    cfg.inventory_aging = parse_inventory_aging(root);
-    cfg.accounting = parse_accounting(root);
-    // [review] The GUI anchors a relative warp.jobs_db at the config file's
-    // directory (gui/services/warp/service.py _job_db_path); the engine must
-    // open the SAME file whatever its working directory, or its
-    // stuck-transaction guard protects a database no job is written to.
-    {
-        const std::filesystem::path db(cfg.accounting.bridge_jobs_db_path);
-        const std::filesystem::path base = std::filesystem::path(path).parent_path();
-        if (!db.empty() && db.is_relative() && !base.empty()) {
-            cfg.accounting.bridge_jobs_db_path =
-                (base / db).lexically_normal().string();
-        }
-    }
-    cfg.market_data = parse_market_data(root);
     validate_usd_anchor(cfg);
     validate_enforced_pegs_are_observable(cfg);
     validate_pair_concentration_overrides(cfg);
+    validate_feed_rate_limits(cfg);
     validate_pace_config(cfg);
-
-    // [S27 review round 3] Since usd_per_xch() now prefers the external
-    // CoinGecko price, a polling interval LONGER than the freshness window
-    // makes that anchor stale for part of every cycle by construction: the
-    // gate rejects the cached value, valuation silently falls through to the
-    // DEX mid, and if the DEX anchor sits higher it can ratchet the equity
-    // peak -- so the next successful CoinGecko refresh reads as a drawdown
-    // the market never produced. Nothing about that looks like a
-    // misconfiguration in the logs, which is why it is called out here.
-    // [review] The same "chia" membership test validate_usd_anchor() uses.
-    // Without it this warned about "the external XCH anchor" alternating
-    // with the DEX for any enabled CoinGecko config -- a Bitcoin-only feed
-    // with a long interval got a diagnostic about an XCH anchor that does
-    // not exist, which is how operators learn to ignore warnings.
-    const auto& cg_ids = cfg.coingecko.coin_ids;
-    const bool cg_quotes_chia =
-        std::find(cg_ids.begin(), cg_ids.end(), "chia") != cg_ids.end();
-    if (cfg.coingecko.enabled && cg_quotes_chia
-            && cfg.market_data.cex_freshness_threshold_sec > 0.0) {
-        const double poll_s = cfg.coingecko.polling_interval_ms / 1000.0;
-        // Strictly greater, not >=. The freshness check accepts
-        // age <= threshold, and a fetch is completed and timestamped BEFORE
-        // valuation reads it -- so poll_s == threshold never produces a
-        // stale cycle during healthy polling. Warning on equality would cry
-        // wolf on a perfectly good configuration, and a warning that fires
-        // when nothing is wrong is how operators learn to ignore warnings.
-        if (poll_s > cfg.market_data.cex_freshness_threshold_sec) {
-            spdlog::warn(
-                "[Config] coingecko.polling_interval_ms ({:.0f}s) is not "
-                "shorter than market_data.cex_freshness_threshold_sec "
-                "({:.0f}s), so the external XCH anchor is STALE for part of "
-                "every poll cycle and valuation alternates between CoinGecko "
-                "and the DEX mid. That can ratchet the equity peak and make "
-                "the next refresh look like a drawdown. Set the polling "
-                "interval well inside the freshness window.",
-                poll_s, cfg.market_data.cex_freshness_threshold_sec);
-        }
-    }
-    cfg.adverse_selection = parse_adverse_selection(root);
-    cfg.market_allocator = parse_market_allocator(root);
-    cfg.recovery   = parse_recovery(root);
-    cfg.buyer      = parse_buyer(root);
-    cfg.engine     = parse_engine(root);
 
     // [S70 2026-09-20] Cross-section: ttl_cancel_mode: expire spares only an
     // offer that carries an on-chain expiry.  With no expiry configured on
@@ -5200,6 +5100,148 @@ AppConfig load_config(const std::string& path,
             }
         }
     }
+}
+
+AppConfig load_config(const std::string& path,
+                      const std::string& secrets_path)
+{
+    // Attempt to load the YAML file.  yaml-cpp throws on I/O or parse errors;
+    // wrap them in ConfigError for a uniform exception type.
+    YAML::Node root;
+    try {
+        root = YAML::LoadFile(path);
+    } catch (const YAML::Exception& e) {
+        throw ConfigError("Failed to load configuration from '" + path + "': "
+                          + std::string(e.what()));
+    }
+
+    if (!root.IsMap()) {
+        throw ConfigError("Top-level YAML structure must be a map in '" + path + "'");
+    }
+
+    // Layer secrets on top of the base config (deep merge).
+    if (!secrets_path.empty()) {
+        try {
+            YAML::Node secrets = YAML::LoadFile(secrets_path);
+            if (secrets.IsMap()) {
+                deep_merge(root, secrets);
+                spdlog::info("Merged secrets from '{}'", secrets_path);
+            }
+        } catch (const YAML::Exception& e) {
+            throw ConfigError("Failed to load secrets from '" + secrets_path
+                              + "': " + std::string(e.what()));
+        }
+    }
+
+    // Parse each required section.  Individual parsers throw ConfigError on
+    // missing or invalid fields.
+    AppConfig cfg;
+    cfg.chia       = parse_chia(root);
+    cfg.dexie      = parse_dexie(root);
+    cfg.pairs      = parse_pairs(root);
+    cfg.pegged_assets = parse_pegged_assets(root);
+    cfg.strategy   = parse_strategy(root);
+    cfg.risk       = parse_risk(root);
+    cfg.volatility = parse_volatility(root);
+    cfg.monitoring = parse_monitoring(root);
+    cfg.database   = parse_database(root);
+    cfg.depeg      = parse_depeg(root);
+    cfg.arbitrage  = parse_arbitrage(root);
+    cfg.coingecko  = parse_coingecko(root);
+    // [PARANCHOR 2026-08-30] Declaring a non-USD peg is the request for
+    // its FX rate; the fetch must carry that currency or usd_par_value()
+    // will (correctly) refuse to anchor the asset.
+    cfg.coingecko.vs_currencies = rpc::vs_currencies_for(cfg.pegged_assets);
+    // An anchor pairing whose quadrature clears the max ceiling can never
+    // make a pair usable by itself -- warn per failing pairing, because
+    // that configuration reads as "anchored" while behaving as "blind".
+    // ([review] the original check tested only worst-par + feed and missed
+    // the two-par pairing, which the earlier 150bps default itself failed.)
+    {
+        const double sig[] = {cfg.strategy.fair_value_feed_sigma_bps,
+                              cfg.strategy.fair_value_par_sigma_bps,
+                              cfg.strategy.fair_value_par_market_sigma_bps};
+        const char* nm[] = {"feed", "par", "par_market"};
+        for (int i = 0; i < 3; ++i) {
+            for (int j = i; j < 3; ++j) {
+                const double combined =
+                    std::sqrt(sig[i] * sig[i] + sig[j] * sig[j]);
+                if (combined > cfg.strategy.fair_value_max_sigma_bps) {
+                    spdlog::warn(
+                        "[Config] fair_value {}+{} sigmas combine to "
+                        "{:.0f}bps, above the max ceiling {:.0f}bps -- a "
+                        "pair anchored only by that combination can never "
+                        "be usable",
+                        nm[i], nm[j], combined,
+                        cfg.strategy.fair_value_max_sigma_bps);
+                }
+            }
+        }
+    }
+    cfg.tibetswap  = parse_tibetswap(root);
+    cfg.fees       = parse_fees(root);
+    cfg.inventory_aging = parse_inventory_aging(root);
+    cfg.accounting = parse_accounting(root);
+    // [review] The GUI anchors a relative warp.jobs_db at the config file's
+    // directory (gui/services/warp/service.py _job_db_path); the engine must
+    // open the SAME file whatever its working directory, or its
+    // stuck-transaction guard protects a database no job is written to.
+    {
+        const std::filesystem::path db(cfg.accounting.bridge_jobs_db_path);
+        const std::filesystem::path base = std::filesystem::path(path).parent_path();
+        if (!db.empty() && db.is_relative() && !base.empty()) {
+            cfg.accounting.bridge_jobs_db_path =
+                (base / db).lexically_normal().string();
+        }
+    }
+    cfg.market_data = parse_market_data(root);
+
+    // [S27 review round 3] Since usd_per_xch() now prefers the external
+    // CoinGecko price, a polling interval LONGER than the freshness window
+    // makes that anchor stale for part of every cycle by construction: the
+    // gate rejects the cached value, valuation silently falls through to the
+    // DEX mid, and if the DEX anchor sits higher it can ratchet the equity
+    // peak -- so the next successful CoinGecko refresh reads as a drawdown
+    // the market never produced. Nothing about that looks like a
+    // misconfiguration in the logs, which is why it is called out here.
+    // [review] The same "chia" membership test validate_usd_anchor() uses.
+    // Without it this warned about "the external XCH anchor" alternating
+    // with the DEX for any enabled CoinGecko config -- a Bitcoin-only feed
+    // with a long interval got a diagnostic about an XCH anchor that does
+    // not exist, which is how operators learn to ignore warnings.
+    const auto& cg_ids = cfg.coingecko.coin_ids;
+    const bool cg_quotes_chia =
+        std::find(cg_ids.begin(), cg_ids.end(), "chia") != cg_ids.end();
+    if (cfg.coingecko.enabled && cg_quotes_chia
+            && cfg.market_data.cex_freshness_threshold_sec > 0.0) {
+        const double poll_s = cfg.coingecko.polling_interval_ms / 1000.0;
+        // Strictly greater, not >=. The freshness check accepts
+        // age <= threshold, and a fetch is completed and timestamped BEFORE
+        // valuation reads it -- so poll_s == threshold never produces a
+        // stale cycle during healthy polling. Warning on equality would cry
+        // wolf on a perfectly good configuration, and a warning that fires
+        // when nothing is wrong is how operators learn to ignore warnings.
+        if (poll_s > cfg.market_data.cex_freshness_threshold_sec) {
+            spdlog::warn(
+                "[Config] coingecko.polling_interval_ms ({:.0f}s) is not "
+                "shorter than market_data.cex_freshness_threshold_sec "
+                "({:.0f}s), so the external XCH anchor is STALE for part of "
+                "every poll cycle and valuation alternates between CoinGecko "
+                "and the DEX mid. That can ratchet the equity peak and make "
+                "the next refresh look like a drawdown. Set the polling "
+                "interval well inside the freshness window.",
+                poll_s, cfg.market_data.cex_freshness_threshold_sec);
+        }
+    }
+    cfg.adverse_selection = parse_adverse_selection(root);
+    cfg.market_allocator = parse_market_allocator(root);
+    cfg.recovery   = parse_recovery(root);
+    cfg.buyer      = parse_buyer(root);
+    cfg.engine     = parse_engine(root);
+
+    // Every cross-section rule, on the fully parsed config. [LIVECFG] The
+    // engine's live reload runs the same function on the config it adopts.
+    validate_config_relations(cfg);
 
     // Emit a redacted summary so operators can verify the loaded parameters
     // without exposing secrets in log files.

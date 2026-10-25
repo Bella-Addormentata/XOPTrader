@@ -737,6 +737,19 @@ void SpreadOptimizer::reset_thompson_posteriors(double decay_factor) {
 // Configuration access
 // ===========================================================================
 
+void SpreadOptimizer::set_tunables(double gamma, double s_floor_bps,
+                                   double high_vol_multiplier) {
+    if (gamma <= 0.0) {
+        throw std::invalid_argument("SpreadOptimizer: gamma must be > 0");
+    }
+    if (s_floor_bps <= 0.0) {
+        throw std::invalid_argument("SpreadOptimizer: s_floor_bps must be > 0");
+    }
+    cfg_.gamma               = gamma;
+    cfg_.s_floor_bps         = s_floor_bps;
+    cfg_.high_vol_multiplier = high_vol_multiplier;
+}
+
 const SpreadConfig& SpreadOptimizer::config() const noexcept {
     return cfg_;
 }
