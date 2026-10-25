@@ -48,7 +48,9 @@ after a day of unreadable trade-record lookups counted from the last pending
 read, never from its age. While an engine this GUI launched runs, the
 bridge records in the jobs database that engine was launched with -- its
 config's directory and `warp.jobs_db` both -- whatever the GUI's current
-config names.
+config names; under a live config save, `warp.jobs_db` and
+`accounting.bridge_jobs_db_path` wait for an engine restart, so the guard's
+database never moves under a running engine.
 
 ## [0.10.31] — 2026-10-24 — a Wallet Link page for the Chia wallet and Sage
 

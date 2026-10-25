@@ -175,6 +175,22 @@ inline bool pair_identity_differs(const PairConfig& a, const PairConfig& b)
         m.accounting.bridge_secondary_asset_ids_explicit =
             ra.bridge_secondary_asset_ids_explicit;
     }
+    // [review] The stuck-transaction guard reads the warp jobs database
+    // (warp.jobs_db) before every cleanup, and the GUI's warp worker records
+    // its sends in the database THIS engine was launched with (it follows
+    // the launched config: EngineBridge._sync_warp_engine_store).  A guard
+    // moved by a live save would read the new file -- empty, "nothing to
+    // protect" -- while the reservations sit in the old one.  Both database
+    // paths wait for a restart, like database.path; the warp switch itself
+    // applies live (an existing database is always read).
+    if (ra.warp_jobs_db_path != sa.warp_jobs_db_path) {
+        rr.push_back("warp.jobs_db");
+        m.accounting.warp_jobs_db_path = ra.warp_jobs_db_path;
+    }
+    if (ra.bridge_jobs_db_path != sa.bridge_jobs_db_path) {
+        rr.push_back("accounting.bridge_jobs_db_path");
+        m.accounting.bridge_jobs_db_path = ra.bridge_jobs_db_path;
+    }
 
     // -- Pairs: the running set, in the running order -----------------------
     plan.pairs = diff_pair_enables(running.pairs, saved.pairs);

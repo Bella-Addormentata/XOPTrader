@@ -132,3 +132,14 @@ def test_the_guard_follows_the_retained_store_pointer():
     assert body.count("warp_send_guard_.readable = false") >= 3
     from gui.services.warp import service as S
     assert S._RETAINED_POINTER_SUFFIX == ".retained"
+
+
+def test_the_guards_database_is_restart_only_under_live_reload():
+    """[review] A live config save must not move the guard's database under
+    a running engine: the GUI's worker records in the database the engine
+    was launched with, and a moved guard would read an empty file."""
+    hpp = (ENGINE_HPP.parent / "config_live_apply.hpp").read_text(encoding="utf-8")
+    plan = hpp[hpp.index("plan_live_config(const AppConfig& running"):]
+    assert 'rr.push_back("warp.jobs_db")' in plan
+    assert "m.accounting.warp_jobs_db_path = ra.warp_jobs_db_path;" in plan
+    assert 'rr.push_back("accounting.bridge_jobs_db_path")' in plan
