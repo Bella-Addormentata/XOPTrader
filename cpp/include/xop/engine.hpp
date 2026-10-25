@@ -1921,6 +1921,11 @@ private:
     /// could not establish this heartbeat: the balance gate suppresses
     /// every side that spends them.  Rebuilt at each Step 8.
     std::unordered_set<std::string> reserve_coins_unknown_;
+    /// [LIVECFG] The wallet each reserved asset's exclusion list was last
+    /// set on (Step 8).  A save that drops an asset from
+    /// strategy.asset_reserve_units clears that wallet's list through this,
+    /// so the coins stop being excluded even if the wallet map was rebuilt.
+    std::unordered_map<std::string, std::int64_t> reserve_wallet_ids_;
 
     /// [WARP-MILLIETH] Record that @p asset_id's tracked inventory was
     /// just SET from the wallet (startup seed, Step 8 recovery seed,

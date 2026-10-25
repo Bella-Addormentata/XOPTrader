@@ -2665,6 +2665,9 @@ class MainWindow(QMainWindow):
             if not self._bridge._master_timer.isActive():
                 self._bridge._master_timer.start()
                 _log.info("Reconnected to engine metrics polling.")
+            ui_timer = getattr(self._bridge, "_ui_timer", None)
+            if ui_timer is not None and not ui_timer.isActive():
+                ui_timer.start()
         self._connected = True
         self._conn_dot.setStyleSheet(f"color: {PRIMARY_GREEN}; font-size: 18px;")
         self._conn_label.setText("Connected")
@@ -2681,6 +2684,9 @@ class MainWindow(QMainWindow):
             if self._bridge._master_timer.isActive():
                 self._bridge._master_timer.stop()
                 _log.info("Disconnected from engine metrics polling.")
+            ui_timer = getattr(self._bridge, "_ui_timer", None)
+            if ui_timer is not None and ui_timer.isActive():
+                ui_timer.stop()
         self._connected = False
         self._conn_dot.setStyleSheet(f"color: {LOSS_RED}; font-size: 18px;")
         self._conn_label.setText("Disconnected")

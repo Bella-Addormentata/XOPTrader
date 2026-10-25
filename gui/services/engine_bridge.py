@@ -293,6 +293,14 @@ class EngineBridge(QObject):
         self._master_timer.setInterval(max(1_000, master_refresh_ms))
         self._master_timer.timeout.connect(self._on_master_tick)
 
+        # [LIVECFG] The dashboard refresh (data_updated) has its own timer,
+        # so Settings > Appearance > Chart Update can change it live without
+        # moving the wallet, report and Warp schedules of the master tick.
+        self._ui_timer: QTimer = QTimer(self)
+        self._ui_timer.setTimerType(Qt.TimerType.CoarseTimer)
+        self._ui_timer.setInterval(max(1_000, master_refresh_ms))
+        self._ui_timer.timeout.connect(self._on_ui_tick)
+
         # -- Wire child service signals -------------------------------------
         self._config_svc.config_loaded.connect(self._on_config_loaded)
         self._config_svc.config_error.connect(self._on_service_error)
@@ -396,6 +404,7 @@ class EngineBridge(QObject):
 
         # Step 4 -- Start master refresh timer.
         self._master_timer.start()
+        self._ui_timer.start()
 
         _log.info("EngineBridge initialisation complete.")
         self.ready.emit()
@@ -404,6 +413,7 @@ class EngineBridge(QObject):
         """Gracefully shut down all services and timers."""
         _log.info("EngineBridge: shutting down.")
         self._master_timer.stop()
+        self._ui_timer.stop()
         self._metrics_svc.stop()
         self._database_svc.stop()
         self._wallet_svc.stop()
@@ -827,10 +837,11 @@ class EngineBridge(QObject):
 
     def set_refresh_interval_ms(self, interval_ms: int) -> None:
         """[LIVECFG] Settings > Appearance > Chart Update, applied live: how
-        often the dashboard, charts and status bar are refreshed."""
+        often the dashboard, charts and status bar are refreshed.  The
+        wallet, report and Warp schedules stay on the master tick."""
         interval = max(1_000, int(interval_ms))
-        if self._master_timer.interval() != interval:
-            self._master_timer.setInterval(interval)
+        if self._ui_timer.interval() != interval:
+            self._ui_timer.setInterval(interval)
             _log.info("Refresh interval set to %d ms", interval)
 
     def _sync_metrics_url_from_config(self) -> None:
@@ -1115,9 +1126,10 @@ class EngineBridge(QObject):
 
     @Slot()
     def _on_master_tick(self) -> None:
-        """Master refresh timer handler.
+        """Master timer handler: the background schedules.
 
-        Aggregates the latest service data and emits ``data_updated``.
+        Wallet balances, reports and the Warp bridge step run here at a
+        fixed cadence; the dashboard refresh is ``_on_ui_tick``.
         """
         self._tick_count += 1
 
@@ -1139,14 +1151,18 @@ class EngineBridge(QObject):
         if self._tick_count % 6 == 5:
             self._warp_svc.tick()
 
-        data = self.get_all_data()
-        self._last_data = data
-        self.data_updated.emit(data)
-
         # [LIVECFG] The engine's answer to a Settings save, once it lands.
         reload_result = self.read_config_reload_result()
         if reload_result is not None:
             self.config_reload_result.emit(reload_result)
+
+    @Slot()
+    def _on_ui_tick(self) -> None:
+        """Dashboard refresh: aggregates the latest service data and emits
+        ``data_updated``, at the Chart Update interval."""
+        data = self.get_all_data()
+        self._last_data = data
+        self.data_updated.emit(data)
 
     @Slot(dict)
     def _on_config_loaded(self, config: dict[str, Any]) -> None:

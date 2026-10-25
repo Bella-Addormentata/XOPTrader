@@ -133,6 +133,39 @@ def test_a_deferred_answer_is_followed_by_the_final_one(tmp_path):
     assert bridge.read_config_reload_result() is None
 
 
+def test_chart_update_moves_only_the_dashboard_refresh(qapp, tmp_path):
+    # The master tick also polls the wallet and steps Warp jobs every sixth
+    # tick: Chart Update must not speed those up or slow them down.
+    from gui.services.engine_bridge import EngineBridge
+
+    bridge = EngineBridge(config_path=tmp_path / "config.yaml")
+    try:
+        background = bridge._master_timer.interval()
+        bridge.set_refresh_interval_ms(1_000)
+        assert bridge._ui_timer.interval() == 1_000
+        assert bridge._master_timer.interval() == background
+
+        calls: list[str] = []
+        bridge._wallet_svc = SimpleNamespace(
+            fetch_balances=lambda: calls.append("wallet"))
+        bridge._database_svc = SimpleNamespace(
+            get_reports=lambda: calls.append("reports"))
+        bridge._warp_svc = SimpleNamespace(tick=lambda: calls.append("warp"))
+        bridge.get_all_data = lambda: {"tick": True}
+        bridge.data_updated.connect(lambda data: calls.append("data"))
+
+        for _ in range(6):
+            bridge._on_master_tick()
+        assert calls == ["wallet", "reports", "warp"]
+
+        bridge._on_ui_tick()
+        assert calls[-1] == "data"
+        assert bridge._last_data == {"tick": True}
+    finally:
+        bridge.deleteLater()
+        qapp.processEvents()
+
+
 # --------------------------------------------------------------------------- #
 # Settings page: the restart row
 # --------------------------------------------------------------------------- #

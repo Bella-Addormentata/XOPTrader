@@ -12664,6 +12664,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 wid, execution::choose_reserve_coins(
                          std::move(coins),
                          execution::reserve_units_to_mojos(units, 1'000)));
+            reserve_wallet_ids_[asset_id] = wid;
         }
     }
 
@@ -26225,6 +26226,20 @@ void Engine::apply_live_config(const AppConfig& m)
     const bool coingecko_changed = !(config_.coingecko == m.coingecko);
     const bool tibetswap_changed = !(config_.tibetswap == m.tibetswap);
 
+    // A reserve dropped from the saved config: Step 8 refreshes only the
+    // assets still listed, so the dropped one's coins would stay excluded
+    // from every offer until a restart.
+    for (auto it = reserve_wallet_ids_.begin(); it != reserve_wallet_ids_.end();) {
+        if (m.strategy.asset_reserve_units.count(it->first) != 0) {
+            ++it;
+            continue;
+        }
+        if (offer_mgr_) offer_mgr_->set_reserved_coins(it->second, {});
+        spdlog::info("[Engine] [LIVECFG] reserve for {} removed -- its coins "
+                     "are no longer excluded from offers", it->first.substr(0, 12));
+        it = reserve_wallet_ids_.erase(it);
+    }
+
     config_.pegged_assets     = m.pegged_assets;
     config_.strategy          = m.strategy;
     config_.risk              = m.risk;
@@ -26313,7 +26328,15 @@ void Engine::apply_live_config(const AppConfig& m)
         arb_detector_->set_config(arbitrage_config_from(config_.arbitrage));
         arb_detector_->set_stablecoin_pairs(stablecoin_pairs_from(config_));
     }
-    if (fee_tracker_) fee_tracker_->set_config(config_.fees);
+    // A restarted controller has a new anchor and class costs, so the
+    // tickets' submit levels (computed against the old ones) would teach it
+    // wrong lessons. They are dropped unheard, like an abandoned ticket.
+    if (fee_tracker_ && fee_tracker_->set_config(config_.fees)
+        && !fee_tickets_.empty()) {
+        spdlog::info("[Engine] [LIVECFG] {} fee ticket(s) dropped unheard: "
+                     "the fee controller restarted", fee_tickets_.size());
+        fee_tickets_.clear();
+    }
     if (kappa_calibrator_) kappa_calibrator_->set_default_kappa(config_.strategy.kappa);
     if (inventory_) inventory_->set_risk_limits(config_.risk);
     if (pre_trade_) {
