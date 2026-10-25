@@ -152,7 +152,7 @@ std::uint32_t KappaCalibrator::total_fills() const noexcept
         std::accumulate(bucket_fills_.begin(), bucket_fills_.end(), 0.0));
 }
 
-const KappaCalibratorConfig& KappaCalibrator::config() const noexcept
+KappaCalibratorConfig KappaCalibrator::config() const noexcept
 {
     std::shared_lock lock(mtx_);
     return cfg_;

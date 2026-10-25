@@ -269,9 +269,9 @@ bool VolatilityEstimator::is_ready() const noexcept
     return candles_.size() >= cfg_.min_candles;
 }
 
-const VolatilityEstimatorConfig& VolatilityEstimator::config() const noexcept
+VolatilityEstimatorConfig VolatilityEstimator::config() const noexcept
 {
-    // T2-02: Shared lock -- read-only access to immutable-after-construction config.
+    // T2-02: Shared lock, and a copy: a reference would outlive the lock.
     std::shared_lock lock(mtx_);
     return cfg_;
 }
@@ -285,10 +285,14 @@ void VolatilityEstimator::set_tunables(std::uint32_t lookback_blocks,
                                        std::uint32_t candle_aggregation_blocks) noexcept
 {
     std::unique_lock lock(mtx_);
+    const bool new_candle_size =
+        candle_aggregation_blocks != cfg_.candle_aggregation_blocks;
+    const bool new_window =
+        lookback_blocks != cfg_.lookback_blocks || yz_alpha != cfg_.yz_alpha;
     // A new candle size makes the window's candles (and the partial one)
     // samples of a different period: mixing them would mis-state sigma
     // until they rolled out. Start the window over, as a fresh estimator.
-    if (candle_aggregation_blocks != cfg_.candle_aggregation_blocks) {
+    if (new_candle_size) {
         candles_.clear();
         agg_tick_count_ = 0;
         agg_open_ = agg_high_ = agg_low_ = agg_close_ = 0.0;
@@ -304,6 +308,37 @@ void VolatilityEstimator::set_tunables(std::uint32_t lookback_blocks,
     cfg_.yz_alpha                  = yz_alpha;
     cfg_.candle_aggregation_blocks = candle_aggregation_blocks;
     while (candles_.size() > cfg_.lookback_blocks) candles_.pop_front();
+
+    // A new lookback or alpha changes what the cached estimate is made of,
+    // and with aggregation the next candle may be heartbeats away: estimate
+    // again from the candles kept, or drop the estimate when the shorter
+    // window no longer holds enough of them.
+    if (new_window && !new_candle_size) {
+        if (candles_.size() >= cfg_.min_candles) {
+            recompute_yang_zhang();
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+            recompute_variance_ratio();
+            classify_regime();
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+        } else {
+            sigma_block_    = 0.0;
+            sigma_annual_   = 0.0;
+            variance_ratio_ = 1.0;
+            regime_ = RegimeInfo{MarketRegime::Random, 1.0, 1.0, 1.0};
+            regime_duration_blocks_ = 0;
+            last_regime_ = MarketRegime::Random;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

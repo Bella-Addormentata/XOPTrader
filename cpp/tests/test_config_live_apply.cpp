@@ -346,6 +346,29 @@ TEST(ConfigLiveApplySetters, volatility_restarts_its_window_on_a_new_candle_size
         << "candles of another period would mis-state sigma";
 }
 
+TEST(ConfigLiveApplySetters, volatility_re_estimates_on_a_shorter_window)
+{
+    xop::VolatilityEstimatorConfig vc;
+    vc.candle_aggregation_blocks = 1;
+    vc.lookback_blocks           = 100;
+    vc.min_candles               = 10;
+    xop::VolatilityEstimator est{vc};
+    // Wild swings first, then a calm tail.
+    for (int i = 0; i < 60; ++i) est.update(i % 2 == 0 ? 1.0 : 1.5);
+    for (int i = 0; i < 20; ++i) est.update(1.0 + 0.001 * (i % 2));
+    const double wide = est.get_sigma_block();
+    ASSERT_GT(wide, 0.0);
+
+    est.set_tunables(15, vc.yz_alpha, 1);
+    EXPECT_LT(est.get_sigma_block(), wide)
+        << "the estimate must come from the 15 calm candles kept, now";
+
+    est.set_tunables(5, vc.yz_alpha, 1);
+    EXPECT_FALSE(est.is_ready());
+    EXPECT_DOUBLE_EQ(est.get_sigma_block(), 0.0)
+        << "too few candles left: no estimate rather than the old one";
+}
+
 TEST(ConfigLiveApplySetters, vpin_starts_over_on_a_new_bucket_size)
 {
     xop::MarketDataConfig mc;
@@ -381,6 +404,30 @@ TEST(ConfigLiveApplySetters, a_withdrawn_amm_observation_is_gone)
         << "a TibetSwap feed switched off must stop feeding the solve";
     EXPECT_DOUBLE_EQ(obs.amm_pool_usd, 0.0);
     feed.clear_amm_observation("XCH/NONE");   // unknown pair: a no-op
+}
+
+TEST(ConfigLiveApplySetters, vpin_recomputes_over_a_shorter_window)
+{
+    xop::MarketDataConfig mc;
+    mc.vpin_bucket_size    = 10.0;
+    mc.vpin_window_buckets = 50;
+    xop::State state;
+    xop::MarketDataFeed feed{mc, state};
+    const std::string pair = "XCH/wUSDC";
+    // 45 one-sided buckets, then 5 balanced ones.
+    for (int i = 0; i < 45; ++i) feed.ingest_trade_for_vpin(pair, xop::Side::Bid, 10.0);
+    for (int i = 0; i < 10; ++i) {
+        feed.ingest_trade_for_vpin(pair, i % 2 ? xop::Side::Ask : xop::Side::Bid, 5.0);
+    }
+    ASSERT_GT(feed.get_vpin_metrics(pair)->vpin, 0.8);
+
+    mc.vpin_window_buckets = 5;
+    feed.set_config(mc);
+    const auto vm = feed.get_vpin_metrics(pair);
+    ASSERT_TRUE(vm.has_value());
+    EXPECT_EQ(vm->complete_buckets, 5u);
+    EXPECT_LT(vm->vpin, 0.01)
+        << "the five buckets kept are balanced: VPIN must say so now";
 }
 
 TEST(ConfigLiveApplySetters, adverse_selection_priors_apply_without_a_new_fill)

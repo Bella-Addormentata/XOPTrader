@@ -98,3 +98,19 @@ def test_a_tibetswap_change_withdraws_the_amm_observations():
             f"{needle} missing: a TibetSwap feed switched off kept feeding "
             "the fair-value solve from its last reserves"
         )
+
+
+METRICS_CPP = REPO / "cpp" / "src" / "monitoring" / "metrics.cpp"
+
+
+def test_a_dropped_peg_asset_leaves_the_peg_panel():
+    text = METRICS_CPP.read_text(encoding="utf-8").replace("\r\n", "\n")
+    start = text.find("void MetricsExporter::update_peg_status(")
+    assert start != -1
+    body = _code(text[start:text.find("\n}\n", start)])
+    assert "peg_status_family_->Remove(" in body and \
+        "peg_deviation_family_->Remove(" in body, (
+        "a reloaded registry that drops or stops enforcing an asset left "
+        "its gauges exported, so the Settings peg panel kept a stale row"
+    )
+    assert "peg_labels_=std::move(published);" in body

@@ -137,7 +137,7 @@ QuoteResult AvellanedaStoikov::compute_quotes(double mid,
     //   - sigma^2 * tau is the expected variance over the remaining horizon;
     //     higher risk => stronger desire to flatten inventory.
     // -------------------------------------------------------------------
-    const double r_raw = reservation_price(mid, sigma, q, tau);
+    const double r_raw = reservation_price_locked(mid, sigma, q, tau);
 
     // -------------------------------------------------------------------
     // Step 3: Apply regime-dependent skew multiplier to the inventory
@@ -175,7 +175,7 @@ QuoteResult AvellanedaStoikov::compute_quotes(double mid,
     // accumulates over the remaining horizon.  It grows with sigma^2 and
     // tau, widening the spread when conditions are more uncertain.
     // -------------------------------------------------------------------
-    double delta = optimal_half_spread(sigma, tau);
+    double delta = optimal_half_spread_locked(sigma, tau);
 
     // -------------------------------------------------------------------
     // Step 5: Apply regime-dependent spread multiplier.
@@ -395,10 +395,16 @@ void AvellanedaStoikov::record_fill()
 double AvellanedaStoikov::reservation_price(double mid, double sigma,
                                             double q, double tau) const
 {
-    // MEDIUM-1: No lock needed -- reads only cfg_ which is immutable after
-    // construction.  Called internally from compute_quotes() which already
-    // holds the exclusive lock; acquiring here would deadlock.
-    // ISO/IEC 27001:2022: cfg_ is const-after-init, safe without lock.
+    std::shared_lock lock(mtx_);
+    return reservation_price_locked(mid, sigma, q, tau);
+}
+
+double AvellanedaStoikov::reservation_price_locked(double mid, double sigma,
+                                                   double q, double tau) const
+{
+    // MEDIUM-1: The caller holds mtx_ -- compute_quotes() exclusively, the
+    // public reservation_price() shared.  [LIVECFG] cfg_.gamma is no longer
+    // immutable: set_risk_params() writes it under the exclusive lock.
 
     // r = S - q * gamma * sigma^2 * tau
     //
@@ -410,9 +416,13 @@ double AvellanedaStoikov::reservation_price(double mid, double sigma,
 
 double AvellanedaStoikov::optimal_half_spread(double sigma, double tau) const
 {
-    // MEDIUM-1: No lock needed -- reads only cfg_ which is immutable after
-    // construction.  Called internally from compute_quotes() which already
-    // holds the exclusive lock; acquiring here would deadlock.
+    std::shared_lock lock(mtx_);
+    return optimal_half_spread_locked(sigma, tau);
+}
+
+double AvellanedaStoikov::optimal_half_spread_locked(double sigma, double tau) const
+{
+    // MEDIUM-1: The caller holds mtx_ (see reservation_price_locked).
 
     // delta = (1/kappa) * ln(1 + kappa/gamma) + 0.5 * gamma * sigma^2 * tau
     //
@@ -519,8 +529,8 @@ double AvellanedaStoikov::per_block_volatility(double sigma_annual,
 
 double AvellanedaStoikov::fill_intensity(double delta) const
 {
-    // MEDIUM-1: No lock needed -- reads only cfg_ which is immutable after
-    // construction.  Safe for concurrent callers.
+    // MEDIUM-1: Shared lock -- [LIVECFG] set_risk_params() may change kappa.
+    std::shared_lock lock(mtx_);
 
     // lambda(delta) = A * exp(-kappa * delta)
     //

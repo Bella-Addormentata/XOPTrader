@@ -257,7 +257,9 @@ public:
     std::uint32_t get_regime_duration_blocks() const noexcept;
 
     /// Read-only access to the configuration.
-    const VolatilityEstimatorConfig& config() const noexcept;
+    /// A copy taken under the shared lock: [LIVECFG] set_tunables() and
+    /// set_block_time_seconds() change it while the engine runs.
+    VolatilityEstimatorConfig config() const noexcept;
 
     /// [T4-15] Update the assumed block time (seconds) used for annualisation.
     ///

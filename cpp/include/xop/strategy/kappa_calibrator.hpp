@@ -89,7 +89,8 @@ public:
     std::uint32_t total_fills() const noexcept;
 
     /// Read-only access to the config.
-    const KappaCalibratorConfig& config() const noexcept;
+    /// A copy taken under the shared lock ([LIVECFG] set_default_kappa).
+    KappaCalibratorConfig config() const noexcept;
 
     /// [LIVECFG] A saved strategy.kappa. Replaces the fallback used while
     /// there is too little fill data; a kappa already FITTED from fills is

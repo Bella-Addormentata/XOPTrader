@@ -1251,9 +1251,11 @@ void MarketDataFeed::set_arb_threshold_bps(double threshold_bps) {
 void MarketDataFeed::set_config(const MarketDataConfig& cfg)
 {
     bool bucket_size_changed = false;
+    bool window_shrank       = false;
     {
         std::unique_lock lock(mtx_config_);
         bucket_size_changed = cfg.vpin_bucket_size != config_.vpin_bucket_size;
+        window_shrank = cfg.vpin_window_buckets < config_.vpin_window_buckets;
         config_ = cfg;
     }
     // Completed VPIN buckets are imbalances of the OLD size; divided by the
@@ -1266,6 +1268,21 @@ void MarketDataFeed::set_config(const MarketDataConfig& cfg)
         }
         std::unique_lock lock(mtx_vpin_metrics_);
         vpin_metrics_.clear();
+    } else if (window_shrank) {
+        // A shorter window: the buckets past it would hold VPIN where it was
+        // until a whole new bucket completes. Trim them and recompute now.
+        std::vector<std::string> trimmed;
+        {
+            std::unique_lock lock(mtx_vpin_);
+            for (auto& [name, vs] : vpin_state_) {
+                if (vs.completed.size() <= cfg.vpin_window_buckets) continue;
+                while (vs.completed.size() > cfg.vpin_window_buckets) {
+                    vs.completed.pop_front();
+                }
+                trimmed.push_back(name);
+            }
+        }
+        for (const auto& name : trimmed) recompute_vpin(name);
     }
 }
 
