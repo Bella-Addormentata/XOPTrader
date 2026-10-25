@@ -226,8 +226,9 @@ public:
     /// shared container.
     std::deque<FillRecord> history() const noexcept;
 
-    /// Read-only access to the configuration.
-    const AdverseSelectionConfig& config() const noexcept;
+    /// A copy of the configuration, taken under the shared lock:
+    /// [LIVECFG] set_config() replaces it while the engine runs.
+    AdverseSelectionConfig config() const noexcept;
 
     // -- Cross-validation (T5-CR4) -------------------------------------------
 

@@ -26241,6 +26241,24 @@ void Engine::apply_live_config(const AppConfig& m)
     }
 
     config_.pegged_assets     = m.pegged_assets;
+    // A peg the saved registry drops or stops enforcing is no longer
+    // watched, and the GUI offers no re-enable for it: a suspension latched
+    // on it would block its pairs for good. Those latches go; the
+    // still-enforced assets keep theirs. The gauges follow below.
+    for (auto it = asset_peg_rt_.begin(); it != asset_peg_rt_.end();) {
+        const PeggedAsset* a = config_.pegged_assets.find(it->first);
+        if (a != nullptr && a->enforce) {
+            ++it;
+            continue;
+        }
+        if (it->second.suspended) {
+            spdlog::warn("[Engine] [LIVECFG] [PEGSUSPEND] {} is no longer an "
+                         "enforced peg in the saved config -- its suspension "
+                         "is released", it->first.substr(0, 12));
+        }
+        peg_circular_anchor_warned_at_.erase(it->first);
+        it = asset_peg_rt_.erase(it);
+    }
     config_.strategy          = m.strategy;
     config_.risk              = m.risk;
     config_.volatility        = m.volatility;
@@ -26347,6 +26365,7 @@ void Engine::apply_live_config(const AppConfig& m)
                                  config_.monitoring.telegram_chat_id);
     }
     if (market_allocator_) market_allocator_->set_config(config_.market_allocator);
+    publish_peg_status();   // drops the gauges of pegs no longer enforced
     // Recovery switched off mid-recovery: step_xch_recovery() returns before
     // its exit check, so the latch would hold Steps 7-8 off for good.
     if (!config_.recovery.enabled && xch_recovery_mode_) {

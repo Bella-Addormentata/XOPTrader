@@ -1710,7 +1710,13 @@ class EngineBridge(QObject):
         database.path is deliberately NOT followed here: MainWindow's panels
         hold the open DatabaseService and its query subscriptions, and the
         new file may not exist until the engine creates it. It applies when
-        the GUI itself is reopened (Settings says so)."""
+        the GUI itself is reopened (Settings says so).
+
+        The file is re-read first: it may have been edited outside Settings
+        while this GUI stayed open, and the engine about to start reads the
+        file, not this GUI's copy. A file that no longer loads keeps the
+        previous copy (ConfigService.reload)."""
+        self._config_svc.reload()
         self._sync_metrics_url_from_config()
 
     def _resolve_config_relative_path(self, raw_path: str) -> Path:

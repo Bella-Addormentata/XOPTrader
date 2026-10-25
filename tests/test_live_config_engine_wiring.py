@@ -114,3 +114,17 @@ def test_a_dropped_peg_asset_leaves_the_peg_panel():
         "its gauges exported, so the Settings peg panel kept a stale row"
     )
     assert "peg_labels_=std::move(published);" in body
+
+
+def test_a_peg_no_longer_enforced_releases_its_latch():
+    body = _definition(APPLY)
+    start = body.find("config_.pegged_assets=m.pegged_assets;")
+    assert start != -1
+    after = body[start:]
+    assert "a!=nullptr&&a->enforce" in after and "asset_peg_rt_.erase(it)" in after, (
+        "a suspension latched on a peg the saved registry drops or stops "
+        "enforcing blocked its pairs for good, with no re-enable offered"
+    )
+    assert "publish_peg_status();" in body, (
+        "the reload must republish the peg gauges so dropped rows go"
+    )

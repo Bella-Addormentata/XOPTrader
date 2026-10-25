@@ -166,6 +166,48 @@ def test_chart_update_moves_only_the_dashboard_refresh(qapp, tmp_path):
         qapp.processEvents()
 
 
+_PORT_CONFIG = """chia:
+  wallet_host: localhost
+  wallet_port: 9256
+pairs:
+  - name: XCH/wUSDC.b
+    base_asset_id: xch
+    quote_asset_id: aa
+    enabled: true
+strategy:
+  gamma: 0.1
+  kappa: 1.5
+  num_tiers: 3
+  min_profit_margin_bps: 25
+risk:
+  soft_limit_pct: 0.6
+  hard_limit_pct: 0.8
+monitoring:
+  prometheus_port: {port}
+"""
+
+
+def test_an_engine_start_follows_a_port_edited_outside_settings(qapp, tmp_path):
+    # The engine about to start reads the FILE; the GUI must poll the port
+    # the file names, not the one it cached when it loaded the config.
+    from gui.services.engine_bridge import EngineBridge
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_PORT_CONFIG.format(port=9100), encoding="utf-8")
+    bridge = EngineBridge(config_path=cfg)
+    try:
+        assert bridge.config_service.load()
+        bridge._follow_restart_only_settings()
+        assert ":9100/" in bridge._metrics_url
+
+        cfg.write_text(_PORT_CONFIG.format(port=9200), encoding="utf-8")
+        bridge._follow_restart_only_settings()
+        assert ":9200/" in bridge._metrics_url
+    finally:
+        bridge.deleteLater()
+        qapp.processEvents()
+
+
 # --------------------------------------------------------------------------- #
 # Settings page: the restart row
 # --------------------------------------------------------------------------- #

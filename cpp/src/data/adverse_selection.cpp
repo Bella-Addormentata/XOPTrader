@@ -244,10 +244,10 @@ AdverseSelectionEstimator::history() const noexcept
     return history_;
 }
 
-const AdverseSelectionConfig&
+AdverseSelectionConfig
 AdverseSelectionEstimator::config() const noexcept
 {
-    // T2-02: Shared lock -- read-only access to config.
+    // T2-02: Shared lock, and a copy: a reference would outlive the lock.
     std::shared_lock lock(mtx_);
     return cfg_;
 }
