@@ -154,6 +154,36 @@ TEST(ConfigLiveApply, the_merged_config_is_held_to_the_cross_section_rules)
     EXPECT_THROW(xop::validate_config_relations(plan.merged), xop::ConfigError);
 }
 
+TEST(ConfigLiveApply, an_enabled_feed_needs_a_rate_limit_its_client_accepts)
+{
+    // The feed clients are rebuilt only after the running settings move, and
+    // their limiters refuse a zero capacity or window: such a save must be
+    // refused whole, before anything applies.
+    auto saved = running_config();
+    const auto refusal = [&saved]() -> std::string {
+        try {
+            xop::validate_config_relations(saved);
+        } catch (const xop::ConfigError& e) {
+            return e.what();
+        }
+        return {};
+    };
+    ASSERT_EQ(refusal(), "");
+
+    saved.tibetswap.enabled              = true;
+    saved.tibetswap.rate_limit_window_ms = 0;
+    EXPECT_NE(refusal().find("tibetswap.rate_limit_window_ms"), std::string::npos);
+    saved.tibetswap.enabled = false;
+    EXPECT_EQ(refusal(), "") << "a feed that is off builds no client";
+
+    saved.coingecko.enabled                 = true;
+    saved.coingecko.rate_limit_max_requests = 0;
+    EXPECT_NE(refusal().find("coingecko.rate_limit_max_requests"), std::string::npos);
+    saved.coingecko.rate_limit_max_requests = 10;
+    saved.coingecko.rate_limit_window_ms    = 0;
+    EXPECT_NE(refusal().find("coingecko.rate_limit_window_ms"), std::string::npos);
+}
+
 TEST(ConfigLiveApply, turning_the_ledger_on_waits_turning_it_off_does_not)
 {
     auto running = running_config();

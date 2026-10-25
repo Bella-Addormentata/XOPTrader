@@ -4491,6 +4491,35 @@ void validate_pair_concentration_overrides(const AppConfig& cfg)
     }
 }
 
+// [LIVECFG] An ENABLED CoinGecko or TibetSwap feed builds a sliding-window
+// rate limiter that refuses a zero capacity or a zero window (std::
+// invalid_argument from the client constructor). At startup that was an
+// unnamed engine crash; on a live reload the client is rebuilt only after
+// the running settings have moved, so the save would half-apply and lose the
+// feed. Refused here instead, with the key named. A disabled feed builds no
+// client, so its values are not judged.
+void validate_feed_rate_limits(const AppConfig& cfg)
+{
+    auto check = [](const char* sec, bool enabled, std::uint32_t max_requests,
+                    std::uint32_t window_ms) {
+        if (!enabled) return;
+        if (max_requests == 0) {
+            throw ConfigError(std::string(sec)
+                              + ".rate_limit_max_requests must be >= 1 while "
+                                "the feed is enabled");
+        }
+        if (window_ms == 0) {
+            throw ConfigError(std::string(sec)
+                              + ".rate_limit_window_ms must be >= 1 while "
+                                "the feed is enabled");
+        }
+    };
+    check("coingecko", cfg.coingecko.enabled,
+          cfg.coingecko.rate_limit_max_requests, cfg.coingecko.rate_limit_window_ms);
+    check("tibetswap", cfg.tibetswap.enabled,
+          cfg.tibetswap.rate_limit_max_requests, cfg.tibetswap.rate_limit_window_ms);
+}
+
 // [PACE 2026-09-13] Checks that need more than the strategy section; they
 // run only with pace enabled.
 //   * The CoinGecko feed age must be establishable: pace refuses a fair value
@@ -4761,6 +4790,7 @@ void validate_config_relations(const AppConfig& cfg)
     validate_usd_anchor(cfg);
     validate_enforced_pegs_are_observable(cfg);
     validate_pair_concentration_overrides(cfg);
+    validate_feed_rate_limits(cfg);
     validate_pace_config(cfg);
 
     // [S70 2026-09-20] Cross-section: ttl_cancel_mode: expire spares only an
