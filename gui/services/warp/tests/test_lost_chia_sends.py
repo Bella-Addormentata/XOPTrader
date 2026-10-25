@@ -3265,3 +3265,25 @@ def test_a_cancelled_job_closed_over_presumed_gone_attempts_keeps_sweep(monkeypa
     plain = seed(store, JobStatus.CANCELLED, columns={"receiver_ph": "ab" * 32})
     with pytest.raises(S.WarpError):
         engine.job_action(plain.id, "sweep")
+
+
+def test_a_third_party_claim_closes_as_completed_under_sweep_and_abandon(monkeypatch):
+    """[review] A third party's claim paid the receiver: the bridge completed
+    without a final CAT coin of ours, and closing it must say so and book
+    it, never "cancelled" or "still claimable"."""
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
+    store = new_store()
+    engine, ctx = build(store)
+    for action in ("sweep", "abandon"):
+        job = seed(store, JobStatus.FAILED,
+                   columns={"receiver_ph": "ab" * 32, "post_tip_mojos": 4985,
+                            "bridge_nonce": "cd" * 32},
+                   state={"failed_from": JobStatus.CLAIMING, "third_party_claim": True,
+                          "swept": True, "security_coin_id": "77" * 32})
+        blob, _sk = make_ephemeral_blob(job.id)
+        store.update_job(job.id, state_patch={"ephemeral_blob": blob, "funding_amount": EXPECTED})
+        out = engine.job_action(job.id, action)
+        assert out["status"] == JobStatus.COMPLETED, action
+        note = store.get_events(job.id, limit=5000)[-1].message
+        assert "third party" in note and "never claimed" not in note, note

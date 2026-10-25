@@ -305,6 +305,32 @@ warp:
               abs_db.generic_string());
 }
 
+TEST(ConfigParserTest, WarpJobsDbPath_KeepsTheGuiDefaultUnderAnAccountingOverride) {
+    // [review] The guard's file is the GUI's default when warp.jobs_db is
+    // absent, whatever accounting.bridge_jobs_db_path was overridden to.
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+accounting:
+  bridge_jobs_db_path: elsewhere/warp.db
+warp:
+  enabled: true
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, anchored(tmp.path(), "elsewhere/warp.db"));
+    EXPECT_EQ(cfg.accounting.warp_jobs_db_path, anchored(tmp.path(), "data/warp_jobs.db"));
+    // ...and an empty warp.jobs_db keeps the default too.
+    std::string yaml2 = std::string(kMinimalValidYaml) + R"(
+accounting:
+  bridge_jobs_db_path: elsewhere/warp.db
+warp:
+  enabled: true
+  jobs_db: ""
+)";
+    TempYaml tmp2(yaml2.c_str());
+    EXPECT_EQ(xop::load_config(tmp2.path()).accounting.warp_jobs_db_path,
+              anchored(tmp2.path(), "data/warp_jobs.db"));
+}
+
 TEST(ConfigParserTest, WarpEnabledIsReadForTheGuard) {
     std::string yaml = std::string(kMinimalValidYaml) + R"(
 warp:

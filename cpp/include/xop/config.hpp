@@ -2293,11 +2293,12 @@ struct AccountingConfig {
     bool warp_enabled{false};
 
     /// [review] The file the GUI actually writes its warp jobs to
-    /// (warp.jobs_db, anchored like bridge_jobs_db_path), for the
-    /// stuck-transaction guard: bridge_jobs_db_path may be overridden for
-    /// the bridge accounting, and the guard must never read a database no
-    /// send reservation is written to.  Empty = same as bridge_jobs_db_path.
-    std::string warp_jobs_db_path;
+    /// (warp.jobs_db, anchored like bridge_jobs_db_path; the GUI's own
+    /// default when the key is absent), for the stuck-transaction guard:
+    /// bridge_jobs_db_path may be overridden for the bridge accounting, and
+    /// the guard must never read a database no send reservation is written
+    /// to.
+    std::string warp_jobs_db_path{"data/warp_jobs.db"};
 
     /// Asset the bridge mints/burns on the Chia side: wUSDC.b mainnet CAT
     /// id.  Valued at exactly $1.00 -- the numeraire doctrine of the peg

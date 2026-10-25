@@ -5523,6 +5523,10 @@ class WarpEngine:
         if job.state.get("delivered_by"):
             detail = (f"the unwrap was delivered ({job.state['delivered_by']}); "
                       f"closed by the operator{unsettled}")
+        elif job.bridge_nonce and job.state.get("third_party_claim"):
+            detail = (f"a third party's claim paid the attested receiver (message "
+                      f"nonce {job.bridge_nonce} is consumed); closed by the "
+                      f"operator{unsettled}")
         elif job.bridge_nonce and self._claim_completed(job):
             detail = (f"the claim completed (final CAT coin "
                       f"{job.state.get('final_cat_coin_id')}); closed by the "
@@ -5570,7 +5574,13 @@ class WarpEngine:
         return _job_dict(self._store.get_job(job.id))
 
     def _claim_completed(self, job: WarpJob) -> bool:
-        """Whether the job's final CAT coin is on chain (the claim landed)."""
+        """Whether the bridge completed: the job's final CAT coin is on chain
+        (our claim landed), or a third party's claim paid the attested
+        receiver (the persisted ``third_party_claim`` checkpoint -- that
+        claim creates no final CAT coin of ours, yet the deposit is paid and
+        the mint happened)."""
+        if job.state.get("third_party_claim"):
+            return True
         final = job.state.get("final_cat_coin_id")
         if not final:
             return False
@@ -5898,7 +5908,10 @@ class WarpEngine:
             # to check.
             patch["security_coin_id"] = coin_id
         if completed:
-            status = f"{status}; the claim had completed (final CAT coin on chain)"
+            status = f"{status}; " + (
+                "a third party's claim had paid the attested receiver"
+                if job.state.get("third_party_claim")
+                else "the claim had completed (final CAT coin on chain)")
         self._store.update_job(
             job.id,
             status=(JobStatus.COMPLETED if completed else JobStatus.CANCELLED) if close else None,
