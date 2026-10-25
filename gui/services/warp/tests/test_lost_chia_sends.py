@@ -2666,3 +2666,46 @@ def test_the_sweep_destination_is_pinned_per_coin_across_rebuilds(monkeypatch):
     # ...while another coin of the same job gets its own destination.
     engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5c" * 32), b"\x01" * 32)
     assert seen[-1] == (b"\x66" * 32).hex()
+
+
+def test_an_identified_retired_attempt_is_persisted_under_its_real_id(monkeypatch):
+    """[review] Once the history names a retired unnamed attempt, its id and
+    coins are kept: a record that later drops out of the history is judged
+    by its coins (the bundle may still sit in a mempool), never presumed
+    gone by absence."""
+    from gui.services.warp import chia_send as cs
+
+    k1 = S._FUNDING_TX_UNKNOWN + "#1"
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    ph = claim_mod.security_coin_puzzle_hash(engine._load_ephemeral_sk(job)).hex()
+    now = 1_000_000.0
+    monkeypatch.setattr(engine, "_now", lambda: now)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": [k1], "funding_tx_id_prior_removals": None,
+        "funding_tx_id_prior_retired_at": {k1: now - 10 * 3600.0}})
+    removal = {"parent_coin_info": "d4" * 32, "puzzle_hash": "11" * 32,
+               "amount": 499_005_000_000}
+    rid = cs.coin_id("d4" * 32, "11" * 32, 499_005_000_000)
+    ctx.wallet.txs = [{"name": "toll-x", "confirmed": False, "removals": [removal],
+                       "additions": [{"puzzle_hash": ph, "amount": NET.chia_toll_mojos}]}]
+    ctx.wallet.tx_records["toll-x"] = {"confirmed": False, "removals": [removal]}
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    ctx.coinset.records[rid] = _rec(spent=False)             # toll-x could still land
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "could still land" in note
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id_prior"] == ["toll-x"]
+    assert st["funding_tx_id_prior_removals"] == {"toll-x": [rid]}
+    assert "toll-x" in st["funding_tx_id_prior_retired_at"] and k1 not in st["funding_tx_id_prior_retired_at"]
+
+    # The record drops out of the wallet history and the wallet: judged by
+    # its coins, still unspent -- not "unobservable", not presumed gone.
+    ctx.wallet.txs = []
+    ctx.wallet.tx_records.clear()
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "could still land" in note
+    ctx.coinset.records[rid] = _rec(spent=True)              # ...until proven dead
+    assert engine._prior_sends_settled(store.get_active_job())[0]

@@ -2555,6 +2555,42 @@ class WarpEngine:
             **{key: None for key in also_clear},
         }
 
+    def _persist_identified_attempt(self, job: WarpJob, tx_key: str, old_key: str,
+                                    tx_id: str, removals: Sequence[str]) -> None:
+        """[review] A retired unnamed attempt identified from the wallet
+        history is re-keyed under its real id, with the coins it spent, in
+        every book (<tx_key>_prior, _prior_removals, _prior_dead,
+        _prior_retired_at): later probes then ask the wallet and the
+        mempool about THAT id and judge it by those coins -- it is never
+        "unobservable" again, so a record that later drops out of the
+        history cannot start the absence-based grace while the bundle may
+        still sit in a mempool.  Best effort: this tick judges it anyway."""
+        st = job.state
+        patch: Dict[str, Any] = {}
+        priors = [t for t in (st.get(f"{tx_key}_prior") or []) if t]
+        if old_key in priors:
+            patch[f"{tx_key}_prior"] = [
+                (tx_id if t == old_key else t) for t in priors
+                if not (t == tx_id and old_key != tx_id)]
+        removal_book = dict(st.get(f"{tx_key}_prior_removals") or {})
+        removal_book.pop(old_key, None)
+        removal_book[tx_id] = [_hx(c) for c in removals if c]
+        patch[f"{tx_key}_prior_removals"] = removal_book
+        dead = [t for t in (st.get(f"{tx_key}_prior_dead") or []) if t]
+        if old_key in dead:
+            patch[f"{tx_key}_prior_dead"] = [(tx_id if t == old_key else t) for t in dead]
+        stamps = dict(st.get(f"{tx_key}_prior_retired_at") or {})
+        if old_key in stamps:
+            stamps[tx_id] = stamps.pop(old_key)
+            patch[f"{tx_key}_prior_retired_at"] = stamps
+        try:
+            self._store.update_job(job.id, expected_status=job.status, state_patch=patch)
+            _log.info("warp job %s: retired %s identified as %s (%d coins)",
+                      job.id, old_key, tx_id, len(removal_book[tx_id]))
+        except Exception as exc:  # noqa: BLE001 -- judged this tick regardless
+            _log.debug("warp job %s: could not persist the identified attempt (%s)",
+                       job.id, exc)
+
     def _unobservable_settled(self, job: WarpJob, tx_key: str, tx_id: str) -> tuple:
         """``(settled, note)`` for a RETIRED attempt nothing can observe: no
         recorded coins, no wallet record, no mempool item.  Presumed gone
@@ -2684,6 +2720,8 @@ class WarpEngine:
                     except Exception as exc:  # noqa: BLE001 -- judged anyway
                         _log.debug("warp job %s: could not persist the identified "
                                    "send (%s)", job.id, exc)
+                else:
+                    self._persist_identified_attempt(job, tx_key, tx_id, probe_id, coins)
             # unique_output=False: the key holds other attempts' coins too,
             # so an output is THIS send's only when its parent is one of the
             # coins this send spent.  A send whose coins are unknown can
@@ -2787,6 +2825,7 @@ class WarpEngine:
                     return False, ("an earlier cat_spend the wallet never named, "
                                    "whose coins are not known, cannot be ruled out")
                 probe_id, coins = ident
+                self._persist_identified_attempt(job, "burn_tx_id", tx_id, probe_id, coins)
                 named.append(probe_id)
                 live_coins = [*live_coins, *coins]
                 recorded_sets = [*recorded_sets, list(coins)]
