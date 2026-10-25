@@ -60,8 +60,9 @@ def test_every_destructive_rpc_re_reads_the_guard_first():
     text = _engine()
     prune = text.index("offer_mgr_->prune_stuck_transactions(\n"
                        "                                            {sb.wid}")
-    assert "wallet_holds_warp_send(sb.wid, block_height,\n"
-    assert "/*fresh=*/true" in text[prune - 900:prune]
+    fresh_call = text.rindex("wallet_holds_warp_send(sb.wid, block_height,", 0, prune)
+    assert prune - fresh_call < 900, "the fresh re-read precedes the prune"
+    assert "/*fresh=*/true" in text[fresh_call:prune]
     delete = text.index("delete_unconfirmed_transactions(pw);")
     fresh = text.rindex("wallet_holds_warp_send(pw, block_height,", 0, delete)
     assert delete - fresh < 900

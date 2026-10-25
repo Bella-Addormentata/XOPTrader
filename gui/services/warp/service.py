@@ -2324,7 +2324,8 @@ class WarpEngine:
 
     def _replacement_patch(self, job: WarpJob, *, tx_key: str, tx_id: str,
                            removals: Sequence[str],
-                           also_clear: Sequence[str] = ()) -> Dict[str, Any]:
+                           also_clear: Sequence[str] = (),
+                           dead: bool = False) -> Dict[str, Any]:
         """State that retires the send recorded as *tx_id* and prepares its
         replacement: the marker and its polls cleared, the id added to
         ``<tx_key>_prior`` with the coins it spent in
@@ -2333,22 +2334,32 @@ class WarpEngine:
         replacement never reuses them, and *also_clear* (an output pin) set
         to None."""
         st = job.state
-        prior_key, prior_removals_key = (f"{tx_key}_prior",
-                                         f"{tx_key}_prior_removals")
+        prior_key, prior_removals_key, dead_key = (
+            f"{tx_key}_prior", f"{tx_key}_prior_removals", f"{tx_key}_prior_dead")
         priors = [t for t in (st.get(prior_key) or []) if t]
         prior_removals = dict(st.get(prior_removals_key) or {})
+        proven_dead = [t for t in (st.get(dead_key) or []) if t]
         coins = [c for c in removals if c]
         if coins:
             prior_removals[tx_id] = coins
-        # [review] The replacement excludes the coins of EVERY replaced
-        # attempt, not only the latest: with A replaced by B and B by C, A
-        # may still surface, and C must not compete with it either.
-        exclude = sorted({c for cs_ in prior_removals.values() for c in cs_ if c})
+        if dead and tx_id not in proven_dead:
+            proven_dead.append(tx_id)
+        # [review] The replacement excludes the coins of every replaced
+        # attempt that COULD STILL LAND, not only the latest: with A
+        # replaced by B and B by C, A may still surface, and C must not
+        # compete with it either.  A send the chain proved dead can never
+        # confirm, so its surviving inputs stay selectable: one conflicting
+        # input makes the verdict, and excluding the rest of a multi-input
+        # send could starve every replacement.  Every attempt's coins stay
+        # on the books for the settlement accounting regardless.
+        exclude = sorted({c for t, cs_ in prior_removals.items()
+                          if t not in proven_dead for c in cs_ if c})
         return {
             tx_key: None, f"{tx_key}_orphan_polls": 0,
             f"{tx_key}_removals": None,
             prior_key: priors + ([tx_id] if tx_id not in priors else []),
             prior_removals_key: prior_removals or None,
+            dead_key: proven_dead or None,
             f"{tx_key}_exclude": exclude or None,
             **{key: None for key in also_clear},
         }
@@ -2625,7 +2636,7 @@ class WarpEngine:
                     return None, self._replacement_patch(
                         job, tx_key=tx_key,
                         tx_id=self._unnamed_attempt_key(job, tx_key),
-                        removals=recorded, also_clear=also_clear)
+                        removals=recorded, also_clear=also_clear, dead=True)
                 return _stay(
                     state={polls_key: polls},
                     message=(f"{label} unnamed by the wallet and absent from its "
@@ -2653,7 +2664,7 @@ class WarpEngine:
             return None, self._replacement_patch(
                 job, tx_key=tx_key, tx_id=tx_id,
                 removals=list(ev.removals) or (st.get(removals_key) or []),
-                also_clear=also_clear)
+                also_clear=also_clear, dead=True)
         if verdict is cs.Verdict.ORPHAN:
             polls += 1
             hint = (("it is sent again once those coins are spent by anything "
@@ -2866,7 +2877,7 @@ class WarpEngine:
                 if verdict in allowed:
                     return self._replacement_patch(
                         job, tx_key=tx_key, tx_id=key, removals=recorded,
-                        also_clear=also_clear)
+                        also_clear=also_clear, dead=verdict is cs.Verdict.DEAD)
                 return {}
             if burn:
                 return {}
@@ -2881,7 +2892,7 @@ class WarpEngine:
         if verdict in allowed:
             return self._replacement_patch(
                 job, tx_key=tx_key, tx_id=tx_id, removals=list(ev.removals),
-                also_clear=also_clear)
+                also_clear=also_clear, dead=verdict is cs.Verdict.DEAD)
         return {}
 
     def _bridge_hashes(self, job: WarpJob) -> list:

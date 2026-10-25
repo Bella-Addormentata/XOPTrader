@@ -1091,9 +1091,10 @@ def test_cat_spend_exclusions_reach_the_daemon_under_its_field_name():
     assert "excluded_coin_ids" not in seen["body"]
 
 
-def test_retrys_burn_replacement_excludes_the_dead_sends_coins():
-    """[review] As the funding paths do: the replacement names the replaced
-    send's coins as exclusions and keeps them for the accounting."""
+def test_retrys_burn_replacement_keeps_the_dead_sends_coins_on_the_books():
+    """[review] A dead send can never confirm, so its coins are NOT excluded
+    from the replacement (one conflicting input made the verdict; the rest
+    stay selectable) -- but they stay on the books for the accounting."""
     store = new_store()
     engine, ctx = build_unwrap(store, params=params_with_cap())
     job = _to_burn_sent(store, engine)
@@ -1105,12 +1106,13 @@ def test_retrys_burn_replacement_excludes_the_dead_sends_coins():
                      expected_status=JobStatus.BURN_SENT,
                      state_patch={"failed_from": JobStatus.BURN_SENT})
     engine.job_action(job.id, "retry")
-    assert store.get_job(job.id).state["burn_tx_id_exclude"] == [RID]
+    st = store.get_job(job.id).state
+    assert st["burn_tx_id_exclude"] is None
+    assert st["burn_tx_id_prior_dead"] == ["burn-dead"]
     engine.step()
-    assert ctx.wallet.cat_spend_excludes == [[RID]]
+    assert ctx.wallet.cat_spend_excludes == [[]]
     st = store.get_active_job().state
     assert st["burn_tx_id"] == "burn-tx-1"
-    assert st["burn_tx_id_exclude"] is None
     assert st["burn_tx_id_prior_removals"] == {"burn-dead": [RID]}
 
 
@@ -1261,8 +1263,9 @@ def test_a_wallet_only_confirmation_does_not_settle_a_replaced_send(monkeypatch)
 
 
 def test_exclusions_accumulate_across_replacements():
-    """[review] A replaced by B, B replaced by C: C must exclude the coins
-    of A as well as B."""
+    """[review] A replaced by B, B replaced by C: every attempt stays on
+    the books, and C excludes the coins of each attempt that could still
+    land (none here: all proven dead) -- never a dead one's."""
     store = new_store()
     engine, ctx = build_unwrap(store, params=params_with_cap())
     job = _to_burn_sent(store, engine)
@@ -1287,10 +1290,14 @@ def test_exclusions_accumulate_across_replacements():
                      state_patch={"failed_from": JobStatus.BURN_SENT})
     engine.job_action(job.id, "retry")
     st = store.get_job(job.id).state
-    assert st["burn_tx_id_exclude"] == sorted([RID, RID2, "f" * 64])
     assert st["burn_tx_id_prior"] == ["burn-a", "burn-b", "burn-c"]
+    assert st["burn_tx_id_prior_removals"] == {
+        "burn-a": [RID], "burn-b": [RID2], "burn-c": ["f" * 64]}
+    assert st["burn_tx_id_prior_dead"] == ["burn-b", "burn-c"]
+    # burn-a was never judged by this job (a legacy prior): retained.
+    assert st["burn_tx_id_exclude"] == [RID]
     engine.step()
-    assert ctx.wallet.cat_spend_excludes == [sorted([RID, RID2, "f" * 64])]
+    assert ctx.wallet.cat_spend_excludes == [[RID]]
 
 
 def test_retry_of_a_burning_job_that_never_made_its_toll_key_resets_nothing():
@@ -1686,7 +1693,7 @@ def test_an_unnamed_cat_spend_whose_coins_went_elsewhere_is_sent_again():
     ctx.coinset.peak = PEAK
     engine.step()
     assert len(ctx.wallet.cat_spends) == 1
-    assert ctx.wallet.cat_spend_excludes == [[RID]]
+    assert ctx.wallet.cat_spend_excludes == [[]], "a dead send's coins are free"
     st = store.get_active_job().state
     assert st["burn_tx_id"] == "burn-tx-1"
     assert st["burn_tx_id_prior"] == [S._FUNDING_TX_UNKNOWN + "#1"]
@@ -1713,7 +1720,8 @@ def test_retry_replaces_an_unnamed_cat_spend_only_when_dead():
     engine.job_action(job.id, "retry")
     st = store.get_job(job.id).state
     assert st["burn_tx_id"] is None
-    assert st["burn_tx_id_exclude"] == [RID]
+    assert st["burn_tx_id_exclude"] is None
+    assert st["burn_tx_id_prior_dead"] == [S._FUNDING_TX_UNKNOWN + "#1"]
     assert st["burn_tx_id_prior"] == [S._FUNDING_TX_UNKNOWN + "#1"]
 
 
@@ -1972,3 +1980,42 @@ def test_a_sweep_is_not_broadcast_unless_its_records_are_written(monkeypatch):
     monkeypatch.setattr(store, "update_job", real)
     engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5a" * 32), b"\x01" * 32)
     assert pushes == [1]
+
+
+# --------------------------------------------------------------------------- #
+# Review round 19.
+# --------------------------------------------------------------------------- #
+
+def test_only_attempts_that_could_still_land_are_excluded(monkeypatch):
+    """[review] An orphan's coins are excluded (it may surface); a dead
+    multi-input send's surviving coins are not (it can never confirm), so
+    replacements are never starved of funds."""
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store, funding_tx_id="fund-a", funding_amount=EXPECTED,
+                        funding_tx_id_removals=[RID])
+    ctx.coinset.records[RID] = _rec(spent=False)             # A: an orphan
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     expected_status=JobStatus.FUNDING_CLAIM,
+                     state_patch={"failed_from": JobStatus.FUNDING_CLAIM})
+    engine.job_action(job.id, "retry")
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id_exclude"] == [RID] and not st.get("funding_tx_id_prior_dead")
+    engine.step()                                            # B sent, excluding A's coin
+    assert ctx.wallet.sent_excludes[-1] == [RID]
+    job = store.get_active_job()
+    other = "a" * 64
+    store.update_job(job.id, state_patch={"funding_tx_id": "fund-b",
+                                          "funding_tx_id_removals": [RID2, other]})
+    ctx.coinset.records[RID2] = _rec(spent=True)             # B: one input gone...
+    ctx.coinset.records[other] = _rec(spent=False)           # ...the other survives
+    ctx.coinset.peak = PEAK
+    engine.step()                                            # B dead -> C sent
+    assert len(ctx.wallet.sent) == 2
+    assert ctx.wallet.sent_excludes[-1] == [RID], "only the orphan's coin"
+    st = store.get_active_job().state
+    assert st["funding_tx_id_prior"] == ["fund-a", "fund-b"]
+    assert st["funding_tx_id_prior_dead"] == ["fund-b"]
+    assert st["funding_tx_id_prior_removals"] == {"fund-a": [RID],
+                                                  "fund-b": [RID2, other]}
