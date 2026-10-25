@@ -133,6 +133,27 @@ TEST(ConfigLiveApply, startup_analysis_length_waits_for_the_next_start)
               running.strategy.startup_analysis_blocks);
 }
 
+TEST(ConfigLiveApply, the_merged_config_is_held_to_the_cross_section_rules)
+{
+    // The saved file is valid on its own and so is the running config, but
+    // their MERGE (a pair the file removed keeps running with its own cap,
+    // under the file's raised global limits) breaks soft < hard for it.
+    auto running = running_config();
+    running.risk.soft_limit_pct = 0.60;
+    running.risk.hard_limit_pct = 0.70;
+    running.pairs[0].hard_limit_pct_override = 0.80;
+    ASSERT_NO_THROW(xop::validate_config_relations(running));
+
+    auto saved = running;
+    saved.pairs.erase(saved.pairs.begin());   // XCH/A dropped from the file
+    saved.risk.soft_limit_pct = 0.85;
+    saved.risk.hard_limit_pct = 0.95;
+    ASSERT_NO_THROW(xop::validate_config_relations(saved));
+
+    const auto plan = xop::plan_live_config(running, saved);
+    EXPECT_THROW(xop::validate_config_relations(plan.merged), xop::ConfigError);
+}
+
 TEST(ConfigLiveApply, a_disable_applies_an_enable_waits)
 {
     const auto running = running_config();

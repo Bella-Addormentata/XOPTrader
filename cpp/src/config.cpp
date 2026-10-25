@@ -4752,6 +4752,18 @@ void validate_enforced_pegs_are_observable(const AppConfig& cfg)
     }
 }
 
+// [LIVECFG] The checks that span sections (and so cannot live in a single
+// parse_*), shared by load_config() and the engine's live reload: a reload
+// merges the saved file with the running engine's restart-only values, and
+// that MERGED config must pass them too.
+void validate_config_relations(const AppConfig& cfg)
+{
+    validate_usd_anchor(cfg);
+    validate_enforced_pegs_are_observable(cfg);
+    validate_pair_concentration_overrides(cfg);
+    validate_pace_config(cfg);
+}
+
 AppConfig load_config(const std::string& path,
                       const std::string& secrets_path)
 {
@@ -4833,10 +4845,7 @@ AppConfig load_config(const std::string& path,
     cfg.inventory_aging = parse_inventory_aging(root);
     cfg.accounting = parse_accounting(root);
     cfg.market_data = parse_market_data(root);
-    validate_usd_anchor(cfg);
-    validate_enforced_pegs_are_observable(cfg);
-    validate_pair_concentration_overrides(cfg);
-    validate_pace_config(cfg);
+    validate_config_relations(cfg);
 
     // [S27 review round 3] Since usd_per_xch() now prefers the external
     // CoinGecko price, a polling interval LONGER than the freshness window

@@ -237,3 +237,48 @@ def test_a_failed_restart_keeps_the_restart_list():
     MainWindow._on_restart_engine_for_settings(window)
     assert "did NOT start" in calls.state
     assert calls.restart == "untouched"
+
+
+def test_a_restart_that_fails_after_launch_restores_the_list():
+    # Popen succeeded, so the row was cleared; the bridge's early-exit
+    # check then reports the engine died during startup.
+    from gui.widgets.main_window import MainWindow
+
+    calls = SimpleNamespace(state=None, restart=None)
+    settings = SimpleNamespace(
+        note_reload_state=lambda text: setattr(calls, "state", text),
+        note_restart_required=lambda items: setattr(calls, "restart", items),
+        restart_required_items=lambda: ["chia wallet host/port"],
+    )
+    bridge = SimpleNamespace(engine_running_locally=True)
+    bridge.stop_engine = lambda **_kw: setattr(
+        bridge, "engine_running_locally", False)
+    bridge.start_engine = lambda: setattr(
+        bridge, "engine_running_locally", True)
+    window = SimpleNamespace(
+        _bridge=bridge, _settings_widget=settings, _unwrap=lambda w: w,
+        _engine_stop_is_ours=lambda: True,
+        _decide_engine_stop=lambda closing: SimpleNamespace(
+            proceed=True, policy="keep"),
+        _style_start_stop_button=lambda: None,
+        _style_pause_resume_button=lambda: None,
+        _RESTART_FAILURE_WINDOW_S=MainWindow._RESTART_FAILURE_WINDOW_S,
+    )
+    MainWindow._on_restart_engine_for_settings(window)
+    assert calls.restart == []
+    assert calls.state == "engine restarted on the saved config"
+
+    MainWindow._restore_restart_items_after_failed_start(window)
+    assert calls.restart == ["chia wallet host/port"]
+    assert "did NOT start" in calls.state
+
+    calls.restart = None
+    MainWindow._restore_restart_items_after_failed_start(window)
+    assert calls.restart is None, "restored once, for that restart only"
+
+
+def test_the_settings_page_reports_its_restart_list(panel):
+    panel.note_restart_required(["monitoring.prometheus_port"])
+    assert panel.restart_required_items() == ["monitoring.prometheus_port"]
+    panel.note_restart_required([])
+    assert panel.restart_required_items() == []

@@ -5375,6 +5375,7 @@ class SettingsWidget(QWidget):
         adopt live (cpp/include/xop/config_live_apply.hpp). Empty hides the
         row: everything saved is live.
         """
+        self._restart_items = list(items)
         if items:
             text = ("Saved, but the running engine applies these only after a "
                     "restart: " + ", ".join(items))
@@ -5387,6 +5388,10 @@ class SettingsWidget(QWidget):
             self._restart_label.setText("")
         self._restart_label.setVisible(bool(items))
         self._restart_btn.setVisible(bool(items))
+
+    def restart_required_items(self) -> list[str]:
+        """[LIVECFG] The settings the restart row currently lists."""
+        return list(getattr(self, "_restart_items", []))
 
     def appearance_prefs(self) -> dict[str, Any]:
         """[LIVECFG] The Appearance preferences MainWindow applies live."""

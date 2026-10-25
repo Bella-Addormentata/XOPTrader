@@ -384,6 +384,9 @@ class MainWindow(QMainWindow):
         self._dry_run: bool = dry_run
         self._start_time: float = time.monotonic()
         self._last_engine_start_failure: str = ""
+        # [LIVECFG] (monotonic time, restart list) of the last Settings
+        # restart, until a startup failure restores the list; else None.
+        self._restart_items_awaiting_start: Optional[tuple[float, list[str]]] = None
         self._chart_last_block_by_pair: dict[str, int] = {}
         self._chart_volume_by_pair_block: dict[tuple[str, int], tuple[float, float]] = {}
         self._chart_seen_trade_keys: set[tuple] = set()
@@ -1255,6 +1258,7 @@ class MainWindow(QMainWindow):
     def _on_engine_start_failed(self, msg: str) -> None:
         """Show a detailed dialog when the managed engine exits on startup."""
         self._status_bar.showMessage("Engine startup failed.", 10_000)
+        self._restore_restart_items_after_failed_start()
         # [STARTINTENT] The boot window's "starting" claim rests on a launch
         # being in flight; a failed launch ends that story, and the chip
         # falls back to naming the real gate (the engine is not running).
@@ -2388,10 +2392,39 @@ class MainWindow(QMainWindow):
                     "the engine stopped but did NOT start again -- see the "
                     "error message, then use the Start button")
             return
+        # The launch can still fail a few seconds in (the bridge's early-exit
+        # check): keep the list so _on_engine_start_failed can put it back.
+        if settings is not None and hasattr(settings, "restart_required_items"):
+            self._restart_items_awaiting_start = (
+                time.monotonic(), list(settings.restart_required_items()))
         if settings is not None and hasattr(settings, "note_restart_required"):
             settings.note_restart_required([])
         if settings is not None and hasattr(settings, "note_reload_state"):
             settings.note_reload_state("engine restarted on the saved config")
+
+    #: [LIVECFG] How long after a Settings restart a startup failure is taken
+    #: as that restart failing (the bridge reports early exits within ~3 s).
+    _RESTART_FAILURE_WINDOW_S: Final[float] = 60.0
+
+    def _restore_restart_items_after_failed_start(self) -> None:
+        """[LIVECFG] A Settings restart whose engine then failed to start:
+        put the restart list back and correct the success message."""
+        pending = getattr(self, "_restart_items_awaiting_start", None)
+        self._restart_items_awaiting_start = None
+        if pending is None:
+            return
+        started_at, items = pending
+        if time.monotonic() - started_at > self._RESTART_FAILURE_WINDOW_S:
+            return
+        settings = self._unwrap(self._settings_widget)
+        if settings is None:
+            return
+        if hasattr(settings, "note_restart_required"):
+            settings.note_restart_required(items)
+        if hasattr(settings, "note_reload_state"):
+            settings.note_reload_state(
+                "the engine stopped but did NOT start again -- see the "
+                "error message, then use the Start button")
 
     def _apply_appearance(self, prefs: dict) -> None:
         """[LIVECFG] Settings > Appearance, applied the moment it is saved."""

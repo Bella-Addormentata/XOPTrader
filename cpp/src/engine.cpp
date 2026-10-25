@@ -26197,6 +26197,10 @@ asio::awaitable<void> Engine::check_config_reload_flag()
 // the subsystems themselves (and so ran only at construction before).
 void Engine::validate_live_config(const AppConfig& cfg)
 {
+    // The merged config mixes the saved file with running values (pairs the
+    // file removed, restart-only settings), so the cross-section rules the
+    // parser applied to the file alone must be checked again on it.
+    validate_config_relations(cfg);
     execution::OfferManager::validate_config(cfg);
     AdverseSelectionEstimator::validate_config(adverse_selection_config_from(cfg));
     (void)SpreadOptimizer{spread_config_from(cfg.strategy)};
@@ -26261,6 +26265,11 @@ void Engine::apply_live_config(const AppConfig& m)
 
     // -- Subsystems that cached a value at construction ---------------------
     max_drawdown_frac_ = config_.risk.max_drawdown_frac;
+    // The drawdown grace is a window counted from startup: a shorter saved
+    // value cuts what is left of it now (0 ends it), a longer one does not
+    // reopen a window that has already run.
+    drawdown_grace_remaining_ =
+        std::min(drawdown_grace_remaining_, config_.risk.drawdown_grace_blocks);
 
     if (market_data_) market_data_->set_config(market_data_config_from(config_));
 

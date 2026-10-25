@@ -2868,6 +2868,12 @@ struct AppConfig {
 AppConfig load_config(const std::string& path,
                       const std::string& secrets_path = {});
 
+// The cross-section checks load_config() runs after parsing every section
+// (USD anchor, observable pegs, per-pair concentration limits, pace).
+// Throws xop::ConfigError. Exposed for the engine's live reload, which must
+// hold the merged config it adopts to the same rules.
+void validate_config_relations(const AppConfig& cfg);
+
 } // namespace xop
 
 #endif // XOP_CONFIG_HPP
