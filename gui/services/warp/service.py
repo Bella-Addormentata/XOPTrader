@@ -2359,14 +2359,14 @@ class WarpEngine:
         live = {_hx(c) for c in live_coins if c}
         recorded = [frozenset(_hx(c) for c in cs_ if c) for cs_ in recorded_sets if cs_]
         for _ in range(16):
-            try:
-                found = scan(used)
-                if not found:
-                    return None
-                tx_id = str(found[0] if isinstance(found, tuple) else found)
-                rec = self._wallet.get_transaction_or_none(tx_id)
-            except Exception:  # noqa: BLE001 -- unidentified, not proof
+            # [review] A lookup that could not run PROPAGATES: "could not
+            # look" must never read as "absent", or the absence-based grace
+            # below would settle a send the wallet may still hold.
+            found = scan(used)
+            if not found:
                 return None
+            tx_id = str(found[0] if isinstance(found, tuple) else found)
+            rec = self._wallet.get_transaction_or_none(tx_id)
             removals = [_hx(c) for c in cs.removal_ids(rec)] if rec else []
             if removals and (live.intersection(removals)
                              or frozenset(removals) in recorded):
@@ -2655,9 +2655,13 @@ class WarpEngine:
                 # that would have adopted the id -- and the current marker is
                 # then persisted under that name; otherwise nothing can rule
                 # it out.
-                ident = self._identify_unnamed_funding(
-                    ph, amount, exclude_ids=named, live_coins=live_coins,
-                    recorded_sets=recorded_sets)
+                try:
+                    ident = self._identify_unnamed_funding(
+                        ph, amount, exclude_ids=named, live_coins=live_coins,
+                        recorded_sets=recorded_sets)
+                except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
+                    return False, (f"the wallet history could not be read ({exc}); "
+                                   f"attempt {tx_id[:16]}... is not ruled out")
                 if not ident or not ident[1]:
                     if tx_id != current:
                         # [review] Retired and unobservable: the grace clock.
@@ -2772,9 +2776,13 @@ class WarpEngine:
         for tx_id in priors:
             probe_id, coins = tx_id, list(prior_removals.get(tx_id) or [])
             if self._unnamed(tx_id) and not coins:
-                ident = self._identify_unnamed_burn(
-                    job, ph, amount, exclude_ids=named, live_coins=live_coins,
-                    recorded_sets=recorded_sets)
+                try:
+                    ident = self._identify_unnamed_burn(
+                        job, ph, amount, exclude_ids=named, live_coins=live_coins,
+                        recorded_sets=recorded_sets)
+                except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
+                    return False, (f"the wallet history could not be read ({exc}); "
+                                   f"an earlier cat_spend is not ruled out")
                 if not ident or not ident[1]:
                     return False, ("an earlier cat_spend the wallet never named, "
                                    "whose coins are not known, cannot be ruled out")

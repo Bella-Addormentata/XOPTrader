@@ -2590,3 +2590,33 @@ def test_abandon_records_a_completed_claim_or_delivery_truthfully():
     engine.job_action(job2.id, "abandon")
     note2 = store.get_events(job2.id, limit=5000)[-1].message
     assert "the unwrap was delivered (our relay)" in note2 and "never claimed" not in note2
+
+
+def test_a_failed_history_lookup_never_starts_or_advances_the_grace(monkeypatch):
+    """[review] "Could not look" is not "absent": an unavailable wallet
+    history keeps the attempt unresolved and leaves the grace clock alone."""
+    k1 = S._FUNDING_TX_UNKNOWN + "#1"
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    now = 1_000_000.0
+    monkeypatch.setattr(engine, "_now", lambda: now)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": [k1], "funding_tx_id_prior_removals": None,
+        "funding_tx_id_prior_retired_at": None})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID2] = _rec(spent=True)
+
+    def down(*a, **k):
+        raise RuntimeError("wallet rpc down")
+
+    ctx.wallet.get_transactions = down
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "could not be read" in note
+    assert not store.get_job(job.id).state.get("funding_tx_id_prior_retired_at"), \
+        "no clock started on an unanswered lookup"
+    # Even past the grace, an unanswered lookup settles nothing.
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior_retired_at": {k1: now - 48 * 3600.0}})
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "could not be read" in note
