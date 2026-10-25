@@ -1104,7 +1104,11 @@ class WarpWidget(QWidget):
                 lambda _=False, j=int(job_id): self.job_action_requested.emit(j, "cancel")
             )
             menu.addAction(act_cancel)
-        if status in (_ST_FAILED, _ST_COMPLETED) and job_id is not None:
+        # [review] A cancelled job closed over sends presumed gone keeps Sweep:
+        # their coins are unspent, and one that lands leaves XCH at the key.
+        sweepable = status in (_ST_FAILED, _ST_COMPLETED) or (
+            status == "CANCELLED" and int(job.get("attempts_presumed") or 0) > 0)
+        if sweepable and job_id is not None:
             act_sweep = QAction("Sweep security coin", menu)
             act_sweep.triggered.connect(
                 lambda _=False, j=int(job_id): self.job_action_requested.emit(j, "sweep")

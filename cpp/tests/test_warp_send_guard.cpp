@@ -143,6 +143,11 @@ TEST(WarpSendGuardTest, RetiredAttemptsProvenDeadProtectNothing) {
     const json all_dead = {{"funding_tx_id_prior", json::array({"a", "b"})},
                            {"funding_tx_id_prior_dead", json::array({"a", "b"})}};
     EXPECT_FALSE(warp_job_chia_send("CLAIMING", all_dead, kUsdc).has_value());
+    // Presumed gone after the GUI's grace counts as settled too.
+    const json presumed = {{"funding_tx_id_prior", json::array({"a", "b"})},
+                           {"funding_tx_id_prior_dead", json::array({"a"})},
+                           {"funding_tx_id_prior_presumed", json::array({"b"})}};
+    EXPECT_FALSE(warp_job_chia_send("CLAIMING", presumed, kUsdc).has_value());
     // One of them not proven dead: protected.
     const json one_live = {{"funding_tx_id_prior", json::array({"a", "b"})},
                            {"funding_tx_id_prior_dead", json::array({"a"})}};

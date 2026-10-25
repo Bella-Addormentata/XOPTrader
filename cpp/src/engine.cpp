@@ -20972,12 +20972,17 @@ void Engine::refresh_warp_send_guard(BlockHeight block_height, bool fresh)
     warp_send_guard_read_  = true;
     warp_send_guard_block_ = block_height;
     const auto& acc = config_.accounting;
-    warp_send_guard_ = read_warp_send_guard(acc.bridge_jobs_db_path,
+    // [review] The file the GUI writes (warp.jobs_db), not the accounting
+    // override: a reservation lives in the former, and an accounting
+    // database with no active job would read as "nothing to protect".
+    const std::string& guard_db = acc.warp_jobs_db_path.empty()
+        ? acc.bridge_jobs_db_path : acc.warp_jobs_db_path;
+    warp_send_guard_ = read_warp_send_guard(guard_db,
                                             acc.bridge_asset_id,
                                             acc.warp_enabled);
     std::error_code ec;
-    const bool missing = !acc.bridge_jobs_db_path.empty()
-        && !std::filesystem::exists(acc.bridge_jobs_db_path, ec) && !ec;
+    const bool missing = !guard_db.empty()
+        && !std::filesystem::exists(guard_db, ec) && !ec;
     if (missing && acc.warp_enabled) {
         // [review] Fail closed while the GUI could still be about to create
         // the file; a headless engine never sees one, and must not lose its
@@ -20993,7 +20998,7 @@ void Engine::refresh_warp_send_guard(BlockHeight block_height, bool fresh)
                              "no warp jobs and resuming the stuck-transaction "
                              "cleanup -- a headless engine should set "
                              "warp.enabled: false",
-                             acc.bridge_jobs_db_path, kWarpDbMissingGraceHeartbeats);
+                             guard_db, kWarpDbMissingGraceHeartbeats);
             }
         }
     } else {
@@ -21004,7 +21009,7 @@ void Engine::refresh_warp_send_guard(BlockHeight block_height, bool fresh)
         spdlog::warn("[Engine] warp_jobs.db ({}) {} -- every wallet's "
                      "unconfirmed transactions are left alone this heartbeat "
                      "in case a warp send is among them",
-                     acc.bridge_jobs_db_path,
+                     guard_db,
                      missing ? "does not exist while warp is enabled (is "
                                "warp.jobs_db the file the GUI writes?)"
                              : "could not be read");

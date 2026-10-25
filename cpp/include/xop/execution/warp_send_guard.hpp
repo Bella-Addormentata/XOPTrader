@@ -108,19 +108,22 @@ struct WarpChiaSend {
     // all-dead list would otherwise hold the wallet for as long as the job
     // stays open ([review]).
     const auto has_live_priors = [&](const char* prior_key,
-                                     const char* dead_key) -> bool {
+                                     const char* dead_key,
+                                     const char* presumed_key) -> bool {
         if (!state.is_object() || !state.contains(prior_key)
             || !state[prior_key].is_array()) {
             return false;
         }
-        const auto is_dead = [&](const std::string& id) -> bool {
-            if (!state.contains(dead_key) || !state[dead_key].is_array()) {
-                return false;
-            }
-            for (const auto& d : state[dead_key]) {
+        // Proven dead, or presumed gone after the GUI's grace: not live.
+        const auto listed = [&](const char* key, const std::string& id) -> bool {
+            if (!state.contains(key) || !state[key].is_array()) return false;
+            for (const auto& d : state[key]) {
                 if (d.is_string() && d.get<std::string>() == id) return true;
             }
             return false;
+        };
+        const auto is_dead = [&](const std::string& id) -> bool {
+            return listed(dead_key, id) || listed(presumed_key, id);
         };
         for (const auto& p : state[prior_key]) {
             if (!p.is_string()) continue;
@@ -171,11 +174,13 @@ struct WarpChiaSend {
     // clears the marker and keeps the orphan on the books, and a gate or a
     // refusal can leave the job in that state with the orphan still able
     // to resurface.
-    if (has_live_priors("funding_tx_id_prior", "funding_tx_id_prior_dead")) {
+    if (has_live_priors("funding_tx_id_prior", "funding_tx_id_prior_dead",
+                        "funding_tx_id_prior_presumed")) {
         s.xch = true;
         any   = true;
     }
-    if (has_live_priors("burn_tx_id_prior", "burn_tx_id_prior_dead")
+    if (has_live_priors("burn_tx_id_prior", "burn_tx_id_prior_dead",
+                        "burn_tx_id_prior_presumed")
         && !text("burn_tx_id").empty()) {
         s.xch = true;
         if (s.cat_asset_id.empty()) {

@@ -735,7 +735,16 @@ def _job_dict(job: Optional[WarpJob]) -> Optional[dict]:
         "swept": job.state.get("swept"),
         "sweep_status": job.state.get("sweep_status"),
         "attempts_open": _open_attempts(job.state),
+        "attempts_presumed": _presumed_attempts(job.state),
     }
+
+
+def _settled_ids(state: dict, tx_key: str) -> set:
+    """Retired attempts that no longer keep a job open: proven dead, or
+    presumed gone after the grace (kept apart: a presumed-gone send's coins
+    are still unspent, so Sweep stays available for it)."""
+    return ({t for t in (state.get(f"{tx_key}_prior_dead") or []) if t}
+            | {t for t in (state.get(f"{tx_key}_prior_presumed") or []) if t})
 
 
 def _open_attempts(state: dict) -> int:
@@ -743,9 +752,16 @@ def _open_attempts(state: dict) -> int:
     presumed gone (the ones that keep Sweep / completion waiting)."""
     n = 0
     for tx_key in ("funding_tx_id", "burn_tx_id"):
-        dead = set(state.get(f"{tx_key}_prior_dead") or [])
-        n += sum(1 for t in (state.get(f"{tx_key}_prior") or []) if t and t not in dead)
+        done = _settled_ids(state, tx_key)
+        n += sum(1 for t in (state.get(f"{tx_key}_prior") or []) if t and t not in done)
     return n
+
+
+def _presumed_attempts(state: dict) -> int:
+    """How many replaced Chia sends were presumed gone with their coins
+    still unspent -- the reason Sweep stays offered on a closed job."""
+    return sum(len([t for t in (state.get(f"{k}_prior_presumed") or []) if t])
+               for k in ("funding_tx_id", "burn_tx_id"))
 
 
 # --------------------------------------------------------------------------- #
@@ -2254,8 +2270,7 @@ class WarpEngine:
         not proven dead.  *pending* is a state patch not yet written."""
         st = {**job.state, **(pending or {})}
         prior_removals = dict(st.get(f"{tx_key}_prior_removals") or {})
-        dead = [t for t in (st.get(f"{tx_key}_prior_dead") or []) if t]
-        live, sets = self._attempt_books(prior_removals, dead)
+        live, sets = self._attempt_books(prior_removals, list(_settled_ids(st, tx_key)))
         return {"exclude_coin_sets": sets, "exclude_coins": live}
 
     def _find_existing_funding(self, security_ph_hex: str, expected: int,
@@ -2518,26 +2533,58 @@ class WarpEngine:
     def _identify_unnamed_funding(self, out_ph_hex: str, out_amount: int, *,
                                   exclude_ids: Sequence[str],
                                   live_coins: Sequence[str] = (),
-                                  recorded_sets: Sequence[Sequence[str]] = ()
+                                  recorded_sets: Sequence[Sequence[str]] = (),
+                                  require_coins: Sequence[str] = ()
                                   ) -> Optional[tuple]:
         return self._identify_unnamed(
             lambda used: self._find_existing_funding(
-                out_ph_hex, int(out_amount), exclude_ids=used),
+                out_ph_hex, int(out_amount), exclude_ids=used,
+                require_coins=require_coins),
             exclude_ids=exclude_ids, live_coins=live_coins,
             recorded_sets=recorded_sets)
 
     def _identify_unnamed_burn(self, job: WarpJob, out_ph_hex: str, out_amount: int, *,
                                exclude_ids: Sequence[str],
                                live_coins: Sequence[str] = (),
-                               recorded_sets: Sequence[Sequence[str]] = ()
+                               recorded_sets: Sequence[Sequence[str]] = (),
+                               require_coins: Sequence[str] = ()
                                ) -> Optional[tuple]:
         """The cat_spend counterpart of :meth:`_identify_unnamed_funding`."""
         wid = int(job.state["cat_wallet_id"])
         return self._identify_unnamed(
             lambda used: self._find_existing_burn(
-                wid, out_ph_hex, int(out_amount), exclude_ids=used),
+                wid, out_ph_hex, int(out_amount), exclude_ids=used,
+                require_coins=require_coins),
             exclude_ids=exclude_ids, live_coins=live_coins,
             recorded_sets=recorded_sets)
+
+    def _identify_retired_by_coins(self, job: WarpJob, tx_key: str, tx_id: str,
+                                   coins: Sequence[str], *, ph: str, amount: int,
+                                   named: Sequence[str], live_coins: Sequence[str],
+                                   recorded_sets: Sequence[Sequence[str]]) -> Optional[str]:
+        """[review] A retired UNNAMED attempt whose coins are recorded is
+        probed as absent by construction (the sentinel is no transaction
+        id); before any absence-based settlement the wallet history is asked
+        for a record spending those very coins, and a hit re-keys the
+        attempt under its real id so the wallet and the mempool answer for
+        it.  Returns the real id, or None.  A lookup that could not run
+        propagates (never absence)."""
+        own_sets = [s for s in recorded_sets if set(_hx(c) for c in s) != set(_hx(c) for c in coins)]
+        own_live = [c for c in live_coins if _hx(c) not in {_hx(x) for x in coins}]
+        if tx_key == "burn_tx_id":
+            ident = self._identify_unnamed_burn(
+                job, ph, amount, exclude_ids=named, live_coins=own_live,
+                recorded_sets=own_sets, require_coins=coins)
+        else:
+            ident = self._identify_unnamed_funding(
+                ph, amount, exclude_ids=named, live_coins=own_live,
+                recorded_sets=own_sets, require_coins=coins)
+        if not ident or not ident[0]:
+            return None
+        found = str(ident[0])
+        self._persist_identified_attempt(job, tx_key, tx_id, found,
+                                         list(ident[1]) or list(coins))
+        return found
 
     def _refresh_exclusions(self, job: WarpJob, *, tx_key: str, out_ph_hex: str,
                             out_amount: int, pending: Dict[str, Any]) -> Dict[str, Any]:
@@ -2559,7 +2606,8 @@ class WarpEngine:
         priors = [t for t in (st.get(prior_key) or []) if t]
         prior_removals = dict(st.get(prior_removals_key) or {})
         dead = [t for t in (st.get(dead_key) or []) if t]
-        retained = [t for t in priors if t not in dead and prior_removals.get(t)]
+        done = _settled_ids(st, tx_key) | set(dead)
+        retained = [t for t in priors if t not in done and prior_removals.get(t)]
         if not retained:
             return {}
         try:
@@ -2582,8 +2630,9 @@ class WarpEngine:
                 changed = True
         if not changed:
             return {}
+        done = done | set(dead)
         exclude = sorted({c for t, cs_ in prior_removals.items()
-                          if t not in dead for c in cs_ if c})
+                          if t not in done for c in cs_ if c})
         return {dead_key: dead or None, exclude_key: exclude or None}
 
     def _unnamed_attempt_key(self, job: WarpJob, tx_key: str) -> str:
@@ -2678,6 +2727,7 @@ class WarpEngine:
         priors = [t for t in (st.get(prior_key) or []) if t]
         prior_removals = dict(st.get(prior_removals_key) or {})
         proven_dead = [t for t in (st.get(dead_key) or []) if t]
+        settled_ids = _settled_ids(st, tx_key) | set(proven_dead)
         retired_at = dict(st.get(f"{tx_key}_prior_retired_at") or {})
         retired_at.setdefault(tx_id, float(self._now()))
         seq_patch: Dict[str, Any] = {}
@@ -2701,8 +2751,10 @@ class WarpEngine:
         # input makes the verdict, and excluding the rest of a multi-input
         # send could starve every replacement.  Every attempt's coins stay
         # on the books for the settlement accounting regardless.
+        if dead:
+            settled_ids.add(tx_id)
         exclude = sorted({c for t, cs_ in prior_removals.items()
-                          if t not in proven_dead for c in cs_ if c})
+                          if t not in settled_ids for c in cs_ if c})
         return {
             tx_key: None, f"{tx_key}_orphan_polls": 0,
             f"{tx_key}_removals": None,
@@ -2775,7 +2827,10 @@ class WarpEngine:
         new = [t for t in ids if t]
         if not new:
             return
-        key = f"{tx_key}_prior_dead"
+        # [review] Presumed-gone attempts are listed apart from proven-dead
+        # ones: their coins are still unspent, so a job closed over them
+        # keeps Sweep available.
+        key = f"{tx_key}_prior_presumed" if presumed else f"{tx_key}_prior_dead"
         try:
             fresh = self._store.get_job(job.id)
             dead = [t for t in (fresh.state.get(key) or []) if t]
@@ -2889,10 +2944,24 @@ class WarpEngine:
         # next identification -- while a proven-dead predecessor's
         # surviving coins may legitimately reappear in its replacement.
         named = [t for t in attempts if not self._unnamed(t)]
-        dead = [t for t in (st.get(f"{tx_key}_prior_dead") or []) if t]
+        dead = list(_settled_ids(st, tx_key))
         live_coins, recorded_sets = self._attempt_books(prior_removals, dead)
         for tx_id in attempts:
             probe_id, coins = tx_id, list(prior_removals.get(tx_id) or [])
+            if self._unnamed(tx_id) and coins and tx_id != current:
+                # [review] Retired, unnamed, coins known: the history may
+                # still name it (its record reappeared, or paged back in);
+                # named, it is probed for real instead of read as absent.
+                try:
+                    found = self._identify_retired_by_coins(
+                        job, tx_key, tx_id, coins, ph=ph, amount=amount, named=named,
+                        live_coins=live_coins, recorded_sets=recorded_sets)
+                except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
+                    return False, (f"the wallet history could not be read ({exc}); "
+                                   f"attempt {tx_id[:16]}... is not ruled out")
+                if found:
+                    probe_id = found
+                    named.append(found)
             if self._unnamed(tx_id) and not coins:
                 # [review] With its coins recorded it is judged like any
                 # other attempt (dead once they are spent elsewhere, landed
@@ -3065,10 +3134,21 @@ class WarpEngine:
             if not self._unnamed(current):
                 named.append(current)
             books.setdefault(current, list(st.get("burn_tx_id_removals") or []))
-        dead = [t for t in (st.get("burn_tx_id_prior_dead") or []) if t]
+        dead = list(_settled_ids(st, "burn_tx_id"))
         live_coins, recorded_sets = self._attempt_books(books, dead)
         for tx_id in priors:
             probe_id, coins = tx_id, list(prior_removals.get(tx_id) or [])
+            if self._unnamed(tx_id) and coins:
+                try:
+                    found = self._identify_retired_by_coins(
+                        job, "burn_tx_id", tx_id, coins, ph=ph, amount=amount, named=named,
+                        live_coins=live_coins, recorded_sets=recorded_sets)
+                except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
+                    return False, (f"the wallet history could not be read ({exc}); "
+                                   "an earlier cat_spend is not ruled out")
+                if found:
+                    probe_id = found
+                    named.append(found)
             if self._unnamed(tx_id) and not coins:
                 try:
                     ident = self._identify_unnamed_burn(
@@ -5472,9 +5552,14 @@ class WarpEngine:
         else:
             detail = "no bridge message was ever attested"
         note = f"operator abandoned: {detail}"
+        # [review] A delivered unwrap or a landed claim is a completed bridge:
+        # closed as COMPLETED (the engine's accounting books the inbound mint
+        # from that event), with the abandonment on the record.
+        done = bool(job.state.get("delivered_by")) or (
+            bool(job.bridge_nonce) and self._claim_completed(job))
         self._store.update_job(
             job.id,
-            status=JobStatus.CANCELLED,
+            status=JobStatus.COMPLETED if done else JobStatus.CANCELLED,
             # The job's own status, not FAILED: a binding-refused job is
             # abandonable from whatever state it is frozen in.
             expected_status=job.status,
@@ -5500,11 +5585,16 @@ class WarpEngine:
         parts = []
         for tx_key, label in (("funding_tx_id", "funding"), ("burn_tx_id", "cat_spend")):
             priors = [t for t in (job.state.get(f"{tx_key}_prior") or []) if t]
-            dead = set(job.state.get(f"{tx_key}_prior_dead") or [])
-            open_ = [t for t in priors if t not in dead]
+            done = _settled_ids(job.state, tx_key)
+            open_ = [t for t in priors if t not in done]
             if open_:
                 parts.append(f"{len(open_)} replaced {label} send(s) not ruled out: "
                              + ", ".join(t[:16] for t in open_))
+            presumed = [t for t in (job.state.get(f"{tx_key}_prior_presumed") or []) if t]
+            if presumed:
+                parts.append(f"{len(presumed)} replaced {label} send(s) presumed gone "
+                             "with coins still unspent (Sweep stays available): "
+                             + ", ".join(t[:16] for t in presumed))
         return ("; " + "; ".join(parts)) if parts else ""
 
     def request_unwrap(
@@ -5691,7 +5781,11 @@ class WarpEngine:
             # input to the claim the machine may still be building, so a race
             # could pull it out from under an in-flight job. Enforce it here
             # too, where the state is authoritative.
-            if job.status not in _SWEEPABLE:
+            if job.status not in _SWEEPABLE and not (
+                    job.status == JobStatus.CANCELLED and _presumed_attempts(job.state)):
+                # [review] A CANCELLED job that was closed over attempts
+                # presumed gone keeps Sweep: their coins are still unspent,
+                # and one that lands after all leaves XCH at the key.
                 raise WarpError(
                     f"cannot sweep a job in {job.status}; the security coin is "
                     "still an input to the claim being built"
@@ -5784,6 +5878,10 @@ class WarpEngine:
             status = f"{status}; {settled_note}"
         close = (resolved and settled and job.status == JobStatus.FAILED
                  and not outbound)
+        # [review] A claim that landed is a completed bridge whatever kept the
+        # job open afterwards: it closes as COMPLETED (the engine's bridge
+        # accounting books the mint from that event), never CANCELLED.
+        completed = close and self._claim_completed(job)
         if outbound and resolved:
             status = (
                 f"{status}; outbound job left open -- Retry resumes it, "
@@ -5799,9 +5897,11 @@ class WarpEngine:
             # None once the sweep mines, and _funding_provably_gone had nothing
             # to check.
             patch["security_coin_id"] = coin_id
+        if completed:
+            status = f"{status}; the claim had completed (final CAT coin on chain)"
         self._store.update_job(
             job.id,
-            status=JobStatus.CANCELLED if close else None,
+            status=(JobStatus.COMPLETED if completed else JobStatus.CANCELLED) if close else None,
             expected_status=job.status,
             columns={"next_retry_at": None},
             state_patch=patch,

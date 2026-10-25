@@ -106,7 +106,10 @@ def test_the_guard_is_read_from_warp_jobs_db_and_fails_closed():
     assert 'resolve_wallet_id("xch")' in holds_body
     refresh = text.index("void Engine::refresh_warp_send_guard(")
     refresh_body = text[refresh:text.index("\n}\n", refresh)]
-    assert "read_warp_send_guard(acc.bridge_jobs_db_path" in refresh_body
+    # [review] The guard reads the GUI's own file (warp.jobs_db), not the
+    # accounting override, which may name a database no reservation is in.
+    assert "read_warp_send_guard(guard_db" in refresh_body
+    assert "acc.warp_jobs_db_path.empty()" in refresh_body
 
 
 def test_the_header_declares_the_guard_beside_the_escalation_counter():

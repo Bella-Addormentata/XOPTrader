@@ -3399,6 +3399,8 @@ AccountingConfig parse_accounting(const YAML::Node& root)
         // The same two expansions read_string gives the engine's own key,
         // in the same order: ${VAR} / ${VAR:-default} first, then ~.
         gui_path = expand_tilde(expand_env_vars(gui_path));
+        // The guard reads the GUI's file whatever the accounting override.
+        cfg.warp_jobs_db_path = gui_path;
         if (!explicit_engine_path) {
             cfg.bridge_jobs_db_path = gui_path;
             spdlog::info("accounting.bridge_jobs_db_path follows warp.jobs_db "
@@ -5187,11 +5189,13 @@ AppConfig load_config(const std::string& path,
     // open the SAME file whatever its working directory, or its
     // stuck-transaction guard protects a database no job is written to.
     {
-        const std::filesystem::path db(cfg.accounting.bridge_jobs_db_path);
         const std::filesystem::path base = std::filesystem::path(path).parent_path();
-        if (!db.empty() && db.is_relative() && !base.empty()) {
-            cfg.accounting.bridge_jobs_db_path =
-                (base / db).lexically_normal().string();
+        for (std::string* p : {&cfg.accounting.bridge_jobs_db_path,
+                               &cfg.accounting.warp_jobs_db_path}) {
+            const std::filesystem::path db(*p);
+            if (!db.empty() && db.is_relative() && !base.empty()) {
+                *p = (base / db).lexically_normal().string();
+            }
         }
     }
     cfg.market_data = parse_market_data(root);

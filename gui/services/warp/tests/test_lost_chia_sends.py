@@ -2594,7 +2594,7 @@ def test_abandon_records_a_completed_claim_or_delivery_truthfully():
                       "funding_tx_id_prior_dead": ["fund-b"]})
     ctx.coinset.records["f2" * 32] = _rec(spent=False)       # the claim landed
     out = engine.job_action(job.id, "abandon")
-    assert out["status"] == JobStatus.CANCELLED
+    assert out["status"] == JobStatus.COMPLETED, "a landed claim is a completed bridge"
     note = store.get_events(job.id, limit=5000)[-1].message
     assert "the claim completed" in note and "never claimed" not in note
     assert "1 replaced funding send(s) not ruled out: fund-a" in note
@@ -2938,7 +2938,9 @@ def test_an_orphaned_retired_attempt_with_coins_settles_after_the_grace(monkeypa
     store.update_job(job.id, state_patch={
         "funding_tx_id_prior_retired_at": {"toll-a": now - 7 * 3600.0}})
     assert engine._prior_sends_settled(store.get_active_job())[0]
-    assert store.get_job(job.id).state["funding_tx_id_prior_dead"] == ["toll-a"]
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id_prior_presumed"] == ["toll-a"]
+    assert not st.get("funding_tx_id_prior_dead"), "presumed, not proven"
 
 
 def test_dead_verdicts_found_during_settlement_are_persisted():
@@ -3185,3 +3187,81 @@ def test_the_wallet_absence_flag_follows_the_wallets_answer(monkeypatch):
     st = store.get_active_job().state
     assert st["funding_tx_id"] == "funding-tx-1"
     assert st["funding_tx_id_wallet_absent"] is None, "a new send has no answer yet"
+
+
+# --------------------------------------------------------------------------- #
+# Review round 41.
+# --------------------------------------------------------------------------- #
+
+def test_a_retired_unnamed_attempt_with_coins_is_identified_before_absence(monkeypatch):
+    """[review] The sentinel is probed as absent by construction; the history
+    is asked for a record spending its coins first, and a hit re-keys it so
+    the mempool and the wallet answer for it."""
+    from gui.services.warp import chia_send as cs
+
+    k1 = S._FUNDING_TX_UNKNOWN + "#1"
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    ph = claim_mod.security_coin_puzzle_hash(engine._load_ephemeral_sk(job)).hex()
+    now = 1_000_000.0
+    monkeypatch.setattr(engine, "_now", lambda: now)
+    monkeypatch.setattr(S, "_UNOBSERVABLE_ATTEMPT_GRACE_S", 6 * 3600)
+    removal = {"parent_coin_info": "d4" * 32, "puzzle_hash": "11" * 32,
+               "amount": 499_005_000_000}
+    rid = cs.coin_id("d4" * 32, "11" * 32, 499_005_000_000)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": [k1], "funding_tx_id_prior_removals": {k1: [rid]},
+        "funding_tx_id_prior_retired_at": {k1: now - 10 * 3600.0}})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    ctx.coinset.records[rid] = _rec(spent=False)
+    ctx.wallet.txs = [{"name": "toll-x", "confirmed": False, "removals": [removal],
+                       "additions": [{"puzzle_hash": ph, "amount": NET.chia_toll_mojos}]}]
+    ctx.wallet.tx_records["toll-x"] = {"confirmed": False, "removals": [removal]}
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "wallet still holds" in note, note
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id_prior"] == ["toll-x"]
+    assert st["funding_tx_id_prior_removals"] == {"toll-x": [rid]}
+
+
+def test_sweep_and_abandon_close_a_landed_claim_as_completed(monkeypatch):
+    """[review] A claim that landed is a completed bridge however the job
+    was closed afterwards; the engine books the mint from that event."""
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
+    store = new_store()
+    engine, ctx = build(store)
+    for action in ("sweep", "abandon"):
+        job = seed(store, JobStatus.FAILED,
+                   columns={"receiver_ph": "ab" * 32, "post_tip_mojos": 4985,
+                            "bridge_nonce": "cd" * 32},
+                   state={"failed_from": JobStatus.CLAIMING, "final_cat_coin_id": "f2" * 32,
+                          "security_coin_id": "77" * 32})
+        blob, _sk = make_ephemeral_blob(job.id)
+        store.update_job(job.id, state_patch={"ephemeral_blob": blob, "funding_amount": EXPECTED})
+        ctx.coinset.records["f2" * 32] = _rec(spent=False)
+        out = engine.job_action(job.id, action)
+        assert out["status"] == JobStatus.COMPLETED, action
+        events = store.get_events(job.id, limit=5000)
+        assert events[-1].status == JobStatus.COMPLETED
+
+
+def test_a_cancelled_job_closed_over_presumed_gone_attempts_keeps_sweep(monkeypatch):
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
+    store = new_store()
+    engine, ctx = build(store)
+    job = seed(store, JobStatus.CANCELLED,
+               columns={"receiver_ph": "ab" * 32, "post_tip_mojos": 4985},
+               state={"funding_tx_id_prior": ["fund-a"],
+                      "funding_tx_id_prior_presumed": ["fund-a"],
+                      "funding_tx_id_prior_removals": {"fund-a": [RID]}})
+    blob, _sk = make_ephemeral_blob(job.id)
+    store.update_job(job.id, state_patch={"ephemeral_blob": blob, "funding_amount": EXPECTED})
+    assert S._job_dict(store.get_job(job.id))["attempts_presumed"] == 1
+    out = engine.job_action(job.id, "sweep")                 # allowed, nothing to sweep yet
+    assert out["status"] == JobStatus.CANCELLED
+    plain = seed(store, JobStatus.CANCELLED, columns={"receiver_ph": "ab" * 32})
+    with pytest.raises(S.WarpError):
+        engine.job_action(plain.id, "sweep")

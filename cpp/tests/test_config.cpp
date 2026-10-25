@@ -329,6 +329,8 @@ warp:
     TempYaml tmp(yaml.c_str());
     auto cfg = xop::load_config(tmp.path());
     EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, anchored(tmp.path(), "elsewhere/warp.db"));
+    // [review] The guard's file is the GUI's whatever the accounting override.
+    EXPECT_EQ(cfg.accounting.warp_jobs_db_path, anchored(tmp.path(), "custom/jobs.db"));
 }
 
 TEST(ConfigParserTest, BridgeAssetWithoutEnabledPair_AutoDisables) {
