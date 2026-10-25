@@ -2367,9 +2367,14 @@ class WarpEngine:
                     current, list(st.get(f"{tx_key}_removals") or []))
         min_depth = int(self._net.chia_confirmation_min_height)
         for tx_id in attempts:
-            if tx_id == _FUNDING_TX_UNKNOWN:
-                return False, ("a send the wallet never named cannot be ruled "
-                               "out; Sweep again later or Abandon")
+            if tx_id == _FUNDING_TX_UNKNOWN and not prior_removals.get(tx_id):
+                # [review] With its coins recorded it is judged like any
+                # other attempt (dead once they are spent elsewhere, landed
+                # by its output's parent); without them nothing can rule it
+                # out.
+                return False, ("a send the wallet never named, whose coins are "
+                               "not known, cannot be ruled out; Sweep again "
+                               "later or Abandon")
             # unique_output=False: the key holds other attempts' coins too,
             # so an output is THIS send's only when its parent is one of the
             # coins this send spent.  A send whose coins are unknown can
@@ -2429,9 +2434,9 @@ class WarpEngine:
         prior_removals = st.get("burn_tx_id_prior_removals") or {}
         min_depth = int(self._net.chia_confirmation_min_height)
         for tx_id in priors:
-            if tx_id == _FUNDING_TX_UNKNOWN:
-                return False, ("an earlier cat_spend the wallet never named "
-                               "cannot be ruled out")
+            if tx_id == _FUNDING_TX_UNKNOWN and not prior_removals.get(tx_id):
+                return False, ("an earlier cat_spend the wallet never named, "
+                               "whose coins are not known, cannot be ruled out")
             ev = cs.gather(
                 wallet_record=lambda t=tx_id: self._wallet.get_transaction_or_none(t),
                 mempool_item=lambda t=tx_id: self._coinset.get_mempool_item_by_tx_id(t),
@@ -2746,8 +2751,15 @@ class WarpEngine:
             found_id = found[0] if isinstance(found, tuple) else found
             if found_id or burn:
                 return {}
+            # [review] The daemon may have named no transaction yet listed
+            # the coins it spent; those are the replacement's exclusions and
+            # the attempt's handle for Sweep's accounting.  Every unnamed
+            # attempt shares the sentinel key, so their coins accumulate.
+            recorded = list(job.state.get(f"{tx_key}_removals") or [])
+            earlier = (job.state.get(f"{tx_key}_prior_removals") or {}).get(tx_id) or []
+            removals = sorted({_hx(c) for c in [*earlier, *recorded] if c})
             return self._replacement_patch(
-                job, tx_key=tx_key, tx_id=tx_id, removals=[],
+                job, tx_key=tx_key, tx_id=tx_id, removals=removals,
                 also_clear=also_clear)
         verdict, _why, ev = self._recorded_send_verdict(
             job, tx_key=tx_key, out_ph_hex=out_ph, out_amount=out_amount,

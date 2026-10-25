@@ -1561,3 +1561,53 @@ def test_an_earlier_burns_spent_cat_settles_only_at_depth():
     assert not settled and "1/32 confirmations" in note
     cat.spent_block_index = PEAK - 40
     assert engine._burn_priors_settled(job)[0]
+
+
+def test_retry_keeps_the_coins_an_unnamed_send_spent(monkeypatch):
+    """[review] The daemon named no transaction but listed the coins it
+    spent: the replacement must exclude them, and Sweep must be able to
+    judge the attempt by them."""
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store, funding_tx_id=S._FUNDING_TX_UNKNOWN,
+                        funding_amount=EXPECTED, funding_tx_id_removals=[RID])
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     expected_status=JobStatus.FUNDING_CLAIM,
+                     state_patch={"failed_from": JobStatus.FUNDING_CLAIM})
+    engine.job_action(job.id, "retry")
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id"] is None
+    assert st["funding_tx_id_exclude"] == [RID]
+    assert st["funding_tx_id_prior_removals"] == {S._FUNDING_TX_UNKNOWN: [RID]}
+
+    engine.step()                                            # the replacement
+    assert ctx.wallet.sent_excludes[-1] == [RID]
+    job = store.get_active_job()
+    # A second unnamed attempt adds its coins to the same sentinel entry.
+    store.update_job(job.id, state_patch={"funding_tx_id": S._FUNDING_TX_UNKNOWN,
+                                          "funding_tx_id_removals": [RID2]})
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     expected_status=JobStatus.FUNDING_CLAIM,
+                     state_patch={"failed_from": JobStatus.FUNDING_CLAIM})
+    engine.job_action(job.id, "retry")
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id_prior_removals"] == {S._FUNDING_TX_UNKNOWN: sorted([RID, RID2])}
+    assert st["funding_tx_id_exclude"] == sorted([RID, RID2])
+
+
+def test_an_unnamed_attempt_with_known_coins_is_judged_for_settlement():
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": [S._FUNDING_TX_UNKNOWN],
+        "funding_tx_id_prior_removals": {S._FUNDING_TX_UNKNOWN: [RID]}})
+    job = store.get_active_job()
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID] = _rec(spent=True)              # its coin went elsewhere
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    assert engine._prior_sends_settled(job)[0]
+    store.update_job(job.id, state_patch={"funding_tx_id_prior_removals": None})
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "not known" in note
