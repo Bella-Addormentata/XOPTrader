@@ -85,7 +85,8 @@ def test_the_guard_is_read_from_warp_jobs_db_and_fails_closed():
     body = text[reader:text.index("\n}\n", reader)]
     assert "SQLITE_OPEN_READONLY" in body
     assert "FROM warp_jobs WHERE active = 1" in body
-    assert "FROM dexie_takes WHERE status IN ('submitting', 'submitted')" in body
+    assert "FROM dexie_takes WHERE status IN ('submitting', 'submitted', " in body
+    assert "'unknown')" in body
     assert body.count("guard.readable = false") >= 6
     assert "std::filesystem::exists(db_path, ec)" in body
     # An active job whose state is not a JSON object protects every wallet.

@@ -155,6 +155,7 @@ TEST(WarpSendGuardTest, ASubmittedTakeProtectsXchAndTheBoughtCat) {
     EXPECT_TRUE(s->xch);
     EXPECT_EQ(s->cat_asset_id, kMilli);
     EXPECT_TRUE(warp_take_chia_send("submitting", kMilli).has_value());
+    EXPECT_TRUE(warp_take_chia_send("unknown", kMilli).has_value());
     EXPECT_FALSE(warp_take_chia_send("confirmed", kMilli).has_value());
     EXPECT_FALSE(warp_take_chia_send("failed", kMilli).has_value());
 }

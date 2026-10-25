@@ -4274,9 +4274,12 @@ class WarpEngine:
                     job.id, expected_status=job.status,
                     state_patch={"sweep_fee_by_coin": pins},
                 )
-            except Exception as exc:  # noqa: BLE001 -- the push still proceeds
-                _log.warning("warp job %s: could not record the sweep fee (%s)",
-                             job.id, exc)
+            except Exception as exc:  # noqa: BLE001 -- [review] then no push
+                # Unrecorded, a later Sweep could reprice over a bundle a
+                # node may hold.  Nothing is broadcast until the pin is on
+                # disk.
+                return False, f"could not record the sweep fee ({exc}); not swept"
+
         # [review] Recorded BEFORE the push: a push that times out may still
         # have reached a node, and a later definitive rejection must not
         # reprice over a bundle that could be pending there.  Only a push
@@ -4294,9 +4297,9 @@ class WarpEngine:
             try:
                 self._store.update_job(job.id, expected_status=job.status,
                                        state_patch={"sweep_pushed_by_coin": pushed})
-            except Exception as patch_exc:  # noqa: BLE001 -- the push still proceeds
-                _log.warning("warp job %s: could not record the sweep push (%s)",
-                             job.id, patch_exc)
+            except Exception as patch_exc:  # noqa: BLE001 -- [review] then no push
+                return False, (f"could not record the sweep submission "
+                               f"({patch_exc}); not swept")
         try:
             kind, status = claim.build_and_push_sweep(
                 self._coinset,
@@ -5226,6 +5229,11 @@ def _trade_status_name(status: Any) -> str:
 #: A submitted Dexie take the wallet still cannot read after this long is
 #: settled as failed (its record is lost), so it cannot block every later buy.
 _TAKE_UNKNOWN_FAIL_S: int = 3600
+# [review] How long an unknown-outcome take keeps the engine's wallet
+# protection before it is released as failed: a Chia transaction still
+# unconfirmed after a day is gone from every mempool, and a take that did
+# land shows up as CAT held (and as a readable trade record first).
+_TAKE_UNKNOWN_RELEASE_S: int = 24 * 3600
 
 
 def _age_s(iso: str) -> float:
@@ -5940,15 +5948,17 @@ class _WarpWorker(QObject):
         for take in engine._store.list_takes(status=jobs.TAKE_SUBMITTING):
             # The take RPC's outcome never reached the store (a lost
             # response, a crash): no wallet trade id to look up. It blocks
-            # buys until _TAKE_UNKNOWN_FAIL_S, then settles as failed -- by
+            # buys until _TAKE_UNKNOWN_FAIL_S, then moves to "unknown" -- by
             # then a buy that did land shows up as wmilliETH.b held, so the
-            # planner no longer asks for one.
+            # planner no longer asks for one.  [review] Not "failed": its
+            # transactions are not proven dead, and the engine's guard keeps
+            # protecting its wallets until they are (_settle_unknown_takes).
             if _age_s(take.created_at) > _TAKE_UNKNOWN_FAIL_S:
                 engine._store.settle_take(
-                    take.trade_id, jobs.TAKE_FAILED,
+                    take.trade_id, jobs.TAKE_UNKNOWN,
                     error="the take's outcome was never recorded")
                 _log.warning("Dexie take of %s: outcome unknown after %ds; "
-                             "settled as failed (check the wallet)",
+                             "no longer blocking buys (check the wallet)",
                              take.offer_id, _TAKE_UNKNOWN_FAIL_S)
             else:
                 in_flight = True
@@ -5965,10 +5975,10 @@ class _WarpWorker(QObject):
             except Exception as exc:  # noqa: BLE001 -- unknown stays in flight
                 if _age_s(take.created_at) > _TAKE_UNKNOWN_FAIL_S:
                     engine._store.settle_take(
-                        take.trade_id, jobs.TAKE_FAILED,
+                        take.trade_id, jobs.TAKE_UNKNOWN,
                         error=f"the wallet has no readable trade record ({exc})")
                     _log.warning("Dexie take %s: no trade record after %ds; "
-                                 "settled as failed", take.trade_id,
+                                 "no longer blocking buys", take.trade_id,
                                  _TAKE_UNKNOWN_FAIL_S)
                     continue
                 _log.debug("Dexie take %s: status unknown (%s)",
@@ -5993,7 +6003,44 @@ class _WarpWorker(QObject):
                 _log.warning("Dexie take %s %s", take.trade_id, status.lower())
             else:
                 in_flight = True
+        self._settle_unknown_takes(engine)
         return in_flight
+
+    def _settle_unknown_takes(self, engine: "WarpEngine") -> None:
+        """[review] Takes the planner stopped waiting for are still open for
+        the engine's guard: each is settled for real once its trade record
+        reads CONFIRMED or FAILED, and released as failed only after
+        ``_TAKE_UNKNOWN_RELEASE_S`` -- a Chia transaction unconfirmed for a
+        day is gone from every mempool.  Never blocks a buy."""
+        unknown = engine._store.list_takes(status=jobs.TAKE_UNKNOWN)
+        if not unknown:
+            return
+        for take in unknown:
+            status = None
+            try:
+                record = engine._wallet.get_offer(take.trade_id)
+                status = _trade_status_name(record.get("status"))
+            except Exception as exc:  # noqa: BLE001 -- still unknown
+                _log.debug("Dexie take %s: still unknown (%s)", take.trade_id, exc)
+            if status == "CONFIRMED":
+                height = record.get("confirmed_at_index")
+                engine._store.settle_take(
+                    take.trade_id, jobs.TAKE_CONFIRMED,
+                    confirmed_height=(int(height) if isinstance(height, int)
+                                      and not isinstance(height, bool)
+                                      and height > 0 else None))
+                _log.info("Dexie take %s confirmed after all", take.trade_id)
+            elif status in ("FAILED", "CANCELLED"):
+                engine._store.settle_take(
+                    take.trade_id, jobs.TAKE_FAILED,
+                    error=f"wallet reports {status}")
+            elif _age_s(take.created_at) > _TAKE_UNKNOWN_RELEASE_S:
+                engine._store.settle_take(
+                    take.trade_id, jobs.TAKE_FAILED,
+                    error=(f"outcome unknown for {_TAKE_UNKNOWN_RELEASE_S // 3600}h; "
+                           "released (an unconfirmed transaction that old is gone)"))
+                _log.warning("Dexie take %s: unknown for %dh; released as failed",
+                             take.trade_id, _TAKE_UNKNOWN_RELEASE_S // 3600)
 
     def _dexie_buy(self, engine: "WarpEngine", want_mojos: int,
                    src: "rb.WmilliethSource", *, min_mojos: int = 1) -> str:

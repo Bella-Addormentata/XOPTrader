@@ -20717,7 +20717,8 @@ execution::WarpSendGuard read_warp_send_guard(const std::string& db_path,
         // failure (locked, I/O) leaves the takes unknown: unreadable.
         static constexpr const char* kTakesSql =
             "SELECT COALESCE(status, ''), COALESCE(asset_id, '') "
-            "FROM dexie_takes WHERE status IN ('submitting', 'submitted')";
+            "FROM dexie_takes WHERE status IN ('submitting', 'submitted', "
+            "'unknown')";
         sqlite3_stmt* stmt = nullptr;
         const int prep = sqlite3_prepare_v2(raw_db, kTakesSql, -1, &stmt,
                                             nullptr);

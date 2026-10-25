@@ -151,7 +151,12 @@ struct WarpChiaSend {
 [[nodiscard]] inline std::optional<WarpChiaSend> warp_take_chia_send(
     const std::string& status, const std::string& asset_id)
 {
-    if (status != "submitting" && status != "submitted") return std::nullopt;
+    // "unknown": the GUI's planner stopped waiting for the take's outcome,
+    // but its transactions are not proven dead; the GUI settles or releases
+    // it later, and until then it is protected like a submitted one.
+    if (status != "submitting" && status != "submitted" && status != "unknown") {
+        return std::nullopt;
+    }
     WarpChiaSend s;
     s.xch          = true;
     s.cat_asset_id = asset_id;

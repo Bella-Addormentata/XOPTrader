@@ -1935,3 +1935,40 @@ def test_a_delivered_unwrap_resumes_settlement_without_relay_prerequisites(statu
     ctx.coinset.records[RID] = _rec(spent=True)
     out = engine.step()
     assert out["status"] == JobStatus.COMPLETED
+
+
+# --------------------------------------------------------------------------- #
+# Review round 17.
+# --------------------------------------------------------------------------- #
+
+def test_a_sweep_is_not_broadcast_unless_its_records_are_written(monkeypatch):
+    """[review] An unrecorded fee pin or submission marker would let a later
+    Sweep reprice over a bundle a node may hold: no push without them."""
+    pushes = []
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep",
+                        lambda *a, **k: pushes.append(1) or ("accepted", "ok"))
+    store = new_store()
+    engine, ctx = build(store, params=default_params(offer_fee_mojos=10_000_000))
+    job = _seed_funding(store, funding_amount=EXPECTED)
+    real = store.update_job
+
+    def fail_on(key):
+        def update(job_id, **kw):
+            if key in (kw.get("state_patch") or {}):
+                raise RuntimeError("disk full")
+            return real(job_id, **kw)
+        return update
+
+    monkeypatch.setattr(store, "update_job", fail_on("sweep_fee_by_coin"))
+    resolved, status = engine._sweep_security(job, FakeCoin(b"\x5a" * 32), b"\x01" * 32)
+    assert not resolved and "not swept" in status and pushes == []
+
+    monkeypatch.setattr(store, "update_job", real)
+    monkeypatch.setattr(store, "update_job", fail_on("sweep_pushed_by_coin"))
+    resolved, status = engine._sweep_security(store.get_job(job.id),
+                                              FakeCoin(b"\x5a" * 32), b"\x01" * 32)
+    assert not resolved and "not swept" in status and pushes == []
+
+    monkeypatch.setattr(store, "update_job", real)
+    engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5a" * 32), b"\x01" * 32)
+    assert pushes == [1]

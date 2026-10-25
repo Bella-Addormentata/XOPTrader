@@ -293,7 +293,7 @@ CREATE TABLE IF NOT EXISTS dexie_takes (
     xch_mojos    INTEGER NOT NULL,          -- paid to the maker
     fee_mojos    INTEGER NOT NULL,          -- our network fee
     status       TEXT    NOT NULL,          -- submitting | submitted |
-                                            -- confirmed | failed
+                                            -- unknown | confirmed | failed
     confirmed_at TEXT,
     confirmed_height INTEGER,               -- chain block the trade landed in
     last_error   TEXT
@@ -304,6 +304,11 @@ TAKE_SUBMITTING = "submitting"   # recorded before the take RPC
 TAKE_SUBMITTED = "submitted"
 TAKE_CONFIRMED = "confirmed"
 TAKE_FAILED = "failed"
+# [review] Its outcome never became readable within the planner's hour: the
+# planner moves on (a buy that landed shows up as CAT held), but the take's
+# wallet transactions are NOT proven dead, so the engine's guard keeps its
+# wallets protected until it is settled for real or released after a day.
+TAKE_UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -709,13 +714,19 @@ class WarpJobStore:
     def settle_take(self, trade_id: str, status: str,
                     error: Optional[str] = None,
                     confirmed_height: Optional[int] = None) -> DexieTake:
-        """Move an open take to ``confirmed`` or ``failed``, once. Only a
-        ``submitted`` take (one with a wallet trade record) can confirm."""
-        if status not in (TAKE_CONFIRMED, TAKE_FAILED):
+        """Move an open take to ``confirmed``, ``failed`` or ``unknown``,
+        once. Only a take with a wallet trade record (``submitted``, or
+        ``unknown`` after one) can confirm; ``unknown`` is the open state of
+        a take whose outcome the planner stopped waiting for."""
+        if status not in (TAKE_CONFIRMED, TAKE_FAILED, TAKE_UNKNOWN):
             raise WarpJobStoreError(f"a take cannot settle as {status!r}")
         take = self.get_take(trade_id)
-        allowed = ((TAKE_SUBMITTED,) if status == TAKE_CONFIRMED
-                   else (TAKE_SUBMITTED, TAKE_SUBMITTING))
+        if status == TAKE_CONFIRMED:
+            allowed: tuple = (TAKE_SUBMITTED, TAKE_UNKNOWN)
+        elif status == TAKE_FAILED:
+            allowed = (TAKE_SUBMITTED, TAKE_SUBMITTING, TAKE_UNKNOWN)
+        else:
+            allowed = (TAKE_SUBMITTED, TAKE_SUBMITTING)
         if take.status not in allowed:
             raise StaleJobError(
                 f"Dexie take {take.trade_id} is {take.status}; cannot settle "

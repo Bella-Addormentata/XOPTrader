@@ -245,7 +245,33 @@ def test_an_unreadable_take_stays_in_flight_then_fails_after_an_hour(monkeypatch
     assert w._settle_dexie_takes(eng) is True
     monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_FAIL_S + 1)
     assert w._settle_dexie_takes(eng) is False
+    # [review] Not failed: its transactions are not proven dead, so the
+    # engine's guard keeps protecting its wallets ("unknown").
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+    assert w._settle_dexie_takes(eng) is False
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_RELEASE_S + 1)
+    w._settle_dexie_takes(eng)
     assert eng._store.get_take(OUR_TID).status == J.TAKE_FAILED
+
+
+def test_an_unknown_take_settles_for_real_once_its_record_reads(monkeypatch):
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    w._maybe_rebalance(eng)
+    real = eng._wallet.get_offer
+
+    def lost(trade_id):
+        raise RuntimeError("trade not found")
+
+    eng._wallet.get_offer = lost
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_FAIL_S + 1)
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+    eng._wallet.get_offer = real
+    eng._wallet.trade_status = "CONFIRMED"
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_CONFIRMED
 
 
 def test_takes_settle_even_with_the_source_switched_off(monkeypatch):
@@ -370,7 +396,7 @@ def test_the_intent_is_recorded_before_the_take(monkeypatch):
     # An hour later, unresolved, it settles as failed.
     monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_FAIL_S + 1)
     assert w._settle_dexie_takes(eng) is False
-    assert eng._store.list_takes()[0].status == J.TAKE_FAILED
+    assert eng._store.list_takes()[0].status == J.TAKE_UNKNOWN
 
 
 def test_an_accepted_take_is_rekeyed_to_the_wallet_trade_id(monkeypatch):
