@@ -1803,14 +1803,42 @@ class WarpEngine:
                     same = False
                 if not same:
                     rec = None
-            if rec is not None:
-                if rec.spent:
-                    return None
-                return drivers.Coin(
-                    bytes.fromhex(_hx(rec.coin.parent_coin_info)),
-                    bytes.fromhex(_hx(rec.coin.puzzle_hash)),
-                    int(rec.coin.amount),
-                )
+            if rec is None:
+                # [review] Not indexed by name yet, or the lookup failed: the
+                # SAME coin by its computed name among the key's records --
+                # never another coin of the amount, which would rebuild the
+                # claim around a different security coin and overwrite
+                # final_cat_coin_id while the first claim may still land.
+                try:
+                    from . import clvm_utils as cu
+
+                    ph = claim.security_coin_puzzle_hash(sk)
+                    for cand in self._coinset.get_coin_records_by_puzzle_hash(
+                            _hx(ph), include_spent=True):
+                        if cu.coin_name(
+                                bytes.fromhex(_hx(cand.coin.parent_coin_info)),
+                                ph, int(cand.coin.amount)).hex() == pinned:
+                            rec = cand
+                            break
+                except Exception:  # noqa: BLE001 -- then it is awaited
+                    rec = None
+            if rec is None:
+                # The key scan too, accepted only when it names the pinned
+                # coin itself: any other coin of the amount is awaited past.
+                try:
+                    cand = claim.find_security_coin(self._coinset, sk, expected)
+                except Exception:  # noqa: BLE001
+                    cand = None
+                if cand is not None and _hx(cand.name().hex()) == pinned:
+                    return cand
+                return None
+            if rec.spent:
+                return None
+            return drivers.Coin(
+                bytes.fromhex(_hx(rec.coin.parent_coin_info)),
+                bytes.fromhex(_hx(rec.coin.puzzle_hash)),
+                int(rec.coin.amount),
+            )
         return claim.find_security_coin(self._coinset, sk, expected)
 
     def _h_claim_funded(self, job: WarpJob) -> _Step:
@@ -1933,7 +1961,31 @@ class WarpEngine:
         # our funding was swept (persisted above): only the replaced funding
         # sends remain to be ruled out.  A landed one is swept here; once all
         # are settled the job completes.
-        if job.state.get("third_party_claim") and job.state.get("swept"):
+        if job.state.get("third_party_claim"):
+            if not job.state.get("swept"):
+                # [review] The recovery sweep was pushed but not confirmed when
+                # that tick ended (swept False).  Once the security coin is
+                # spent it is swept; until then the same bundle is pushed
+                # again.  Falling through to the claim wait instead would have
+                # the job await its own final CAT coin, which a third-party
+                # claim means can never appear.
+                sec_id = job.state.get("security_coin_id")
+                spent = bool(sec_id) and claim.security_coin_spent(
+                    self._coinset, bytes.fromhex(sec_id))
+                if spent:
+                    self._store.update_job(job.id, expected_status=job.status,
+                                           state_patch={"swept": True})
+                else:
+                    coin = self._security_coin_for(job, sk, expected)
+                    if coin is not None:
+                        resolved, status = self._sweep_security(job, coin, sk)
+                        return _stay(
+                            state={"swept": resolved, "sweep_status": status},
+                            message=(f"third-party claim paid the receiver; {status}; "
+                                     + ("funding swept back" if resolved else "retrying")),
+                        )
+                    return _stay(message="third-party claim paid the receiver; awaiting "
+                                         "the sweep of our funding coin")
             settled, note = self._prior_sends_settled(job)
             if settled:
                 return _advance(

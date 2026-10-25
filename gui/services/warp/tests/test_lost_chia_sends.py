@@ -3012,3 +3012,86 @@ def test_burning_waits_for_an_unindexed_pinned_toll_coin(monkeypatch):
     out = engine.step()
     assert out["status"] == JobStatus.BURNING and built == []
     assert "not indexed yet" in _last_message(store, job.id)
+
+
+def test_a_pinned_security_coin_never_yields_to_another_coin_at_the_key(monkeypatch):
+    """[review] A pinned coin the by-name index does not show yet is found by
+    its computed name among the key's records, or awaited -- never replaced
+    by another coin of the amount."""
+    from gui.services.warp import drivers
+
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store, funding_amount=EXPECTED)
+    sk = engine._load_ephemeral_sk(job)
+    ph = claim_mod.security_coin_puzzle_hash(sk)
+    ours = drivers.Coin(b"\x5a" * 32, ph, EXPECTED)
+    other = drivers.Coin(b"\x6a" * 32, ph, EXPECTED)
+    store.update_job(job.id, state_patch={"security_coin_id": ours.name().hex()})
+    job = store.get_active_job()
+
+    def rec(coin, spent=False):
+        return SimpleNamespace(
+            coin=SimpleNamespace(parent_coin_info=coin.parent_coin_info.hex(),
+                                 puzzle_hash=coin.puzzle_hash.hex(), amount=coin.amount),
+            spent=spent, confirmed_block_index=PEAK - 100, spent_block_index=0)
+
+    ctx.coinset.by_ph = [rec(other)]                          # only the other is indexed
+    assert engine._security_coin_for(job, sk, EXPECTED) is None, "awaited, not re-elected"
+    ctx.coinset.by_ph = [rec(other), rec(ours)]               # ours by its computed name
+    assert engine._security_coin_for(job, sk, EXPECTED).name() == ours.name()
+    ctx.coinset.by_ph = [rec(other), rec(ours, spent=True)]
+    assert engine._security_coin_for(job, sk, EXPECTED) is None
+    # No pin at all: the key scan as before.
+    store.update_job(job.id, state_patch={"security_coin_id": None})
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: other)
+    assert engine._security_coin_for(store.get_active_job(), sk, EXPECTED) is other
+
+
+def test_a_confirmed_third_party_sweep_resumes_recovery(monkeypatch):
+    """[review] The recovery sweep was pending when the tick ended; once the
+    security coin is spent the job resumes settlement and completes instead
+    of awaiting a final CAT coin that can never appear."""
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
+    store = new_store()
+    engine, ctx = build(store)
+    job = seed(store, JobStatus.CLAIMING,
+               columns={"receiver_ph": "ab" * 32, "post_tip_mojos": 4985,
+                        "bridge_nonce": "cd" * 32},
+               state={"message_destination": "ee" * 32, "third_party_claim": True,
+                      "sweep_status": "pending", "security_coin_id": "77" * 32,
+                      "funding_tx_id": "fund-b", "funding_tx_id_removals": [RID2],
+                      "funding_tx_id_prior": ["fund-a"],
+                      "funding_tx_id_prior_removals": {"fund-a": [RID]}})
+    blob, _sk = make_ephemeral_blob(job.id)
+    store.update_job(job.id, state_patch={"ephemeral_blob": blob, "funding_amount": EXPECTED})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID] = _rec(spent=True)              # fund-a: dead
+    ctx.coinset.records[RID2] = _rec(spent=True)             # fund-b: landed, swept at depth
+    ctx.coinset.by_ph = [SimpleNamespace(
+        coin=SimpleNamespace(parent_coin_info=RID2, puzzle_hash="5b" * 32, amount=EXPECTED),
+        spent=True, confirmed_block_index=PEAK - 50, spent_block_index=PEAK - 40)]
+    out = engine.step()
+    assert out["status"] == JobStatus.COMPLETED
+    assert store.get_job(job.id).state["swept"] is True
+
+
+def test_a_pending_third_party_sweep_is_pushed_again(monkeypatch):
+    pushes = []
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: False)
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep",
+                        lambda *a, **k: pushes.append(1) or ("pending", "already in mempool"))
+    store = new_store()
+    engine, ctx = build(store)
+    job = seed(store, JobStatus.CLAIMING,
+               columns={"receiver_ph": "ab" * 32, "post_tip_mojos": 4985,
+                        "bridge_nonce": "cd" * 32},
+               state={"message_destination": "ee" * 32, "third_party_claim": True,
+                      "sweep_status": "pending"})
+    blob, _sk = make_ephemeral_blob(job.id)
+    store.update_job(job.id, state_patch={"ephemeral_blob": blob, "funding_amount": EXPECTED})
+    monkeypatch.setattr(claim_mod, "find_security_coin",
+                        lambda *a, **k: FakeCoin(b"\x5a" * 32))
+    out = engine.step()
+    assert out["status"] == JobStatus.CLAIMING and pushes == [1]
+    assert "retrying" in _last_message(store, job.id)
