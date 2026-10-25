@@ -208,6 +208,47 @@ def test_an_engine_start_follows_a_port_edited_outside_settings(qapp, tmp_path):
         qapp.processEvents()
 
 
+def test_a_new_engine_retires_the_reload_the_old_one_answered(
+        qapp, tmp_path, monkeypatch):
+    # The old engine answered just before it stopped, and no master tick
+    # read the answer. Its replacement loads the saved file whole: that
+    # answer must not be shown as the new engine's.
+    from gui.services import engine_bridge as eb
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_PORT_CONFIG.format(port=9100), encoding="utf-8")
+    bridge = eb.EngineBridge(config_path=cfg)
+    try:
+        bridge.request_config_reload()
+        _write_result(bridge.config_reload_result_path,
+                      request_id=_flag_id(bridge), status="rejected",
+                      error="from the engine that stopped")
+
+        launched = []
+        bridge.engine_launched.connect(lambda: launched.append(True))
+        monkeypatch.setattr(bridge, "_engine_binary_candidates",
+                            lambda: [tmp_path / "xop_trader"])
+        monkeypatch.setattr(bridge, "_engine_supports_flag", lambda *_a: False)
+        monkeypatch.setattr(bridge, "_determine_engine_launch_dir",
+                            lambda _p: tmp_path)
+        monkeypatch.setattr(bridge, "_ensure_engine_runtime_dirs",
+                            lambda _d: None)
+        monkeypatch.setattr(eb.subprocess, "Popen", lambda *_a, **_k:
+                            SimpleNamespace(pid=4242, poll=lambda: None))
+        monkeypatch.setattr(eb, "QTimer", SimpleNamespace(
+            singleShot=lambda *_a, **_k: None))
+        bridge.start_engine()
+        assert launched == [True]
+        assert bridge.read_config_reload_result() is None
+    finally:
+        bridge._engine_process = None
+        if bridge._engine_log_fh is not None:
+            bridge._engine_log_fh.close()
+            bridge._engine_log_fh = None
+        bridge.deleteLater()
+        qapp.processEvents()
+
+
 # --------------------------------------------------------------------------- #
 # Settings page: the restart row
 # --------------------------------------------------------------------------- #
@@ -339,6 +380,7 @@ def test_a_restart_that_fails_after_launch_restores_the_list():
         _style_pause_resume_button=lambda: None,
         _RESTART_FAILURE_WINDOW_S=MainWindow._RESTART_FAILURE_WINDOW_S,
     )
+    window._on_engine_launched = lambda: MainWindow._on_engine_launched(window)
     MainWindow._on_restart_engine_for_settings(window)
     assert calls.restart == []
     assert calls.state == "engine restarted on the saved config"
@@ -350,6 +392,52 @@ def test_a_restart_that_fails_after_launch_restores_the_list():
     calls.restart = None
     MainWindow._restore_restart_items_after_failed_start(window)
     assert calls.restart is None, "restored once, for that restart only"
+
+
+def _launch_window(tmp_path, *, launched_config):
+    from gui.widgets.main_window import MainWindow
+
+    calls = SimpleNamespace(state=None, restart=["chia wallet host/port"])
+    settings = SimpleNamespace(
+        note_reload_state=lambda text: setattr(calls, "state", text),
+        note_restart_required=lambda items: setattr(calls, "restart", items),
+        restart_required_items=lambda: list(calls.restart),
+    )
+    window = SimpleNamespace(
+        _bridge=SimpleNamespace(launched_config_path=launched_config),
+        _settings_widget=settings, _unwrap=lambda w: w,
+        _reload_saved_path=str(tmp_path / "config.yaml"),
+        _restart_items_awaiting_start=None,
+        _RESTART_FAILURE_WINDOW_S=MainWindow._RESTART_FAILURE_WINDOW_S,
+    )
+    return window, calls
+
+
+def test_any_engine_start_answers_the_restart_list(tmp_path):
+    # Start button, venue switch or Restart Engine: the new engine loads the
+    # saved file whole. Restart Engine reaches this twice (the bridge's
+    # signal, then its own call); the second must not lose the list.
+    from gui.widgets.main_window import MainWindow
+
+    window, calls = _launch_window(
+        tmp_path, launched_config=tmp_path / "config.yaml")
+    MainWindow._on_engine_launched(window)
+    MainWindow._on_engine_launched(window)
+    assert calls.restart == []
+    assert calls.state == "engine restarted on the saved config"
+
+    MainWindow._restore_restart_items_after_failed_start(window)
+    assert calls.restart == ["chia wallet host/port"]
+
+
+def test_a_start_on_another_config_leaves_the_restart_list(tmp_path):
+    from gui.widgets.main_window import MainWindow
+
+    window, calls = _launch_window(
+        tmp_path, launched_config=tmp_path / "other.yaml")
+    MainWindow._on_engine_launched(window)
+    assert calls.restart == ["chia wallet host/port"]
+    assert calls.state is None
 
 
 def test_the_settings_page_reports_its_restart_list(panel):

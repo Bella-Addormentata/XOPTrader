@@ -1291,7 +1291,15 @@ void MarketDataFeed::set_config(const MarketDataConfig& cfg)
                 trimmed.push_back(name);
             }
         }
-        for (const auto& name : trimmed) recompute_vpin(name);
+        if (cfg.vpin_window_buckets == 0) {
+            // A window of zero keeps no bucket, and recompute_vpin() leaves
+            // the metric of an empty window alone: drop it, or nothing would
+            // ever replace it.
+            std::unique_lock lock(mtx_vpin_metrics_);
+            vpin_metrics_.clear();
+        } else {
+            for (const auto& name : trimmed) recompute_vpin(name);
+        }
     }
 }
 

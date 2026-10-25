@@ -624,6 +624,8 @@ class MainWindow(QMainWindow):
         # for whatever it could not adopt, and the Appearance preferences.
         if hasattr(bridge, "config_reload_result"):
             bridge.config_reload_result.connect(self._on_config_reload_result)
+        if hasattr(bridge, "engine_launched"):
+            bridge.engine_launched.connect(self._on_engine_launched)
         settings_page = self._unwrap(self._settings_widget)
         if settings_page is not None:
             if hasattr(settings_page, "engine_restart_requested"):
@@ -2392,14 +2394,41 @@ class MainWindow(QMainWindow):
                     "the engine stopped but did NOT start again -- see the "
                     "error message, then use the Start button")
             return
-        # The launch can still fail a few seconds in (the bridge's early-exit
-        # check): keep the list so _on_engine_start_failed can put it back.
-        if settings is not None and hasattr(settings, "restart_required_items"):
-            self._restart_items_awaiting_start = (
-                time.monotonic(), list(settings.restart_required_items()))
-        if settings is not None and hasattr(settings, "note_restart_required"):
+        # The bridge's engine_launched has already run this; repeating it is
+        # harmless, and covers a bridge without the signal.
+        self._on_engine_launched()
+
+    def _on_engine_launched(self) -> None:
+        """[LIVECFG] Any engine start from this GUI (Start, Restart Engine,
+        a venue switch): the new engine loads the saved config whole, so the
+        restart list and any reload still waiting are answered by the start
+        itself. The bridge retires that reload, so a late answer from the
+        old engine is never shown."""
+        from pathlib import Path
+
+        settings = self._unwrap(self._settings_widget)
+        if settings is None:
+            return
+        saved = getattr(self, "_reload_saved_path", None)
+        launched = getattr(self._bridge, "launched_config_path", None)
+        if saved and launched:
+            try:
+                same = Path(saved).resolve() == Path(launched).resolve()
+            except OSError:
+                same = True
+            if not same:
+                # The start ran another file; the last save still waits.
+                return
+        items = (list(settings.restart_required_items())
+                 if hasattr(settings, "restart_required_items") else [])
+        if items:
+            # The launch can still fail a few seconds in (the bridge's
+            # early-exit check): keep the list so _on_engine_start_failed
+            # can put it back.
+            self._restart_items_awaiting_start = (time.monotonic(), items)
+        if hasattr(settings, "note_restart_required"):
             settings.note_restart_required([])
-        if settings is not None and hasattr(settings, "note_reload_state"):
+        if (saved or items) and hasattr(settings, "note_reload_state"):
             settings.note_reload_state("engine restarted on the saved config")
 
     #: [LIVECFG] How long after a Settings restart a startup failure is taken

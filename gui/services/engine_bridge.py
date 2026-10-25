@@ -188,6 +188,9 @@ class EngineBridge(QObject):
     #: "rejected"), ``error``, ``restart_required`` (settings the save
     #: changed that wait for an engine restart) and ``config_file``.
     config_reload_result = Signal(dict)
+    #: [LIVECFG] start_engine() launched a new engine, which loads the saved
+    #: config whole: any restart list or reload still waiting is moot.
+    engine_launched = Signal()
 
     def __init__(
         self,
@@ -634,6 +637,7 @@ class EngineBridge(QObject):
         self._follow_restart_only_settings()
         if self._start_engine_process():
             _log.info("Engine started via start_engine().")
+            self.engine_launched.emit()
         else:
             self.error.emit(
                 "Could not start the engine.  Make sure xop_trader"
@@ -1413,6 +1417,16 @@ class EngineBridge(QObject):
                 self._launched_config_path = (
                     self._config_path if self._config_path.is_file() else None
                 )
+                # [LIVECFG] A reload still waiting was addressed to the
+                # engine this one replaces, and this one loads the saved file
+                # whole at startup. An answer the old engine left behind
+                # must not be shown as this engine's.
+                if self._reload_request_id is not None:
+                    _log.info("[LIVECFG] reload request %s retired: the new "
+                              "engine loads the saved config at startup",
+                              self._reload_request_id)
+                self._reload_request_id = None
+                self._reload_deferred_reported = False
                 self._engine_keep_supported = keep_supported
                 self._engine_binary_path = engine_path
                 self._engine_keep_reprobed = False

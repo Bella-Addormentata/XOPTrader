@@ -430,6 +430,25 @@ TEST(ConfigLiveApplySetters, vpin_recomputes_over_a_shorter_window)
         << "the five buckets kept are balanced: VPIN must say so now";
 }
 
+TEST(ConfigLiveApplySetters, a_vpin_window_of_zero_drops_the_metric)
+{
+    xop::MarketDataConfig mc;
+    mc.vpin_bucket_size    = 10.0;
+    mc.vpin_window_buckets = 50;
+    xop::State state;
+    xop::MarketDataFeed feed{mc, state};
+    const std::string pair = "XCH/wUSDC";
+    for (int i = 0; i < 10; ++i) feed.ingest_trade_for_vpin(pair, xop::Side::Bid, 10.0);
+    ASSERT_GT(feed.get_vpin_metrics(pair)->vpin, 0.9);
+
+    mc.vpin_window_buckets = 0;
+    feed.set_config(mc);
+    EXPECT_FALSE(feed.get_vpin_metrics(pair).has_value())
+        << "no bucket is kept, so nothing would ever replace a cached VPIN";
+    for (int i = 0; i < 3; ++i) feed.ingest_trade_for_vpin(pair, xop::Side::Bid, 10.0);
+    EXPECT_FALSE(feed.get_vpin_metrics(pair).has_value());
+}
+
 TEST(ConfigLiveApplySetters, a_lower_whale_cap_applies_without_a_new_whale)
 {
     xop::MarketDataConfig mc;
