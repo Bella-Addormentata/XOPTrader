@@ -34,6 +34,7 @@
 #include "xop/execution/cancel_retry.hpp"
 #include "xop/execution/coin_pool_verdict.hpp"
 #include "xop/execution/stuck_prune_scope.hpp"
+#include "xop/execution/warp_send_guard.hpp"
 #include "xop/execution/wallet_circuit.hpp"
 #include "xop/strategy/tier_gain.hpp"
 #include "xop/strategy/competitiveness_gate.hpp"
@@ -2966,6 +2967,23 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         offer_mgr_->resolve_wallet_id(pair.base_asset_id));
                     prune_candidates.push_back(
                         offer_mgr_->resolve_wallet_id(pair.quote_asset_id));
+                }
+                // [WARP-LOST-SEND 2026-10-25] Not a wallet a warp job has a
+                // Chia send in flight on: the GUI may have restarted the
+                // engine mid-job, and this prune is wallet-wide.
+                {
+                    std::vector<std::int64_t> kept;
+                    for (const auto wid : prune_candidates) {
+                        if (wallet_holds_warp_send(wid, 0)) {
+                            spdlog::info("[Engine] Startup stuck-transaction "
+                                         "prune skips wallet {}: a warp job "
+                                         "has a Chia send in flight on it",
+                                         wid);
+                            continue;
+                        }
+                        kept.push_back(wid);
+                    }
+                    prune_candidates.swap(kept);
                 }
                 // execution/stuck_prune_scope.hpp: an unbuilt map DEFERS the
                 // whole scan instead of shrinking it to whatever resolved.
@@ -13799,13 +13817,34 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                          pair_name, sb.label, pending,
                                          spendable);
 
+                            // [WARP-LOST-SEND 2026-10-25] A wallet a warp
+                            // job has a Chia send in flight on: that send IS
+                            // the pending_change.  It is not counted toward
+                            // the escalation, and neither the periodic prune
+                            // nor the force-delete below may touch the
+                            // wallet -- both are wallet-wide and took job 4's
+                            // funding send with them on 2026-10-24.
+                            const bool warp_send_here =
+                                wallet_holds_warp_send(sb.wid, block_height);
+                            if (warp_send_here) {
+                                spdlog::info("[Engine] Step 8: {} wallet {} "
+                                             "pending_change is a warp job's "
+                                             "own Chia send -- not counted "
+                                             "toward the stuck-transaction "
+                                             "escalation; its unconfirmed "
+                                             "transactions are left alone",
+                                             pair_name, sb.label);
+                            }
                             // Track consecutive blocks with pending_change.
-                            pending_wallets_this_block.insert(sb.wid);
+                            if (!warp_send_here) {
+                                pending_wallets_this_block.insert(sb.wid);
+                            }
                             // [REVIVE2 2026-10-22] Not in a revive-only run:
                             // it skips the clean-heartbeat reset below the
                             // loop, so counting here would turn alternating
                             // pending/clear heartbeats into a false streak.
-                            if (!saw_pending_change && !step8_pair_filter_) {
+                            if (!saw_pending_change && !step8_pair_filter_
+                                && !warp_send_here) {
                                 ++consecutive_pending_blocks_;
                                 saw_pending_change = true;
                                 // [S67] Half way to the force-delete: our own
@@ -13823,7 +13862,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             // transaction in the wallet, including the
                             // pending creates/cancels of pairs the flash-
                             // crash guard is holding.
-                            if (!step8_pair_filter_
+                            if (!step8_pair_filter_ && !warp_send_here
                                 && block_height >= last_stuck_tx_prune_block_
                                                    + kStuckTxPruneInterval) {
                                 last_stuck_tx_prune_block_ = block_height;
@@ -20585,6 +20624,87 @@ bool Engine::bridge_accounting_operational() const
 
 namespace {
 
+// [WARP-LOST-SEND 2026-10-25] Which wallets the GUI's warp jobs have a Chia
+// send in flight on (execution/warp_send_guard.hpp for the rules).  Read-only,
+// like read_bridge_job_rows below, and as plain a function: the SQLite guards
+// destruct on return.  A database that does not exist means no warp, so
+// nothing to protect; one that exists but cannot be read protects every
+// wallet this heartbeat (readable = false).
+execution::WarpSendGuard read_warp_send_guard(const std::string& db_path,
+                                              const std::string& default_cat)
+{
+    execution::WarpSendGuard guard;
+    std::error_code ec;
+    if (db_path.empty() || !std::filesystem::exists(db_path, ec)) {
+        return guard;
+    }
+    sqlite3* raw_db = nullptr;
+    const int rc = sqlite3_open_v2(db_path.c_str(), &raw_db,
+                                   SQLITE_OPEN_READONLY, nullptr);
+    const std::unique_ptr<sqlite3, int (*)(sqlite3*)> wdb_guard(
+        raw_db, &sqlite3_close);
+    if (rc != SQLITE_OK) {
+        guard.readable = false;
+        return guard;
+    }
+    sqlite3_busy_timeout(raw_db, 250);
+
+    {
+        static constexpr const char* kJobsSql =
+            "SELECT COALESCE(status, ''), COALESCE(state, '{}') "
+            "FROM warp_jobs WHERE active = 1";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(raw_db, kJobsSql, -1, &stmt, nullptr)
+            != SQLITE_OK) {
+            guard.readable = false;
+            return guard;
+        }
+        const std::unique_ptr<sqlite3_stmt, int (*)(sqlite3_stmt*)> sg(
+            stmt, &sqlite3_finalize);
+        int step_rc;
+        while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            const auto* st = reinterpret_cast<const char*>(
+                sqlite3_column_text(stmt, 0));
+            const auto* sj = reinterpret_cast<const char*>(
+                sqlite3_column_text(stmt, 1));
+            auto state = nlohmann::json::parse(sj ? sj : "{}", nullptr,
+                                               /*allow_exceptions=*/false);
+            if (state.is_discarded()) state = nlohmann::json::object();
+            if (const auto send = execution::warp_job_chia_send(
+                    st ? st : "", state, default_cat)) {
+                guard.add(*send);
+            }
+        }
+        if (step_rc != SQLITE_DONE) guard.readable = false;  // truncated scan
+    }
+    {
+        // dexie_takes arrived with [MILLIETH-TOPUP]; an older store has no
+        // such table, which is not an error here.
+        static constexpr const char* kTakesSql =
+            "SELECT COALESCE(status, ''), COALESCE(asset_id, '') "
+            "FROM dexie_takes WHERE status IN ('submitting', 'submitted')";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(raw_db, kTakesSql, -1, &stmt, nullptr)
+            == SQLITE_OK) {
+            const std::unique_ptr<sqlite3_stmt, int (*)(sqlite3_stmt*)> sg(
+                stmt, &sqlite3_finalize);
+            int step_rc;
+            while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+                const auto* st = reinterpret_cast<const char*>(
+                    sqlite3_column_text(stmt, 0));
+                const auto* aid = reinterpret_cast<const char*>(
+                    sqlite3_column_text(stmt, 1));
+                if (const auto send = execution::warp_take_chia_send(
+                        st ? st : "", aid ? aid : "")) {
+                    guard.add(*send);
+                }
+            }
+            if (step_rc != SQLITE_DONE) guard.readable = false;
+        }
+    }
+    return guard;
+}
+
 // [WARP-MILLIETH 2026-10-24] The read-only warp_jobs.db scan, moved out of
 // step_ingest_bridge_flows unchanged so the secondary scan reads the same
 // rows the same way.  Returns every booking-eligible job; a missing,
@@ -20715,6 +20835,48 @@ std::vector<accounting::BridgeJobRow> read_bridge_job_rows(
 }
 
 }  // namespace
+
+// [WARP-LOST-SEND 2026-10-25] One warp_jobs.db read per heartbeat (and one
+// at startup, block 0, before the stuck-transaction prune).
+void Engine::refresh_warp_send_guard(BlockHeight block_height)
+{
+    if (warp_send_guard_read_ && warp_send_guard_block_ == block_height) {
+        return;
+    }
+    warp_send_guard_read_  = true;
+    warp_send_guard_block_ = block_height;
+    const auto& acc = config_.accounting;
+    warp_send_guard_ = read_warp_send_guard(acc.bridge_jobs_db_path,
+                                            acc.bridge_asset_id);
+    if (!warp_send_guard_.readable) {
+        spdlog::warn("[Engine] warp_jobs.db ({}) could not be read -- every "
+                     "wallet's unconfirmed transactions are left alone this "
+                     "heartbeat in case a warp send is among them",
+                     acc.bridge_jobs_db_path);
+    } else if (warp_send_guard_.any()) {
+        spdlog::debug("[Engine] warp has a Chia send in flight (xch={}, cat "
+                      "wallets={}); their unconfirmed transactions are off "
+                      "limits", warp_send_guard_.xch,
+                      warp_send_guard_.cat_asset_ids.size());
+    }
+}
+
+// Whether a warp job has a Chia send in flight on @p wallet_id.  True when
+// the database could not be read (fail closed: a delayed cleanup is cheap,
+// a deleted warp send is a two-hour stall and an operator retry).
+bool Engine::wallet_holds_warp_send(std::int64_t wallet_id,
+                                    BlockHeight block_height)
+{
+    refresh_warp_send_guard(block_height);
+    const auto& g = warp_send_guard_;
+    if (!g.readable) return true;
+    if (!offer_mgr_) return g.any();
+    if (g.xch && wallet_id == offer_mgr_->resolve_wallet_id("xch")) return true;
+    for (const auto& asset : g.cat_asset_ids) {
+        if (wallet_id == offer_mgr_->resolve_wallet_id(asset)) return true;
+    }
+    return false;
+}
 
 // The bridge scans' on-demand wallet read (contract in engine.hpp).
 // Moved out of step_ingest_bridge_flows unchanged when the secondary scan

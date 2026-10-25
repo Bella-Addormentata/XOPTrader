@@ -1,0 +1,199 @@
+"""[WARP-LOST-SEND 2026-10-25] Will a Chia send warp made still land?
+
+Job 4 on 2026-10-24: the claim's funding send (0.0001 XCH, fee 0) spent a
+coin the trading engine's next offer also used.  The offer's spend landed at
+block 9477776, and 53 seconds after the send the engine's stuck-transaction
+cleanup deleted every unconfirmed transaction in the XCH wallet, the warp
+send among them.  The job then waited two hours for a coin that could never
+appear, failed, and Retry had nothing to do: the recorded tx id said
+"already sent".
+
+A recorded send is therefore JUDGED on every tick, from evidence the two
+parties that matter give independently:
+
+* the WALLET: does it still hold the transaction (it rebroadcasts what it
+  holds), and does it call it confirmed?
+* the CHAIN (coinset): is a coin the send spent already spent by something
+  else (then this send can never confirm), did the expected output land
+  (then it did confirm), and is the bundle still in the mempool?
+
+Verdicts, most certain first:
+
+``LANDED``   the output exists on chain (spent or not);
+``DEAD``     an input is spent and our output is not among that spend's
+             children: nothing can ever include this send;
+``ALIVE``    the wallet still holds it, or the mempool still has it;
+``ORPHAN``   nowhere, with its inputs unspent: it MAY still surface, so a
+             caller waits a bounded number of polls before treating it as
+             dead;
+``UNKNOWN``  a probe failed; wait.
+
+Pure functions only.  The probes are injected, so every rule is testable
+offline, and this module imports no chia library.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Callable, Iterable, Optional, Sequence
+
+
+class Verdict(str, Enum):
+    LANDED = "landed"
+    DEAD = "dead"
+    ALIVE = "alive"
+    ORPHAN = "orphan"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class SendEvidence:
+    """What the probes said.  ``None`` means "could not tell"."""
+
+    wallet_known: Optional[bool]        # the wallet still holds the record
+    wallet_confirmed: bool              # ...and calls it confirmed
+    removals: tuple                     # coin ids (hex, no 0x) it spent; () unknown
+    removal_spent: Optional[bool]       # any input spent on chain
+    output_landed: Optional[bool]       # the expected output exists on chain
+    in_mempool: Optional[bool]          # coinset's mempool has the bundle
+
+
+def _hx(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text[2:] if text.startswith("0x") else text
+
+
+def _int_to_bytes(value: int) -> bytes:
+    """CLVM's minimal signed big-endian encoding (0 -> b""), as
+    clvm_utils.int_to_bytes does it, repeated here so this module needs no
+    chia library."""
+    if value == 0:
+        return b""
+    return value.to_bytes((value.bit_length() + 8) >> 3, "big", signed=True)
+
+
+def coin_id(parent_hex: str, puzzle_hash_hex: str, amount: int) -> str:
+    """sha256(parent . puzzle_hash . int_to_bytes(amount)), hex."""
+    return hashlib.sha256(
+        bytes.fromhex(_hx(parent_hex)) + bytes.fromhex(_hx(puzzle_hash_hex))
+        + _int_to_bytes(int(amount))
+    ).hexdigest()
+
+
+def removal_ids(record: Optional[dict]) -> tuple:
+    """Coin ids a wallet transaction record (or mempool item) spent."""
+    out = []
+    for coin in (record or {}).get("removals") or []:
+        if not isinstance(coin, dict):
+            continue
+        try:
+            out.append(coin_id(coin.get("parent_coin_info"),
+                               coin.get("puzzle_hash"), int(coin.get("amount"))))
+        except (TypeError, ValueError):
+            continue
+    return tuple(out)
+
+
+def gather(
+    *,
+    wallet_record: Callable[[], Optional[dict]],
+    mempool_item: Callable[[], Optional[dict]],
+    coin_spent: Callable[[str], Optional[bool]],
+    outputs_at: Callable[[], Iterable[Any]],
+    known_removals: Sequence[str],
+    out_amount: int,
+    unique_output: bool,
+) -> SendEvidence:
+    """Run the probes, each tolerated to fail on its own.
+
+    ``coin_spent(coin_id)`` answers True/False, or None when the coin is not
+    indexed.  ``outputs_at()`` lists coin records (``.coin.amount``,
+    ``.coin.parent_coin_info``) at the expected output puzzle hash, spent
+    ones included.  With ``unique_output`` the puzzle hash belongs to this
+    job alone (an ephemeral key), so any coin of the right amount there is
+    ours; otherwise the output must descend from one of our inputs.
+    """
+    wallet_known: Optional[bool] = None
+    wallet_confirmed = False
+    removals = tuple(_hx(r) for r in known_removals if r)
+    try:
+        rec = wallet_record()
+        wallet_known = rec is not None
+        if rec is not None:
+            wallet_confirmed = bool(rec.get("confirmed"))
+            if not removals:
+                removals = removal_ids(rec)
+    except Exception:  # noqa: BLE001 -- a failed probe is "unknown", not "no"
+        wallet_known = None
+
+    in_mempool: Optional[bool] = None
+    try:
+        item = mempool_item()
+        in_mempool = item is not None
+        if item is not None and not removals:
+            removals = removal_ids(item)
+    except Exception:  # noqa: BLE001
+        in_mempool = None
+
+    removal_spent: Optional[bool] = None
+    if removals:
+        seen_all = True
+        for rid in removals:
+            try:
+                spent = coin_spent(rid)
+            except Exception:  # noqa: BLE001
+                spent = None
+            if spent is True:
+                removal_spent = True
+                break
+            if spent is None:
+                seen_all = False
+        if removal_spent is None and seen_all:
+            removal_spent = False
+
+    output_landed: Optional[bool] = None
+    try:
+        output_landed = False
+        for rec in outputs_at():
+            coin = getattr(rec, "coin", None)
+            if coin is None or int(getattr(coin, "amount", -1)) != int(out_amount):
+                continue
+            if unique_output or _hx(getattr(coin, "parent_coin_info", "")) in removals:
+                output_landed = True
+                break
+    except Exception:  # noqa: BLE001
+        output_landed = None
+
+    return SendEvidence(
+        wallet_known=wallet_known, wallet_confirmed=wallet_confirmed,
+        removals=removals, removal_spent=removal_spent,
+        output_landed=output_landed, in_mempool=in_mempool,
+    )
+
+
+def judge(ev: SendEvidence) -> tuple:
+    """``(Verdict, reason)`` for one recorded send."""
+    if ev.output_landed:
+        return Verdict.LANDED, "its output is on chain"
+    if ev.removal_spent:
+        return Verdict.DEAD, (
+            "a coin it spent was spent by another transaction, so it can "
+            "never confirm")
+    if ev.wallet_known:
+        if ev.wallet_confirmed:
+            return Verdict.LANDED, "the wallet calls it confirmed; awaiting the index"
+        return Verdict.ALIVE, "the wallet still holds it unconfirmed"
+    if ev.in_mempool:
+        return Verdict.ALIVE, "the wallet no longer holds it, but the mempool does"
+    if ev.wallet_known is False and ev.in_mempool is False:
+        if ev.removal_spent is False:
+            return Verdict.ORPHAN, (
+                "gone from the wallet and the mempool while the coins it "
+                "spent are still unspent")
+        if not ev.removals:
+            return Verdict.ORPHAN, (
+                "gone from the wallet and the mempool, and the coins it "
+                "spent are not known")
+    return Verdict.UNKNOWN, "a probe did not answer"

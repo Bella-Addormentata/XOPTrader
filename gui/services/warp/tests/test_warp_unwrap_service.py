@@ -90,6 +90,7 @@ class UnwrapFakeWallet(FakeWallet):
         }
         self.cat_spends: list = []
         self.cat_txs: list = []
+        self.cat_removals: list = []      # coins the next cat_spend reports spent
 
     def get_wallets(self, *, wallet_type=None):
         return [{"id": self.cat_wallet_id, "type": 6, "name": "wUSDC.b"}]
@@ -102,7 +103,8 @@ class UnwrapFakeWallet(FakeWallet):
 
     def cat_spend(self, wallet_id, amount, inner_address, *, fee_mojos=0, memos=None):
         self.cat_spends.append((wallet_id, amount, inner_address, fee_mojos))
-        return {"name": f"burn-tx-{len(self.cat_spends)}"}
+        return {"name": f"burn-tx-{len(self.cat_spends)}",
+                "removals": list(self.cat_removals)}
 
     def get_transactions(self, wallet_id=1, *, start=0, end=50, reverse=True,
                          confirmed=None):

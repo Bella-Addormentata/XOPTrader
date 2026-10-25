@@ -122,12 +122,18 @@ class WalletClient:
         *,
         fee_mojos: int = 0,
         memos: Optional[list[str]] = None,
+        exclude_coin_ids: Optional[list[str]] = None,
     ) -> dict:
         """Send XCH; returns the daemon's transaction record (incl. ``transaction_id``).
 
         The caller is responsible for de-duplication (scan by destination puzzle
         hash before sending) -- this method issues one RPC and never retries, so
         a resumed job cannot double-fund by calling it again blindly.
+
+        ``exclude_coin_ids`` keeps named coins out of the daemon's selection
+        (still its own selection, so offer locks are honoured): a send that
+        replaces one that vanished unconfirmed names the first send's coins,
+        so the two can never conflict with each other.
         """
         body: dict[str, Any] = {
             "wallet_id": int(wallet_id),
@@ -137,6 +143,11 @@ class WalletClient:
         }
         if memos:
             body["memos"] = list(memos)
+        if exclude_coin_ids:
+            body["exclude_coin_ids"] = [
+                c if str(c).startswith("0x") else "0x" + str(c)
+                for c in exclude_coin_ids
+            ]
         data = self._post("send_transaction", body)
         tx = data.get("transaction")
         return tx if isinstance(tx, dict) else data
@@ -211,6 +222,24 @@ class WalletClient:
     def get_transaction(self, transaction_id: str) -> dict:
         data = self._post("get_transaction", {"transaction_id": str(transaction_id)})
         return data.get("transaction") or {}
+
+    def get_transaction_or_none(self, transaction_id: str) -> Optional[dict]:
+        """The daemon's record of one transaction, or ``None`` when the
+        daemon no longer knows it (deleted, or never recorded). Any other
+        failure still raises: an unanswered lookup is not "gone"."""
+        try:
+            data = self._post(
+                "get_transaction", {"transaction_id": str(transaction_id)})
+        except WalletError as exc:
+            if "not found" in str(exc).lower():
+                return None
+            raise
+        tx = data.get("transaction")
+        return tx if isinstance(tx, dict) else None
+
+    def get_sync_status(self) -> dict:
+        """``{"synced": bool, "syncing": bool, ...}`` from the daemon."""
+        return self._post("get_sync_status", {})
 
     def get_transactions(
         self,

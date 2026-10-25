@@ -1511,7 +1511,14 @@ warp:
   # refuses every wmilliETH.b unwrap.
   # max_unwrap_millieth: 10
   claim_fee_mojos: 100000000             # [OPTIONAL] XCH fee reserved for the Chia claim spend (0.0001 XCH)
-  chia_funding_fee_mojos: 0              # [OPTIONAL] extra fee on the wallet->claim funding send
+  # Chia fees warp pays from the hot wallet.  0 (the default) means AUTOMATIC:
+  # at least strategy.offer_fee_mojos, raised to the node's estimate for
+  # inclusion within 5 minutes when the mempool demands more, capped at 10x the
+  # offer fee.  A fee-less send sits at the bottom of a full mempool, and one
+  # that sat for ~10 minutes used to be deleted by the engine's stuck-transaction
+  # cleanup (2026-10-24).  A number pins the fee exactly.
+  chia_funding_fee_mojos: 0              # [OPTIONAL, default: 0 = automatic] fee on the wallet->claim funding send
+  unwrap_chia_fee_mojos: 0               # [OPTIONAL, default: 0 = automatic] fee on an unwrap's cat_spend and its toll funding send (paid twice)
   poll_interval_s: 15                    # [OPTIONAL, default: 15] background tick cadence
   coinset_url: ""                        # [OPTIONAL] override coinset API base (blank = network default)
   chia_receiver_address: ""              # [OPTIONAL] where wUSDC.b lands (blank = bot's own wallet address)

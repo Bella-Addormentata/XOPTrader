@@ -217,7 +217,8 @@ def test_funding_dedupe_hit_also_records_the_amount(monkeypatch):
     job, _sk = _seed_funding_claim(store)
     expected = int(job.post_tip_mojos) + int(default_params().claim_fee_mojos)
     monkeypatch.setattr(
-        S.WarpEngine, "_find_existing_funding", lambda self, ph, amt: "prior-tx"
+        S.WarpEngine, "_find_existing_funding",
+        lambda self, ph, amt, exclude_ids=(): "prior-tx",
     )
 
     engine.step()

@@ -106,6 +106,10 @@ class FakeEngine:
     def _resolve_cat_wallet_id(self, asset_id=None):
         return 9
 
+    def _unwrap_xch_budget(self):
+        return self._net.chia_toll_mojos + 2 * int(
+            getattr(self._params, "unwrap_chia_fee_mojos", 0) or 0)
+
     def _cat_wallet_ids(self, asset_id=None):
         return list(self.cat_wallets)
 

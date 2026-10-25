@@ -164,6 +164,10 @@ class FakeWallet:
     def __init__(self) -> None:
         self.logged_in = 0
         self.sent: list = []
+        self.sent_excludes: list = []     # exclude_coin_ids of each send
+        self.next_removals: list = []     # coins the next send reports spent
+        self.tx_records: dict = {}        # tx id -> record (get_transaction_or_none)
+        self.synced = True
         self.txs: list = []
         self.next_address = ADDR
         # Wallet 1 XCH balance; tests shrink spendable to model offer locks.
@@ -184,9 +188,18 @@ class FakeWallet:
             {"confirmed_wallet_balance": 0, "spendable_balance": 0},
         ))
 
-    def send_transaction(self, wallet_id, amount, address, fee_mojos=0):
+    def send_transaction(self, wallet_id, amount, address, fee_mojos=0,
+                         exclude_coin_ids=None):
         self.sent.append((amount, address, fee_mojos))
-        return {"name": f"funding-tx-{len(self.sent)}"}
+        self.sent_excludes.append(list(exclude_coin_ids or []))
+        return {"name": f"funding-tx-{len(self.sent)}",
+                "removals": list(self.next_removals)}
+
+    def get_transaction_or_none(self, tx_id):
+        return self.tx_records.get(tx_id)
+
+    def get_sync_status(self):
+        return {"synced": self.synced, "syncing": not self.synced}
 
     def get_transactions(self, wallet_id, start=0, end=200, reverse=True,
                          confirmed=None):
@@ -198,11 +211,25 @@ class FakeWallet:
 class FakeCoinset:
     def __init__(self) -> None:
         self.record = None
+        self.records: dict = {}        # coin id -> record, consulted before .record
+        self.mempool: dict = {}        # tx id -> mempool item
+        self.fee_estimates: list = []  # get_fee_estimate's answer
         self.peak = 0
         self.by_ph: list = []
 
     def get_coin_record_by_name(self, name):
+        key = str(name).lower()
+        key = key[2:] if key.startswith("0x") else key
+        if key in self.records:
+            return self.records[key]
         return self.record
+
+    def get_mempool_item_by_tx_id(self, tx_id):
+        key = str(tx_id).lower()
+        return self.mempool.get(key[2:] if key.startswith("0x") else key)
+
+    def get_fee_estimate(self, *, cost, target_times):
+        return list(self.fee_estimates)
 
     def get_peak_height(self):
         return self.peak
@@ -301,6 +328,8 @@ def default_params(**over) -> S.WarpParams:
         max_micros=0,
         claim_fee_mojos=100_000_000,
         chia_funding_fee_mojos=0,
+        # No automatic fee floor in the harness: the fee tests set one.
+        offer_fee_mojos=0,
         poll_interval_s=15.0,
         chia_receiver_address=ADDR,
         # A static hint so tests never fall through to the Nostr bootstrap (which

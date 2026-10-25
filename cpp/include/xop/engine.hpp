@@ -110,6 +110,9 @@
 // Startup market analysis
 #include "xop/data/market_analyzer.hpp"
 
+// [WARP-LOST-SEND 2026-10-25] Wallets warp has a Chia send in flight on
+#include "xop/execution/warp_send_guard.hpp"
+
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -2893,6 +2896,22 @@ private:
     // than relying on the transaction-scanning heuristic.
     uint32_t consecutive_pending_blocks_{0};
     static constexpr uint32_t kForceDeletePendingBlocks{12};  // ~10 min
+
+    // [WARP-LOST-SEND 2026-10-25] Which wallets the GUI's warp jobs have a
+    // Chia send in flight on, read from warp_jobs.db once per heartbeat
+    // (execution/warp_send_guard.hpp).  Those wallets' pending_change IS
+    // the warp send, so it must not count toward the force-delete, and
+    // neither the periodic prune nor the force-delete may clear their
+    // unconfirmed transactions: on 2026-10-24 the force-delete took a
+    // claim's funding send with it (job 4) and the job stalled for two
+    // hours on a coin that could never appear.  An unreadable database
+    // protects every wallet (fail closed).
+    execution::WarpSendGuard warp_send_guard_{};
+    BlockHeight warp_send_guard_block_{0};
+    bool        warp_send_guard_read_{false};
+    void refresh_warp_send_guard(BlockHeight block_height);
+    bool wallet_holds_warp_send(std::int64_t wallet_id,
+                                BlockHeight block_height);
 
     // -- Wallet unsync auto-recovery [WALLET-RESTART-LIVELOCK 2026-09-22] --
     // Step 8 restarts the wallet service only when
