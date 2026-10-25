@@ -315,10 +315,11 @@ def test_a_cat_spend_whose_coin_went_elsewhere_is_sent_again():
     assert st["burn_tx_id_prior"] == ["burn-dead"]
 
 
-def test_a_vanished_cat_spend_waits_for_the_operators_retry():
-    """Nowhere, coins unspent: never re-sent on the handler's own authority
-    (a second burn is a real loss if the first surfaces).  The operator's
-    Retry clears it, and the next tick sends."""
+def test_a_vanished_cat_spend_is_never_replaced_until_proven_dead():
+    """Nowhere, coins unspent: a replacement would spend other coins, so
+    both could land -- a second CAT on the forward-only burn puzzle.  Not
+    the handler, and not Retry, replaces it; the moment anything spends its
+    coins (the chain proves it dead) the handler does."""
     store = new_store()
     engine, ctx = build_unwrap(store, params=params_with_cap())
     job = _to_burn_sent(store, engine)
@@ -329,19 +330,25 @@ def test_a_vanished_cat_spend_waits_for_the_operators_retry():
     for _ in range(LIMIT + 5):
         engine.step()
     assert ctx.wallet.cat_spends == []
-    assert "Retry" in _last_message(store, job.id)
+    assert "proves it dead" in _last_message(store, job.id)
 
     store.update_job(job.id, status=JobStatus.FAILED,
                      expected_status=JobStatus.BURN_SENT,
                      state_patch={"failed_from": JobStatus.BURN_SENT})
     engine.job_action(job.id, "retry")
     st = store.get_job(job.id).state
-    assert st["burn_tx_id"] is None
-    assert st["burn_tx_id_prior"] == ["burn-gone"]
+    assert st["burn_tx_id"] == "burn-gone", "Retry leaves an orphaned burn alone"
     assert store.get_job(job.id).status == JobStatus.BURN_SENT
+    engine.step()
+    assert ctx.wallet.cat_spends == []
 
+    ctx.coinset.records[RID] = _rec(spent=True)             # its coins went elsewhere
+    ctx.coinset.peak = PEAK
     engine.step()
     assert len(ctx.wallet.cat_spends) == 1
+    st = store.get_active_job().state
+    assert st["burn_tx_id"] == "burn-tx-1"
+    assert st["burn_tx_id_prior"] == ["burn-gone"]
 
 
 def test_retry_keeps_a_cat_spend_the_wallet_still_holds():
@@ -497,14 +504,15 @@ def test_a_dead_cat_spends_output_pin_goes_with_it():
     assert st["burn_tx_id"] == "burn-tx-1"
 
 
-def test_retry_clears_the_output_pin_with_the_vanished_cat_spend():
+def test_retry_clears_the_output_pin_with_a_dead_cat_spend():
     store = new_store()
     engine, ctx = build_unwrap(store, params=params_with_cap())
     job = _to_burn_sent(store, engine)
     store.update_job(job.id, state_patch={
-        "burn_tx_id": "burn-gone", "burn_tx_id_removals": [RID],
+        "burn_tx_id": "burn-dead", "burn_tx_id_removals": [RID],
         "burn_cat_coin_id": "aa" * 32})
-    ctx.coinset.records[RID] = _rec(spent=False)
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = PEAK
     store.update_job(job.id, status=JobStatus.FAILED,
                      expected_status=JobStatus.BURN_SENT,
                      state_patch={"failed_from": JobStatus.BURN_SENT})
@@ -1083,16 +1091,16 @@ def test_cat_spend_exclusions_reach_the_daemon_under_its_field_name():
     assert "excluded_coin_ids" not in seen["body"]
 
 
-def test_retrys_burn_replacement_excludes_the_vanished_sends_coins():
-    """[review] As the funding paths do: the replacement must not reuse the
-    orphan's coins, so a resurfacing original cannot compete with it."""
+def test_retrys_burn_replacement_excludes_the_dead_sends_coins():
+    """[review] As the funding paths do: the replacement names the replaced
+    send's coins as exclusions and keeps them for the accounting."""
     store = new_store()
     engine, ctx = build_unwrap(store, params=params_with_cap())
     job = _to_burn_sent(store, engine)
-    store.update_job(job.id, state_patch={"burn_tx_id": "burn-gone",
+    store.update_job(job.id, state_patch={"burn_tx_id": "burn-dead",
                                           "burn_tx_id_removals": [RID]})
-    ctx.coinset.records[RID] = _rec(spent=False)
-    engine.step()                                          # orphan: waits
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = PEAK
     store.update_job(job.id, status=JobStatus.FAILED,
                      expected_status=JobStatus.BURN_SENT,
                      state_patch={"failed_from": JobStatus.BURN_SENT})
@@ -1103,7 +1111,7 @@ def test_retrys_burn_replacement_excludes_the_vanished_sends_coins():
     st = store.get_active_job().state
     assert st["burn_tx_id"] == "burn-tx-1"
     assert st["burn_tx_id_exclude"] is None
-    assert st["burn_tx_id_prior_removals"] == {"burn-gone": [RID]}
+    assert st["burn_tx_id_prior_removals"] == {"burn-dead": [RID]}
 
 
 def test_a_swept_replacements_output_does_not_settle_an_orphan(monkeypatch):
@@ -1260,18 +1268,27 @@ def test_exclusions_accumulate_across_replacements():
         "burn_tx_id": "burn-b", "burn_tx_id_removals": [RID2],
         "burn_tx_id_prior": ["burn-a"],
         "burn_tx_id_prior_removals": {"burn-a": [RID]}})
-    ctx.coinset.records[RID] = _rec(spent=False)
-    ctx.coinset.records[RID2] = _rec(spent=False)
-    engine.step()                                            # B: an orphan
+    ctx.coinset.records[RID] = _rec(spent=True)              # A: dead
+    ctx.coinset.records[RID2] = _rec(spent=True)             # B: dead
+    ctx.coinset.peak = PEAK
+    engine.step()                                            # B replaced by C
+    st = store.get_active_job().state
+    assert st["burn_tx_id"] == "burn-tx-1"
+    assert st["burn_tx_id_prior_removals"] == {"burn-a": [RID], "burn-b": [RID2]}
+    # ...and when C vanishes AND dies, D excludes the coins of A, B and C.
+    store.update_job(job.id, state_patch={"burn_tx_id": "burn-c",
+                                          "burn_tx_id_removals": ["f" * 64]})
+    ctx.coinset.records["f" * 64] = _rec(spent=True)
+    ctx.wallet.cat_spend_excludes.clear()
     store.update_job(job.id, status=JobStatus.FAILED,
                      expected_status=JobStatus.BURN_SENT,
                      state_patch={"failed_from": JobStatus.BURN_SENT})
     engine.job_action(job.id, "retry")
     st = store.get_job(job.id).state
-    assert st["burn_tx_id_exclude"] == sorted([RID, RID2])
-    assert st["burn_tx_id_prior"] == ["burn-a", "burn-b"]
+    assert st["burn_tx_id_exclude"] == sorted([RID, RID2, "f" * 64])
+    assert st["burn_tx_id_prior"] == ["burn-a", "burn-b", "burn-c"]
     engine.step()
-    assert ctx.wallet.cat_spend_excludes == [sorted([RID, RID2])]
+    assert ctx.wallet.cat_spend_excludes == [sorted([RID, RID2, "f" * 64])]
 
 
 def test_retry_of_a_burning_job_that_never_made_its_toll_key_resets_nothing():
@@ -1351,3 +1368,129 @@ def test_sweep_resolves_when_every_attempt_is_dead_and_nothing_was_funded(monkey
     assert out["status"] == JobStatus.CANCELLED
     assert store.get_active_job() is None
     assert "nothing to sweep" in store.get_job(job.id).state["sweep_status"]
+
+
+# --------------------------------------------------------------------------- #
+# Review round 10.
+# --------------------------------------------------------------------------- #
+
+def test_a_landed_prior_burn_is_found_despite_a_dead_replacements_pin():
+    """[review] B (pinned to a coin that never appeared) is dead; A, which
+    B replaced, landed: its burn CAT carries the unwrap forward, re-pinned,
+    instead of being treated as settled and cancelled over."""
+    from gui.services.warp import clvm_utils as cu
+
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _to_burn_sent(store, engine)
+    burn_ph = store.get_active_job().state["burn_cat_ph"]
+    store.update_job(job.id, state_patch={
+        "burn_tx_id": "burn-b", "burn_tx_id_removals": [RID2],
+        "burn_cat_coin_id": "aa" * 32,                       # never appeared
+        "burn_tx_id_prior": ["burn-a"],
+        "burn_tx_id_prior_removals": {"burn-a": [RID]},
+        "rebalance_eth_target_wei": 10 ** 16, "rebalance": True})
+    ctx.coinset.records[RID] = _rec(spent=True)              # A landed: its coin...
+    ctx.coinset.records[RID2] = _rec(spent=True)             # B dead
+    ctx.coinset.peak = PEAK
+    ctx.coinset.by_ph = [SimpleNamespace(                    # ...is at the burn puzzle
+        coin=SimpleNamespace(parent_coin_info=RID, puzzle_hash=burn_ph, amount=AMOUNT),
+        spent=False, confirmed_block_index=PEAK - 3, spent_block_index=0)]
+    ctx.evm.get_erc20_balance = lambda token, owner: 0
+    ctx.evm.eth = 10 ** 16                                   # would otherwise cancel
+    out = engine.step()
+    assert out["status"] == JobStatus.BURNING
+    st = store.get_active_job().state
+    assert st["burn_cat_coin_id"] == cu.coin_name(
+        bytes.fromhex(RID), bytes.fromhex(burn_ph), AMOUNT).hex()
+    assert st["burn_cat_parent"] == RID
+    assert ctx.wallet.cat_spends == []
+
+
+def test_a_malformed_wallet_reply_keeps_the_reservation(monkeypatch):
+    """[review] Only the daemon's own rejection proves nothing was sent; an
+    unreadable reply may follow a broadcast."""
+    from gui.services.warp.wallet import WalletError
+
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store)
+
+    def garbage(*a, **k):
+        raise WalletError("send_transaction: unexpected response list")
+
+    ctx.wallet.send_transaction = garbage
+    engine.step()
+    assert store.get_job(job.id).state["funding_tx_id"] == S._FUNDING_TX_UNKNOWN
+
+
+def test_an_unwrap_completes_only_once_replaced_toll_sends_are_ruled_out(monkeypatch):
+    """[review] A replaced toll send that could still land keeps the job
+    open; one that landed is swept first; then COMPLETED."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = seed(store, JobStatus.RELAYING, columns={"amount_mojos": AMOUNT},
+               state={"direction": "out", "receiver_evm": "ab" * 20,
+                      "post_tip_base_units": 4_985_000})
+    blob, _sk = make_ephemeral_blob(job.id)
+    store.update_job(job.id, state_patch={
+        "ephemeral_blob": blob, "funding_amount": NET.chia_toll_mojos,
+        "funding_tx_id": "toll-b", "funding_tx_id_removals": [RID2],
+        "funding_tx_id_prior": ["toll-a"],
+        "funding_tx_id_prior_removals": {"toll-a": [RID]}})
+    job = store.get_active_job()
+    ctx.coinset.records[RID2] = _rec(spent=True)             # B: settled (dead)
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID] = _rec(spent=False)             # A could still land
+    step = engine._unwrap_delivered(job, by="our relay", tx_hash="0x" + "77" * 32)
+    assert step.next_status is None and "could still land" in step.message
+
+    swept = []
+    monkeypatch.setattr(claim_mod, "find_security_coin",
+                        lambda *a, **k: FakeCoin(b"\x5a" * 32))
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep",
+                        lambda *a, **k: swept.append(1) or ("accepted", "ok"))
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
+    ctx.coinset.records[RID] = _rec(spent=True)              # A landed...
+    ctx.coinset.by_ph = [SimpleNamespace(                    # ...its toll coin unspent
+        coin=SimpleNamespace(parent_coin_info=RID, puzzle_hash="5b" * 32,
+                             amount=NET.chia_toll_mojos),
+        spent=False, confirmed_block_index=PEAK - 3, spent_block_index=0)]
+    step = engine._unwrap_delivered(job, by="our relay")
+    assert step.next_status is None and swept == [1]
+
+    ctx.coinset.by_ph[0].spent = True                        # the sweep mined
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
+    step = engine._unwrap_delivered(job, by="our relay")
+    assert step.next_status == JobStatus.COMPLETED
+
+
+def test_a_delivered_unwraps_deadline_names_the_toll_wait():
+    """[review] The RELAYING deadline on a delivered unwrap is a hand-over
+    about the replaced toll send, not an undelivered relay."""
+    store = new_store()
+    engine, _ctx = build_unwrap(store, params=params_with_cap())
+    limit = S._PENDING_MAX_POLLS[JobStatus.RELAYING]
+    reason = engine._pending_expired(SimpleNamespace(
+        status=JobStatus.RELAYING,
+        state={"pending_polls": limit, "delivered_by": "our relay"}))
+    assert "the unwrap was delivered" in reason and "Sweep recovers" in reason
+    plain = engine._pending_expired(SimpleNamespace(
+        status=JobStatus.RELAYING, state={"pending_polls": limit}))
+    assert "delivered" not in plain
+
+
+def test_retry_after_delivery_keeps_the_mined_relay():
+    """[review] A fresh relay would only revert "!nonce" and burn its gas."""
+    store = new_store()
+    engine, _ctx = build_unwrap(store, params=params_with_cap())
+    job = seed(store, JobStatus.FAILED, columns={"amount_mojos": AMOUNT},
+               state={"direction": "out", "failed_from": JobStatus.RELAYING,
+                      "relay_raw": "02ee", "relay_tx_hash": "0x" + "77" * 32,
+                      "delivered_by": "our relay"})
+    engine.job_action(job.id, "retry")
+    after = store.get_job(job.id)
+    assert after.status == JobStatus.RELAYING
+    assert after.state["relay_raw"] == "02ee"
+    assert after.state["relay_tx_hash"] == "0x" + "77" * 32

@@ -928,6 +928,17 @@ class WarpEngine:
         if polls < limit:
             return None
         hours = polls * float(self._params.poll_interval_s) / 3600.0
+        if job.state.get("delivered_by"):
+            # [WARP-LOST-SEND] The unwrap WAS delivered; the wait is for a
+            # replaced toll send to be ruled out before the job may close
+            # (_unwrap_delivered).  The generic remedy would misread as an
+            # undelivered relay.
+            return (
+                f"the unwrap was delivered, but a replaced toll send is not "
+                f"ruled out after {polls} polls (~{hours:.1f}h); handing over "
+                "to the operator -- Sweep recovers a toll coin that landed, "
+                "Retry resumes the wait, Abandon closes the job"
+            )
         # No Sweep suggestion for the Base-side states: they have no funding
         # coin, and pointing the operator at Sweep there aimed them straight at
         # the close-over-a-live-bridge hazard the sweep guard now blocks.
@@ -2199,8 +2210,15 @@ class WarpEngine:
         try:
             return send()
         except Exception as exc:
+            # Only the daemon's own rejection ("<endpoint> failed: <error>",
+            # WalletClient._post's success=false form) proves nothing was
+            # sent.  A transport failure ("request failed") or a malformed
+            # reply ("unexpected response") may follow a broadcast: the
+            # reservation stands and the history scan decides next tick.
+            text = str(exc)
             refused = (isinstance(exc, WalletError)
-                       and "request failed" not in str(exc).lower())
+                       and re.match(r"^\S+ failed: ", text) is not None
+                       and "request failed" not in text.lower())
             if refused:
                 self._store.update_job(job.id, expected_status=job.status,
                                        state_patch=previous)
@@ -2345,6 +2363,15 @@ class WarpEngine:
                            f"({why}); Sweep again later")
         return True, ""
 
+    def _attempt_coins(self, job: WarpJob, tx_key: str) -> set:
+        """Every coin any attempt recorded under *tx_key* spent: the current
+        send's and each replaced one's."""
+        st = job.state
+        coins = {_hx(c) for c in (st.get(f"{tx_key}_removals") or []) if c}
+        for removals in (st.get(f"{tx_key}_prior_removals") or {}).values():
+            coins.update(_hx(c) for c in (removals or []) if c)
+        return coins
+
     def _burn_priors_settled(self, job: WarpJob) -> tuple:
         """``(settled, note)``: whether every REPLACED cat_spend of *job* is
         ruled out.  A replaced burn is settled when the chain proves it dead,
@@ -2458,11 +2485,14 @@ class WarpEngine:
                              "history; awaiting the coin"),
                 ), {}
             polls += 1
+            hint = (("its coins are unknown, so it can never be proven dead; "
+                     "Abandon closes the job if it never lands")
+                    if tx_key == "burn_tx_id"
+                    else "the operator's Retry sends it again")
             return _stay(
                 state={polls_key: polls},
                 message=(f"{label} unnamed by the wallet and absent from its "
-                         f"history (poll {polls}); waiting -- the operator's "
-                         "Retry sends it again"),
+                         f"history (poll {polls}); waiting -- {hint}"),
             ), {}
 
         verdict, why, ev = self._recorded_send_verdict(
@@ -2480,10 +2510,13 @@ class WarpEngine:
                 also_clear=also_clear)
         if verdict is cs.Verdict.ORPHAN:
             polls += 1
+            hint = (("it is sent again once those coins are spent by anything "
+                     "else, which proves it dead; Abandon closes the job")
+                    if tx_key == "burn_tx_id"
+                    else "the operator's Retry sends it again")
             return _stay(
                 state={**learned, polls_key: polls},
-                message=(f"{label} {tx_id} is {why} (poll {polls}); waiting -- "
-                         "the operator's Retry sends it again"),
+                message=f"{label} {tx_id} is {why} (poll {polls}); waiting -- {hint}",
             ), {}
         if verdict in (cs.Verdict.UNKNOWN, cs.Verdict.SHALLOW):
             return _stay(
@@ -2561,14 +2594,23 @@ class WarpEngine:
             # [WARP-LOST-SEND 2026-10-25] A Chia send that is nowhere -- not
             # in the wallet, not in the mempool, its coins unspent -- is never
             # sent again on the handler's own authority: a replacement spends
-            # other coins, so both could land, and a second burn is a real
-            # loss.  The operator's Retry is that authority.  The marker is
-            # cleared (the coins it spent become the replacement's exclusions
-            # and are kept for Sweep's accounting), so the handler runs its
-            # fail-closed history scan and, finding nothing, sends.  A send
-            # the wallet or the mempool still holds is kept.
+            # other coins, so both could land.  For the XCH funding sends the
+            # operator's Retry is that authority (the surplus is sweepable);
+            # a cat_spend is replaced only once the chain proves it dead, by
+            # the handler itself, so Retry leaves an orphaned burn in place.
+            # The marker is cleared (the coins it spent become the
+            # replacement's exclusions and are kept for Sweep's accounting),
+            # so the handler runs its fail-closed history scan and, finding
+            # nothing, sends.  A send the wallet or the mempool still holds
+            # is kept.
             return self._release_recorded_send(job, target)
         if target == JobStatus.RELAYING:
+            if job.state.get("delivered_by"):
+                # [WARP-LOST-SEND] Delivered already: the job failed waiting
+                # for a replaced toll send to settle, not for the relay.  A
+                # fresh relay would only revert "!nonce" and burn its gas;
+                # the mined one is re-polled and the wait resumes.
+                return {}
             # Unconditional, and safe ONLY here: a relay re-signed at a
             # fresh nonce cannot double-deliver -- the second attempt
             # reverts "!nonce". The bridge below has no such guard, which
@@ -2619,8 +2661,9 @@ class WarpEngine:
 
     def _release_recorded_send(self, job: WarpJob, target: str) -> Dict[str, Any]:
         """Retry's reset for a job that failed waiting on a Chia send: the
-        replacement patch when the send is proven dead or orphaned, {} when
-        it is still alive somewhere (or landed)."""
+        replacement patch when the send is proven dead (an XCH funding send
+        also when it is orphaned), {} when it is still alive somewhere, has
+        landed, or is a cat_spend the chain has not proven dead."""
         from . import chia_send as cs, claim
 
         tx_key = "burn_tx_id" if target == JobStatus.BURN_SENT else "funding_tx_id"
@@ -2648,11 +2691,17 @@ class WarpEngine:
             scan = lambda dead: self._find_existing_funding(  # noqa: E731
                 out_ph, out_amount, exclude_ids=dead)
         priors = [t for t in (job.state.get(f"{tx_key}_prior") or []) if t]
+        # [review] A cat_spend is replaced ONLY when the chain proves it dead:
+        # a replacement spends other coins, so an orphaned burn that surfaced
+        # later would put a second CAT on the forward-only burn puzzle with
+        # nothing to bridge it.  The XCH funding sends may be replaced while
+        # orphaned -- their surplus is XCH at a key Sweep recovers from.
+        burn = target == JobStatus.BURN_SENT
         if tx_id == _FUNDING_TX_UNKNOWN:
             self._wallet.log_in()
             found = scan(priors)
             found_id = found[0] if isinstance(found, tuple) else found
-            if found_id:
+            if found_id or burn:
                 return {}
             return self._replacement_patch(
                 job, tx_key=tx_key, tx_id=tx_id, removals=[],
@@ -2660,7 +2709,9 @@ class WarpEngine:
         verdict, _why, ev = self._recorded_send_verdict(
             job, tx_key=tx_key, out_ph_hex=out_ph, out_amount=out_amount,
             unique_output=unique)
-        if verdict in (cs.Verdict.DEAD, cs.Verdict.ORPHAN):
+        allowed = ((cs.Verdict.DEAD,) if burn
+                   else (cs.Verdict.DEAD, cs.Verdict.ORPHAN))
+        if verdict in allowed:
             return self._replacement_patch(
                 job, tx_key=tx_key, tx_id=tx_id, removals=list(ev.removals),
                 also_clear=also_clear)
@@ -3248,6 +3299,29 @@ class WarpEngine:
                     state={"burn_cat_parent": _hx(rec.coin.parent_coin_info)},
                     message="burn CAT is on chain; the unwrap is now forward-only",
                 )
+            # [WARP-LOST-SEND] The pin names a coin that never appeared (its
+            # send was replaced); an EARLIER attempt's burn CAT may be there
+            # instead.  Any unspent coin of the amount whose parent is a coin
+            # one of this job's attempts spent carries the unwrap forward,
+            # re-pinned with its provenance.
+            mine = self._attempt_coins(job, "burn_tx_id")
+            if mine:
+                from . import clvm_utils as cu
+
+                for rec in self._coinset.get_coin_records_by_puzzle_hash(burn_cat_ph):
+                    parent = _hx(rec.coin.parent_coin_info)
+                    if (int(rec.coin.amount) == amount and not rec.spent
+                            and parent in mine):
+                        coin_id = cu.coin_name(
+                            bytes.fromhex(parent), bytes.fromhex(burn_cat_ph),
+                            amount).hex()
+                        return _advance(
+                            JobStatus.BURNING,
+                            state={"burn_cat_parent": parent,
+                                   "burn_cat_coin_id": coin_id},
+                            message=("an earlier cat_spend's burn CAT is on "
+                                     "chain; the unwrap is now forward-only"),
+                        )
         else:
             for rec in self._coinset.get_coin_records_by_puzzle_hash(burn_cat_ph):
                 if int(rec.coin.amount) == amount and not rec.spent:
@@ -3260,8 +3334,10 @@ class WarpEngine:
         # b) The persisted marker.  [WARP-LOST-SEND] Judged, not assumed:
         # a cat_spend whose coin went to another spend can never land and is
         # sent again; one that merely vanished (no wallet, no mempool, coins
-        # unspent) is NOT -- a second burn is a real loss if the first
-        # surfaces -- so it waits for the operator's Retry (_retry_tx_reset).
+        # unspent) is NOT -- not even on Retry: a replacement spends other
+        # coins, so both could land, and a second CAT at the forward-only
+        # burn puzzle has nothing to bridge it.  It waits until the chain
+        # proves it dead; Abandon closes the job.
         resend: Dict[str, Any] = {}
         if job.state.get("burn_tx_id"):
             wid = int(job.state["cat_wallet_id"])
@@ -3821,6 +3897,30 @@ class WarpEngine:
 
     def _unwrap_delivered(self, job: WarpJob, *, by: str, tx_hash=None) -> _Step:
         post_tip = job.state.get("post_tip_base_units")
+        if job.state.get("funding_tx_id_prior"):
+            # [WARP-LOST-SEND] COMPLETED offers no Sweep: a replaced toll
+            # send that could still land keeps the job open, and one that
+            # landed is swept here first.
+            from . import claim
+
+            settled, note = self._prior_sends_settled(job)
+            if not settled:
+                columns = {"bridge_tx_hash": tx_hash} if tx_hash else None
+                sk = self._load_ephemeral_sk(job)
+                extra = claim.find_security_coin(
+                    self._coinset, sk, int(self._funded_amount(job)))
+                if extra is not None:
+                    _resolved, status = self._sweep_security(job, extra, sk)
+                    return _stay(
+                        columns=columns,
+                        state={"delivered_by": by, "sweep_status": status},
+                        message=(f"unwrap delivered ({by}); a replaced toll "
+                                 f"send landed too -- {status}"),
+                    )
+                return _stay(
+                    columns=columns, state={"delivered_by": by},
+                    message=f"unwrap delivered ({by}); {note}",
+                )
         return _advance(
             JobStatus.COMPLETED,
             columns={"bridge_tx_hash": tx_hash} if tx_hash else None,

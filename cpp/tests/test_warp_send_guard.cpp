@@ -101,6 +101,36 @@ TEST(WarpSendGuardTest, AFailedJobIsReadByWhereItFailedFrom) {
                                     kUsdc).has_value());
 }
 
+TEST(WarpSendGuardTest, AReplacedSendKeepsProtectionInEveryActiveStatus) {
+    // Orphan funding A replaced by B; A landed first and the job moved on
+    // while B is still confirming in the wallet.
+    const json state = {{"funding_tx_id", "b"},
+                        {"funding_tx_id_prior", json::array({"a"})}};
+    for (const char* st : {"CLAIM_FUNDED", "COLLECTING_SIGS", "CLAIMING",
+                           "FAILED"}) {
+        const auto s = warp_job_chia_send(st, state, kUsdc);
+        ASSERT_TRUE(s.has_value()) << st;
+        EXPECT_TRUE(s->xch) << st;
+    }
+    // A replaced cat_spend protects its CAT wallet too, in any status.
+    const json burn = {{"burn_tx_id", "b"},
+                       {"burn_tx_id_prior", json::array({"a"})}};
+    const auto b = warp_job_chia_send("BURNING", burn, kUsdc);
+    ASSERT_TRUE(b.has_value());
+    EXPECT_TRUE(b->xch);
+    EXPECT_EQ(b->cat_asset_id, kUsdc);
+    // No replacement, no marker, or an empty prior list: the status rules.
+    EXPECT_FALSE(warp_job_chia_send(
+        "CLAIMING", json{{"funding_tx_id", "b"}}, kUsdc).has_value());
+    EXPECT_FALSE(warp_job_chia_send(
+        "CLAIMING", json{{"funding_tx_id_prior", json::array({"a"})}}, kUsdc)
+                     .has_value());
+    EXPECT_FALSE(warp_job_chia_send(
+        "CLAIMING", json{{"funding_tx_id", "b"},
+                         {"funding_tx_id_prior", json::array()}}, kUsdc)
+                     .has_value());
+}
+
 TEST(WarpSendGuardTest, OtherStatusesHoldNoWalletSend) {
     const json state = {{"funding_tx_id", "x"}, {"burn_tx_id", "y"}};
     for (const char* st : {"AWAITING_DEPOSIT", "APPROVING", "BRIDGING",

@@ -103,23 +103,46 @@ struct WarpChiaSend {
         }
         return state[key].get<std::string>();
     };
+    const auto has_priors = [&](const char* key) -> bool {
+        return state.is_object() && state.contains(key)
+            && state[key].is_array() && !state[key].empty();
+    };
     const std::string status =
         status_in == "FAILED" ? text("failed_from") : status_in;
+    WarpChiaSend s;
+    bool any = false;
     if (status == "FUNDING_CLAIM" || status == "BURNING") {
-        if (text("funding_tx_id").empty()) return std::nullopt;
-        WarpChiaSend s;
-        s.xch = true;
-        return s;
+        if (!text("funding_tx_id").empty()) {
+            s.xch = true;
+            any   = true;
+        }
     }
     if (status == "BURN_SENT") {
-        if (text("burn_tx_id").empty()) return std::nullopt;
-        WarpChiaSend s;
-        s.xch          = true;
-        s.cat_asset_id = fingerprint_asset_id(text("asset_fingerprint"));
-        if (s.cat_asset_id.empty()) s.cat_asset_id = default_cat_asset_id;
-        return s;
+        if (!text("burn_tx_id").empty()) {
+            s.xch          = true;
+            s.cat_asset_id = fingerprint_asset_id(text("asset_fingerprint"));
+            if (s.cat_asset_id.empty()) s.cat_asset_id = default_cat_asset_id;
+            any = true;
+        }
     }
-    return std::nullopt;
+    // A job that REPLACED a send keeps its wallets protected in every
+    // active status until it closes: an earlier attempt's coin may have
+    // carried the job forward while the replacement is still confirming,
+    // and the GUI settles the attempts only when it closes the job.
+    if (has_priors("funding_tx_id_prior") && !text("funding_tx_id").empty()) {
+        s.xch = true;
+        any   = true;
+    }
+    if (has_priors("burn_tx_id_prior") && !text("burn_tx_id").empty()) {
+        s.xch = true;
+        if (s.cat_asset_id.empty()) {
+            s.cat_asset_id = fingerprint_asset_id(text("asset_fingerprint"));
+            if (s.cat_asset_id.empty()) s.cat_asset_id = default_cat_asset_id;
+        }
+        any = true;
+    }
+    if (!any) return std::nullopt;
+    return s;
 }
 
 /// From one dexie_takes row: a take the wallet is still confirming spends
