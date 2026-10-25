@@ -5959,7 +5959,10 @@ class _WarpWorker(QObject):
         failed, so a lost trade record cannot stop every later buy.
         """
         in_flight = False
-        for take in engine._store.list_takes(status=jobs.TAKE_SUBMITTING):
+        # [review] EVERY open take (limit=-1 is SQLite's "no limit"): the
+        # default page would let newer rows hide an older one from
+        # settlement for good -- a confirmed purchase never booked.
+        for take in engine._store.list_takes(status=jobs.TAKE_SUBMITTING, limit=-1):
             # The take RPC's outcome never reached the store (a lost
             # response, a crash): no wallet trade id to look up. It blocks
             # buys until _TAKE_UNKNOWN_FAIL_S, then moves to "unknown" -- by
@@ -5976,7 +5979,7 @@ class _WarpWorker(QObject):
                              take.offer_id, _TAKE_UNKNOWN_FAIL_S)
             else:
                 in_flight = True
-        submitted = engine._store.list_takes(status=jobs.TAKE_SUBMITTED)
+        submitted = engine._store.list_takes(status=jobs.TAKE_SUBMITTED, limit=-1)
         if submitted:
             # [review] The configured key first, OUTSIDE the per-take handler:
             # after a restart the daemon may be logged out or on another key,
@@ -6026,7 +6029,7 @@ class _WarpWorker(QObject):
         reads CONFIRMED or FAILED, and released as failed only after
         ``_TAKE_UNKNOWN_RELEASE_S`` -- a Chia transaction unconfirmed for a
         day is gone from every mempool.  Never blocks a buy."""
-        unknown = engine._store.list_takes(status=jobs.TAKE_UNKNOWN)
+        unknown = engine._store.list_takes(status=jobs.TAKE_UNKNOWN, limit=-1)
         if not unknown:
             return
         # [review] The configured key first, outside the per-take handler: a

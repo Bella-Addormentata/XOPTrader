@@ -842,3 +842,26 @@ def test_completed_offers_of_ours_are_excluded_too():
     ids = WalletClient({}, poster=poster).get_my_offer_trade_ids()
     assert ids == {"c" * 64}
     assert bodies[0]["include_completed"] is True
+
+
+def test_settlement_reads_every_open_take_not_a_page(monkeypatch):
+    """[review] Fifty newer unknown takes must not hide an older one from
+    settlement for good."""
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    w._maybe_rebalance(eng)
+    eng._wallet.get_offer = lambda tid: (_ for _ in ()).throw(RuntimeError("lost"))
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_FAIL_S + 1)
+    w._settle_dexie_takes(eng)
+    seen = []
+    real = eng._store.list_takes
+
+    def spy(status=None, limit=50):
+        seen.append((status, limit))
+        return real(status=status, limit=limit)
+
+    eng._store.list_takes = spy
+    w._settle_dexie_takes(eng)
+    assert (J.TAKE_SUBMITTING, -1) in seen
+    assert (J.TAKE_SUBMITTED, -1) in seen
+    assert (J.TAKE_UNKNOWN, -1) in seen
