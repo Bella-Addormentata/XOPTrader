@@ -1841,6 +1841,23 @@ class WarpEngine:
                 raise WarpPending(
                     f"claim {depth}/{net.chia_confirmation_min_height} confirmations"
                 )
+            # [WARP-LOST-SEND] COMPLETED frees the slot and offers no Sweep,
+            # so a replaced funding send that could still land -- or already
+            # did, leaving a second coin at the key -- keeps the job here: a
+            # landed one is swept now, an undecided one waited out.
+            settled, note = self._prior_sends_settled(job)
+            if not settled:
+                extra = claim.find_security_coin(self._coinset, sk, expected)
+                if extra is not None:
+                    _resolved, status = self._sweep_security(job, extra, sk)
+                    return _stay(
+                        state={"sweep_status": status},
+                        message=(f"claim confirmed at {depth} confirmations; a "
+                                 f"replaced funding send landed too -- {status}"),
+                    )
+                return _stay(
+                    message=f"claim confirmed at {depth} confirmations; {note}",
+                )
             return _advance(
                 JobStatus.COMPLETED,
                 message=f"claim confirmed at {depth} confirmations",
@@ -2261,19 +2278,23 @@ class WarpEngine:
             if tx_id == _FUNDING_TX_UNKNOWN:
                 return False, ("an earlier send the wallet never named cannot "
                                "be ruled out; Sweep again later or Abandon")
+            # unique_output=False: the key holds the replacement's coin too
+            # (swept, so spent), so an output is THIS send's only when its
+            # parent is one of the coins this send spent.  A send whose
+            # coins are unknown can therefore never read as landed.
             ev = cs.gather(
                 wallet_record=lambda t=tx_id: self._wallet.get_transaction_or_none(t),
                 mempool_item=lambda t=tx_id: self._coinset.get_mempool_item_by_tx_id(t),
                 coin_spent=self._coin_spent_depth,
                 outputs_at=lambda: outputs,
                 known_removals=prior_removals.get(tx_id) or [],
-                out_amount=amount, unique_output=True, min_depth=min_depth,
+                out_amount=amount, unique_output=False, min_depth=min_depth,
             )
             verdict, why = cs.judge(ev)
             if verdict is cs.Verdict.DEAD:
                 continue
             if verdict is cs.Verdict.LANDED:
-                continue          # its coin is at the key and spent (above)
+                continue          # its own coin is at the key and spent (above)
             return False, (f"replaced funding send {tx_id[:16]}... could "
                            f"still land ({why}); Sweep again later")
         return True, ""
@@ -3227,6 +3248,8 @@ class WarpEngine:
             context="cat_spend (its fee, then the toll coin and its fee)",
         )
         self._wallet.log_in()
+        exclude = [c for c in (resend.get("burn_tx_id_exclude")
+                               or job.state.get("burn_tx_id_exclude") or []) if c]
         record = self._send_reserved(
             job, tx_key="burn_tx_id", reserve_patch=resend,
             send=lambda: self._wallet.cat_spend(
@@ -3234,6 +3257,7 @@ class WarpEngine:
                 amount,
                 job.state["burn_address"],
                 fee_mojos=fee,
+                **({"exclude_coin_ids": exclude} if exclude else {}),
             ),
         )
         tx_id = record.get("name") or record.get("transaction_id")
@@ -3249,7 +3273,8 @@ class WarpEngine:
 
         patch = {**resend, "burn_tx_id": tx_id,
                  "burn_tx_id_removals": list(cs.removal_ids(record)) or None,
-                 "burn_tx_id_orphan_polls": 0, "burn_fee_mojos": fee}
+                 "burn_tx_id_orphan_polls": 0, "burn_fee_mojos": fee,
+                 "burn_tx_id_exclude": None}
         for add in record.get("additions") or []:
             if _hx(str(add.get("puzzle_hash") or "")) == burn_cat_ph \
                     and int(add.get("amount") or 0) == amount:
@@ -3851,13 +3876,20 @@ class WarpEngine:
         # Sweep re-pushes the SAME bundle (an idempotent "pending") instead
         # of a differently-priced twin the mempool would reject as a
         # conflict with the first.
-        fee = job.state.get("sweep_fee_mojos")
+        # [review] Per security coin: replaced funding sends can leave more
+        # than one coin at the key, each swept on its own.  The same coin
+        # re-pushes the identical bundle; another coin prices its own.
+        cid = coin.name().hex()
+        pins = dict(job.state.get("sweep_fee_by_coin") or {})
+        pushed = dict(job.state.get("sweep_pushed_by_coin") or {})
+        fee = pins.get(cid)
         if not isinstance(fee, int) or isinstance(fee, bool) or fee < 0:
             fee = self._sweep_fee_for(job)
+            pins[cid] = int(fee)
             try:
                 self._store.update_job(
                     job.id, expected_status=job.status,
-                    state_patch={"sweep_fee_mojos": int(fee)},
+                    state_patch={"sweep_fee_by_coin": pins},
                 )
             except Exception as exc:  # noqa: BLE001 -- the push still proceeds
                 _log.warning("warp job %s: could not record the sweep fee (%s)",
@@ -3881,21 +3913,23 @@ class WarpEngine:
             fee_rejected = ("request failed" not in low and any(
                 t in low for t in ("invalid_fee", "fee_too_low", "low_fee",
                                    "fee too low")))
-            if fee_rejected and not job.state.get("sweep_pushed"):
+            if fee_rejected and not pushed.get(cid):
+                pins.pop(cid, None)
                 try:
                     self._store.update_job(
                         job.id, expected_status=job.status,
-                        state_patch={"sweep_fee_mojos": None})
+                        state_patch={"sweep_fee_by_coin": pins})
                 except Exception as patch_exc:  # noqa: BLE001
                     _log.warning("warp job %s: could not release the sweep fee (%s)",
                                  job.id, patch_exc)
                 return False, (f"sweep rejected for its fee ({text}); it is "
                                "repriced on the next Sweep")
             return False, f"sweep failed: {text}"
-        if kind in ("accepted", "pending"):
+        if kind in ("accepted", "pending") and not pushed.get(cid):
+            pushed[cid] = True
             try:
                 self._store.update_job(job.id, expected_status=job.status,
-                                       state_patch={"sweep_pushed": True})
+                                       state_patch={"sweep_pushed_by_coin": pushed})
             except Exception as patch_exc:  # noqa: BLE001
                 _log.warning("warp job %s: could not record the sweep push (%s)",
                              job.id, patch_exc)

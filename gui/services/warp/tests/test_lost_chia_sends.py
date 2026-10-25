@@ -46,6 +46,7 @@ RID = "c4a91ced4257254eb8a1e7c166de014eb3daaedd0f8a8c0ef6f41cfc09847d3c"
 SECURITY_PH = b"\x5b" * 32
 EXPECTED = 4985 + 100_000_000          # post-tip + the default claim fee
 LIMIT = 20                             # polls a test waits to prove "never"
+COIN = (b"\x5a" * 32).hex()               # the FakeCoin every sweep test uses
 PEAK = 9_478_613                       # 837 blocks past the conflicting spend
 
 
@@ -544,7 +545,7 @@ def test_the_sweep_fee_is_fixed_on_the_first_sweep(monkeypatch):
     engine, ctx = build(store, params=default_params(offer_fee_mojos=10_000_000))
     job = _seed_funding(store, funding_amount=EXPECTED)
     engine._sweep_security(job, FakeCoin(b"Z" * 32), b"" * 32)
-    assert store.get_active_job().state["sweep_fee_mojos"] == 10_000_000
+    assert store.get_active_job().state["sweep_fee_by_coin"] == {COIN: 10_000_000}
     ctx.coinset.fee_estimates = [50_000_000]            # the market moved
     engine._sweep_security(store.get_active_job(), FakeCoin(b"Z" * 32), b"" * 32)
     assert fees == [10_000_000, 10_000_000]
@@ -949,19 +950,19 @@ def test_a_definitively_rejected_sweep_fee_is_repriced_unless_already_pushed(
     job = _seed_funding(store, funding_amount=EXPECTED)
     resolved, status = engine._sweep_security(job, FakeCoin(b"\x5a" * 32), b"\x01" * 32)
     assert not resolved and "repriced" in status
-    assert store.get_job(job.id).state["sweep_fee_mojos"] is None
+    assert store.get_job(job.id).state["sweep_fee_by_coin"] == {}
     ctx.coinset.fee_estimates = [30_000_000]              # the market asks more
     outcome["raise"] = False
     engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5a" * 32), b"\x01" * 32)
     assert fees == [10_000_000, 30_000_000]
-    assert store.get_job(job.id).state["sweep_pushed"] is True
+    assert store.get_job(job.id).state["sweep_pushed_by_coin"] == {COIN: True}
     # Once pushed, a later fee rejection keeps the pin: a repriced twin
     # would only conflict with the bundle a node already holds.
     outcome["raise"] = True
     ctx.coinset.fee_estimates = [50_000_000]
     engine._sweep_security(store.get_job(job.id), FakeCoin(b"\x5a" * 32), b"\x01" * 32)
     assert fees[-1] == 30_000_000
-    assert store.get_job(job.id).state["sweep_fee_mojos"] == 30_000_000
+    assert store.get_job(job.id).state["sweep_fee_by_coin"] == {COIN: 30_000_000}
 
 
 def _failed_with_replaced_funding(store, *, prior_removals):
@@ -1019,3 +1020,161 @@ def test_an_unspent_coin_from_a_replaced_send_asks_for_another_sweep(monkeypatch
     out = engine.job_action(job.id, "sweep")
     assert out["status"] == JobStatus.FAILED
     assert "Sweep again" in store.get_job(job.id).state["sweep_status"]
+
+
+# --------------------------------------------------------------------------- #
+# Review round 7.
+# --------------------------------------------------------------------------- #
+
+def test_sweep_state_is_scoped_per_security_coin(monkeypatch):
+    """[review] Two coins at the key (a replaced send landed too): the first
+    coin's accepted push must not pin the second coin's rejected fee."""
+    from gui.services.warp.coinset import CoinsetError
+
+    fees = []
+    rejected = {"on": False}
+
+    def push(coinset, net, *, security_coin, destination_puzzle_hash,
+             ephemeral_sk, sweep_fee=0):
+        fees.append((security_coin.name().hex()[:4], sweep_fee))
+        if rejected["on"]:
+            raise CoinsetError("push_tx failed: [INVALID_FEE_LOW_FEE] too low")
+        return ("accepted", "ok")
+
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep", push)
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: False)
+    store = new_store()
+    engine, ctx = build(store, params=default_params(offer_fee_mojos=10_000_000))
+    job = _seed_funding(store, funding_amount=EXPECTED)
+    first, second = FakeCoin(b"\x5a" * 32), FakeCoin(b"\x5b" * 32)
+    engine._sweep_security(job, first, b"\x01" * 32)               # accepted
+    rejected["on"] = True
+    engine._sweep_security(store.get_job(job.id), second, b"\x01" * 32)
+    st = store.get_job(job.id).state
+    assert st["sweep_pushed_by_coin"] == {first.name().hex(): True}
+    assert second.name().hex() not in st["sweep_fee_by_coin"], "released"
+    assert st["sweep_fee_by_coin"][first.name().hex()] == 10_000_000, "kept"
+    rejected["on"] = False
+    ctx.coinset.fee_estimates = [40_000_000]
+    engine._sweep_security(store.get_job(job.id), second, b"\x01" * 32)
+    assert fees == [("5a5a", 10_000_000), ("5b5b", 10_000_000), ("5b5b", 40_000_000)]
+
+
+def test_cat_spend_exclusions_reach_the_daemon_under_its_field_name():
+    from gui.services.warp.wallet import WalletClient
+
+    seen = {}
+
+    def poster(url, body):
+        seen["body"] = body
+        return {"success": True, "transaction": {"name": "0xbb"}}
+
+    WalletClient({}, poster=poster).cat_spend(
+        3, AMOUNT, "xch1burn", fee_mojos=5, exclude_coin_ids=[RID])
+    assert seen["body"]["excluded_coin_ids"] == ["0x" + RID]
+    WalletClient({}, poster=poster).cat_spend(3, AMOUNT, "xch1burn")
+    assert "excluded_coin_ids" not in seen["body"]
+
+
+def test_retrys_burn_replacement_excludes_the_vanished_sends_coins():
+    """[review] As the funding paths do: the replacement must not reuse the
+    orphan's coins, so a resurfacing original cannot compete with it."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _to_burn_sent(store, engine)
+    store.update_job(job.id, state_patch={"burn_tx_id": "burn-gone",
+                                          "burn_tx_id_removals": [RID]})
+    ctx.coinset.records[RID] = _rec(spent=False)
+    engine.step()                                          # orphan: waits
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     expected_status=JobStatus.BURN_SENT,
+                     state_patch={"failed_from": JobStatus.BURN_SENT})
+    engine.job_action(job.id, "retry")
+    assert store.get_job(job.id).state["burn_tx_id_exclude"] == [RID]
+    engine.step()
+    assert ctx.wallet.cat_spend_excludes == [[RID]]
+    st = store.get_active_job().state
+    assert st["burn_tx_id"] == "burn-tx-1"
+    assert st["burn_tx_id_exclude"] is None
+    assert st["burn_tx_id_prior_removals"] == {"burn-gone": [RID]}
+
+
+def test_a_swept_replacements_output_does_not_settle_an_orphan(monkeypatch):
+    """[review] The key holds the replacement's (swept) coin; it must not
+    make the orphan read as landed while the orphan's own coins are unspent."""
+    monkeypatch.setattr(claim_mod, "find_security_coin",
+                        lambda *a, **k: FakeCoin(b"\x5a" * 32))
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep",
+                        lambda *a, **k: ("accepted", "ok"))
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _failed_with_replaced_funding(store, prior_removals={DEAD_TX: [RID]})
+    ctx.coinset.records[RID] = _rec(spent=False)           # the orphan lives on
+    ctx.coinset.by_ph = [SimpleNamespace(                  # the replacement's coin, swept
+        coin=SimpleNamespace(parent_coin_info="d4" * 32, puzzle_hash="5b" * 32,
+                             amount=EXPECTED),
+        spent=True, confirmed_block_index=PEAK - 3, spent_block_index=PEAK - 1)]
+    out = engine.job_action(job.id, "sweep")
+    assert out["status"] == JobStatus.FAILED, "left open"
+    assert "could still land" in store.get_job(job.id).state["sweep_status"]
+
+
+def _claiming_with_replaced_funding(store, ctx, *, prior_removals, final_hex):
+    job = seed(store, JobStatus.CLAIMING,
+               columns={"receiver_ph": "ab" * 32, "post_tip_mojos": 4985,
+                        "bridge_nonce": "cd" * 32},
+               state={"message_destination": "ee" * 32})
+    blob, _sk = make_ephemeral_blob(job.id)
+    store.update_job(job.id, state_patch={
+        "ephemeral_blob": blob, "funding_amount": EXPECTED,
+        "funding_tx_id": "replacement-tx", "funding_tx_id_prior": [DEAD_TX],
+        "funding_tx_id_prior_removals": prior_removals,
+        "final_cat_coin_id": final_hex, "security_coin_id": "77" * 32})
+    ctx.coinset.records[final_hex] = SimpleNamespace(
+        coin=SimpleNamespace(parent_coin_info="99" * 32, puzzle_hash="88" * 32,
+                             amount=4985),
+        spent=False, confirmed_block_index=PEAK - 100, spent_block_index=0)
+    ctx.coinset.peak = PEAK
+    return store.get_active_job()
+
+
+def test_a_self_claim_completes_only_once_replaced_sends_are_ruled_out(monkeypatch):
+    """[review] COMPLETED offers no Sweep: a confirmed self-claim waits in
+    CLAIMING while a replaced funding send could still land."""
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _claiming_with_replaced_funding(store, ctx, prior_removals={DEAD_TX: [RID]},
+                                          final_hex="f1" * 32)
+    ctx.coinset.records[RID] = _rec(spent=False)           # the orphan could land
+    out = engine.step()
+    assert out["status"] == JobStatus.CLAIMING
+    assert "could still land" in _last_message(store, job.id)
+    ctx.coinset.records[RID] = _rec(spent=True)            # ...until proven dead
+    out = engine.step()
+    assert out["status"] == JobStatus.COMPLETED
+
+
+def test_a_self_claim_sweeps_a_replaced_send_that_landed(monkeypatch):
+    swept = []
+    monkeypatch.setattr(claim_mod, "find_security_coin",
+                        lambda *a, **k: FakeCoin(b"\x5a" * 32))
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep",
+                        lambda *a, **k: swept.append(1) or ("accepted", "ok"))
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _claiming_with_replaced_funding(store, ctx, prior_removals={DEAD_TX: [RID]},
+                                          final_hex="f2" * 32)
+    ctx.coinset.records[RID] = _rec(spent=True)            # the orphan DID land:
+    ctx.coinset.by_ph = [SimpleNamespace(                  # its coin sits unspent
+        coin=SimpleNamespace(parent_coin_info=RID, puzzle_hash="5b" * 32,
+                             amount=EXPECTED),
+        spent=False, confirmed_block_index=PEAK - 3, spent_block_index=0)]
+    out = engine.step()
+    assert out["status"] == JobStatus.CLAIMING and swept == [1]
+    assert "landed too" in _last_message(store, job.id)
+    ctx.coinset.by_ph[0].spent = True                      # the sweep mined
+    out = engine.step()
+    assert out["status"] == JobStatus.COMPLETED

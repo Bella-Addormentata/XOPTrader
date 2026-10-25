@@ -91,6 +91,7 @@ class UnwrapFakeWallet(FakeWallet):
         self.cat_spends: list = []
         self.cat_txs: list = []
         self.cat_removals: list = []      # coins the next cat_spend reports spent
+        self.cat_spend_excludes: list = []  # exclude_coin_ids of each cat_spend
 
     def get_wallets(self, *, wallet_type=None):
         return [{"id": self.cat_wallet_id, "type": 6, "name": "wUSDC.b"}]
@@ -101,8 +102,10 @@ class UnwrapFakeWallet(FakeWallet):
     def get_wallet_balance(self, wallet_id):
         return dict(self.balances[int(wallet_id)])
 
-    def cat_spend(self, wallet_id, amount, inner_address, *, fee_mojos=0, memos=None):
+    def cat_spend(self, wallet_id, amount, inner_address, *, fee_mojos=0, memos=None,
+                  exclude_coin_ids=None):
         self.cat_spends.append((wallet_id, amount, inner_address, fee_mojos))
+        self.cat_spend_excludes.append(list(exclude_coin_ids or []))
         return {"name": f"burn-tx-{len(self.cat_spends)}",
                 "removals": list(self.cat_removals)}
 

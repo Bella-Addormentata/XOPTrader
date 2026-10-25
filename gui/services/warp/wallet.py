@@ -191,6 +191,7 @@ class WalletClient:
         *,
         fee_mojos: int = 0,
         memos: Optional[list[str]] = None,
+        exclude_coin_ids: Optional[list[str]] = None,
     ) -> dict:
         """Move CAT units to an arbitrary inner puzzle hash (bech32m-encoded).
 
@@ -207,6 +208,11 @@ class WalletClient:
         to an open offer. This omission is the entire coin-conflict mitigation
         (docs/warp-unwrap-design.md §6.1/§7).
 
+        ``exclude_coin_ids`` (the daemon's ``excluded_coin_ids``) keeps named
+        coins OUT of its selection -- still its selection, so offer locks are
+        honoured -- for a replacement of a vanished cat_spend that must not
+        reuse the first one's coins.
+
         Like send_transaction, this issues one RPC and never retries; the
         caller owns de-duplication.
         """
@@ -218,6 +224,11 @@ class WalletClient:
         }
         if memos:
             body["memos"] = list(memos)
+        if exclude_coin_ids:
+            body["excluded_coin_ids"] = [
+                c if str(c).startswith("0x") else "0x" + str(c)
+                for c in exclude_coin_ids
+            ]
         data = self._post("cat_spend", body)
         tx = data.get("transaction")
         return tx if isinstance(tx, dict) else data
