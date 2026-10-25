@@ -2422,6 +2422,11 @@ class WarpEngine:
             # check above, is spent -- at depth, or the recovery could yet be
             # reorged out); the wallet's word alone keeps waiting.
             if verdict is cs.Verdict.LANDED and ev.output_landed:
+                if (tx_id == _FUNDING_TX_UNKNOWN and len(ev.removals) > 1
+                        and not self._unnamed_group_dead(ev.removals, min_depth)):
+                    return False, ("unnamed funding sends share one record; one "
+                                   "landed but not every coin of theirs is spent "
+                                   "yet; Sweep again later")
                 deep, depth_why = self._outputs_settled(
                     outputs, amount=amount, removals=ev.removals,
                     min_depth=min_depth)
@@ -2481,6 +2486,11 @@ class WarpEngine:
                                    "every coin of theirs is spent yet")
                 continue
             if verdict is cs.Verdict.LANDED and ev.output_landed:
+                if (tx_id == _FUNDING_TX_UNKNOWN and len(ev.removals) > 1
+                        and not self._unnamed_group_dead(ev.removals, min_depth)):
+                    return False, ("unnamed cat_spends share one record; one "
+                                   "landed but not every coin of theirs is spent "
+                                   "yet")
                 deep, depth_why = self._outputs_settled(
                     outputs, amount=amount, removals=ev.removals,
                     min_depth=min_depth)
@@ -2502,9 +2512,27 @@ class WarpEngine:
 
         self._wallet.log_in()
         tx_id = str(job.state.get(tx_key) or "")
+        if self._unnamed(tx_id):
+            # [review] The sentinel is not a transaction id: the hash-based
+            # RPCs would answer with an error, which gather reads as "could
+            # not tell" and the send would never leave UNKNOWN.  The wallet
+            # history scan (run by the caller) is its only wallet handle;
+            # here it is known to hold no record and to be in no mempool
+            # item of that name, and its recorded coins decide.
+            wallet_record = lambda: None  # noqa: E731
+            mempool_item = lambda: None  # noqa: E731
+        else:
+            wallet_record = lambda: self._wallet.get_transaction_or_none(tx_id)  # noqa: E731
+            mempool_item = lambda: self._coinset.get_mempool_item_by_tx_id(tx_id)  # noqa: E731
+        if job.state.get(f"{tx_key}_prior"):
+            # [review] Once a send was replaced the key holds other attempts'
+            # coins too: a replaced send that landed and was swept must not
+            # make a dead current one read as landed.  An output is this
+            # send's only when its parent is one of the coins it spent.
+            unique_output = False
         ev = cs.gather(
-            wallet_record=lambda: self._wallet.get_transaction_or_none(tx_id),
-            mempool_item=lambda: self._coinset.get_mempool_item_by_tx_id(tx_id),
+            wallet_record=wallet_record,
+            mempool_item=mempool_item,
             coin_spent=self._coin_spent_depth,
             outputs_at=lambda: self._coinset.get_coin_records_by_puzzle_hash(
                 out_ph_hex, include_spent=True),

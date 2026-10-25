@@ -1715,3 +1715,75 @@ def test_retry_replaces_an_unnamed_cat_spend_only_when_dead():
     assert st["burn_tx_id"] is None
     assert st["burn_tx_id_exclude"] == [RID]
     assert st["burn_tx_id_prior"] == [S._FUNDING_TX_UNKNOWN + "#1"]
+
+
+# --------------------------------------------------------------------------- #
+# Review round 13.
+# --------------------------------------------------------------------------- #
+
+def test_an_unnamed_sends_evidence_never_queries_the_sentinel(monkeypatch):
+    """[review] The hash RPCs reject the sentinel; that error must not keep
+    an orphaned unnamed funding send UNKNOWN on every Retry."""
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_funding(store, funding_tx_id=S._FUNDING_TX_UNKNOWN,
+                        funding_amount=EXPECTED, funding_tx_id_removals=[RID])
+    ctx.coinset.records[RID] = _rec(spent=False)
+
+    def invalid_hex(tx_id):
+        raise RuntimeError(f"invalid hex: {tx_id}")
+
+    ctx.wallet.get_transaction_or_none = invalid_hex
+    ctx.coinset.get_mempool_item_by_tx_id = invalid_hex
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     expected_status=JobStatus.FUNDING_CLAIM,
+                     state_patch={"failed_from": JobStatus.FUNDING_CLAIM})
+    engine.job_action(job.id, "retry")
+    st = store.get_job(job.id).state
+    assert st["funding_tx_id"] is None
+    assert st["funding_tx_id_prior"] == [S._FUNDING_TX_UNKNOWN + "#1"]
+
+
+def test_a_legacy_merged_entry_settles_as_landed_only_with_every_coin_spent():
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _job_with_a_landed_replaced_toll(store)
+    store.update_job(job.id, state_patch={
+        "funding_tx_id_prior": [S._FUNDING_TX_UNKNOWN],
+        "funding_tx_id_prior_removals": {S._FUNDING_TX_UNKNOWN: [RID, RID2]}})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID] = _rec(spent=True)              # A landed, swept at depth
+    ctx.coinset.by_ph = [SimpleNamespace(
+        coin=SimpleNamespace(parent_coin_info=RID, puzzle_hash="5b" * 32,
+                             amount=NET.chia_toll_mojos),
+        spent=True, confirmed_block_index=PEAK - 50, spent_block_index=PEAK - 40)]
+    ctx.coinset.records[RID2] = _rec(spent=False)            # B could still land
+    settled, note = engine._prior_sends_settled(store.get_active_job())
+    assert not settled and "share one record" in note
+    ctx.coinset.records[RID2] = _rec(spent=True)
+    assert engine._prior_sends_settled(store.get_active_job())[0]
+
+
+def test_a_dead_replacement_is_not_read_as_landed_by_a_swept_priors_coin(monkeypatch):
+    """[review] A replaced send A landed and was swept; the replacement B
+    then died.  A's spent output must not make B read LANDED."""
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_funding(store, funding_tx_id="fund-b", funding_amount=EXPECTED,
+                  funding_tx_id_removals=[RID2],
+                  funding_tx_id_prior=["fund-a"],
+                  funding_tx_id_prior_removals={"fund-a": [RID]})
+    ctx.coinset.peak = PEAK
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.records[RID2] = _rec(spent=True)             # B: dead
+    ctx.coinset.by_ph = [SimpleNamespace(                    # A's coin, swept
+        coin=SimpleNamespace(parent_coin_info=RID, puzzle_hash=SECURITY_PH.hex(),
+                             amount=EXPECTED),
+        spent=True, confirmed_block_index=PEAK - 50, spent_block_index=PEAK - 40)]
+    engine.step()
+    assert [s[0] for s in ctx.wallet.sent] == [EXPECTED]
+    st = store.get_active_job().state
+    assert st["funding_tx_id"] == "funding-tx-1"
+    assert st["funding_tx_id_prior"] == ["fund-a", "fund-b"]
