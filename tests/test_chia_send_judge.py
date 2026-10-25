@@ -24,8 +24,12 @@ def _coin(parent, ph, amount):
         parent_coin_info=parent, puzzle_hash=ph, amount=amount))
 
 
+DEEP = 32    # mainnet's chia_confirmation_min_height
+
+
 def _gather(*, wallet=None, wallet_raises=False, mempool=None, spent=None,
-            outputs=(), removals=(), unique=True):
+            outputs=(), removals=(), unique=True, min_depth=DEEP):
+    """``spent`` maps a coin id to its spend's confirmations (0 = unspent)."""
     def wallet_record():
         if wallet_raises:
             raise RuntimeError("rpc down")
@@ -37,6 +41,7 @@ def _gather(*, wallet=None, wallet_raises=False, mempool=None, spent=None,
         coin_spent=lambda cid: (spent or {}).get(cid),
         outputs_at=lambda: list(outputs),
         known_removals=removals, out_amount=OUT_AMOUNT, unique_output=unique,
+        min_depth=min_depth,
     )
 
 
@@ -68,7 +73,7 @@ def test_removal_ids_read_the_coins_a_record_spent():
 def test_job_4_is_dead():
     """Gone from the wallet, its input spent by another spend, no output."""
     rid = "c" * 64
-    ev = _gather(wallet=None, mempool=None, spent={rid: True}, removals=[rid])
+    ev = _gather(wallet=None, mempool=None, spent={rid: 837}, removals=[rid])
     assert ev.removal_spent is True and ev.wallet_known is False
     verdict, why = cs.judge(ev)
     assert verdict is cs.Verdict.DEAD
@@ -77,7 +82,7 @@ def test_job_4_is_dead():
 
 def test_an_input_spent_by_our_own_send_means_landed():
     rid = "c" * 64
-    ev = _gather(wallet=None, mempool=None, spent={rid: True}, removals=[rid],
+    ev = _gather(wallet=None, mempool=None, spent={rid: 837}, removals=[rid],
                  outputs=[_coin(rid, OUT_PH, OUT_AMOUNT)])
     assert cs.judge(ev)[0] is cs.Verdict.LANDED
 
@@ -87,10 +92,10 @@ def test_a_shared_output_puzzle_needs_our_parent():
     someone else's spend is not our output."""
     rid = "c" * 64
     other = _coin("d" * 64, OUT_PH, OUT_AMOUNT)
-    ev = _gather(wallet=None, mempool=None, spent={rid: True}, removals=[rid],
+    ev = _gather(wallet=None, mempool=None, spent={rid: 837}, removals=[rid],
                  outputs=[other], unique=False)
     assert cs.judge(ev)[0] is cs.Verdict.DEAD
-    ev2 = _gather(wallet=None, mempool=None, spent={rid: True}, removals=[rid],
+    ev2 = _gather(wallet=None, mempool=None, spent={rid: 837}, removals=[rid],
                   outputs=[other], unique=True)
     assert cs.judge(ev2)[0] is cs.Verdict.LANDED
 
@@ -98,9 +103,9 @@ def test_a_shared_output_puzzle_needs_our_parent():
 def test_the_wallet_holding_it_means_alive():
     rid = "c" * 64
     ev = _gather(wallet={"confirmed": False, "removals": []},
-                 spent={rid: False}, removals=[rid])
+                 spent={rid: 0}, removals=[rid])
     assert cs.judge(ev)[0] is cs.Verdict.ALIVE
-    ev = _gather(wallet={"confirmed": True}, spent={rid: False}, removals=[rid])
+    ev = _gather(wallet={"confirmed": True}, spent={rid: 0}, removals=[rid])
     assert cs.judge(ev)[0] is cs.Verdict.LANDED
 
 
@@ -115,7 +120,7 @@ def test_the_mempool_holding_it_means_alive_and_teaches_the_removals():
 
 def test_nowhere_with_unspent_inputs_is_an_orphan():
     rid = "c" * 64
-    ev = _gather(wallet=None, mempool=None, spent={rid: False}, removals=[rid])
+    ev = _gather(wallet=None, mempool=None, spent={rid: 0}, removals=[rid])
     verdict, why = cs.judge(ev)
     assert verdict is cs.Verdict.ORPHAN and "unspent" in why
     # ...and so is one whose inputs nobody recorded.
@@ -127,7 +132,7 @@ def test_nowhere_with_unspent_inputs_is_an_orphan():
 def test_an_unanswered_probe_is_unknown_not_dead():
     rid = "c" * 64
     # The wallet did not answer: nothing can be concluded from "no record".
-    ev = _gather(wallet_raises=True, mempool=None, spent={rid: False},
+    ev = _gather(wallet_raises=True, mempool=None, spent={rid: 0},
                  removals=[rid])
     assert ev.wallet_known is None
     assert cs.judge(ev)[0] is cs.Verdict.UNKNOWN
@@ -141,7 +146,7 @@ def test_a_spent_input_outranks_the_wallets_optimism():
     """The wallet keeps retrying a send whose coin is gone (DOUBLE_SPEND
     forever); the chain's verdict wins."""
     rid = "c" * 64
-    ev = _gather(wallet={"confirmed": False}, spent={rid: True}, removals=[rid])
+    ev = _gather(wallet={"confirmed": False}, spent={rid: 837}, removals=[rid])
     assert cs.judge(ev)[0] is cs.Verdict.DEAD
 
 
@@ -154,7 +159,7 @@ def test_a_spent_input_with_no_output_answer_is_unknown_not_dead():
         raise RuntimeError("coinset down")
 
     ev = cs.gather(wallet_record=lambda: None, mempool_item=lambda: None,
-                   coin_spent=lambda cid: True, outputs_at=boom,
+                   coin_spent=lambda cid: 837, outputs_at=boom,
                    known_removals=[rid], out_amount=OUT_AMOUNT, unique_output=True)
     assert ev.output_landed is None and ev.removal_spent is True
     verdict, why = cs.judge(ev)
@@ -170,7 +175,25 @@ def test_the_wallets_confirmation_outranks_a_spent_input():
         raise RuntimeError("coinset down")
 
     ev = cs.gather(wallet_record=lambda: {"confirmed": True},
-                   mempool_item=lambda: None, coin_spent=lambda cid: True,
+                   mempool_item=lambda: None, coin_spent=lambda cid: 837,
                    outputs_at=boom, known_removals=[rid], out_amount=OUT_AMOUNT,
                    unique_output=True)
     assert cs.judge(ev)[0] is cs.Verdict.LANDED
+
+
+def test_a_shallow_conflict_waits_for_depth():
+    """[review] A reorg can hand the coin back and make the send valid again;
+    only a spend at the confirmation threshold proves it dead."""
+    rid = "c" * 64
+    ev = _gather(wallet=None, mempool=None, spent={rid: 5}, removals=[rid])
+    assert ev.removal_spent is False, "no spend AT DEPTH"
+    assert ev.removal_spent_depth == 5
+    verdict, why = cs.judge(ev)
+    assert verdict is cs.Verdict.SHALLOW and "5/32" in why
+    # At the threshold it counts.
+    ev = _gather(wallet=None, mempool=None, spent={rid: DEEP}, removals=[rid])
+    assert cs.judge(ev)[0] is cs.Verdict.DEAD
+    # The wallet still holding a shallowly-conflicted send: still shallow,
+    # never alive-and-forgotten.
+    ev = _gather(wallet={"confirmed": False}, spent={rid: 5}, removals=[rid])
+    assert cs.judge(ev)[0] is cs.Verdict.SHALLOW

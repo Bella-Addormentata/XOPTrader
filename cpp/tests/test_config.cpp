@@ -212,6 +212,44 @@ accounting:
               "aabbccddeeff00112233445566778899");
 }
 
+// [WARP-LOST-SEND 2026-10-25] The engine reads the jobs database the GUI
+// writes: warp.jobs_db when accounting.bridge_jobs_db_path is not set.
+TEST(ConfigParserTest, BridgeJobsDbPath_FollowsWarpJobsDbWhenUnset) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+warp:
+  enabled: false
+  jobs_db: custom/jobs.db
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, "custom/jobs.db");
+
+    // ...and with an accounting section that leaves the key unset.
+    std::string yaml2 = std::string(kMinimalValidYaml) + R"(
+accounting:
+  ledger_enabled: true
+warp:
+  enabled: false
+  jobs_db: custom/jobs.db
+)";
+    TempYaml tmp2(yaml2.c_str());
+    auto cfg2 = xop::load_config(tmp2.path());
+    EXPECT_EQ(cfg2.accounting.bridge_jobs_db_path, "custom/jobs.db");
+}
+
+TEST(ConfigParserTest, BridgeJobsDbPath_ExplicitEngineKeyWins) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+accounting:
+  bridge_jobs_db_path: elsewhere/warp.db
+warp:
+  enabled: false
+  jobs_db: custom/jobs.db
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, "elsewhere/warp.db");
+}
+
 TEST(ConfigParserTest, BridgeAssetWithoutEnabledPair_AutoDisables) {
     // [S19 review round 14] Bridge ingestion needs the asset tracked by
     // an enabled pair (openings + balance snapshots come from pairs).

@@ -20,8 +20,11 @@ parties that matter give independently:
 Verdicts, most certain first:
 
 ``LANDED``   the output exists on chain (spent or not);
-``DEAD``     an input is spent and the chain was asked and showed no output
-             of ours: nothing can ever include this send;
+``DEAD``     an input is spent, at the network's confirmation depth, and
+             the chain was asked and showed no output of ours: nothing can
+             ever include this send;
+``SHALLOW``  an input is spent, but too recently to rule out a reorg that
+             puts it back: wait;
 ``ALIVE``    the wallet still holds it, or the mempool still has it;
 ``ORPHAN``   nowhere, with its inputs unspent: it MAY still surface, so a
              caller waits a bounded number of polls before treating it as
@@ -43,6 +46,7 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 class Verdict(str, Enum):
     LANDED = "landed"
     DEAD = "dead"
+    SHALLOW = "shallow"
     ALIVE = "alive"
     ORPHAN = "orphan"
     UNKNOWN = "unknown"
@@ -55,9 +59,11 @@ class SendEvidence:
     wallet_known: Optional[bool]        # the wallet still holds the record
     wallet_confirmed: bool              # ...and calls it confirmed
     removals: tuple                     # coin ids (hex, no 0x) it spent; () unknown
-    removal_spent: Optional[bool]       # any input spent on chain
+    removal_spent: Optional[bool]       # any input spent on chain, at depth
+    removal_spent_depth: int            # confirmations of the deepest such spend
     output_landed: Optional[bool]       # the expected output exists on chain
     in_mempool: Optional[bool]          # coinset's mempool has the bundle
+    min_depth: int = 1                  # the depth a spend needs to count
 
 
 def _hx(value: Any) -> str:
@@ -100,20 +106,26 @@ def gather(
     *,
     wallet_record: Callable[[], Optional[dict]],
     mempool_item: Callable[[], Optional[dict]],
-    coin_spent: Callable[[str], Optional[bool]],
+    coin_spent: Callable[[str], Optional[int]],
     outputs_at: Callable[[], Iterable[Any]],
     known_removals: Sequence[str],
     out_amount: int,
     unique_output: bool,
+    min_depth: int = 1,
 ) -> SendEvidence:
     """Run the probes, each tolerated to fail on its own.
 
-    ``coin_spent(coin_id)`` answers True/False, or None when the coin is not
-    indexed.  ``outputs_at()`` lists coin records (``.coin.amount``,
-    ``.coin.parent_coin_info``) at the expected output puzzle hash, spent
-    ones included.  With ``unique_output`` the puzzle hash belongs to this
-    job alone (an ephemeral key), so any coin of the right amount there is
-    ours; otherwise the output must descend from one of our inputs.
+    ``coin_spent(coin_id)`` answers the spend's confirmations (0 = unspent),
+    or None when the coin is not indexed or the depth cannot be told.  A
+    spend counts as proof only from ``min_depth`` confirmations (the
+    network's confirmation threshold): a shallower one may yet be reorged
+    out, which would make the judged send valid again -- and a cat_spend
+    sent again on that proof would then burn twice.  ``outputs_at()`` lists
+    coin records (``.coin.amount``, ``.coin.parent_coin_info``) at the
+    expected output puzzle hash, spent ones included.  With
+    ``unique_output`` the puzzle hash belongs to this job alone (an
+    ephemeral key), so any coin of the right amount there is ours;
+    otherwise the output must descend from one of our inputs.
     """
     wallet_known: Optional[bool] = None
     wallet_confirmed = False
@@ -138,18 +150,22 @@ def gather(
         in_mempool = None
 
     removal_spent: Optional[bool] = None
+    deepest = 0
     if removals:
         seen_all = True
         for rid in removals:
             try:
-                spent = coin_spent(rid)
+                depth = coin_spent(rid)
             except Exception:  # noqa: BLE001
-                spent = None
-            if spent is True:
-                removal_spent = True
-                break
-            if spent is None:
+                depth = None
+            if depth is None:
                 seen_all = False
+                continue
+            depth = int(depth)
+            if depth > deepest:
+                deepest = depth
+            if depth >= max(1, int(min_depth)):
+                removal_spent = True
         if removal_spent is None and seen_all:
             removal_spent = False
 
@@ -169,7 +185,8 @@ def gather(
     return SendEvidence(
         wallet_known=wallet_known, wallet_confirmed=wallet_confirmed,
         removals=removals, removal_spent=removal_spent,
-        output_landed=output_landed, in_mempool=in_mempool,
+        removal_spent_depth=deepest, output_landed=output_landed,
+        in_mempool=in_mempool, min_depth=max(1, int(min_depth)),
     )
 
 
@@ -189,11 +206,19 @@ def judge(ev: SendEvidence) -> tuple:
     if ev.removal_spent:
         if ev.output_landed is False:
             return Verdict.DEAD, (
-                "a coin it spent was spent by another transaction, so it can "
+                "a coin it spent was spent by another transaction "
+                f"({ev.removal_spent_depth} confirmations ago), so it can "
                 "never confirm")
         return Verdict.UNKNOWN, (
             "a coin it spent is spent, but the chain did not answer whether "
             "our output exists")
+    if ev.removal_spent_depth > 0:
+        # Spent, but not yet past the confirmation threshold: a reorg could
+        # still return the coin, and with it this send's validity.
+        return Verdict.SHALLOW, (
+            "a coin it spent was spent by another transaction "
+            f"{ev.removal_spent_depth}/{ev.min_depth} confirmations ago; "
+            "waiting for depth before treating it as dead")
     if ev.wallet_known:
         return Verdict.ALIVE, "the wallet still holds it unconfirmed"
     if ev.in_mempool:

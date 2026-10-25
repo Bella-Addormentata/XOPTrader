@@ -46,6 +46,7 @@ RID = "c4a91ced4257254eb8a1e7c166de014eb3daaedd0f8a8c0ef6f41cfc09847d3c"
 SECURITY_PH = b"\x5b" * 32
 EXPECTED = 4985 + 100_000_000          # post-tip + the default claim fee
 LIMIT = S._ORPHAN_POLLS_BEFORE_RESEND
+PEAK = 9_478_613                       # 837 blocks past the conflicting spend
 
 
 def _last_message(store, job_id) -> str:
@@ -89,6 +90,7 @@ def test_job_4s_funding_send_is_sent_again(monkeypatch):
     _seed_funding(store, funding_tx_id=DEAD_TX, funding_amount=EXPECTED,
                   funding_tx_id_removals=[RID])
     ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = PEAK
 
     out = engine.step()
 
@@ -109,6 +111,7 @@ def test_a_dead_send_still_in_the_history_is_not_adopted_again(monkeypatch):
     engine, ctx = build(store)
     _seed_funding(store, funding_tx_id=DEAD_TX, funding_tx_id_removals=[RID])
     ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = PEAK
     ctx.wallet.tx_records[DEAD_TX] = {"confirmed": False, "removals": []}
     ctx.wallet.txs = [{"name": DEAD_TX, "additions": [
         {"puzzle_hash": SECURITY_PH.hex(), "amount": EXPECTED}]}]
@@ -284,6 +287,7 @@ def test_a_cat_spend_whose_coin_went_elsewhere_is_sent_again():
     store.update_job(job.id, state_patch={"burn_tx_id": "burn-dead",
                                           "burn_tx_id_removals": [RID]})
     ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = PEAK
 
     engine.step()
 
@@ -351,6 +355,7 @@ def test_a_toll_funding_send_whose_coin_went_elsewhere_is_sent_again(monkeypatch
         "ephemeral_blob": blob, "funding_tx_id": "toll-dead",
         "funding_amount": NET.chia_toll_mojos, "funding_tx_id_removals": [RID]})
     ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = PEAK
 
     engine.step()
 
@@ -466,6 +471,7 @@ def test_a_dead_cat_spends_output_pin_goes_with_it():
         "burn_tx_id": "burn-dead", "burn_tx_id_removals": [RID],
         "burn_cat_coin_id": "aa" * 32})
     ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = PEAK
     engine.step()
     st = store.get_active_job().state
     assert len(ctx.wallet.cat_spends) == 1
@@ -541,3 +547,59 @@ def test_a_sweep_conflict_resolves_only_a_spent_coin(monkeypatch):
     monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
     resolved, _status = engine._sweep_security(job, FakeCoin(b"Z" * 32), b"" * 32)
     assert resolved
+
+
+# --------------------------------------------------------------------------- #
+# Review round 2.
+# --------------------------------------------------------------------------- #
+
+def test_a_shallow_conflict_does_not_authorise_a_second_cat_spend():
+    """[review] The conflicting spend must reach chia_confirmation_min_height
+    before it counts: a reorg could return the coin and validate the first
+    cat_spend, and a second one would then burn twice."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = _to_burn_sent(store, engine)
+    store.update_job(job.id, state_patch={"burn_tx_id": "burn-conflicted",
+                                          "burn_tx_id_removals": [RID]})
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = 9_477_776 + 5                 # 6 confirmations
+    for _ in range(3):
+        engine.step()
+    assert ctx.wallet.cat_spends == []
+    st = store.get_active_job().state
+    assert st["burn_tx_id"] == "burn-conflicted"
+    assert "6/" in _last_message(store, job.id)
+    assert not st.get("burn_tx_id_orphan_polls")
+    ctx.coinset.peak = 9_477_776 + NET.chia_confirmation_min_height - 1
+    engine.step()
+    assert len(ctx.wallet.cat_spends) == 1
+
+
+def test_an_unknown_peak_never_counts_a_spend_as_proof(monkeypatch):
+    _no_coin(monkeypatch)
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_funding(store, funding_tx_id=DEAD_TX, funding_tx_id_removals=[RID])
+    ctx.coinset.records[RID] = _rec(spent=True)
+    ctx.coinset.peak = 0
+    engine.step()
+    assert ctx.wallet.sent == []
+
+
+def test_the_cat_spend_waits_until_the_toll_and_both_fees_are_covered():
+    """[review] After the burn the job is forward-only: the toll coin and its
+    fee must still be affordable on the tick that commits."""
+    toll, fee = NET.chia_toll_mojos, 10_000_000
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap(offer_fee_mojos=fee))
+    _to_burn_sent(store, engine)
+    ctx.wallet.balances[1] = {"confirmed_wallet_balance": toll + 2 * fee - 1,
+                              "spendable_balance": toll + 2 * fee - 1}
+    out = engine.step()
+    assert ctx.wallet.cat_spends == []
+    assert out["status"] == JobStatus.BURN_SENT and out["retry_count"] == 0
+    ctx.wallet.balances[1] = {"confirmed_wallet_balance": toll + 2 * fee,
+                              "spendable_balance": toll + 2 * fee}
+    engine.step()
+    assert len(ctx.wallet.cat_spends) == 1

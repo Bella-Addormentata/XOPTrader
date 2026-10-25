@@ -2110,9 +2110,20 @@ class WarpEngine:
         if status.get("synced") is not True or status.get("syncing") is True:
             raise WarpPending(f"{context}: the Chia wallet is syncing; waiting")
 
-    def _coin_spent(self, coin_id_hex: str) -> Optional[bool]:
+    def _coin_spent_depth(self, coin_id_hex: str) -> Optional[int]:
+        """Confirmations of the spend of a coin: 0 when unspent, None when
+        the coin is not indexed or the peak is unknown (then the depth
+        cannot be told, and a spend must not count as proof)."""
         rec = self._coinset.get_coin_record_by_name(coin_id_hex)
-        return None if rec is None else bool(rec.spent)
+        if rec is None:
+            return None
+        if not rec.spent:
+            return 0
+        peak = int(self._coinset.get_peak_height() or 0)
+        spent_at = int(rec.spent_block_index or 0)
+        if peak <= 0 or spent_at <= 0 or peak < spent_at:
+            return None
+        return peak - spent_at + 1
 
     def _recorded_send_verdict(self, job: WarpJob, *, tx_key: str,
                                out_ph_hex: str, out_amount: int,
@@ -2125,11 +2136,15 @@ class WarpEngine:
         ev = cs.gather(
             wallet_record=lambda: self._wallet.get_transaction_or_none(tx_id),
             mempool_item=lambda: self._coinset.get_mempool_item_by_tx_id(tx_id),
-            coin_spent=self._coin_spent,
+            coin_spent=self._coin_spent_depth,
             outputs_at=lambda: self._coinset.get_coin_records_by_puzzle_hash(
                 out_ph_hex, include_spent=True),
             known_removals=job.state.get(f"{tx_key}_removals") or [],
             out_amount=int(out_amount), unique_output=unique_output,
+            # [review] A conflicting spend is proof only at the depth the
+            # network treats as final: shallower, a reorg could hand the
+            # coin back and make the judged send valid again.
+            min_depth=int(self._net.chia_confirmation_min_height),
         )
         verdict, why = cs.judge(ev)
         return verdict, why, ev
@@ -2217,7 +2232,7 @@ class WarpEngine:
                 state={**learned, polls_key: polls},
                 message=f"{label} {tx_id} is {why} ({polls}/{limit}); {hint}",
             ), {}
-        if verdict is cs.Verdict.UNKNOWN:
+        if verdict in (cs.Verdict.UNKNOWN, cs.Verdict.SHALLOW):
             return _stay(
                 state=learned or None,
                 message=f"{label} {tx_id}: {why}; awaiting the coin",
@@ -3028,7 +3043,15 @@ class WarpEngine:
         # UNWRAP_CHECKS and collateral may have moved.
         fee = self._chia_send_fee(p.unwrap_chia_fee_mojos, cost=_COST_CAT_SPEND)
         self._require_wallet_synced("cat_spend")
-        self._require_spendable_xch(fee, context="cat_spend fee")
+        # [review] Not just this fee: after the burn the job is forward-only
+        # and must still fund the toll coin (toll + the send's fee).  Fees
+        # may have risen since G10, so the whole remaining budget is
+        # re-checked on the tick that commits.
+        toll_fee = self._chia_send_fee(p.unwrap_chia_fee_mojos, cost=_COST_XCH_SEND)
+        self._require_spendable_xch(
+            int(net.chia_toll_mojos) + fee + toll_fee,
+            context="cat_spend (its fee, then the toll coin and its fee)",
+        )
         self._wallet.log_in()
         record = self._wallet.cat_spend(
             int(job.state["cat_wallet_id"]),
