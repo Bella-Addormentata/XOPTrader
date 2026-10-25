@@ -24,6 +24,10 @@
 //   * strategy.startup_analysis_blocks
 //                             -- the observe-before-quoting phase runs once,
 //                                before the first heartbeat.
+//   * accounting.ledger_enabled / bridge_ingest_enabled turned ON, or the
+//     bridge asset ids changing
+//                             -- the ledger openings they rely on are posted
+//                                once, at startup (turning either OFF is live).
 //   * a pair being ENABLED, ADDED or REMOVED, or a pair's asset ids or
 //                                units changing -- per-pair strategy objects,
 //                                estimators and seats exist only for pairs
@@ -148,6 +152,29 @@ inline bool pair_identity_differs(const PairConfig& a, const PairConfig& b)
             != saved.strategy.startup_analysis_blocks,
         "strategy.startup_analysis_blocks");
     m.strategy.startup_analysis_blocks = running.strategy.startup_analysis_blocks;
+
+    // Ledger openings (post_ledger_genesis) are written once, at startup,
+    // for the accounting set-up of that moment: turning the ledger or bridge
+    // booking ON, or moving the bridge assets, needs that genesis to run
+    // again. Turning either OFF applies live.
+    const AccountingConfig& ra = running.accounting;
+    const AccountingConfig& sa = saved.accounting;
+    if (!ra.ledger_enabled && sa.ledger_enabled) {
+        rr.push_back("accounting.ledger_enabled");
+        m.accounting.ledger_enabled = false;
+    }
+    if (!ra.bridge_ingest_enabled && sa.bridge_ingest_enabled) {
+        rr.push_back("accounting.bridge_ingest_enabled");
+        m.accounting.bridge_ingest_enabled = false;
+    }
+    if (ra.bridge_asset_id != sa.bridge_asset_id
+        || ra.bridge_secondary_asset_ids != sa.bridge_secondary_asset_ids) {
+        rr.push_back("accounting bridge asset ids");
+        m.accounting.bridge_asset_id            = ra.bridge_asset_id;
+        m.accounting.bridge_secondary_asset_ids = ra.bridge_secondary_asset_ids;
+        m.accounting.bridge_secondary_asset_ids_explicit =
+            ra.bridge_secondary_asset_ids_explicit;
+    }
 
     // -- Pairs: the running set, in the running order -----------------------
     plan.pairs = diff_pair_enables(running.pairs, saved.pairs);

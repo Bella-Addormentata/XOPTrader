@@ -154,6 +154,50 @@ TEST(ConfigLiveApply, the_merged_config_is_held_to_the_cross_section_rules)
     EXPECT_THROW(xop::validate_config_relations(plan.merged), xop::ConfigError);
 }
 
+TEST(ConfigLiveApply, turning_the_ledger_on_waits_turning_it_off_does_not)
+{
+    auto running = running_config();
+    running.accounting.ledger_enabled        = false;
+    running.accounting.bridge_ingest_enabled = false;
+    auto saved = running;
+    saved.accounting.ledger_enabled        = true;
+    saved.accounting.bridge_ingest_enabled = true;
+    auto plan = xop::plan_live_config(running, saved);
+    EXPECT_TRUE(lists(plan.restart_required, "accounting.ledger_enabled"));
+    EXPECT_TRUE(lists(plan.restart_required, "accounting.bridge_ingest_enabled"));
+    EXPECT_FALSE(plan.merged.accounting.ledger_enabled)
+        << "no opening balances exist in this process";
+    EXPECT_FALSE(plan.merged.accounting.bridge_ingest_enabled);
+
+    plan = xop::plan_live_config(saved, running);   // on -> off
+    EXPECT_TRUE(plan.restart_required.empty());
+    EXPECT_FALSE(plan.merged.accounting.ledger_enabled);
+}
+
+TEST(ConfigLiveApply, a_retained_revive_pair_still_refuses_batching)
+{
+    // The file drops a Revive pair and turns batching on: fine on its own,
+    // but the running engine keeps that pair, and batching would merge its
+    // capped tiers into one offer above revive_max_offer_size_units.
+    auto running = running_config();
+    running.strategy.revive_max_offer_size_units = 1.0;
+    running.strategy.batch_offers_enabled        = false;
+    running.pairs[1].revive_market               = true;
+    auto saved = running;
+    saved.pairs.erase(saved.pairs.begin() + 1);
+    saved.strategy.batch_offers_enabled = true;
+
+    const auto plan = xop::plan_live_config(running, saved);
+    ASSERT_TRUE(plan.merged.pairs[1].revive_market);
+    try {
+        xop::validate_config_relations(plan.merged);
+        FAIL() << "the merged config must be refused";
+    } catch (const xop::ConfigError& e) {
+        EXPECT_NE(std::string(e.what()).find("batch_offers_enabled"),
+                  std::string::npos) << e.what();
+    }
+}
+
 TEST(ConfigLiveApply, a_disable_applies_an_enable_waits)
 {
     const auto running = running_config();
