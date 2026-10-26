@@ -8191,8 +8191,14 @@ void Engine::step_evaluate_pace(BlockHeight block_height)
         pace_assets_consumed_this_cycle_.clear();
         pace_last_status_.clear();
         pace_band_conflict_logged_.clear();
-        pace_refresh_attempted_at_.clear();
-        pace_refresh_failures_.clear();
+        // [TARGET-GAP 2026-10-26] The balance refresh keeps its backoff while
+        // the target-gap bid floor still runs it: cleared every heartbeat, a
+        // failing or malformed reply would be retried, and warned about, on
+        // every heartbeat instead of once per refresh age.
+        if (!config_.strategy.target_gap_sizing_enabled) {
+            pace_refresh_attempted_at_.clear();
+            pace_refresh_failures_.clear();
+        }
         return;
     }
 

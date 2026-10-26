@@ -208,3 +208,26 @@ TEST(SizingWiring, TheBalanceRefreshRunsWhileTheTargetGapFloorIsOn) {
     // The refresh's own gate is pinned with its other gates in
     // test_pace_wiring.cpp (PaceWiring.BalanceRefreshClosedByEveryPostingGate).
 }
+
+TEST(SizingWiring, TheBalanceRefreshKeepsItsBackoffWhilePaceIsOff) {
+    // step_evaluate_pace() resets pace's state every heartbeat while pace is
+    // off.  The refresh's backoff (one RPC per asset per refresh age, a warning
+    // on the first failure of a run) must survive that while the target-gap
+    // floor still runs the refresh, or a failing reply is retried every
+    // heartbeat.
+    const std::string body =
+        function_body(read_engine_cpp(), "void Engine::step_evaluate_pace(BlockHeight block_height)");
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t off_at = position_of(body, "if (!config_.strategy.pace_enabled) {");
+    const std::size_t kept_at = position_of(body, "if (!config_.strategy.target_gap_sizing_enabled) { "
+                                                  "pace_refresh_attempted_at_.clear(); "
+                                                  "pace_refresh_failures_.clear(); }");
+    ASSERT_NE(off_at, std::string::npos);
+    ASSERT_NE(kept_at, std::string::npos);
+    EXPECT_LT(off_at, kept_at);
+    // Cleared nowhere else.
+    EXPECT_EQ(count_of(body, "pace_refresh_attempted_at_.clear();"), 1u);
+    EXPECT_EQ(count_of(body, "pace_refresh_failures_.clear();"), 1u);
+    EXPECT_EQ(count_of(read_engine_cpp(), "pace_refresh_attempted_at_.clear()"), 1u);
+    EXPECT_EQ(count_of(read_engine_cpp(), "pace_refresh_failures_.clear()"), 1u);
+}
