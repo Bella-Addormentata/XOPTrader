@@ -138,22 +138,39 @@ TEST(SizingReserveTest, OneUnitHeldPostsAHalfUnitAskInsteadOfNone) {
     const Mojo budget = cap_pool_above_reserve(kHeld, kHeld, reserve);
     EXPECT_EQ(budget, 900);
 
+    // Step 8's pre-post projection for the new asks, under either
+    // strategy.exposure_rule (nothing resting, every coin free).
+    const auto step8 = [&](bool unified, Mojo planned) {
+        ExposureInputs in;
+        in.owned_mojos = kHeld;
+        in.spendable_mojos = kHeld;
+        in.planned_spend_mojos = planned;
+        in.reserve_mojos = reserve;
+        return decide_exposure(unified, in, 0.25).verdict;
+    };
+
     // Before: a 1.0 minimum and the whole balance as the budget kept one
     // 1,000-mojo ask, and Step 8 suppressed it -- 1,000 - 1,000 < 100.
     EXPECT_EQ(xop::tiers_within_budget({1'000, 1'000}, kHeld), 1u);
-    EXPECT_TRUE(exposure_breaches_reserve(kHeld, 0, 1'000, reserve));
+    for (const bool unified : {false, true}) {
+        EXPECT_EQ(step8(unified, 1'000), ExposureVerdict::SuppressNew)
+            << "unified=" << unified;
+    }
 
     // After, at the pair's 0.5 minimum: the floored 500-mojo pool is under
     // the cap, the budget keeps the first up-scaled tier, and Step 8 passes it.
     EXPECT_EQ(cap_pool_above_reserve(500, kHeld, reserve), 500);
     EXPECT_EQ(xop::tiers_within_budget({500, 500, 500, 500, 500, 500}, budget), 1u);
-    EXPECT_FALSE(exposure_breaches_reserve(kHeld, 0, 500, reserve));
 
     // A pool at the whole balance is cut to 900, so tier 0 (the whole pool
     // on a CAT base) still fits instead of being dropped.
     EXPECT_EQ(cap_pool_above_reserve(kHeld, kHeld, reserve), 900);
     EXPECT_EQ(xop::tiers_within_budget({900, 500}, budget), 1u);
-    EXPECT_FALSE(exposure_breaches_reserve(kHeld, 0, 900, reserve));
+
+    for (const bool unified : {false, true}) {
+        EXPECT_EQ(step8(unified, 500), ExposureVerdict::Ok) << "unified=" << unified;
+        EXPECT_EQ(step8(unified, 900), ExposureVerdict::Ok) << "unified=" << unified;
+    }
 }
 
 // -- [review] the reserve kept SPENDABLE: coins held out of offers ---------
