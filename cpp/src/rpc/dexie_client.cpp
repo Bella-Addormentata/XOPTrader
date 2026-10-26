@@ -659,7 +659,8 @@ TickerData parse_market_ticker(const nlohmann::json& j,
 std::optional<MarketTickerMatch> orient_market_ticker(
     const nlohmann::json& markets,
     std::string_view      base_asset_id,
-    std::string_view      quote_asset_id) {
+    std::string_view      quote_asset_id,
+    std::string_view      market_quote) {
 
     if (!markets.is_object()) {
         return std::nullopt;
@@ -724,29 +725,138 @@ std::optional<MarketTickerMatch> orient_market_ticker(
     // [CHURN 2026-10-26] WHICH listing, when Dexie lists the market under
     // both assets' keys.  Bid, ask, high and low are in each listing's own
     // units, so either listing orients them correctly; `last` is not.  Dexie
-    // serves the SAME raw `last` in both listings (TODO S53), so it is right
-    // only in the market's canonical listing: the one under "xch" for an XCH
-    // market, and for a CAT/CAT market the one under its quote -- for
-    // BYC/wUSDC.b, wUSDC.b's.  Our own BYC/wUSDC.b bids settled at 0.896 and
-    // 0.900 on 2026-10-20, and the wUSDC.b-keyed listing served last 0.8988;
-    // the BYC-keyed one, present in 86 of 1,218 reads on 2026-10-25/26,
-    // served the same 0.8988, which Case A turned into 1.1126.  Searching
-    // Case A first under every key made the ingested last trade flip between
-    // the two -- and each flip re-stamped the print as fresh, moved the
-    // published mid by 24%, and got our resting BYC/wUSDC.b asks cancelled as
-    // crossed (68 of them in those 17 h).
-    // So: Case A first only when the BASE is XCH; otherwise Case B first.
-    // With a single listing the order cannot matter.
-    if (base_asset_id == "xch") {
-        if (auto match = find_case_a()) {
-            return match;
-        }
-        return find_case_b();
+    // serves the SAME raw `last` in both listings (TODO S53), in the units of
+    // the market's canonical listing: the one under "xch" for an XCH market,
+    // and for a CAT/CAT market the one under the asset Dexie prices it in
+    // (`market_quote`, from GET /v1/pairs) -- for BYC/wUSDC.b, wUSDC.b's.  Our
+    // own BYC/wUSDC.b bids settled at 0.896 and 0.900 on 2026-10-20, and the
+    // wUSDC.b-keyed listing served last 0.8988; the BYC-keyed one, present in
+    // 86 of 1,218 reads on 2026-10-25/26, served the same 0.8988, which Case
+    // A turned into 1.1126.  Searching Case A first under every key made the
+    // ingested last trade flip between the two -- and each flip re-stamped
+    // the print as fresh, moved the published mid by 24%, and got our resting
+    // BYC/wUSDC.b asks cancelled as crossed (68 of them in those 17 h).
+    // So: search the canonical listing first, and orient `last` as it would,
+    // whichever listing answers.  Without `market_quote` a CAT/CAT market
+    // falls back to the requested quote, which is right for every pair
+    // configured the way Dexie prices it.
+    bool canonical_is_base = false;
+    if (base_asset_id == "xch" || quote_asset_id == "xch") {
+        canonical_is_base = (base_asset_id == "xch");
+    } else {
+        canonical_is_base = !market_quote.empty()
+                         && market_quote == base_asset_id;
     }
-    if (auto match = find_case_b()) {
+
+    if (auto match = canonical_is_base ? find_case_a() : find_case_b()) {
         return match;
     }
-    return find_case_a();
+    auto other = canonical_is_base ? find_case_b() : find_case_a();
+    if (!other) {
+        return std::nullopt;
+    }
+    other->canonical_listing = false;
+    other->oriented.price_last = canonical_is_base
+        ? invert(other->listed.price_last)
+        : other->listed.price_last;
+    return other;
+}
+
+std::vector<PairInfo> parse_pairs_response(const nlohmann::json& body) {
+    std::vector<PairInfo> result;
+    if (!body.is_object()) {
+        return result;
+    }
+    const auto it = body.find("pairs");
+    if (it == body.end() || !it->is_array()) {
+        return result;
+    }
+    // Lenient per entry: one malformed pair must not cost every CAT/CAT
+    // ticker its orientation.
+    const auto side = [](const nlohmann::json& p, const char* key,
+                         PairInfo::Side& out) -> bool {
+        const auto s = p.find(key);
+        if (s == p.end() || !s->is_object()) {
+            return false;
+        }
+        const auto id = s->find("id");
+        if (id == s->end() || !id->is_string()) {
+            return false;
+        }
+        out.id = id->get<std::string>();
+        if (out.id.empty()) {
+            return false;
+        }
+        const auto code = s->find("code");
+        if (code != s->end() && code->is_string()) {
+            out.code = code->get<std::string>();
+        }
+        const auto name = s->find("name");
+        if (name != s->end() && name->is_string()) {
+            out.name = name->get<std::string>();
+        }
+        return true;
+    };
+    result.reserve(it->size());
+    for (const auto& p : *it) {
+        if (!p.is_object()) {
+            continue;
+        }
+        PairInfo pi;
+        if (side(p, "base", pi.base) && side(p, "quote", pi.quote)) {
+            result.push_back(std::move(pi));
+        }
+    }
+    return result;
+}
+
+std::optional<std::string> cat_market_quote(
+    const std::vector<PairInfo>& pairs,
+    std::string_view             a,
+    std::string_view             b) {
+    if (a == "xch" || b == "xch" || a.empty() || b.empty() || a == b) {
+        return std::nullopt;
+    }
+    std::optional<std::string> found;
+    for (const auto& p : pairs) {
+        const bool pairs_them = (p.base.id == a && p.quote.id == b)
+                             || (p.base.id == b && p.quote.id == a);
+        if (!pairs_them) {
+            continue;
+        }
+        if (found && *found != p.quote.id) {
+            return std::nullopt;   // both orders listed: no single answer
+        }
+        found = p.quote.id;
+    }
+    return found;
+}
+
+bool PairsOrientationCache::claim_fetch(Clock::time_point now) {
+    std::lock_guard lock(mu_);
+    if (due_at_ && now < *due_at_) {
+        return false;
+    }
+    due_at_ = now + kRetry;
+    return true;
+}
+
+void PairsOrientationCache::store(std::vector<PairInfo> pairs,
+                                  Clock::time_point     now) {
+    std::lock_guard lock(mu_);
+    pairs_  = std::move(pairs);
+    due_at_ = now + kTtl;
+}
+
+void PairsOrientationCache::fail(Clock::time_point now) {
+    std::lock_guard lock(mu_);
+    due_at_ = now + kRetry;
+}
+
+std::optional<std::string> PairsOrientationCache::quote_for(
+    std::string_view a, std::string_view b) const {
+    std::lock_guard lock(mu_);
+    return cat_market_quote(pairs_, a, b);
 }
 
 // =======================================================================
@@ -760,30 +870,18 @@ asio::awaitable<std::vector<PairInfo>> DexieClient::get_pairs() {
     log_->info("get_pairs()");
 
     const auto json = co_await http_get_("/pairs");
-    std::vector<PairInfo> result;
 
     if (!json.contains("pairs") || !json["pairs"].is_array()) {
         log_->warn("get_pairs: unexpected response shape");
-        co_return result;
+        co_return std::vector<PairInfo>{};
     }
 
-    result.reserve(json["pairs"].size());
-    for (const auto& p : json["pairs"]) {
-        PairInfo pi;
-        if (p.contains("base") && p["base"].is_object()) {
-            pi.base.id   = p["base"].value("id", "");
-            pi.base.code = p["base"].value("code", "");
-            pi.base.name = p["base"].value("name", "");
-        }
-        if (p.contains("quote") && p["quote"].is_object()) {
-            pi.quote.id   = p["quote"].value("id", "");
-            pi.quote.code = p["quote"].value("code", "");
-            pi.quote.name = p["quote"].value("name", "");
-        }
-        result.push_back(std::move(pi));
-    }
-
-    log_->info("get_pairs -> {} pairs", result.size());
+    // [CHURN 2026-10-26] The pure parse_pairs_response() skips an entry
+    // without a usable base and quote id; this loop used to keep it with
+    // empty ids, or throw on a non-string one.
+    auto result = parse_pairs_response(json);
+    log_->info("get_pairs -> {} pairs ({} malformed skipped)", result.size(),
+               json["pairs"].size() - result.size());
     co_return result;
 }
 
@@ -881,28 +979,71 @@ asio::awaitable<std::optional<TickerData>> DexieClient::get_ticker(
         co_return std::nullopt;
     }
 
+    // [CHURN 2026-10-26] A CAT/CAT market's canonical listing is the one
+    // under the asset Dexie prices it in, and only GET /v1/pairs says which
+    // that is.  Read at most every PairsOrientationCache::kTtl (kRetry after
+    // a failure); until it answers, the configured quote stands in, which is
+    // right for every pair configured the way Dexie prices it.  An XCH market
+    // never needs it.
+    std::string market_quote;
+    if (base_asset_id != "xch" && quote_asset_id != "xch") {
+        const auto now = PairsOrientationCache::Clock::now();
+        if (pairs_cache_.claim_fetch(now)) {
+            bool stored = false;
+            try {
+                auto pairs = co_await get_pairs();
+                if (!pairs.empty()) {
+                    pairs_cache_.store(std::move(pairs), now);
+                    stored = true;
+                }
+            } catch (const std::exception& e) {
+                log_->warn("get_ticker: GET /pairs failed: {}", e.what());
+            }
+            if (!stored) {
+                pairs_cache_.fail(now);
+                log_->warn("get_ticker: no market orientations from GET "
+                           "/pairs; CAT/CAT tickers use the configured quote "
+                           "until it answers (next try in {} min)",
+                           PairsOrientationCache::kRetry.count());
+            }
+        }
+        if (auto q = pairs_cache_.quote_for(base_asset_id, quote_asset_id)) {
+            market_quote = std::move(*q);
+        }
+    }
+
     // Finding and orienting the entry is pure -- orient_market_ticker(),
     // driven by test_dexie_market_ticker.cpp -- so which Dexie array is the
     // bid is pinned without HTTP.  See TickerData for the convention, and
     // note markets are keyed by XCH OR by a CAT (BYC/wUSDC.b is Case B).
-    const auto match = orient_market_ticker(json["markets"],
-                                            base_asset_id, quote_asset_id);
+    const auto match = orient_market_ticker(json["markets"], base_asset_id,
+                                            quote_asset_id, market_quote);
     if (!match) {
         log_->info("get_ticker -> base_asset_id={}, quote_asset_id={} not found",
                    base_asset_id, quote_asset_id);
         co_return std::nullopt;
     }
 
+    // Said only when it matters: a pair configured against Dexie's own
+    // orientation, or a market whose canonical listing was missing.
+    std::string note;
+    if (!market_quote.empty() && market_quote != quote_asset_id) {
+        note += " [Dexie prices this market in the base]";
+    }
+    if (!match->canonical_listing) {
+        note += " [canonical listing absent: last oriented as the market's]";
+    }
+
     if (match->inverted) {
         log_->info("get_ticker -> found {} ({}) [inverted: "
                    "raw_buy(ask)={:.6f} raw_sell(bid)={:.6f} -> "
-                   "bid={:.6f} ask={:.6f}]",
+                   "bid={:.6f} ask={:.6f}]{}",
                    match->oriented.code, match->oriented.pair_id,
                    match->listed.best_ask, match->listed.best_bid,
-                   match->oriented.best_bid, match->oriented.best_ask);
+                   match->oriented.best_bid, match->oriented.best_ask, note);
     } else {
-        log_->info("get_ticker -> found direct market {} ({})",
-                   match->oriented.code, match->oriented.pair_id);
+        log_->info("get_ticker -> found direct market {} ({}){}",
+                   match->oriented.code, match->oriented.pair_id, note);
     }
     co_return match->oriented;
 }
