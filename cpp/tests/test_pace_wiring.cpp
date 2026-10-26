@@ -35,7 +35,8 @@ TEST(PaceWiring, BalanceRefreshClosedByEveryPostingGate) {
     const std::string body = function_body(read_engine_cpp(), kRefreshSignature);
     ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
     const char* const gates[] = {
-        "pace_gates.pace_enabled = config_.strategy.pace_enabled;",
+        // [TARGET-GAP 2026-10-26] The target-gap bid floor reads the same balances.
+        "pace_gates.pace_enabled = config_.strategy.pace_enabled || config_.strategy.target_gap_sizing_enabled;",
         "pace_gates.dry_run = dry_run_;",
         "pace_gates.wallet_circuit_open = wallet_circuit_open_;",
         "pace_gates.watchdog_fired = watchdog_fired_.load(std::memory_order_acquire);",

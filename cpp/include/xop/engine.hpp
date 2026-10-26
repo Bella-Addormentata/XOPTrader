@@ -3099,6 +3099,10 @@ private:
     // failures in a row it has seen there (for the rate-limited warning).
     std::unordered_map<std::string, BlockHeight>                 pace_refresh_attempted_at_{};
     std::unordered_map<std::string, std::uint32_t>               pace_refresh_failures_{};
+    // [TARGET-GAP 2026-10-26] Why Step 4's target-gap bid floor was last off
+    // ("" while it is on), so the on/off line is logged once per change;
+    // empty until Step 4 first values the portfolio with the switch on.
+    std::optional<std::string>                                   target_gap_last_reason_{};
 
     // -- [PNL-BASIS-PERSIST 2026-07-30] One-shot wallet reconcile ---------
     // After restart the restored inventory quantities can drift from the

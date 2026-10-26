@@ -108,71 +108,103 @@ TEST(SizingWiring, ReviveMaintenanceUsesThePairsMinimum) {
 // XCH/wUSDC.b posted nothing on 2026-10-26: the strategy's bid was q_max 20 -
 // 34.76 XCH held = 0 while XCH sat at 13.8% against a 50% target.  The floor's
 // arithmetic is unit-tested in test_target_gap.cpp; these scans pin that Step 4
-// values the portfolio only when the switch is on and only from validated
-// balances, applies the floor after the strategy and before anything reads the
-// size, and only ever raises the bid.
+// values the portfolio only when the switch is on and only from validated,
+// fresh balances, applies the floor once every pair is quoted and before
+// anything reads the size, shares each coin's gap across the pairs, skips a
+// quote the strategy rejected, only ever raises the bid, and that the pace
+// balance refresh keeps the targeted balances fresh while the floor is on.
 
 namespace {
 
 const char* const kComputeQuotesSignature = "void Engine::step_compute_quotes(BlockHeight block_height)";
-const char* const kFloorCall =
-    "strategy::target_gap::bid_floor_units(gap_valuation, gap_base_key, gap_quote_key, gap_base_xch_per_unit)";
+const char* const kHeartbeatSignature = "asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)";
+const char* const kStep4Log = "spdlog::debug(\"[Engine] Step 4: {} bid={:.6f} ask={:.6f} spread={:.1f}bps \"";
+const char* const kValuationCall =
+    "strategy::target_gap::value_targeted(gap_holdings, config_.strategy.pace_max_balance_age_blocks);";
+const char* const kSharedCall = "strategy::target_gap::shared_bid_floors_xch(gap_valuation, gap_pairs);";
 
 }  // namespace
 
-TEST(SizingWiring, TargetGapValuationIsGatedAndValidated) {
+TEST(SizingWiring, TargetGapValuationIsGatedValidatedAndFresh) {
     const std::string body = function_body(read_engine_cpp(), kComputeQuotesSignature);
     ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
-    const std::size_t gate_at = position_of(body, "if (config_.strategy.target_gap_sizing_enabled) {");
-    const std::size_t value_at =
-        position_of(body, "gap_valuation = strategy::target_gap::value_targeted(gap_holdings);");
-    const std::size_t loop_at = position_of(body, "for (auto& [pair_name, pcs] : cycle_) {");
+    const std::size_t log_at = position_of(body, kStep4Log);
+    const std::size_t gate_at = position_of(body, "if (!config_.strategy.target_gap_sizing_enabled) {");
+    const std::size_t value_at = position_of(body, kValuationCall);
+    ASSERT_NE(log_at, std::string::npos);
     ASSERT_NE(gate_at, std::string::npos);
     ASSERT_NE(value_at, std::string::npos);
-    ASSERT_NE(loop_at, std::string::npos);
+    EXPECT_LT(log_at, gate_at) << "after the pair loop: once per heartbeat";
     EXPECT_LT(gate_at, value_at);
-    EXPECT_LT(value_at, loop_at) << "valued once per heartbeat, not per pair";
-    // Every targeted coin, from the balances Step 8 validated, at the marks
-    // the drift guard reads; a balance with no mark is unvalued.
+    // Every targeted coin, from the balances Step 8 and the pace refresh
+    // validated, with their age, at the marks the drift guard reads; a
+    // balance with no mark is unpriced.
     EXPECT_NE(position_of(body, "for (const auto& [gap_key, gap_target] : config_.strategy.asset_target_allocations)"),
               std::string::npos);
     EXPECT_NE(position_of(body, "gap_cached != cached_wallet_balances_.end() && gap_cached->second.fields_validated"),
               std::string::npos);
     EXPECT_NE(position_of(body, "const Mojo gap_confirmed = gap_cached->second.confirmed;"), std::string::npos);
-    EXPECT_NE(position_of(body, "gap_holding.valued = gap_confirmed == 0 || gap_rate > 0.0;"), std::string::npos);
+    EXPECT_NE(position_of(body, "gap_holding.balance_known = true;"), std::string::npos);
+    EXPECT_NE(position_of(body, "gap_holding.balance_age_blocks = block_height > gap_cached->second.as_of_block "
+                                "? block_height - gap_cached->second.as_of_block : 0u;"),
+              std::string::npos);
+    EXPECT_NE(position_of(body, "gap_holding.priced = gap_confirmed == 0 || gap_rate > 0.0;"), std::string::npos);
     EXPECT_EQ(count_of(body, "value_targeted("), 1u);
+    // An unusable valuation posts no floor.
+    const std::size_t off_at = position_of(body, "if (!gap_valuation.ok) { return; }");
+    ASSERT_NE(off_at, std::string::npos);
+    EXPECT_LT(value_at, off_at);
 }
 
-TEST(SizingWiring, TargetGapFloorFollowsTheStrategyAndOnlyRaisesTheBid) {
+TEST(SizingWiring, TargetGapFloorIsSharedAndOnlyRaisesAUsableBid) {
     const std::string body = function_body(read_engine_cpp(), kComputeQuotesSignature);
     ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
     const std::size_t strategy_at =
         position_of(body, "pcs.raw_quote = strategy.compute_quotes(mid, sigma, q, block_height);");
-    const std::size_t gate_at =
-        position_of(body, "if (config_.strategy.target_gap_sizing_enabled && gap_valuation.ok) {");
-    const std::size_t floor_at = position_of(body, kFloorCall);
-    const std::size_t raise_at = position_of(body, "if (gap_floor > 0.0 && gap_floor > pcs.raw_quote.bid_size) {");
-    const std::size_t assign_at = position_of(body, "pcs.raw_quote.bid_size = gap_floor;");
-    const std::size_t kept_at = position_of(body, "pcs.strategy_q = q;");
+    const std::size_t log_at = position_of(body, kStep4Log);
+    const std::size_t usable_at = position_of(body, "if (!pcs.quote_valid || !std::isfinite(pcs.raw_quote.spread_bps) "
+                                                    "|| !(pcs.raw_quote.spread_bps > 0.0)) { continue; }");
+    const std::size_t claim_at = position_of(body, "gap_pairs.push_back(std::move(gap_coins));");
+    const std::size_t shared_at = position_of(body, kSharedCall);
+    const std::size_t units_at = position_of(body,
+        "strategy::target_gap::floor_units(gap_floors_xch[gap_i], gap_base_xch_per_unit);");
+    const std::size_t raise_at = position_of(body, "if (gap_floor > 0.0 && gap_floor > gap_pcs.raw_quote.bid_size) {");
+    const std::size_t assign_at = position_of(body, "gap_pcs.raw_quote.bid_size = gap_floor;");
     ASSERT_NE(strategy_at, std::string::npos);
-    ASSERT_NE(gate_at, std::string::npos);
-    ASSERT_NE(floor_at, std::string::npos);
+    ASSERT_NE(log_at, std::string::npos);
+    ASSERT_NE(usable_at, std::string::npos);
+    ASSERT_NE(claim_at, std::string::npos);
+    ASSERT_NE(shared_at, std::string::npos);
+    ASSERT_NE(units_at, std::string::npos);
     ASSERT_NE(raise_at, std::string::npos);
     ASSERT_NE(assign_at, std::string::npos);
-    ASSERT_NE(kept_at, std::string::npos);
-    EXPECT_LT(strategy_at, gate_at);
-    EXPECT_LT(gate_at, floor_at);
-    EXPECT_LT(floor_at, raise_at);
+    EXPECT_LT(strategy_at, log_at);
+    EXPECT_LT(log_at, usable_at) << "every pair is quoted before any floor";
+    EXPECT_LT(usable_at, claim_at) << "a rejected quote claims no share";
+    EXPECT_LT(claim_at, shared_at);
+    EXPECT_LT(shared_at, units_at);
+    EXPECT_LT(units_at, raise_at);
     EXPECT_LT(raise_at, assign_at);
-    EXPECT_LT(assign_at, kept_at) << "before the Step 4 log and every later step";
     // The base coin's XCH per unit at the mark the valuation used.
-    EXPECT_NE(position_of(body, "state_->get_asset_xch_rate(AssetId{pair_cfg->base_asset_id}) "
-                                "* static_cast<double>(pair_cfg->base_mojos_per_unit) "
+    EXPECT_NE(position_of(body, "state_->get_asset_xch_rate(AssetId{gap_pc->base_asset_id}) "
+                                "* static_cast<double>(gap_pc->base_mojos_per_unit) "
                                 "/ static_cast<double>(kMojosPerXch);"),
               std::string::npos);
+    // The shared floors are the only ones: no pair takes an unshared floor.
+    EXPECT_EQ(count_of(body, "shared_bid_floors_xch("), 1u);
+    EXPECT_EQ(position_of(body, "unshared_bid_floor_xch("), std::string::npos);
     // The floor is the only write to the sizes in Step 4, and the ask is
     // never touched: the strategy sizes it q_max + q.
-    EXPECT_EQ(count_of(body, kFloorCall), 1u);
-    EXPECT_EQ(count_of(body, "pcs.raw_quote.bid_size ="), 1u);
-    EXPECT_EQ(count_of(body, "pcs.raw_quote.ask_size ="), 0u);
+    EXPECT_EQ(count_of(body, "raw_quote.bid_size ="), 1u);
+    EXPECT_EQ(count_of(body, "raw_quote.ask_size ="), 0u);
+}
+
+TEST(SizingWiring, TheBalanceRefreshRunsWhileTheTargetGapFloorIsOn) {
+    const std::string body = function_body(read_engine_cpp(), kHeartbeatSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    EXPECT_NE(position_of(body, "if (config_.strategy.pace_enabled || config_.strategy.target_gap_sizing_enabled) { "
+                                "try { co_await refresh_pace_balances(block_height); }"),
+              std::string::npos);
+    // The refresh's own gate is pinned with its other gates in
+    // test_pace_wiring.cpp (PaceWiring.BalanceRefreshClosedByEveryPostingGate).
 }

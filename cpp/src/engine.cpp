@@ -4860,7 +4860,12 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // this heartbeat (the latch is kept) and clears the remaining budget, so
     // Step 9f refuses spends of an Active asset.  refresh_pace_balances checks
     // P25's gates (the engine modes that skip Step 8) itself, before any RPC.
-    if (config_.strategy.pace_enabled) {
+    // [TARGET-GAP 2026-10-26] The refresh also runs while the target-gap bid
+    // floor is on: next heartbeat's Step 4 values the same targeted balances,
+    // and this keeps one fresh when no enabled pair's Step 8 reads it (a coin
+    // whose pairs are all disabled).  A balance Step 8 keeps reading is never
+    // due (pace_refresh_due), so that costs no RPC.
+    if (config_.strategy.pace_enabled || config_.strategy.target_gap_sizing_enabled) {
         try { co_await refresh_pace_balances(block_height); }
         catch (const std::exception& e) {
             spdlog::warn("[Engine] Pace balance refresh failed: {}", e.what());
@@ -7173,35 +7178,6 @@ void Engine::step_update_analytics(BlockHeight block_height)
 // [T3-24] Gates on market_data_valid flag from Step 1.
 void Engine::step_compute_quotes(BlockHeight block_height)
 {
-    // [TARGET-GAP 2026-10-26] The targeted portfolio, valued once per
-    // heartbeat for the bid floor below (xop/strategy/target_gap.hpp): the
-    // wallet-confirmed balances Step 8 cached, at the XCH marks the drift
-    // guard reads.  A targeted coin with no validated balance, or with a
-    // balance and no mark, leaves it unusable and every floor 0.
-    strategy::target_gap::Valuation gap_valuation{};
-    if (config_.strategy.target_gap_sizing_enabled) {
-        std::vector<strategy::target_gap::Holding> gap_holdings;
-        for (const auto& [gap_key, gap_target] : config_.strategy.asset_target_allocations) {
-            strategy::target_gap::Holding gap_holding{};
-            gap_holding.key = gap_key;
-            gap_holding.target = gap_target;
-            const auto gap_id = pace_asset_id_for_key(gap_key);
-            const auto gap_cached = gap_id ? cached_wallet_balances_.find(*gap_id)
-                                           : cached_wallet_balances_.end();
-            if (gap_cached != cached_wallet_balances_.end() && gap_cached->second.fields_validated) {
-                const Mojo gap_confirmed = gap_cached->second.confirmed;
-                const double gap_rate = (*gap_id == "xch")
-                    ? 1.0 : state_->get_asset_xch_rate(AssetId{*gap_id});
-                gap_holding.valued = gap_confirmed == 0 || gap_rate > 0.0;
-                gap_holding.xch_value = gap_holding.valued
-                    ? static_cast<double>(gap_confirmed) * gap_rate / static_cast<double>(kMojosPerXch)
-                    : 0.0;
-            }
-            gap_holdings.push_back(std::move(gap_holding));
-        }
-        gap_valuation = strategy::target_gap::value_targeted(gap_holdings);
-    }
-
     for (auto& [pair_name, pcs] : cycle_) {
         // [T3-24] Dependency-aware gating: skip pairs where Step 1 failed.
         // Quoting with invalid/stale market data risks adverse selection.
@@ -7416,41 +7392,6 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         pcs.raw_quote = strategy.compute_quotes(mid, sigma, q, block_height);
         pcs.quote_valid = true;  // Mark as valid for steps 5-8.
 
-        // [TARGET-GAP 2026-10-26] The strategy's bid is q_max - the WHOLE base
-        // holding, blind to the targets: raise it, never lower it, to what
-        // moves both coins toward their targets -- min(base deficit, quote
-        // excess), in base units.  Before Step 6, so every limit and cap still
-        // applies; Step 7's pace post-pass re-sizes a pace-managed pair's bid
-        // tiers anyway.
-        if (config_.strategy.target_gap_sizing_enabled && gap_valuation.ok) {
-            const auto gap_slash = pair_name.find('/');
-            if (gap_slash != std::string::npos) {
-                std::string gap_base_key = pair_name.substr(0, gap_slash);
-                std::string gap_quote_key = pair_name.substr(gap_slash + 1);
-                for (auto& c : gap_base_key) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                for (auto& c : gap_quote_key) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                // XCH per base display unit, at the mark the valuation used.
-                const double gap_base_xch_per_unit = (pair_cfg->base_asset_id == "xch")
-                    ? 1.0
-                    : state_->get_asset_xch_rate(AssetId{pair_cfg->base_asset_id})
-                          * static_cast<double>(pair_cfg->base_mojos_per_unit)
-                          / static_cast<double>(kMojosPerXch);
-                const double gap_floor = strategy::target_gap::bid_floor_units(
-                    gap_valuation, gap_base_key, gap_quote_key, gap_base_xch_per_unit);
-                if (gap_floor > 0.0 && gap_floor > pcs.raw_quote.bid_size) {
-                    spdlog::info("[Engine] Step 4: {} target-gap bid floor: bid_size {:.6f} -> {:.6f} "
-                                 "({} {:.1f}% vs target {:.1f}%, {} {:.1f}% vs target {:.1f}%, q={:.6f} q_max={:.6f})",
-                                 pair_name, pcs.raw_quote.bid_size, gap_floor,
-                                 gap_base_key, gap_valuation.xch_by_key.at(gap_base_key) / gap_valuation.total_xch * 100.0,
-                                 gap_valuation.target_by_key.at(gap_base_key) * 100.0,
-                                 gap_quote_key, gap_valuation.xch_by_key.at(gap_quote_key) / gap_valuation.total_xch * 100.0,
-                                 gap_valuation.target_by_key.at(gap_quote_key) * 100.0,
-                                 q, effective_q_max(*pair_cfg, config_.strategy));
-                    pcs.raw_quote.bid_size = gap_floor;
-                }
-            }
-        }
-
         // [STEP6-CAUSE 2026-09-13] Keep q and the q_max this pair's strategy
         // was built with.  Avellaneda sizes the bid from TOTAL base holdings
         // (net_inventory returns total_quantity, inventory.cpp:273-277), so
@@ -7469,6 +7410,110 @@ void Engine::step_compute_quotes(BlockHeight block_height)
                       pcs.raw_quote.ask_price, pcs.raw_quote.spread_bps,
                       pcs.raw_quote.bid_size, pcs.raw_quote.ask_size,
                       pcs.strategy_q, pcs.strategy_q_max);
+    }
+
+    // [TARGET-GAP 2026-10-26] The target-gap bid floor
+    // (xop/strategy/target_gap.hpp), once every pair is quoted so the pairs
+    // can share each coin's gap.  The strategy's bid is q_max - the WHOLE
+    // base holding, blind to the targets: raise it, never lower it, to the
+    // pair's share of min(base deficit, quote excess), in base units.  Before
+    // Step 6, so every limit and cap still applies; Step 7's pace post-pass
+    // re-sizes a pace-managed pair's bid tiers anyway.  The valuation is the
+    // wallet-confirmed balances Step 8 and the pace refresh cache, at the XCH
+    // marks the drift guard reads; a targeted coin with no validated balance
+    // younger than pace_max_balance_age_blocks, or with a balance and no
+    // mark, leaves it unusable and every floor 0.
+    if (!config_.strategy.target_gap_sizing_enabled) {
+        target_gap_last_reason_.reset();
+        return;
+    }
+    std::vector<strategy::target_gap::Holding> gap_holdings;
+    for (const auto& [gap_key, gap_target] : config_.strategy.asset_target_allocations) {
+        strategy::target_gap::Holding gap_holding{};
+        gap_holding.key = gap_key;
+        gap_holding.target = gap_target;
+        const auto gap_id = pace_asset_id_for_key(gap_key);
+        const auto gap_cached = gap_id ? cached_wallet_balances_.find(*gap_id)
+                                       : cached_wallet_balances_.end();
+        if (gap_cached != cached_wallet_balances_.end() && gap_cached->second.fields_validated) {
+            const Mojo gap_confirmed = gap_cached->second.confirmed;
+            const double gap_rate = (*gap_id == "xch")
+                ? 1.0 : state_->get_asset_xch_rate(AssetId{*gap_id});
+            gap_holding.balance_known = true;
+            gap_holding.balance_age_blocks = block_height > gap_cached->second.as_of_block
+                ? block_height - gap_cached->second.as_of_block : 0u;
+            gap_holding.priced = gap_confirmed == 0 || gap_rate > 0.0;
+            gap_holding.xch_value = gap_holding.priced
+                ? static_cast<double>(gap_confirmed) * gap_rate / static_cast<double>(kMojosPerXch)
+                : 0.0;
+        }
+        gap_holdings.push_back(std::move(gap_holding));
+    }
+    const strategy::target_gap::Valuation gap_valuation = strategy::target_gap::value_targeted(
+        gap_holdings, config_.strategy.pace_max_balance_age_blocks);
+    // Said once per change, not every heartbeat.
+    if (!target_gap_last_reason_ || *target_gap_last_reason_ != gap_valuation.unusable_reason) {
+        if (gap_valuation.ok) {
+            spdlog::info("[Engine] Step 4: target-gap bid floor on ({} targeted coins, {:.2f} XCH)",
+                         gap_holdings.size(), gap_valuation.total_xch);
+        } else {
+            spdlog::info("[Engine] Step 4: target-gap bid floor off until every targeted coin is valued -- {}",
+                         gap_valuation.unusable_reason);
+        }
+        target_gap_last_reason_ = gap_valuation.unusable_reason;
+    }
+    if (!gap_valuation.ok) {
+        return;
+    }
+    // A pair Step 4 skipped, or whose strategy rejected its inputs (the
+    // zero-spread quote), gets no floor and claims no share of a gap.
+    std::vector<std::string> gap_pair_names;
+    std::vector<strategy::target_gap::PairCoins> gap_pairs;
+    for (const auto& [pair_name, pcs] : cycle_) {
+        if (!pcs.quote_valid || !std::isfinite(pcs.raw_quote.spread_bps)
+            || !(pcs.raw_quote.spread_bps > 0.0)) {
+            continue;
+        }
+        const auto gap_slash = pair_name.find('/');
+        if (gap_slash == std::string::npos) {
+            continue;
+        }
+        strategy::target_gap::PairCoins gap_coins{};
+        gap_coins.base_key = pair_name.substr(0, gap_slash);
+        gap_coins.quote_key = pair_name.substr(gap_slash + 1);
+        for (auto& c : gap_coins.base_key) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        for (auto& c : gap_coins.quote_key) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        gap_pair_names.push_back(pair_name);
+        gap_pairs.push_back(std::move(gap_coins));
+    }
+    const std::vector<double> gap_floors_xch =
+        strategy::target_gap::shared_bid_floors_xch(gap_valuation, gap_pairs);
+    for (std::size_t gap_i = 0; gap_i < gap_pair_names.size(); ++gap_i) {
+        const PairConfig* gap_pc = find_pair_config(gap_pair_names[gap_i]);
+        if (gap_pc == nullptr) {
+            continue;
+        }
+        auto& gap_pcs = cycle_.at(gap_pair_names[gap_i]);
+        // XCH per base display unit, at the mark the valuation used.
+        const double gap_base_xch_per_unit = (gap_pc->base_asset_id == "xch")
+            ? 1.0
+            : state_->get_asset_xch_rate(AssetId{gap_pc->base_asset_id})
+                  * static_cast<double>(gap_pc->base_mojos_per_unit)
+                  / static_cast<double>(kMojosPerXch);
+        const double gap_floor = strategy::target_gap::floor_units(gap_floors_xch[gap_i], gap_base_xch_per_unit);
+        if (gap_floor > 0.0 && gap_floor > gap_pcs.raw_quote.bid_size) {
+            const std::string& gap_base_key = gap_pairs[gap_i].base_key;
+            const std::string& gap_quote_key = gap_pairs[gap_i].quote_key;
+            spdlog::info("[Engine] Step 4: {} target-gap bid floor: bid_size {:.6f} -> {:.6f} "
+                         "({} {:.1f}% vs target {:.1f}%, {} {:.1f}% vs target {:.1f}%, q={:.6f} q_max={:.6f})",
+                         gap_pair_names[gap_i], gap_pcs.raw_quote.bid_size, gap_floor,
+                         gap_base_key, gap_valuation.xch_by_key.at(gap_base_key) / gap_valuation.total_xch * 100.0,
+                         gap_valuation.target_by_key.at(gap_base_key) * 100.0,
+                         gap_quote_key, gap_valuation.xch_by_key.at(gap_quote_key) / gap_valuation.total_xch * 100.0,
+                         gap_valuation.target_by_key.at(gap_quote_key) * 100.0,
+                         gap_pcs.strategy_q, gap_pcs.strategy_q_max);
+            gap_pcs.raw_quote.bid_size = gap_floor;
+        }
     }
 }
 
@@ -8039,7 +8084,10 @@ asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)
     // Unlike the throw counter it does rise in a brown-out, because rpc_post
     // records every call however its caller handles the exception.
     strategy::pace::RefreshGates pace_gates{};
-    pace_gates.pace_enabled                = config_.strategy.pace_enabled;
+    // [TARGET-GAP 2026-10-26] Either consumer of the targeted balances opens
+    // this gate: pace, or Step 4's target-gap bid floor.
+    pace_gates.pace_enabled                = config_.strategy.pace_enabled
+                                             || config_.strategy.target_gap_sizing_enabled;
     pace_gates.dry_run                     = dry_run_;
     pace_gates.wallet_circuit_open         = wallet_circuit_open_;
     pace_gates.watchdog_fired              = watchdog_fired_.load(std::memory_order_acquire);

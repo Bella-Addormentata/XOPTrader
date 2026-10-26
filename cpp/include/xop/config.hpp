@@ -1330,14 +1330,20 @@ struct StrategyConfig {
     double   asset_drift_guard_max_factor{2.0};
 
     /// [TARGET-GAP 2026-10-26] When true, Step 4 raises each pair's bid size
-    /// to at least min(base coin's deficit below its target, quote coin's
-    /// excess above its target), valued in XCH from wallet-confirmed
-    /// balances over the `asset_target_allocations` coins
-    /// (xop/strategy/target_gap.hpp).  The strategy sizes the bid as
-    /// q_max - TOTAL base held, so without this a coin held past q_max gets
-    /// no bid however far below its target it is.  Runs before the Step 6
-    /// risk limits, so every limit and cap still applies; prices are
-    /// untouched.  No effect without targets.  Applies live.  Default true.
+    /// to at least its share of min(base coin's deficit below its target,
+    /// quote coin's excess above its target), valued in XCH from
+    /// wallet-confirmed balances over the `asset_target_allocations` coins
+    /// (xop/strategy/target_gap.hpp).  The pairs buying, or spending, one
+    /// coin share its gap, so together they never take it past its target.
+    /// The strategy sizes the bid as q_max - TOTAL base held, so without
+    /// this a coin held past q_max gets no bid however far below its target
+    /// it is.  Runs before the Step 6 risk limits, so every limit and cap
+    /// still applies; prices are untouched.  Off for a heartbeat while a
+    /// targeted coin's balance is missing, unvalidated or older than
+    /// pace_max_balance_age_blocks, or it has no XCH price (logged once per
+    /// change); the pace balance refresh runs while this is on to keep those
+    /// balances fresh.  No effect without targets.  Applies live.  Default
+    /// true.
     bool     target_gap_sizing_enabled{true};
 
     // -- [PACE 2026-09-13] Pace controller (default OFF) -------------------
@@ -1362,7 +1368,7 @@ struct StrategyConfig {
     double                   pace_min_edge_bps{50.0};              ///< (0, 2000]
     double                   pace_edge_sigma_mult{1.0};            ///< [0, 5]; edge = max(min_edge, mult x sigma)
     double                   pace_max_fair_value_sigma_bps{200.0}; ///< (0, 2000]; <= fair_value_max_sigma_bps when enabled
-    std::uint32_t            pace_max_balance_age_blocks{20};      ///< [1, 4608]
+    std::uint32_t            pace_max_balance_age_blocks{20};      ///< [1, 4608]; also bounds the target-gap floor's balances
     double                   pace_reprice_min_bps{50.0};           ///< (0, 1000]
     std::uint32_t            pace_reprice_min_age_blocks{96};      ///< [12, 4608]
 
