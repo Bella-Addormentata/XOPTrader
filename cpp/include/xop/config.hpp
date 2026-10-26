@@ -328,6 +328,24 @@ inline bool peg_guard_is_waived(const PairConfig& pc) {
     return pc.revive_market && !pc.peg_guard;
 }
 
+/// [PAIRMIN 2026-10-26] The smallest offer, in base units, Step 7 posts on
+/// this pair: its min_offer_size_units_override when set, else 1.0 on an
+/// XCH-base pair, else strategy.min_offer_size_units (`global_min_units`).
+/// The one definition behind the deploy-idle floor, the up-scale and dust
+/// filter, and revive maintenance; the pace controller mirrors it in
+/// strategy::pace::effective_offer_size_band (test_config.cpp pins the two
+/// equal).  The floor used to read the global figure, so a pair whose
+/// override sat below it was floored to a bigger offer than it asked for.
+inline double effective_min_offer_units(const PairConfig& pc,
+                                        double global_min_units) {
+    if (pc.min_offer_size_units_override.has_value()) {
+        return *pc.min_offer_size_units_override;
+    }
+    const bool xch_base =
+        pc.base_asset_id == "xch" || pc.base_asset_id == "XCH";
+    return xch_base ? 1.0 : global_min_units;
+}
+
 /// Step 7's empty-book decision, factored out so it is unit-testable.
 ///
 /// With both filtered book sides at zero the ladder is normally cleared --
@@ -1170,7 +1188,11 @@ struct StrategyConfig {
 
     /// Minimum units of each asset to keep as reserve.  Offers on the
     /// side that would deplete an asset below this level are suppressed.
-    /// Uses the pair's mojos_per_unit for conversion.  Default 1.0.
+    /// Uses the pair's mojos_per_unit for conversion.  [PAIRMIN
+    /// 2026-10-26] While wallet_balance_caps_enabled is on, Step 7 also
+    /// sizes every CAT's pools to leave it unsold, as it does for an
+    /// asset_reserve_units entry, so a small holding posts a smaller
+    /// ladder instead of having its whole side suppressed.  Default 1.0.
     double   min_reserve_units{1.0};
 
     /// [GAS-RESERVE 2026-10-24] Per-asset reserve, in display units, keyed
@@ -1179,10 +1201,12 @@ struct StrategyConfig {
     /// throttle, and also caps that asset's pools at the very end of
     /// Step 7 to confirmed-minus-reserve -- the same last-word cap
     /// fee_reserve_xch gets for XCH -- so the ladder is sized to leave the
-    /// reserve unsold instead of being suppressed outright.  Built for
-    /// wmilliETH.b: the warp rebalancer unwraps it into ETH to pay Base
-    /// gas, and the asks must never sell the last of it.  XCH has its own
-    /// reserve (fee_reserve_xch) and is refused as a key.  Default empty.
+    /// reserve unsold instead of being suppressed outright, even with
+    /// wallet_balance_caps_enabled off (execution::sizing_reserve_units).
+    /// Built for wmilliETH.b: the warp rebalancer unwraps it into ETH to
+    /// pay Base gas, and the asks must never sell the last of it.  XCH has
+    /// its own reserve (fee_reserve_xch) and is refused as a key.  Default
+    /// empty.
     std::unordered_map<std::string, double> asset_reserve_units;
 
     /// Minimum offer size in base-asset units.  Tiers with a size below
@@ -1227,8 +1251,9 @@ struct StrategyConfig {
     bool     wallet_balance_caps_enabled{true};
 
     /// When true, Step 7 ensures the bid pool is large enough to emit at
-    /// least one tier above min_offer_size_units when the quote wallet has
-    /// sufficient balance (and likewise for the ask pool / base wallet).
+    /// least one tier of the pair's minimum offer size
+    /// (effective_min_offer_units) when the quote wallet has sufficient
+    /// balance (and likewise for the ask pool / base wallet).
     /// Counteracts aggressive risk/allocator shrinking that would otherwise
     /// produce zero tier quotes despite ample wallet capacity to trade.
     /// Respects ratio-rebalance mode: only floors the side being acquired

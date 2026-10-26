@@ -5,7 +5,7 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — offers stay up instead of being cancelled minutes after they are posted
+## [Unreleased] — offers stay up instead of being cancelled minutes after they are posted, and a small holding quotes a smaller ladder instead of nothing
 
 ### Fewer offers cancelled right after posting
 
@@ -53,6 +53,31 @@ reads; for BYC/wUSDC.b and wmilliETH.b/XCH it used to be in the quote asset.
 Settings page does not show these keys, and a Settings save drops keys added
 to config.yaml after the GUI loaded it (TODO S79), so edit them with the GUI
 closed.
+
+### wmilliETH.b/XCH quotes again on a 1-unit balance
+
+wmilliETH.b/XCH stopped posting on 2026-10-25 with 1.0 wmilliETH.b held and
+`revive_market` on. Two Step 7 sizing rules disagreed with what came after
+them:
+
+- **The pair's own minimum.** The deploy-idle floor, which raises a starved
+  pool to one minimum-size offer, used the global
+  `strategy.min_offer_size_units` even when the pair's
+  `min_offer_size_units_override` was smaller. It now uses the pair's
+  minimum, the one the up-scale and dust filter already enforce.
+- **The reserve.** Step 8 holds `strategy.min_reserve_units` back on every
+  asset, but Step 7 sized a CAT with no `strategy.asset_reserve_units` entry
+  to its whole balance. A ladder spending the whole 1.0 breached the 0.1
+  reserve, and Step 8 suppressed the whole side every cycle. While
+  `wallet_balance_caps_enabled` is on (the default), Step 7 now sizes every
+  CAT to leave the reserve unsold, as it already did for an entry, so the
+  side posts what fits.
+
+The shipped `config.example.yaml` sets `min_offer_size_units_override: 0.5`
+on wmilliETH.b/XCH: one unit is about 1.6 XCH, more than a 1 XCH minimum
+offer on the XCH-base pairs. An existing config keeps its own value. Settings
+does not show this key, so edit `config.yaml` with the GUI closed. No other
+default changed.
 
 ## [0.10.32] — 2026-10-26 — saved settings apply live, and the bridge judges its Chia sends instead of assuming them
 

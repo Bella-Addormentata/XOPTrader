@@ -10,64 +10,20 @@
 //
 // Every whitespace character is removed from both the source and the needle
 // before comparing, so re-wrapping a line does not break a scan; renaming or
-// reordering does.
+// reordering does.  The scan helpers live in engine_source_scan.hpp.
 
 #include <gtest/gtest.h>
 
+#include "engine_source_scan.hpp"
+
 #include <cstddef>
-#include <fstream>
-#include <sstream>
 #include <string>
 
 namespace {
 
-std::string read_engine_cpp()
-{
-    std::ifstream in(XOP_TESTS_ENGINE_CPP, std::ios::binary);
-    std::ostringstream buffer;
-    buffer << in.rdbuf();
-    return buffer.str();
-}
-
-std::string squeeze(const std::string& text)
-{
-    std::string out;
-    out.reserve(text.size());
-    for (const char c : text) {
-        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
-            out.push_back(c);
-        }
-    }
-    return out;
-}
-
-/// The squeezed text of the function whose definition begins with
-/// `signature`, up to the first line holding only "}" (engine.cpp closes
-/// every function at column 0).  Empty when the signature is absent.
-std::string function_body(const std::string& raw, const std::string& signature)
-{
-    const std::size_t start = raw.find(signature);
-    if (start == std::string::npos) {
-        return {};
-    }
-    std::size_t at = start;
-    while (true) {
-        at = raw.find("\n}", at);
-        if (at == std::string::npos) {
-            return squeeze(raw.substr(start));
-        }
-        const std::size_t after = at + 2;
-        if (after >= raw.size() || raw[after] == '\r' || raw[after] == '\n') {
-            return squeeze(raw.substr(start, after - start));
-        }
-        at = after;
-    }
-}
-
-std::size_t position_of(const std::string& body, const std::string& needle)
-{
-    return body.find(squeeze(needle));
-}
+using xop_tests::engine_scan::function_body;
+using xop_tests::engine_scan::position_of;
+using xop_tests::engine_scan::read_engine_cpp;
 
 const char* const kRefreshSignature = "asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)";
 const char* const kLadderSignature  = "void Engine::step_generate_ladder(BlockHeight block_height)";

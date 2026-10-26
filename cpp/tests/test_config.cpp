@@ -18,6 +18,7 @@
 #include <xop/execution/book_side_quality.hpp>
 #include <xop/execution/cancel_escalation_config.hpp>
 #include <xop/strategy/fee_controller.hpp>
+#include <xop/strategy/pace_controller.hpp>
 
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
@@ -28,6 +29,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1538,6 +1540,63 @@ TEST(ApplyDeployIdleFloor, RespectsArmingWalletAndExistingPool) {
 
     // Degenerate min_pool: no-op.
     EXPECT_EQ(xop::apply_deploy_idle_floor(0, 0, true, 1.0, true), 0);
+}
+
+// [PAIRMIN 2026-10-26] The pair's own minimum offer size: what the
+// deploy-idle floor raises a pool to, and what the up-scale, dust filter and
+// revive maintenance enforce.  The floor read the global, so wmilliETH.b/XCH
+// at a 0.5 override would have been floored to a whole unit.
+
+TEST(EffectiveMinOfferUnits, TheOverrideWinsInEitherDirection) {
+    xop::PairConfig pc;
+    pc.base_asset_id = kWmilliEthId;
+    pc.min_offer_size_units_override = 0.5;
+    EXPECT_DOUBLE_EQ(xop::effective_min_offer_units(pc, 1.0), 0.5)
+        << "below the global";
+    pc.min_offer_size_units_override = 2.0;
+    EXPECT_DOUBLE_EQ(xop::effective_min_offer_units(pc, 1.0), 2.0);
+    pc.min_offer_size_units_override = 0.0;
+    EXPECT_DOUBLE_EQ(xop::effective_min_offer_units(pc, 1.0), 0.0)
+        << "0 is a legal override: no floor, no up-scale";
+    pc.base_asset_id = "xch";
+    pc.min_offer_size_units_override = 0.5;
+    EXPECT_DOUBLE_EQ(xop::effective_min_offer_units(pc, 1.0), 0.5)
+        << "an XCH base takes its override too";
+}
+
+TEST(EffectiveMinOfferUnits, WithoutAnOverrideAnXchBaseIsOneUnitElseTheGlobal) {
+    xop::PairConfig pc;
+    pc.base_asset_id = "xch";
+    EXPECT_DOUBLE_EQ(xop::effective_min_offer_units(pc, 0.1), 1.0);
+    pc.base_asset_id = "XCH";
+    EXPECT_DOUBLE_EQ(xop::effective_min_offer_units(pc, 3.0), 1.0);
+    pc.base_asset_id = kWmilliEthId;
+    EXPECT_DOUBLE_EQ(xop::effective_min_offer_units(pc, 0.1), 0.1);
+    EXPECT_DOUBLE_EQ(xop::effective_min_offer_units(pc, 1.0), 1.0);
+}
+
+TEST(EffectiveMinOfferUnits, MatchesThePaceControllersBandMinimum) {
+    // The pace controller sizes its tiers to Step 7's band through its own
+    // copy of the rule; the two must never disagree.
+    const std::vector<std::string> bases{"xch", "XCH", kWmilliEthId};
+    const std::vector<std::optional<double>> overrides{
+        std::nullopt, 0.0, 0.5, 2.0};
+    for (const auto& base : bases) {
+        for (const auto& ovr : overrides) {
+            for (const double global : {0.1, 1.0, 3.0}) {
+                xop::PairConfig pc;
+                pc.base_asset_id = base;
+                pc.min_offer_size_units_override = ovr;
+                const bool xch_base = base == "xch" || base == "XCH";
+                EXPECT_DOUBLE_EQ(
+                    xop::effective_min_offer_units(pc, global),
+                    xop::strategy::pace::effective_offer_size_band(
+                        xch_base, ovr, global, 5.0).min_units)
+                    << base << " override=" << ovr.value_or(-1.0)
+                    << " global=" << global;
+            }
+        }
+    }
 }
 
 TEST(EffectiveQMax, PairOverrideWinsElseStrategyDefault) {
