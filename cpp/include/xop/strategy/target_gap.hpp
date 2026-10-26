@@ -38,8 +38,9 @@
 // strategy.pace_max_balance_age_blocks, or a balance and no mark leaves the
 // valuation unusable and every floor 0: today's sizing, never a guess.  The
 // pace balance refresh keeps every targeted balance fresh while this is on,
-// a coin whose pairs are all disabled included, and like Step 8 it reads
-// only from a wallet that reports itself synced.  The floor converts to base
+// a coin whose pairs are all disabled included, and every writer of the
+// balance cache (Step 8, that refresh, the bridge scans) reads only from a
+// wallet that reports itself synced.  The floor converts to base
 // units at the base coin's mark, so a tiny mark makes a huge size: it is
 // capped at kMaxFloorBaseMojos, far above any ladder, so Step 6's conversion
 // to mojos stays in range.  Unit-tested in tests/test_target_gap.cpp; the

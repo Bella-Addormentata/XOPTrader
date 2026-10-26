@@ -45,10 +45,14 @@ no price. The log says so once per change
 then `target-gap bid floor on`). To keep those balances fresh when no enabled
 pair reads one (a coin whose pairs are all disabled), the pace balance refresh
 now also runs while the floor is on; a balance Step 8 keeps reading costs it
-no RPC. Like Step 8, the refresh now reads only from a wallet that reports
-itself synced (for pace too), since a syncing wallet can report a partial
-balance. A floor's size in base units is capped far above any ladder, so a
-tiny price for the base coin cannot overflow its conversion to mojos.
+no RPC. A syncing wallet can report a partial balance, so like Step 8 that
+refresh (pace's too) now reads only from a wallet that reports itself synced,
+and so does the wUSDC.b bridge scan's on-demand balance read, as the
+wmilliETH.b scan's already did. Every writer of the balance cache now reads
+from a synced wallet; while the wallet syncs, bridge booking waits, as it
+already does while the wallet's circuit is open. A floor's size in base units
+is capped far above any ladder, so a tiny price for the base coin cannot
+overflow its conversion to mojos.
 
 On the 2026-10-26 book (Step 4 sizes, before the per-tier cap of 5 XCH over
 six tiers), the three pairs buying XCH want 107.4 XCH of its 91.2 XCH

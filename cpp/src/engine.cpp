@@ -21358,7 +21358,8 @@ asio::awaitable<bool> Engine::fetch_bridge_balance(const AssetId& asset,
 }
 
 // [WARP-MILLIETH review] Whether the wallet is known synced for the
-// secondary scan's reads: Step 8 saw it synced in this heartbeat, or -- when
+// secondary scan's reads (and, since [TARGET-GAP 2026-10-26], every bridge
+// scan's): Step 8 saw it synced in this heartbeat, or -- when
 // Step 8 did not get that far (a pause) -- an on-demand get_sync_status gives
 // the reading Step 8 requires (synced=true, syncing=false; a reply without
 // `syncing` reads as syncing).  Asked at most once per heartbeat.
@@ -21519,8 +21520,15 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     // transport failure sooner: wallet_step_may_run also refuses after an
     // unanswered failure earlier in this heartbeat.  Evaluated last, so it is
     // consulted only when a fetch is actually needed.
+    // [TARGET-GAP 2026-10-26] And only from a wallet known synced, as the
+    // secondary scan and the top-up takes read: a mid-sync reply is a partial
+    // balance, and this cache entry is what the ledger invariant, Step 7's
+    // wallet caps and the next heartbeat's Step 4 target-gap valuation read.
+    // No RPC when this heartbeat's Step 8 passed its sync gate; otherwise one
+    // get_sync_status, shared with the secondary scan.
     if (!snapshot_current) {
-        snapshot_current = co_await fetch_bridge_balance(asset, block_height);
+        snapshot_current = co_await secondary_wallet_synced(block_height)
+                           && co_await fetch_bridge_balance(asset, block_height);
     }
     if (!snapshot_current && !jobs.empty()) {
         spdlog::debug("[Engine] Bridge ingest: no usable wallet snapshot "
@@ -21776,8 +21784,9 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                     // [review round 6] ...and only from a wallet Step 8 saw
                     // synced in THIS heartbeat.  The scan runs every heartbeat,
                     // Step 8 stopped at its sync gate or not, and its own fetch
-                    // checks only that the wallet answers: a mid-sync balance
-                    // must not verify the asset.
+                    // needs only a synced reading ([TARGET-GAP 2026-10-26];
+                    // during a pause an on-demand one), not Step 8's: a
+                    // mid-sync balance must not verify the asset.
                     // [review round 7] Its pairs' offers from before this
                     // verification are then drained by Step 8, as the
                     // verification pass's are.
