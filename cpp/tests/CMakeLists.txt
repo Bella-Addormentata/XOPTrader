@@ -61,6 +61,7 @@ add_executable(xop_tests
     test_pace_controller.cpp
     test_pace_wiring.cpp
     test_sizing_wiring.cpp
+    test_target_gap.cpp
     test_config.cpp
     test_config_reload.cpp
     test_config_live_apply.cpp
@@ -157,7 +158,8 @@ target_include_directories(xop_tests
 
 # [PACE round 2] test_pace_wiring.cpp scans the pace glue in engine.cpp, which
 # no unit test can construct; test_sizing_wiring.cpp scans Step 7's minimum-size
-# and reserve glue the same way (helpers: engine_source_scan.hpp).
+# and reserve glue, and Step 4's target-gap bid floor, the same way (helpers:
+# engine_source_scan.hpp).
 target_compile_definitions(xop_tests
     PRIVATE
         XOP_TESTS_ENGINE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/../src/engine.cpp"

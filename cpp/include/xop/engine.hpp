@@ -1907,12 +1907,17 @@ private:
     /// @p validated, when given, says whether THIS call cached a validated
     /// snapshot -- independent of pending change, and never true from an
     /// earlier same-block entry a failed call left in place.
+    /// [TARGET-GAP 2026-10-26] It does not check the wallet's sync, so every
+    /// caller asks secondary_wallet_synced() first: a mid-sync reply is a
+    /// partial balance, and the cache it writes feeds the ledger invariant,
+    /// Step 7's wallet caps and Step 4's target-gap valuation.
     asio::awaitable<bool> fetch_bridge_balance(const AssetId& asset,
                                                BlockHeight block_height,
                                                bool* validated = nullptr);
 
     /// [WARP-MILLIETH review] Whether the wallet is known synced for the
-    /// secondary scan's balance reads: Step 8 passed its sync gate in this
+    /// secondary scan's balance reads (since [TARGET-GAP 2026-10-26], every
+    /// fetch_bridge_balance() caller's): Step 8 passed its sync gate in this
     /// heartbeat, else one on-demand get_sync_status per heartbeat.
     asio::awaitable<bool> secondary_wallet_synced(BlockHeight block_height);
     BlockHeight secondary_sync_checked_block_{0};
@@ -3099,6 +3104,10 @@ private:
     // failures in a row it has seen there (for the rate-limited warning).
     std::unordered_map<std::string, BlockHeight>                 pace_refresh_attempted_at_{};
     std::unordered_map<std::string, std::uint32_t>               pace_refresh_failures_{};
+    // [TARGET-GAP 2026-10-26] Why Step 4's target-gap bid floor was last off
+    // ("" while it is on), so the on/off line is logged once per change;
+    // empty until Step 4 first values the portfolio with the switch on.
+    std::optional<std::string>                                   target_gap_last_reason_{};
 
     // -- [PNL-BASIS-PERSIST 2026-07-30] One-shot wallet reconcile ---------
     // After restart the restored inventory quantities can drift from the

@@ -1808,6 +1808,10 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         }
         cfg.asset_drift_guard_max_factor = f;
     }
+    if (node["target_gap_sizing_enabled"] && node["target_gap_sizing_enabled"].IsDefined()
+        && !node["target_gap_sizing_enabled"].IsNull()) {
+        cfg.target_gap_sizing_enabled = node["target_gap_sizing_enabled"].as<bool>();
+    }
 
     // [PACE 2026-09-13] Pace controller keys (default OFF).  Every double goes
     // through read_optional_finite_in_range and every count through

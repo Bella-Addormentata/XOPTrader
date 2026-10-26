@@ -5,6 +5,70 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — bids are sized toward the target allocations, so a coin held past q_max is still bought while it sits below its target
+
+### XCH/wUSDC.b bids again after a large wUSDC.b bridge
+
+On 2026-10-26 a 100 wUSDC.b bridge took wUSDC.b to 59% of the portfolio
+against its 20% target, while XCH sat at 14% against 50%, and XCH/wUSDC.b
+posted nothing at all. The strategy sizes a pair's bid as `q_max` minus the
+WHOLE holding of its base coin, so with 34.76 XCH held against `q_max` 20
+every XCH-base bid was 0, however far below its target XCH was. The ask, which
+would have collected more wUSDC.b, was zeroed by the single-CAT cap, and with
+both sides at 0 the pair was dropped before the ratio rebalancer, drift guard
+or deploy-idle floor could act: they only scale what the strategy produced.
+
+Once every pair is quoted, Step 4 now raises each pair's bid, never lowers
+it, to its share of
+
+    min(base coin's shortfall below its target, quote coin's surplus above its target)
+
+valued in XCH from wallet-confirmed balances over the
+`asset_target_allocations` coins, and converted to base units. It is non-zero
+only when the bid moves both coins toward their targets. The pairs share each
+coin's gap: where the pairs buying one coin together want more than its
+shortfall, or the pairs spending one coin want more than its surplus, all of
+them are scaled down by the same factor, so filling every floor of a heartbeat
+takes no coin past its target (beyond the usual up-scale to a pair's minimum
+offer size; an offer already resting keeps its size until it is repriced or
+expires). It runs before the Step 6 risk limits, so every limit, the ratio
+scaling, the drift guard, the wallet caps, the XCH lock ledger and the
+per-tier maximum still apply, and prices are unchanged. A pair whose strategy
+rejected its inputs (the zero-spread quote) gets no floor. Asks need no floor:
+the strategy sizes them `q_max` plus the whole holding.
+
+The floor is off for a heartbeat, rather than guessing, while a targeted
+coin's wallet balance is missing, unvalidated or older than
+`pace_max_balance_age_blocks` (20 blocks by default), or it has a balance and
+no price. The log says so once per change
+(`target-gap bid floor off until every targeted coin is valued -- <coin>: ...`,
+then `target-gap bid floor on`). To keep those balances fresh when no enabled
+pair reads one (a coin whose pairs are all disabled), the pace balance refresh
+now also runs while the floor is on; a balance Step 8 keeps reading costs it
+no RPC. A syncing wallet can report a partial balance, so like Step 8 that
+refresh (pace's too) now reads only from a wallet that reports itself synced,
+and so does the wUSDC.b bridge scan's on-demand balance read, as the
+wmilliETH.b scan's already did. Every writer of the balance cache now reads
+from a synced wallet; while the wallet syncs, bridge booking waits, as it
+already does while the wallet's circuit is open. A floor's size in base units
+is capped far above any ladder, so a tiny price for the base coin cannot
+overflow its conversion to mojos.
+
+On the 2026-10-26 book (Step 4 sizes, before the per-tier cap of 5 XCH over
+six tiers), the three pairs buying XCH want 107.4 XCH of its 91.2 XCH
+shortfall, so each gets 85% of its own floor:
+
+- XCH/wUSDC.b: 77.4 XCH, until wUSDC.b nears its 20%.
+- XCH/BYC: 13.1 XCH (was 5.2 with its `q_max_override` of 40).
+- XCH/DBX: 0.7 XCH (was 0), since DBX is a hair over its 15%; Step 7 raises
+  it to the pair's 1 XCH minimum.
+- BYC/wUSDC.b and wmilliETH.b/XCH: unchanged. BYC is over its target, and the
+  wmilliETH.b bid would spend XCH, which is under its own.
+
+New key `strategy.target_gap_sizing_enabled` (default `true`, applies live);
+`false` sizes bids from `q_max` alone, as before. Without
+`asset_target_allocations` it does nothing.
+
 ## [0.10.33] — 2026-10-26 — offers stay up instead of being cancelled minutes after they are posted, and a small holding quotes a smaller ladder instead of nothing
 
 ### Fewer offers cancelled right after posting (#194)

@@ -57,6 +57,7 @@
 #include "xop/strategy/avellaneda.hpp"
 #include "xop/strategy/glft.hpp"
 #include "xop/strategy/reservation_offset.hpp"
+#include "xop/strategy/target_gap.hpp"
 
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
@@ -4859,7 +4860,12 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // this heartbeat (the latch is kept) and clears the remaining budget, so
     // Step 9f refuses spends of an Active asset.  refresh_pace_balances checks
     // P25's gates (the engine modes that skip Step 8) itself, before any RPC.
-    if (config_.strategy.pace_enabled) {
+    // [TARGET-GAP 2026-10-26] The refresh also runs while the target-gap bid
+    // floor is on: next heartbeat's Step 4 values the same targeted balances,
+    // and this keeps one fresh when no enabled pair's Step 8 reads it (a coin
+    // whose pairs are all disabled).  A balance Step 8 keeps reading is never
+    // due (pace_refresh_due), so that costs no RPC.
+    if (config_.strategy.pace_enabled || config_.strategy.target_gap_sizing_enabled) {
         try { co_await refresh_pace_balances(block_height); }
         catch (const std::exception& e) {
             spdlog::warn("[Engine] Pace balance refresh failed: {}", e.what());
@@ -7405,6 +7411,112 @@ void Engine::step_compute_quotes(BlockHeight block_height)
                       pcs.raw_quote.bid_size, pcs.raw_quote.ask_size,
                       pcs.strategy_q, pcs.strategy_q_max);
     }
+
+    // [TARGET-GAP 2026-10-26] The target-gap bid floor
+    // (xop/strategy/target_gap.hpp), once every pair is quoted so the pairs
+    // can share each coin's gap.  The strategy's bid is q_max - the WHOLE
+    // base holding, blind to the targets: raise it, never lower it, to the
+    // pair's share of min(base deficit, quote excess), in base units.  Before
+    // Step 6, so every limit and cap still applies; Step 7's pace post-pass
+    // re-sizes a pace-managed pair's bid tiers anyway.  The valuation is the
+    // wallet-confirmed balances Step 8 and the pace refresh cache, at the XCH
+    // marks the drift guard reads; a targeted coin with no validated balance
+    // younger than pace_max_balance_age_blocks, or with a balance and no
+    // mark, leaves it unusable and every floor 0.
+    if (!config_.strategy.target_gap_sizing_enabled) {
+        target_gap_last_reason_.reset();
+        return;
+    }
+    std::vector<strategy::target_gap::Holding> gap_holdings;
+    for (const auto& [gap_key, gap_target] : config_.strategy.asset_target_allocations) {
+        strategy::target_gap::Holding gap_holding{};
+        gap_holding.key = gap_key;
+        gap_holding.target = gap_target;
+        const auto gap_id = pace_asset_id_for_key(gap_key);
+        const auto gap_cached = gap_id ? cached_wallet_balances_.find(*gap_id)
+                                       : cached_wallet_balances_.end();
+        if (gap_cached != cached_wallet_balances_.end() && gap_cached->second.fields_validated) {
+            const Mojo gap_confirmed = gap_cached->second.confirmed;
+            const double gap_rate = (*gap_id == "xch")
+                ? 1.0 : state_->get_asset_xch_rate(AssetId{*gap_id});
+            gap_holding.balance_known = true;
+            gap_holding.balance_age_blocks = block_height > gap_cached->second.as_of_block
+                ? block_height - gap_cached->second.as_of_block : 0u;
+            gap_holding.priced = gap_confirmed == 0 || gap_rate > 0.0;
+            gap_holding.xch_value = gap_holding.priced
+                ? static_cast<double>(gap_confirmed) * gap_rate / static_cast<double>(kMojosPerXch)
+                : 0.0;
+        }
+        gap_holdings.push_back(std::move(gap_holding));
+    }
+    const strategy::target_gap::Valuation gap_valuation = strategy::target_gap::value_targeted(
+        gap_holdings, config_.strategy.pace_max_balance_age_blocks);
+    // Said once per change, not every heartbeat.
+    if (!target_gap_last_reason_ || *target_gap_last_reason_ != gap_valuation.unusable_reason) {
+        if (gap_valuation.ok) {
+            spdlog::info("[Engine] Step 4: target-gap bid floor on ({} targeted coins, {:.2f} XCH)",
+                         gap_holdings.size(), gap_valuation.total_xch);
+        } else {
+            spdlog::info("[Engine] Step 4: target-gap bid floor off until every targeted coin is valued -- {}",
+                         gap_valuation.unusable_reason);
+        }
+        target_gap_last_reason_ = gap_valuation.unusable_reason;
+    }
+    if (!gap_valuation.ok) {
+        return;
+    }
+    // A pair Step 4 skipped, or whose strategy rejected its inputs (the
+    // zero-spread quote), gets no floor and claims no share of a gap.
+    std::vector<std::string> gap_pair_names;
+    std::vector<strategy::target_gap::PairCoins> gap_pairs;
+    for (const auto& [pair_name, pcs] : cycle_) {
+        if (!pcs.quote_valid || !std::isfinite(pcs.raw_quote.spread_bps)
+            || !(pcs.raw_quote.spread_bps > 0.0)) {
+            continue;
+        }
+        const auto gap_slash = pair_name.find('/');
+        if (gap_slash == std::string::npos) {
+            continue;
+        }
+        strategy::target_gap::PairCoins gap_coins{};
+        gap_coins.base_key = pair_name.substr(0, gap_slash);
+        gap_coins.quote_key = pair_name.substr(gap_slash + 1);
+        for (auto& c : gap_coins.base_key) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        for (auto& c : gap_coins.quote_key) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        gap_pair_names.push_back(pair_name);
+        gap_pairs.push_back(std::move(gap_coins));
+    }
+    const std::vector<double> gap_floors_xch =
+        strategy::target_gap::shared_bid_floors_xch(gap_valuation, gap_pairs);
+    for (std::size_t gap_i = 0; gap_i < gap_pair_names.size(); ++gap_i) {
+        const PairConfig* gap_pc = find_pair_config(gap_pair_names[gap_i]);
+        if (gap_pc == nullptr) {
+            continue;
+        }
+        auto& gap_pcs = cycle_.at(gap_pair_names[gap_i]);
+        // XCH per base display unit, at the mark the valuation used.
+        const double gap_base_xch_per_unit = (gap_pc->base_asset_id == "xch")
+            ? 1.0
+            : state_->get_asset_xch_rate(AssetId{gap_pc->base_asset_id})
+                  * static_cast<double>(gap_pc->base_mojos_per_unit)
+                  / static_cast<double>(kMojosPerXch);
+        // Capped where Step 6's llround of the size stays in range.
+        const double gap_floor = strategy::target_gap::floor_units(
+            gap_floors_xch[gap_i], gap_base_xch_per_unit, static_cast<double>(gap_pc->base_mojos_per_unit));
+        if (gap_floor > 0.0 && gap_floor > gap_pcs.raw_quote.bid_size) {
+            const std::string& gap_base_key = gap_pairs[gap_i].base_key;
+            const std::string& gap_quote_key = gap_pairs[gap_i].quote_key;
+            spdlog::info("[Engine] Step 4: {} target-gap bid floor: bid_size {:.6f} -> {:.6f} "
+                         "({} {:.1f}% vs target {:.1f}%, {} {:.1f}% vs target {:.1f}%, q={:.6f} q_max={:.6f})",
+                         gap_pair_names[gap_i], gap_pcs.raw_quote.bid_size, gap_floor,
+                         gap_base_key, gap_valuation.xch_by_key.at(gap_base_key) / gap_valuation.total_xch * 100.0,
+                         gap_valuation.target_by_key.at(gap_base_key) * 100.0,
+                         gap_quote_key, gap_valuation.xch_by_key.at(gap_quote_key) / gap_valuation.total_xch * 100.0,
+                         gap_valuation.target_by_key.at(gap_quote_key) * 100.0,
+                         gap_pcs.strategy_q, gap_pcs.strategy_q_max);
+            gap_pcs.raw_quote.bid_size = gap_floor;
+        }
+    }
 }
 
 // Step 5: Apply spread optimizer adjustments.
@@ -7961,7 +8073,9 @@ asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)
     // active (the balances only feed a plan that could not post), nor while
     // wallet_consecutive_failures_ > 0.  Step 8's own wallet-sync and
     // fee-budget checks are not among these gates, so the refresh still runs
-    // while either holds Step 8 back.  Nor do the gates keep pace out of a
+    // while either holds Step 8 back -- though since [TARGET-GAP 2026-10-26]
+    // it reads no balance from a wallet that does not report itself synced
+    // (below).  Nor do the gates keep pace out of a
     // wallet brown-out: wallet_consecutive_failures_ rarely rises in one,
     // because detect_fills catches RPC errors and Step 8's sync check catches
     // and returns.  What bounds the load pace adds is the per-asset backoff
@@ -7974,7 +8088,10 @@ asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)
     // Unlike the throw counter it does rise in a brown-out, because rpc_post
     // records every call however its caller handles the exception.
     strategy::pace::RefreshGates pace_gates{};
-    pace_gates.pace_enabled                = config_.strategy.pace_enabled;
+    // [TARGET-GAP 2026-10-26] Either consumer of the targeted balances opens
+    // this gate: pace, or Step 4's target-gap bid floor.
+    pace_gates.pace_enabled                = config_.strategy.pace_enabled
+                                             || config_.strategy.target_gap_sizing_enabled;
     pace_gates.dry_run                     = dry_run_;
     pace_gates.wallet_circuit_open         = wallet_circuit_open_;
     pace_gates.watchdog_fired              = watchdog_fired_.load(std::memory_order_acquire);
@@ -7996,6 +8113,15 @@ asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)
     // and the per-asset backoff retries a failed attempt at age 2h.
     const std::uint32_t pace_refresh_age =
         strategy::pace::pace_refresh_age_blocks(config_.strategy.pace_max_balance_age_blocks);
+    // [TARGET-GAP 2026-10-26] Read only from a synced wallet.  One that is not
+    // synced can report a partial balance, and the next heartbeat's Step 4
+    // values the targeted coins from this cache before Step 8 reads anything;
+    // every Step 8 writer of the cache sits below its sync gate.  Asked once,
+    // before the first due read, and read the way that gate reads it
+    // (synced=true and syncing=false; a reply without `syncing` reads as
+    // syncing).  An unsynced wallet records no attempt, so every due balance
+    // stays due and is read on the first synced heartbeat.
+    std::optional<bool> pace_wallet_synced{};
     for (const auto& pace_key : pace_keys) {
         const auto pace_id = pace_asset_id_for_key(pace_key);
         if (!pace_id) {
@@ -8017,6 +8143,25 @@ asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)
         const auto pace_wid = offer_mgr_->resolve_wallet_id(*pace_id);
         if (pace_wid <= 0) {
             continue;
+        }
+        if (!pace_wallet_synced.has_value()) {
+            pace_wallet_synced = false;
+            try {
+                const auto pace_sync = co_await wallet_->get_sync_status();
+                const bool pace_synced = pace_sync.contains("synced") && pace_sync["synced"].is_boolean()
+                                         && pace_sync["synced"].get<bool>();
+                const bool pace_syncing = !pace_sync.contains("syncing") || !pace_sync["syncing"].is_boolean()
+                                          || pace_sync["syncing"].get<bool>();
+                pace_wallet_synced = pace_synced && !pace_syncing;
+                if (!*pace_wallet_synced) {
+                    spdlog::debug("[Engine] Pace: balance refresh deferred -- the wallet is not synced");
+                }
+            } catch (const std::exception& e) {
+                spdlog::debug("[Engine] Pace: balance refresh deferred -- wallet sync check failed: {}", e.what());
+            }
+        }
+        if (!*pace_wallet_synced) {
+            co_return;
         }
         // Recorded BEFORE the RPC: a failed, timed-out or malformed attempt
         // backs off exactly like a good one, so this refresh sends at most one
@@ -8078,8 +8223,14 @@ void Engine::step_evaluate_pace(BlockHeight block_height)
         pace_assets_consumed_this_cycle_.clear();
         pace_last_status_.clear();
         pace_band_conflict_logged_.clear();
-        pace_refresh_attempted_at_.clear();
-        pace_refresh_failures_.clear();
+        // [TARGET-GAP 2026-10-26] The balance refresh keeps its backoff while
+        // the target-gap bid floor still runs it: cleared every heartbeat, a
+        // failing or malformed reply would be retried, and warned about, on
+        // every heartbeat instead of once per refresh age.
+        if (!config_.strategy.target_gap_sizing_enabled) {
+            pace_refresh_attempted_at_.clear();
+            pace_refresh_failures_.clear();
+        }
         return;
     }
 
@@ -21207,7 +21358,8 @@ asio::awaitable<bool> Engine::fetch_bridge_balance(const AssetId& asset,
 }
 
 // [WARP-MILLIETH review] Whether the wallet is known synced for the
-// secondary scan's reads: Step 8 saw it synced in this heartbeat, or -- when
+// secondary scan's reads (and, since [TARGET-GAP 2026-10-26], every bridge
+// scan's): Step 8 saw it synced in this heartbeat, or -- when
 // Step 8 did not get that far (a pause) -- an on-demand get_sync_status gives
 // the reading Step 8 requires (synced=true, syncing=false; a reply without
 // `syncing` reads as syncing).  Asked at most once per heartbeat.
@@ -21368,8 +21520,15 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     // transport failure sooner: wallet_step_may_run also refuses after an
     // unanswered failure earlier in this heartbeat.  Evaluated last, so it is
     // consulted only when a fetch is actually needed.
+    // [TARGET-GAP 2026-10-26] And only from a wallet known synced, as the
+    // secondary scan and the top-up takes read: a mid-sync reply is a partial
+    // balance, and this cache entry is what the ledger invariant, Step 7's
+    // wallet caps and the next heartbeat's Step 4 target-gap valuation read.
+    // No RPC when this heartbeat's Step 8 passed its sync gate; otherwise one
+    // get_sync_status, shared with the secondary scan.
     if (!snapshot_current) {
-        snapshot_current = co_await fetch_bridge_balance(asset, block_height);
+        snapshot_current = co_await secondary_wallet_synced(block_height)
+                           && co_await fetch_bridge_balance(asset, block_height);
     }
     if (!snapshot_current && !jobs.empty()) {
         spdlog::debug("[Engine] Bridge ingest: no usable wallet snapshot "
@@ -21625,8 +21784,9 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                     // [review round 6] ...and only from a wallet Step 8 saw
                     // synced in THIS heartbeat.  The scan runs every heartbeat,
                     // Step 8 stopped at its sync gate or not, and its own fetch
-                    // checks only that the wallet answers: a mid-sync balance
-                    // must not verify the asset.
+                    // needs only a synced reading ([TARGET-GAP 2026-10-26];
+                    // during a pause an on-demand one), not Step 8's: a
+                    // mid-sync balance must not verify the asset.
                     // [review round 7] Its pairs' offers from before this
                     // verification are then drained by Step 8, as the
                     // verification pass's are.

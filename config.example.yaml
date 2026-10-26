@@ -668,6 +668,13 @@ strategy:
   ratio_force_one_sided: true          # [OPTIONAL, default: true] Force one-sided posting while rebalancing
   ratio_tier_size_scale_min: 0.35      # [OPTIONAL, default: 0.35] Overweight side minimum size multiplier
   ratio_tier_size_scale_max: 1.15      # [OPTIONAL, default: 1.15] Underweight side maximum size multiplier
+  target_gap_sizing_enabled: true      # [OPTIONAL, default: true] Size each bid to at least its share of min(the base coin's
+                                       #   shortfall below its asset_target_allocations share, the quote coin's surplus above
+                                       #   its share), valued in XCH; the pairs buying or spending one coin share its gap.
+                                       #   Without it a coin held past q_max gets no bid however far below its target it is.
+                                       #   Risk limits and caps still apply. Off while a targeted coin's wallet balance is
+                                       #   missing or older than pace_max_balance_age_blocks, or it has no price (logged); no
+                                       #   effect without targets. Applies live; false = size bids from q_max alone, as before.
   xch_ask_throttle_enabled: true       # [OPTIONAL, default: true] Enable smooth XCH ask throttling
   xch_ask_throttle_caution_xch: 2.0    # [OPTIONAL, default: 2.0] Start mild ask throttling below this
   xch_ask_throttle_low_xch: 1.0        # [OPTIONAL, default: 1.0] Stronger ask throttling below this
@@ -717,6 +724,7 @@ strategy:
   # pace_edge_sigma_mult: 1.0            # [OPTIONAL, default: 1.0] [0, 5]; edge = max(min_edge, mult x fair-value sigma)
   # pace_max_fair_value_sigma_bps: 200   # [OPTIONAL, default: 200] (0, 2000]; a fair value above this sigma is unusable
   # pace_max_balance_age_blocks: 20      # [OPTIONAL, default: 20] [1, 4608] freshness bound on cached wallet balances
+  #                                      #   (also for target_gap_sizing_enabled's valuation, which keeps them refreshed)
   # pace_reprice_min_bps: 50             # [OPTIONAL, default: 50] (0, 1000] minimum improvement to reprice a pace bid
   # pace_reprice_min_age_blocks: 96      # [OPTIONAL, default: 96] [12, 4608] minimum age to reprice a pace bid
 
