@@ -670,50 +670,83 @@ std::optional<MarketTickerMatch> orient_market_ticker(
     };
 
     // --- Case (A): the market key is the requested BASE ---
-    for (const auto& [market_key, listing] : markets.items()) {
-        if (market_key != base_asset_id || !listing.is_array()) {
-            continue;
-        }
-        for (const auto& entry : listing) {
-            if (!entry.is_object()
-                || json_string_or(entry, "id") != quote_asset_id) {
+    const auto find_case_a = [&]() -> std::optional<MarketTickerMatch> {
+        for (const auto& [market_key, listing] : markets.items()) {
+            if (market_key != base_asset_id || !listing.is_array()) {
                 continue;
             }
-            MarketTickerMatch match;
-            match.listed   = parse_market_ticker(entry, market_key);
-            match.inverted = true;
-            match.oriented = match.listed;  // identity and volume fields
-            // A bid for the pair's base is paid in the token -- an offer to
-            // SELL the token, i.e. a token ask -- so each side comes from the
-            // opposite side of the listing.  The extremes swap the same way.
-            match.oriented.best_bid   = invert(match.listed.best_ask);
-            match.oriented.best_ask   = invert(match.listed.best_bid);
-            match.oriented.price_last = invert(match.listed.price_last);
-            match.oriented.price_high = invert(match.listed.price_low);
-            match.oriented.price_low  = invert(match.listed.price_high);
-            return match;
+            for (const auto& entry : listing) {
+                if (!entry.is_object()
+                    || json_string_or(entry, "id") != quote_asset_id) {
+                    continue;
+                }
+                MarketTickerMatch match;
+                match.listed   = parse_market_ticker(entry, market_key);
+                match.inverted = true;
+                match.oriented = match.listed;  // identity and volume fields
+                // A bid for the pair's base is paid in the token -- an offer
+                // to SELL the token, i.e. a token ask -- so each side comes
+                // from the opposite side of the listing.  The extremes swap
+                // the same way.
+                match.oriented.best_bid   = invert(match.listed.best_ask);
+                match.oriented.best_ask   = invert(match.listed.best_bid);
+                match.oriented.price_last = invert(match.listed.price_last);
+                match.oriented.price_high = invert(match.listed.price_low);
+                match.oriented.price_low  = invert(match.listed.price_high);
+                return match;
+            }
         }
-    }
+        return std::nullopt;
+    };
 
     // --- Case (B): the market key is the requested QUOTE ---
-    for (const auto& [market_key, listing] : markets.items()) {
-        if (market_key != quote_asset_id || !listing.is_array()) {
-            continue;
-        }
-        for (const auto& entry : listing) {
-            if (!entry.is_object()
-                || json_string_or(entry, "id") != base_asset_id) {
+    const auto find_case_b = [&]() -> std::optional<MarketTickerMatch> {
+        for (const auto& [market_key, listing] : markets.items()) {
+            if (market_key != quote_asset_id || !listing.is_array()) {
                 continue;
             }
-            MarketTickerMatch match;
-            match.listed   = parse_market_ticker(entry, market_key);
-            // Already quote per base: the listing's own sides are the pair's.
-            match.oriented = match.listed;
+            for (const auto& entry : listing) {
+                if (!entry.is_object()
+                    || json_string_or(entry, "id") != base_asset_id) {
+                    continue;
+                }
+                MarketTickerMatch match;
+                match.listed   = parse_market_ticker(entry, market_key);
+                // Already quote per base: the listing's own sides are the
+                // pair's.
+                match.oriented = match.listed;
+                return match;
+            }
+        }
+        return std::nullopt;
+    };
+
+    // [CHURN 2026-10-26] WHICH listing, when Dexie lists the market under
+    // both assets' keys.  Bid, ask, high and low are in each listing's own
+    // units, so either listing orients them correctly; `last` is not.  Dexie
+    // serves the SAME raw `last` in both listings (TODO S53), so it is right
+    // only in the market's canonical listing: the one under "xch" for an XCH
+    // market, and for a CAT/CAT market the one under its quote -- for
+    // BYC/wUSDC.b, wUSDC.b's.  Our own BYC/wUSDC.b bids settled at 0.896 and
+    // 0.900 on 2026-10-20, and the wUSDC.b-keyed listing served last 0.8988;
+    // the BYC-keyed one, present in 86 of 1,218 reads on 2026-10-25/26,
+    // served the same 0.8988, which Case A turned into 1.1126.  Searching
+    // Case A first under every key made the ingested last trade flip between
+    // the two -- and each flip re-stamped the print as fresh, moved the
+    // published mid by 24%, and got our resting BYC/wUSDC.b asks cancelled as
+    // crossed (68 of them in those 17 h).
+    // So: Case A first only when the BASE is XCH; otherwise Case B first.
+    // With a single listing the order cannot matter.
+    if (base_asset_id == "xch") {
+        if (auto match = find_case_a()) {
             return match;
         }
+        return find_case_b();
     }
-
-    return std::nullopt;
+    if (auto match = find_case_b()) {
+        return match;
+    }
+    return find_case_a();
 }
 
 // =======================================================================

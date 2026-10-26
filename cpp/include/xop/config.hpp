@@ -87,7 +87,8 @@ enum class TtlCancelMode : std::uint8_t { Cancel = 0, Expire = 1 };
 ///   Unified: one verdict from lock-invariant inputs, shared by both sites --
 ///            and, while any LIVE resting offer's pair cannot be resolved
 ///            against this config, a refusal to ADD exposure rather than a
-///            reading of that offer's spend as zero.
+///            reading of that offer's spend as zero.  The default since
+///            2026-10-26 (StrategyConfig::exposure_rule).
 enum class ExposureRule : std::uint8_t { Legacy = 0, Unified = 1 };
 
 /// strategy.price_cancel_mode -- when a resting offer is cancelled for PRICE.
@@ -567,10 +568,16 @@ struct StrategyConfig {
     /// chain clock".  Check the wallet's own get_connections before enabling.
     TtlCancelMode ttl_cancel_mode{TtlCancelMode::Cancel};
 
-    /// [S71 2026-09-20] Step 8's reserve-exposure rule.  `legacy` (default)
-    /// is the pair of spendable-based checks that cancelled 528 offers in 14
-    /// days at an average age of 27 blocks; `unified` is one verdict from
-    /// lock-invariant inputs (execution/exposure_gate.hpp).
+    /// [S71 2026-09-20] Step 8's reserve-exposure rule.  `legacy` is the pair
+    /// of spendable-based checks that cancelled 528 offers in 14 days at an
+    /// average age of 27 blocks; `unified` is one verdict from lock-invariant
+    /// inputs (execution/exposure_gate.hpp).
+    /// [CHURN 2026-10-26] `unified` is now the DEFAULT.  It shipped off, the
+    /// live config never turned it on, and with four pairs spending XCH and
+    /// two spending BYC `legacy` had become the bot's main cancel source: 402
+    /// of the 675 cancels in 17 h of the live log (2026-10-25/26), median
+    /// offer age 2.5 minutes.  `exposure_rule: legacy` is still accepted as a
+    /// rollback.
     /// [review #164] `unified` also fails CLOSED in one direction, which is
     /// not a reserve breach and does not say so in the log: while a LIVE
     /// resting offer's pair cannot be resolved against this config (an
@@ -580,7 +587,7 @@ struct StrategyConfig {
     /// posts are suppressed on both sides.  It never cancels a resting offer
     /// on that account.  Watch for "exposure (unified) ... cannot be
     /// projected -- a LIVE resting offer's pair is not in this config".
-    ExposureRule  exposure_rule{ExposureRule::Legacy};
+    ExposureRule  exposure_rule{ExposureRule::Unified};
     /// [S71] Unified rule only.  New posts are suppressed when the projected
     /// balance is below the reserve; RESTING offers are cancelled only below
     /// reserve x (1 - this).  [0, 1]; 1 never cancels (suppress only).

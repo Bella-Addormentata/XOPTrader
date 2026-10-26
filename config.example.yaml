@@ -483,8 +483,11 @@ strategy:
   tier_size_pct: [0.15, 0.20, 0.30, 0.35] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)
   max_half_spread_bps: 250  # [OPTIONAL, default: 250] Global cap on half-spread
   # [S70-S72] Three switches that cut CANCELS (each is a fee-bearing spend).
-  # Every one defaults to the rule in force before it existed; all need a
-  # restart.  Enable one at a time and watch the log line named beside it.
+  # ttl_cancel_mode and price_cancel_mode default to the rule in force before
+  # they existed; exposure_rule defaults to unified since 2026-10-26.  The GUI
+  # does not show these keys: edit them here with the GUI closed (a Settings
+  # Save rewrites this file from what the GUI loaded, dropping keys added
+  # since).  Enable one at a time and watch the log line named beside it.
   #
   # ttl_cancel_mode: expire -- an offer that verifiably carries the expiry
   #   above is no longer cancelled at the hard TTL; the chain ages it out and
@@ -503,9 +506,16 @@ strategy:
   #   direction, and the log line naming it is "no trusted chain clock".
   # ttl_cancel_mode: cancel                # [OPTIONAL, default: cancel] cancel | expire
   #
-  # exposure_rule: unified -- one reserve-exposure verdict for the pre-post
-  #   projection AND the resting-offer check, from inputs that do not move
-  #   when an offer locks a coin.  Log: "exposure (unified)".
+  # exposure_rule: unified (the default since 2026-10-26) -- one
+  #   reserve-exposure verdict for the pre-post projection AND the
+  #   resting-offer check, from inputs that do not move when an offer locks a
+  #   coin.  Log: "exposure (unified)".
+  #   legacy (the default before 2026-10-26) subtracts each resting offer from
+  #   a spendable balance that ALREADY excludes the coin the offer locked, so
+  #   it counts every offer twice and cancels what it has just posted: on
+  #   2026-10-25/26 it made 402 of the live bot's 675 cancels in 17 h, at a
+  #   median offer age of 2.5 minutes.  Write exposure_rule: legacy only to
+  #   roll back.
   #   FAILS CLOSED, and not as a reserve breach: while a LIVE resting offer's
   #   pair cannot be resolved against this config (an adopted UNKNOWN wallet
   #   record, or a pair since REMOVED from the file -- a merely DISABLED pair
@@ -515,7 +525,7 @@ strategy:
   #   cancelled on its account.  Watch for the line that says so in its own
   #   words: "exposure (unified) ... cannot be projected -- a LIVE resting
   #   offer's pair is not in this config".
-  # exposure_rule: legacy                  # [OPTIONAL, default: legacy] legacy | unified
+  # exposure_rule: unified                 # [OPTIONAL, default: unified] unified | legacy
   # exposure_cancel_hysteresis_pct: 0.25   # [OPTIONAL, default: 0.25] [0, 1] unified only: resting offers are cancelled only below reserve x (1 - this); 1 = never cancel, suppress only
   # exposure_cancel_min_age_blocks: 32     # [OPTIONAL, default: 32] [0, 4608] unified only: younger offers are never exposure-cancelled (32 blocks = 10 min)
   #

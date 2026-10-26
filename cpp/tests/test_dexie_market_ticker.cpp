@@ -30,7 +30,10 @@
 //         CaseAXchDbxMatchesTheEngineLogReadCorrectly,
 //         CaseBBycXchIsReturnedAsListed, CaseBBycWusdcbJunkAskIsTheAsk,
 //         MissingSideStaysZeroWhenInverted, MissingSideStaysZeroWhenDirect,
-//         WithBothListingsPresentCaseAIsSearchedFirst.
+//         WithBothListingsPresentCaseAIsSearchedFirst,
+//         CatCatWithBothListingsTheQuoteKeyedOneIsUsed,
+//         CatCatListedOnlyUnderItsBaseIsTakenAsListed,
+//         XchQuotedPairWithBothListingsTheXchKeyedOneIsUsed.
 //      BothListingsOfOneMarketAgree stays GREEN: the mislabel swaps both
 //      listings identically.  That is how S7's closure could look right --
 //      the flip is self-consistent; only our own bid shows which side is
@@ -39,15 +42,26 @@
 //      -> CaseAXchBycBidIsOurOwnRestingBid,
 //         CaseAXchDbxMatchesTheEngineLogReadCorrectly,
 //         MissingSideStaysZeroWhenInverted, BothListingsOfOneMarketAgree,
-//         WithBothListingsPresentCaseAIsSearchedFirst.
+//         WithBothListingsPresentCaseAIsSearchedFirst,
+//         CatCatListedOnlyUnderItsBaseIsTakenAsListed.
 //   M3 Case B exchanges the sides
 //      -> CaseBBycXchIsReturnedAsListed, CaseBBycWusdcbJunkAskIsTheAsk,
-//         MissingSideStaysZeroWhenDirect.
+//         MissingSideStaysZeroWhenDirect,
+//         CatCatWithBothListingsTheQuoteKeyedOneIsUsed,
+//         XchQuotedPairWithBothListingsTheXchKeyedOneIsUsed.
 //   M4 Case A takes reciprocals of high/low without exchanging them
 //      -> InvertedHighAndLowAreExchanged, BothListingsOfOneMarketAgree.
-//   M7 the Case B search runs before Case A (round 3)
-//      -> WithBothListingsPresentCaseAIsSearchedFirst, alone: every other
+//   M7 the Case B search runs before Case A for every pair (round 3)
+//      -> WithBothListingsPresentCaseAIsSearchedFirst, alone: the other
+//         both-listings tests want Case B first anyway, and every other
 //         fixture lists each market once, so the order cannot show there.
+//   M8 [CHURN 2026-10-26] the Case A search runs first for every pair again
+//      (the order before this round)
+//      -> CatCatWithBothListingsTheQuoteKeyedOneIsUsed,
+//         XchQuotedPairWithBothListingsTheXchKeyedOneIsUsed.
+//   M9 the XCH test reads the QUOTE instead of the base
+//      -> WithBothListingsPresentCaseAIsSearchedFirst,
+//         XchQuotedPairWithBothListingsTheXchKeyedOneIsUsed.
 // ---------------------------------------------------------------------------
 
 #include <cmath>
@@ -165,6 +179,49 @@ constexpr const char* kOneSidedMarkets = R"json({
       }
     },
     {"id": "bbbb", "code": "NONE", "pair_id": "xch"}
+  ]
+})json";
+
+// [CHURN 2026-10-26] BYC/wUSDC.b as Dexie served it on 2026-10-25/26 (engine
+// log: the "get_ticker -> found" and "ingest_dexie" lines), trimmed to the
+// fields the parser reads.  Under wUSDC.b's key, BYC with our own 0.908 ask
+// and no bid: the listing get_ticker read in 1,132 of 1,218 reads.
+constexpr const char* kWusdcbKeyOct26 = R"json({
+  "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d": [
+    {
+      "id": "ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac",
+      "code": "BYC", "name": "Bytecash",
+      "pair_id": "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d",
+      "prices": {
+        "buy":  [{"depth": 0, "price": 0.908}],
+        "sell": [{"depth": 0, "price": null}],
+        "last": {"price": 0.8988},
+        "high": {"daily": null},
+        "low":  {"daily": null}
+      }
+    }
+  ]
+})json";
+
+// The same market under BYC's key, which Case A found in the other 86:
+// wUSDC.b, BYC per wUSDC.b, with our 0.908 ask seen from the other side
+// (1/0.908, a wUSDC.b bid) and a junk 710.546 ask.  Its `last` is the same
+// 0.8988 -- wUSDC.b per BYC, not BYC per wUSDC.b: our own BYC/wUSDC.b bids
+// settled at 0.896 and 0.900 on 2026-10-20.
+constexpr const char* kBycKeyOct26 = R"json({
+  "ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac": [
+    {
+      "id": "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d",
+      "code": "wUSDC.b",
+      "pair_id": "ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac",
+      "prices": {
+        "buy":  [{"depth": 0, "price": 710.545999}],
+        "sell": [{"depth": 0, "price": 1.1013215859030836}],
+        "last": {"price": 0.8988},
+        "high": {"daily": null},
+        "low":  {"daily": null}
+      }
+    }
   ]
 })json";
 
@@ -304,12 +361,14 @@ TEST(DexieMarketTicker, BothListingsOfOneMarketAgree)
 }
 
 // [round 3] Dexie can list one market under BOTH keys, and the saved response
-// does so for XCH/BYC.  orient_market_ticker searches Case A under every key
-// before Case B, and that order is not cosmetic: the two listings disagree on
-// `last` (the xch-keyed 0.5 orients to 2.0; the BYC-keyed 0.5 would pass
-// through as 0.5), so the search order alone decides the last trade the
-// engine ingests.  Bid and ask agree either way, which is why they cannot
-// catch a reordering -- `inverted`, the listing's key and `last` can.
+// does so for XCH/BYC.  The search order is not cosmetic: the two listings
+// disagree on `last` (the xch-keyed 0.5 orients to 2.0; the BYC-keyed 0.5
+// would pass through as 0.5), so the order alone decides the last trade the
+// engine ingests.  For a pair whose BASE is XCH, Case A -- the xch-keyed
+// listing -- is searched first; for every other pair Case B is, since
+// [CHURN 2026-10-26] (the two tests after this one).  Bid and ask agree
+// either way, which is why they cannot catch a reordering -- `inverted`, the
+// listing's key and `last` can.
 TEST(DexieMarketTicker, WithBothListingsPresentCaseAIsSearchedFirst)
 {
     auto m = nlohmann::json::parse(kXchMarkets);
@@ -326,6 +385,67 @@ TEST(DexieMarketTicker, WithBothListingsPresentCaseAIsSearchedFirst)
         << "Case B would have returned the BYC-keyed listing's 0.5 verbatim";
     EXPECT_DOUBLE_EQ(match->oriented.best_bid, 1.451);
     EXPECT_DOUBLE_EQ(match->oriented.best_ask, 3.3333333333333335);
+}
+
+// [CHURN 2026-10-26] A CAT/CAT market listed under both keys: the listing
+// under the QUOTE is read.  Case A first -- the order before this -- read the
+// BYC-keyed listing and inverted its `last` to 1.1126, 24% above the 0.8988
+// both listings served; each switch between the two re-stamped the print as
+// fresh and got our resting BYC/wUSDC.b asks cancelled as crossed.
+TEST(DexieMarketTicker, CatCatWithBothListingsTheQuoteKeyedOneIsUsed)
+{
+    auto m = nlohmann::json::parse(kWusdcbKeyOct26);
+    m[kByc] = nlohmann::json::parse(kBycKeyOct26).at(kByc);
+    ASSERT_TRUE(m.contains(kWusdcb));
+    ASSERT_TRUE(m.contains(kByc)) << "precondition: both listings present";
+
+    const auto match = orient_market_ticker(m, kByc, kWusdcb);
+    ASSERT_TRUE(match.has_value());
+    EXPECT_FALSE(match->inverted) << "Case B: the wUSDC.b-keyed listing";
+    EXPECT_EQ(match->listed.pair_id, kWusdcb);
+    EXPECT_DOUBLE_EQ(match->oriented.price_last, 0.8988)
+        << "between our own 0.896 and 0.900 fills; Case A gave 1.1126";
+    EXPECT_DOUBLE_EQ(match->oriented.best_ask, 0.908) << "our own ask";
+    EXPECT_DOUBLE_EQ(match->oriented.best_bid, 0.0) << "no bid listed";
+}
+
+// The same market listed under its BASE only is taken as listed -- Case A,
+// inverted, `last` included.  This pins the documented fallback, not a price
+// anyone has checked: nothing shows Dexie serving the BYC-keyed listing
+// without the wUSDC.b-keyed one, and a lone listing is assumed canonical
+// (for a CAT/CAT pair configured against Dexie's own orientation, it is).
+TEST(DexieMarketTicker, CatCatListedOnlyUnderItsBaseIsTakenAsListed)
+{
+    const auto m = nlohmann::json::parse(kBycKeyOct26);
+    const auto match = orient_market_ticker(m, kByc, kWusdcb);
+    ASSERT_TRUE(match.has_value());
+    EXPECT_TRUE(match->inverted);
+    EXPECT_EQ(match->listed.pair_id, kByc);
+    EXPECT_NEAR(match->oriented.best_ask, 0.908, 1e-12)
+        << "our own ask, 1 / the wUSDC.b bid";
+    EXPECT_NEAR(match->oriented.best_bid, 1.0 / 710.545999, 1e-15);
+    EXPECT_NEAR(match->oriented.price_last, 1.0 / 0.8988, 1e-12);
+}
+
+// An XCH-QUOTED pair listed under both keys reads the "xch" listing too --
+// Case B for this pair -- and with it the right `last`.  Case A would read the
+// BYC-keyed listing and invert its 0.5 to 2.0 XCH per BYC, outside even the
+// xch-keyed listing's own 0.5-0.8 daily range.
+TEST(DexieMarketTicker, XchQuotedPairWithBothListingsTheXchKeyedOneIsUsed)
+{
+    auto m = nlohmann::json::parse(kXchMarkets);
+    m[kByc] = nlohmann::json::parse(kBycKeyMarkets).at(kByc);
+    ASSERT_TRUE(m.contains("xch"));
+    ASSERT_TRUE(m.contains(kByc)) << "precondition: both listings present";
+
+    const auto match = orient_market_ticker(m, kByc, "xch");
+    ASSERT_TRUE(match.has_value());
+    EXPECT_FALSE(match->inverted) << "Case B: the xch-keyed listing, direct";
+    EXPECT_EQ(match->listed.pair_id, "xch");
+    EXPECT_DOUBLE_EQ(match->oriented.price_last, 0.5)
+        << "Case A would have inverted the BYC-keyed listing's 0.5 to 2.0";
+    EXPECT_DOUBLE_EQ(match->oriented.best_bid, 0.3);
+    EXPECT_DOUBLE_EQ(match->oriented.best_ask, 0.6891798759476223);
 }
 
 TEST(DexieMarketTicker, MissingSideStaysZeroWhenInverted)

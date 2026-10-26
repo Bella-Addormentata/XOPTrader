@@ -5,6 +5,48 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — offers stay up instead of being cancelled minutes after they are posted
+
+### Fewer offers cancelled right after posting
+
+In 17 hours of the live log (2026-10-25/26) the bot posted 746 offers and
+cancelled 675 of them, half within five minutes, with no fill in between.
+Each cancel is a fee-bearing spend. Two causes, both fixed:
+
+**The September exposure rule is now the default.** `strategy.exposure_rule:
+unified` (S71, #164) shipped switched off. The old `legacy` rule subtracts
+each resting offer from a spendable balance that already leaves out the coin
+the offer locked, so it counted every offer twice: a freshly posted offer
+pushed its own pair under the reserve and the next heartbeat cancelled it.
+With four pairs spending XCH and two spending BYC, that made 402 of the 675
+cancels (`exposure_floor_rebalance`, median offer age 2.5 minutes). `unified`
+measures what the wallet owns minus every resting offer that spends the asset,
+on every pair, against the reserve. It stops new posts at the reserve but
+cancels a resting offer only below 75% of it
+(`exposure_cancel_hysteresis_pct`), and never one younger than 32 blocks
+(`exposure_cancel_min_age_blocks`). A config without the key now gets
+`unified`; `exposure_rule: legacy` keeps the old rule. One behaviour to know:
+while any live resting offer belongs to a pair the config cannot resolve (an
+adopted UNKNOWN wallet offer, or a pair removed from the file; a disabled pair
+is fine), `unified` posts nothing new on any pair and logs "exposure (unified)
+... cannot be projected -- a LIVE resting offer's pair is not in this config".
+It never cancels that offer itself.
+
+**BYC/wUSDC.b reads the right last trade.** Dexie sometimes lists BYC/wUSDC.b
+under BYC's key as well as wUSDC.b's, with the same raw last price (0.8988) in
+both. The ticker read BYC's listing first and inverted that price to 1.1126,
+so the pair's mid jumped between about 0.90 and 1.11, each jump looked like a
+fresh trade, and the resting asks were cancelled as crossed (`crossed_mid`, 68
+cancels). A CAT/CAT pair now reads the listing under its quote, and an
+XCH-quoted pair the one under `xch`; pairs with XCH as the base read the same
+listing as before. TODO S53, which suspected the opposite orientation, is
+resolved against our own settled BYC/wUSDC.b fills.
+
+`ttl_cancel_mode` and `price_cancel_mode` keep their old defaults. The GUI's
+Settings page does not show these keys, and a Settings save drops keys added
+to config.yaml after the GUI loaded it (TODO S79), so edit them with the GUI
+closed.
+
 ## [0.10.32] — 2026-10-26 — saved settings apply live, and the bridge judges its Chia sends instead of assuming them
 
 ### Saved settings apply to the running engine without a restart (#190)

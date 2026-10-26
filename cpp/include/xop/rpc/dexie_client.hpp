@@ -218,9 +218,14 @@ struct MarketTickerMatch {
 ///   (B) key == quote (BYC/wUSDC.b under wUSDC.b's key): prices are already
 ///       quote per base, so the listing is returned as it is.
 ///
-/// (A) is searched under every key before (B), the order get_ticker always
-/// used.  An absent (zero) price stays zero.  nullopt when nothing matches
-/// or `markets` is not an object.
+/// [CHURN 2026-10-26] Dexie can list one market under BOTH keys, and then the
+/// listing decides `last`: Dexie serves the same raw number in both (TODO
+/// S53), so it is right only in the market's canonical listing -- the one
+/// under "xch" for an XCH market and, for a CAT/CAT market, the one under the
+/// requested quote (BYC/wUSDC.b: wUSDC.b's key).  So (A) is searched first
+/// when the base is "xch" and (B) first otherwise.  A market listed under one
+/// key only is taken as listed.  An absent (zero) price stays zero.  nullopt
+/// when nothing matches or `markets` is not an object.
 [[nodiscard]] std::optional<MarketTickerMatch> orient_market_ticker(
     const nlohmann::json& markets,
     std::string_view      base_asset_id,

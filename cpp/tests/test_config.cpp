@@ -3878,22 +3878,25 @@ TEST(PaceConfig, ParsesAllKeysAndUppercasesAssets) {
 // [S70-S72 2026-09-20] The three cancel-reduction switches, through the PARSER.
 //
 // Each switch changes what the bot CANCELS, so the properties that matter
-// are: the default is the rule that existed before the key did; a mode is a
-// closed vocabulary (a typo must not silently keep the old rule while the
-// operator believes the new one is on); and `expire` cannot be selected with
-// nothing to expire.
+// are: the default is the rule that existed before the key did -- except
+// exposure_rule, whose default became `unified` on 2026-10-26 (config.hpp
+// [CHURN]); a mode is a closed vocabulary (a typo must not silently keep the
+// old rule while the operator believes the new one is on); and `expire`
+// cannot be selected with nothing to expire.
 //
 // (Placed mid-file on purpose: two open branches add their config tests at the
 // top of the PaceConfig suite and at the end of this file, and these tests need
 // the helpers defined above both.)
 // ===========================================================================
 
-TEST(CancelReductionConfig, DefaultsAreTheRulesThatExistedBeforeTheKeys) {
+TEST(CancelReductionConfig, DefaultsAreTheOldTtlAndPriceRulesAndUnifiedExposure) {
     TempYaml tmp(kMinimalValidYaml);
     const auto cfg = xop::load_config(tmp.path());
     const xop::StrategyConfig& s = cfg.strategy;
     EXPECT_EQ(s.ttl_cancel_mode, xop::TtlCancelMode::Cancel);
-    EXPECT_EQ(s.exposure_rule, xop::ExposureRule::Legacy);
+    // [CHURN 2026-10-26] A config that never names the key -- the live one
+    // among them -- gets the rule that does not count a locked coin twice.
+    EXPECT_EQ(s.exposure_rule, xop::ExposureRule::Unified);
     EXPECT_EQ(s.price_cancel_mode, xop::PriceCancelMode::Deviation);
     EXPECT_DOUBLE_EQ(s.exposure_cancel_hysteresis_pct, 0.25);
     EXPECT_EQ(s.exposure_cancel_min_age_blocks, 32u);
@@ -3902,7 +3905,7 @@ TEST(CancelReductionConfig, DefaultsAreTheRulesThatExistedBeforeTheKeys) {
     // file get) agrees with the parser.
     const xop::StrategyConfig fresh{};
     EXPECT_EQ(fresh.ttl_cancel_mode, xop::TtlCancelMode::Cancel);
-    EXPECT_EQ(fresh.exposure_rule, xop::ExposureRule::Legacy);
+    EXPECT_EQ(fresh.exposure_rule, xop::ExposureRule::Unified);
     EXPECT_EQ(fresh.price_cancel_mode, xop::PriceCancelMode::Deviation);
 }
 
