@@ -5,7 +5,32 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — the bridge judges its Chia sends instead of assuming them
+## [0.10.32] — 2026-10-26 — saved settings apply live, and the bridge judges its Chia sends instead of assuming them
+
+### Saved settings apply to the running engine without a restart (#190)
+
+A Settings save used to reach a running engine only when it switched a pair
+or the pace controller off; everything else waited for the next start. Now
+the engine adopts the whole saved file at its next heartbeat (usually within
+a minute). It validates the merged config first (a refused save changes
+nothing and raises an alert), defers while a Cancel All is in flight, and
+pushes the new values into every subsystem while keeping what each has
+learned, recomputing where the old state no longer fits.
+
+A short list still needs an engine restart: `chia.*`, `dexie.api_base` and
+`dexie.max_requests_per_10s`, `monitoring.prometheus_port`,
+`risk.watchdog_stall_seconds`, `strategy.startup_analysis_blocks`, turning
+the ledger or bridge ingest on, and enabling, adding or removing a pair
+(disabling still applies live). `database.path` needs the GUI reopened.
+Settings says whether the save was applied, applied except the listed
+settings (with a **Restart Engine** button), deferred, or rejected, and why.
+
+**Chart Update** and **Show Grid** now take effect. Theme, Font Size,
+Dashboard Refresh and Mono Font never did, and are now disabled with a
+tooltip saying so. No config keys or defaults changed; an enabled CoinGecko
+or TibetSwap feed with a zero rate-limit capacity or window is now refused
+as a named `ConfigError` instead of an unnamed startup failure.
+
 
 ### Lost Chia sends recovered, and never caused again (#191)
 
