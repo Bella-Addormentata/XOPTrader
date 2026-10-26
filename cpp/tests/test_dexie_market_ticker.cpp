@@ -31,8 +31,10 @@
 // HTTP is involved.  NOT reachable from here: the Engine call sites that hand
 // best_bid / best_ask / volume_base_daily to ingest_dexie and to the OFI
 // snapshot -- nothing in cpp/tests constructs an Engine -- and get_ticker()'s
-// glue around GET /v1/pairs: when it claims a fetch, what it stores or marks
-// failed, and that it hands the cached quote to orient_market_ticker().
+// glue around GET /v1/pairs: when it claims a fetch, that it waits for an
+// Inline one before the snapshot and spawns a Background one, what it stores
+// or marks failed, and that it hands the cached quote to
+// orient_market_ticker().
 // DexieClient has no HTTP seam; the parse, the lookup and the cache that
 // glue calls are driven below.
 //
@@ -123,6 +125,15 @@
 //   M22 the parse takes volume_base_daily from the market key's volume
 //      -> CaseBBycXchIsReturnedAsListed,
 //         XchQuotedPairWithBothListingsTheXchKeyedOneIsUsed.
+//   M23 claim_fetch() answers Inline for every due fetch
+//      -> PairsCacheFetchesEveryTtlAndRetriesAfterAFailure,
+//         PairsCacheWaitsOnlyForTheFirstFetch.
+//   M24 claim_fetch() answers Inline while nothing is held (a failed first
+//      read waited for again at every retry)
+//      -> PairsCacheWaitsOnlyForTheFirstFetch.
+//   M25 claim_fetch() answers Background for the first fetch too
+//      -> PairsCacheFetchesEveryTtlAndRetriesAfterAFailure,
+//         PairsCacheWaitsOnlyForTheFirstFetch.
 // ---------------------------------------------------------------------------
 
 #include <chrono>
@@ -136,6 +147,7 @@
 #include "xop/rpc/dexie_client.hpp"
 
 using xop::rpc::PairInfo;
+using xop::rpc::PairsFetch;
 using xop::rpc::PairsOrientationCache;
 using xop::rpc::TickerData;
 using xop::rpc::cat_market_quote;
@@ -786,27 +798,56 @@ TEST(DexieMarketTicker, PairsCacheFetchesEveryTtlAndRetriesAfterAFailure)
     PairsOrientationCache cache;
     const auto t0 = PairsOrientationCache::Clock::time_point{} + 1000h;
 
-    EXPECT_TRUE(cache.claim_fetch(t0)) << "due before the first fetch";
-    EXPECT_FALSE(cache.claim_fetch(t0))
+    EXPECT_EQ(cache.claim_fetch(t0), PairsFetch::Inline)
+        << "due before the first fetch";
+    EXPECT_EQ(cache.claim_fetch(t0), PairsFetch::None)
         << "claimed: a second ticker in the same cycle does not fetch too";
     EXPECT_FALSE(cache.quote_for(kByc, kWusdcb).has_value())
         << "nothing held yet: the configured quote stands";
 
     cache.store(parse_pairs_response(nlohmann::json::parse(kPairsOct26)), t0);
     EXPECT_EQ(cache.quote_for(kByc, kWusdcb).value_or("none"), kWusdcb);
-    EXPECT_FALSE(cache.claim_fetch(t0 + kTtl - 1s)) << "a good read lasts kTtl";
+    EXPECT_EQ(cache.claim_fetch(t0 + kTtl - 1s), PairsFetch::None)
+        << "a good read lasts kTtl";
     const auto t1 = t0 + kTtl;
-    EXPECT_TRUE(cache.claim_fetch(t1));
+    EXPECT_EQ(cache.claim_fetch(t1), PairsFetch::Background);
 
     cache.fail(t1);
     EXPECT_EQ(cache.quote_for(kByc, kWusdcb).value_or("none"), kWusdcb)
         << "a failed read keeps the last good entries";
-    EXPECT_FALSE(cache.claim_fetch(t1 + kRetry - 1s));
+    EXPECT_EQ(cache.claim_fetch(t1 + kRetry - 1s), PairsFetch::None);
     const auto t2 = t1 + kRetry;
-    EXPECT_TRUE(cache.claim_fetch(t2)) << "a failed read is retried after kRetry";
+    EXPECT_EQ(cache.claim_fetch(t2), PairsFetch::Background)
+        << "a failed read is retried after kRetry";
 
     // A claimed fetch that never reports back does not hold off the next
     // one for longer than kRetry.
-    EXPECT_FALSE(cache.claim_fetch(t2 + kRetry - 1s));
-    EXPECT_TRUE(cache.claim_fetch(t2 + kRetry));
+    EXPECT_EQ(cache.claim_fetch(t2 + kRetry - 1s), PairsFetch::None);
+    EXPECT_EQ(cache.claim_fetch(t2 + kRetry), PairsFetch::Background);
+}
+
+// Copilot on PR #194: get_ticker() awaited every /v1/pairs refresh after the
+// snapshot, so one that timed out through its four 30 s attempts held up the
+// heartbeat for two minutes and aged the snapshot.  Only the very first fetch
+// is now waited for (before the snapshot); a retry after that first one
+// failed runs beside the heartbeat like any refresh, so a /v1/pairs that
+// hangs costs one wait per start, not one per kRetry.
+TEST(DexieMarketTicker, PairsCacheWaitsOnlyForTheFirstFetch)
+{
+    constexpr auto kRetry = PairsOrientationCache::kRetry;
+    PairsOrientationCache cache;
+    const auto t0 = PairsOrientationCache::Clock::time_point{}
+                  + std::chrono::hours{1000};
+
+    EXPECT_EQ(cache.claim_fetch(t0), PairsFetch::Inline);
+    cache.fail(t0);
+    EXPECT_FALSE(cache.quote_for(kByc, kWusdcb).has_value())
+        << "the first read failed: the configured quote stands";
+    EXPECT_EQ(cache.claim_fetch(t0 + kRetry), PairsFetch::Background)
+        << "nothing held, but the wait was had: retry off the heartbeat";
+
+    cache.store(parse_pairs_response(nlohmann::json::parse(kPairsOct26)),
+                t0 + kRetry);
+    EXPECT_EQ(cache.quote_for(kByc, kWusdcb).value_or("none"), kWusdcb)
+        << "the background read answers the next ticker";
 }

@@ -20,6 +20,7 @@
 #include <utility>
 
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include "xop/util/client_logger.hpp"
@@ -403,6 +404,13 @@ asio::awaitable<nlohmann::json> DexieClient::execute_request_(
                         wait_dur.count(), method, url);
             asio::steady_timer timer(ioc_, wait_dur);
             co_await timer.async_wait(asio::use_awaitable);
+        }
+
+        // [CHURN 2026-10-26] close() can run while this coroutine waits on
+        // a timer, above or in a retry backoff -- get_ticker() runs GET
+        // /v1/pairs refreshes detached -- and leaves no pool to dispatch to.
+        if (!open_ || !thread_pool_) {
+            throw DexieError("DexieClient closed while a request was waiting");
         }
 
         // 2. Dispatch the blocking CURL transfer to the thread pool.
@@ -836,13 +844,14 @@ std::optional<std::string> cat_market_quote(
     return found;
 }
 
-bool PairsOrientationCache::claim_fetch(Clock::time_point now) {
+PairsFetch PairsOrientationCache::claim_fetch(Clock::time_point now) {
     std::lock_guard lock(mu_);
     if (due_at_ && now < *due_at_) {
-        return false;
+        return PairsFetch::None;
     }
+    const bool first = !due_at_;
     due_at_ = now + kRetry;
-    return true;
+    return first ? PairsFetch::Inline : PairsFetch::Background;
 }
 
 void PairsOrientationCache::store(std::vector<PairInfo> pairs,
@@ -887,6 +896,31 @@ asio::awaitable<std::vector<PairInfo>> DexieClient::get_pairs() {
     log_->info("get_pairs -> {} pairs ({} malformed skipped)", result.size(),
                json["pairs"].size() - result.size());
     co_return result;
+}
+
+// [CHURN 2026-10-26] See the declaration: get_ticker() awaits the first
+// call and spawns the rest detached, so nothing may escape.
+asio::awaitable<void> DexieClient::refresh_pairs_() {
+    bool stored = false;
+    try {
+        auto pairs = co_await get_pairs();
+        if (!pairs.empty()) {
+            pairs_cache_.store(std::move(pairs),
+                               PairsOrientationCache::Clock::now());
+            stored = true;
+        }
+    } catch (const std::exception& e) {
+        log_->warn("refresh_pairs: GET /pairs failed: {}", e.what());
+    } catch (...) {
+        log_->warn("refresh_pairs: GET /pairs failed (non-standard exception)");
+    }
+    if (!stored) {
+        pairs_cache_.fail(PairsOrientationCache::Clock::now());
+        log_->warn("refresh_pairs: no market orientations from GET /pairs; "
+                   "CAT/CAT tickers keep the last good read, or the "
+                   "configured quote before one (next try in {} min)",
+                   PairsOrientationCache::kRetry.count());
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -974,6 +1008,31 @@ asio::awaitable<std::optional<TickerData>> DexieClient::get_ticker(
     log_->info("get_ticker(base_asset_id={}, quote_asset_id={})",
                base_asset_id, quote_asset_id);
 
+    // [CHURN 2026-10-26] A CAT/CAT market's canonical listing is the one
+    // under the asset Dexie prices it in, and only GET /v1/pairs says which
+    // that is.  Read at most every PairsOrientationCache::kTtl (kRetry after
+    // a failure), and BEFORE the snapshot below, so a slow read cannot age
+    // it.  Only the first read is waited for; every later one runs beside
+    // the heartbeat, which reads the entries held meanwhile.  Until a read
+    // answers, the configured quote stands in, which is right for every
+    // pair configured the way Dexie prices it.  An XCH market never needs it.
+    std::string market_quote;
+    if (base_asset_id != "xch" && quote_asset_id != "xch") {
+        switch (pairs_cache_.claim_fetch(PairsOrientationCache::Clock::now())) {
+        case PairsFetch::Inline:
+            co_await refresh_pairs_();
+            break;
+        case PairsFetch::Background:
+            asio::co_spawn(ioc_, refresh_pairs_(), asio::detached);
+            break;
+        case PairsFetch::None:
+            break;
+        }
+        if (auto q = pairs_cache_.quote_for(base_asset_id, quote_asset_id)) {
+            market_quote = std::move(*q);
+        }
+    }
+
     // The dexie API does not offer a single-pair ticker endpoint.
     // We fetch the full markets response and filter client-side.
     const auto json = co_await http_get_("/markets");
@@ -981,39 +1040,6 @@ asio::awaitable<std::optional<TickerData>> DexieClient::get_ticker(
     if (!json.contains("markets") || !json["markets"].is_object()) {
         log_->warn("get_ticker: unexpected response shape");
         co_return std::nullopt;
-    }
-
-    // [CHURN 2026-10-26] A CAT/CAT market's canonical listing is the one
-    // under the asset Dexie prices it in, and only GET /v1/pairs says which
-    // that is.  Read at most every PairsOrientationCache::kTtl (kRetry after
-    // a failure); until it answers, the configured quote stands in, which is
-    // right for every pair configured the way Dexie prices it.  An XCH market
-    // never needs it.
-    std::string market_quote;
-    if (base_asset_id != "xch" && quote_asset_id != "xch") {
-        const auto now = PairsOrientationCache::Clock::now();
-        if (pairs_cache_.claim_fetch(now)) {
-            bool stored = false;
-            try {
-                auto pairs = co_await get_pairs();
-                if (!pairs.empty()) {
-                    pairs_cache_.store(std::move(pairs), now);
-                    stored = true;
-                }
-            } catch (const std::exception& e) {
-                log_->warn("get_ticker: GET /pairs failed: {}", e.what());
-            }
-            if (!stored) {
-                pairs_cache_.fail(now);
-                log_->warn("get_ticker: no market orientations from GET "
-                           "/pairs; CAT/CAT tickers use the configured quote "
-                           "until it answers (next try in {} min)",
-                           PairsOrientationCache::kRetry.count());
-            }
-        }
-        if (auto q = pairs_cache_.quote_for(base_asset_id, quote_asset_id)) {
-            market_quote = std::move(*q);
-        }
     }
 
     // Finding and orienting the entry is pure -- orient_market_ticker(),

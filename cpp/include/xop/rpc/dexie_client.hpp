@@ -265,20 +265,32 @@ struct MarketTickerMatch {
     std::string_view             a,
     std::string_view             b);
 
+/// [CHURN 2026-10-26] What a CAT/CAT get_ticker() does about GET /v1/pairs.
+enum class PairsFetch {
+    None,        ///< not due: read the entries held now
+    Inline,      ///< the first fetch: wait for it, before the price snapshot
+    Background,  ///< any later fetch: run it beside the heartbeat and read
+                 ///< the entries held now (none before a good read)
+};
+
 /// [CHURN 2026-10-26] get_ticker()'s copy of /v1/pairs.  A fetch is due
 /// before the first one, kTtl after a good read and kRetry after a failed
 /// one, so an outage costs one request per kRetry rather than one per
 /// ticker.  claim_fetch() moves the due time on by kRetry, so concurrent
-/// tickers start one fetch between them.  A failed read keeps the last good
-/// entries.  Thread-safe; the clock is passed in.
+/// tickers start one fetch between them.  Only the first fetch is waited
+/// for: a /v1/pairs that hangs through all its retries (by default four
+/// 30 s attempts) would otherwise hold up the heartbeat for two minutes at
+/// every refresh.  A failed read keeps the last good entries.  Thread-safe;
+/// the clock is passed in.
 class PairsOrientationCache {
 public:
     using Clock = std::chrono::steady_clock;
     static constexpr std::chrono::hours   kTtl{6};
     static constexpr std::chrono::minutes kRetry{10};
 
-    /// True, and the due time moved on by kRetry, when a fetch is due.
-    [[nodiscard]] bool claim_fetch(Clock::time_point now);
+    /// Whether to fetch now, and how.  Anything but None moves the due time
+    /// on by kRetry; Inline only before the first fetch.
+    [[nodiscard]] PairsFetch claim_fetch(Clock::time_point now);
     /// A good read: replace the entries; next fetch due at now + kTtl.
     void store(std::vector<PairInfo> pairs, Clock::time_point now);
     /// A failed read: keep the entries; next fetch due at now + kRetry.
@@ -573,7 +585,8 @@ public:
 
     /// GET /v1/markets  (filtered client-side for a single asset pair)
     /// Returns the ticker for the configured base and quote asset IDs,
-    /// oriented to that pair by orient_market_ticker().
+    /// oriented to that pair by orient_market_ticker().  A CAT/CAT pair
+    /// also reads GET /v1/pairs, as PairsOrientationCache schedules it.
     [[nodiscard]] boost::asio::awaitable<std::optional<TickerData>> get_ticker(
         std::string_view base_asset_id,
         std::string_view quote_asset_id);
@@ -676,6 +689,14 @@ private:
                               const std::string& body,
                               std::string&       response_body,
                               long&              http_status);
+
+    /// [CHURN 2026-10-26] GET /v1/pairs into pairs_cache_: store() on a
+    /// non-empty answer, fail() on anything else, timed from when it ends.
+    /// Never throws.  get_ticker() co_spawns every fetch after the first
+    /// one detached, so one can still be pending at close(), which
+    /// execute_request_() then refuses, and the client must outlive every
+    /// run of the io_context it was given (the Engine's does).
+    [[nodiscard]] boost::asio::awaitable<void> refresh_pairs_();
 
     /// Build a query-string from key-value pairs, URL-encoding values.
     [[nodiscard]] static std::string build_query_(

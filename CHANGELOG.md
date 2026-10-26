@@ -37,17 +37,19 @@ under BYC's key as well as wUSDC.b's, with the same raw last price (0.8988) in
 both. The ticker read BYC's listing first and inverted that price to 1.1126,
 so the pair's mid jumped between about 0.90 and 1.11, each jump looked like a
 fresh trade, and the resting asks were cancelled as crossed (`crossed_mid`, 68
-cancels). The ticker now reads each market's own listing first: the one
-under `xch` for an XCH market, and for a market between two CATs the one under
-the token Dexie prices it in, which it looks up in Dexie's pairs list (at most
-every 6 hours). Whichever listing it ends up reading, the last price keeps the
-market's units, so a CAT/CAT pair entered the other way round from Dexie
-(wUSDC.b/BYC, say) gets the right prices too. Pairs with XCH as the base read
-the same listing as before. TODO S53, which suspected the opposite
-orientation, is resolved against our own settled BYC/wUSDC.b fills. The daily
-volume the bot takes from Dexie (for the market allocator and the whale and
-order-flow signals) is now in each pair's base asset whichever listing it
-reads; for BYC/wUSDC.b and wmilliETH.b/XCH it used to be in the quote asset.
+cancels). The ticker now reads each market's own listing first: the one under
+`xch` for an XCH market, and for a market between two CATs the one under the
+token Dexie prices it in, which it looks up in Dexie's pairs list (at most
+every 6 hours; the bot waits for that lookup only once after a start, and
+later ones run in the background). Whichever listing it ends up reading, the
+last price keeps the market's units, so a CAT/CAT pair entered the other way
+round from Dexie (wUSDC.b/BYC, say) gets the right prices too. Pairs with XCH
+as the base read the same listing as before. TODO S53, which suspected the
+opposite orientation, is resolved against our own settled BYC/wUSDC.b fills.
+The daily volume the bot takes from Dexie (for the market allocator and the
+whale and order-flow signals) is now in each pair's base asset whichever
+listing it reads; for BYC/wUSDC.b and wmilliETH.b/XCH it used to be in the
+quote asset.
 
 `ttl_cancel_mode` and `price_cancel_mode` keep their old defaults. The GUI's
 Settings page does not show these keys, and a Settings save drops keys added
