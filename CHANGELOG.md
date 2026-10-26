@@ -5,9 +5,9 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — bids are sized toward the target allocations, so a coin held past q_max is still bought while it sits below its target
+## [0.10.34] — 2026-10-26 — bids are sized toward the target allocations, so a coin held past q_max is still bought while it sits below its target
 
-### XCH/wUSDC.b bids again after a large wUSDC.b bridge
+### XCH/wUSDC.b bids again after a large wUSDC.b bridge (#196)
 
 On 2026-10-26 a 100 wUSDC.b bridge took wUSDC.b to 59% of the portfolio
 against its 20% target, while XCH sat at 14% against 50%, and XCH/wUSDC.b
