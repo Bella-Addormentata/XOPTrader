@@ -668,6 +668,11 @@ strategy:
   ratio_force_one_sided: true          # [OPTIONAL, default: true] Force one-sided posting while rebalancing
   ratio_tier_size_scale_min: 0.35      # [OPTIONAL, default: 0.35] Overweight side minimum size multiplier
   ratio_tier_size_scale_max: 1.15      # [OPTIONAL, default: 1.15] Underweight side maximum size multiplier
+  target_gap_sizing_enabled: true      # [OPTIONAL, default: true] Size each bid to at least min(the base coin's shortfall
+                                       #   below its asset_target_allocations share, the quote coin's surplus above its share),
+                                       #   valued in XCH. Without it a coin held past q_max gets no bid however far below its
+                                       #   target it is. Risk limits and caps still apply; no effect without targets. Applies
+                                       #   live; false = size bids from q_max alone, as before.
   xch_ask_throttle_enabled: true       # [OPTIONAL, default: true] Enable smooth XCH ask throttling
   xch_ask_throttle_caution_xch: 2.0    # [OPTIONAL, default: 2.0] Start mild ask throttling below this
   xch_ask_throttle_low_xch: 1.0        # [OPTIONAL, default: 1.0] Stronger ask throttling below this

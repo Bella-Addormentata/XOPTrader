@@ -5,6 +5,48 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — bids are sized toward the target allocations, so a coin held past q_max is still bought while it sits below its target
+
+### XCH/wUSDC.b bids again after a large wUSDC.b bridge
+
+On 2026-10-26 a 100 wUSDC.b bridge took wUSDC.b to 59% of the portfolio
+against its 20% target, while XCH sat at 14% against 50%, and XCH/wUSDC.b
+posted nothing at all. The strategy sizes a pair's bid as `q_max` minus the
+WHOLE holding of its base coin, so with 34.76 XCH held against `q_max` 20
+every XCH-base bid was 0, however far below its target XCH was. The ask, which
+would have collected more wUSDC.b, was zeroed by the single-CAT cap, and with
+both sides at 0 the pair was dropped before the ratio rebalancer, drift guard
+or deploy-idle floor could act: they only scale what the strategy produced.
+
+Step 4 now raises each pair's bid, never lowers it, to
+
+    min(base coin's shortfall below its target, quote coin's surplus above its target)
+
+valued in XCH from wallet-confirmed balances over the
+`asset_target_allocations` coins, and converted to base units. It is non-zero
+only when the bid moves both coins toward their targets, and filling all of it
+brings one of them exactly to its target, so neither overshoots (beyond the
+usual up-scale to the pair's minimum offer size). It runs before the Step 6
+risk limits, so every limit, the ratio scaling, the drift guard, the wallet
+caps, the XCH lock ledger and the per-tier maximum still apply, and prices are
+unchanged. A targeted coin with no validated balance, or a balance and no
+price, switches the floor off for that heartbeat rather than guessing. Asks
+need no floor: the strategy sizes them `q_max` plus the whole holding.
+
+On the 2026-10-26 book (Step 4 sizes, before the per-tier cap of 5 XCH over
+six tiers):
+
+- XCH/wUSDC.b: 91.2 XCH, the XCH shortfall, until wUSDC.b nears its 20%.
+- XCH/BYC: 15.4 XCH, BYC's surplus (was 5.2 with its `q_max_override` of 40).
+- XCH/DBX: 0.8 XCH (was 0), since DBX is a hair over its 15%; Step 7 raises
+  it to the pair's 1 XCH minimum.
+- BYC/wUSDC.b and wmilliETH.b/XCH: unchanged. BYC is over its target, and the
+  wmilliETH.b bid would spend XCH, which is under its own.
+
+New key `strategy.target_gap_sizing_enabled` (default `true`, applies live);
+`false` sizes bids from `q_max` alone, as before. Without
+`asset_target_allocations` it does nothing.
+
 ## [0.10.33] — 2026-10-26 — offers stay up instead of being cancelled minutes after they are posted, and a small holding quotes a smaller ladder instead of nothing
 
 ### Fewer offers cancelled right after posting (#194)

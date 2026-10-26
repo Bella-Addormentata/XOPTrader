@@ -761,6 +761,7 @@ Key sections to configure before first run:
 | `kappa` | 1.5 | Fill intensity decay — higher = expects fills at wider spreads |
 | `phi` | 0.5 | GLFT inventory skew strength — higher = more aggressive rebalancing (recommended: 0.8 for skewed portfolios) |
 | `q_max` | 1000 | Maximum inventory in base units before hard limit |
+| `target_gap_sizing_enabled` | true | Sizes each bid to at least min(the base coin's shortfall below its `asset_target_allocations` share, the quote coin's surplus above its share), valued in XCH, so a coin held past `q_max` is still bought while it sits below its target. Every risk limit and cap still applies; no effect without targets; applies live. `false` sizes bids from `q_max` alone |
 | `min_profit_margin_bps` | 35 | Minimum margin above cost basis for asks (when no-loss enabled) |
 | `offer_ttl_blocks` | 60 | Cancel and refresh offers after N blocks (~52 minutes) |
 | `num_tiers` | 4 | Number of price tiers per side |

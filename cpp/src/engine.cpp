@@ -57,6 +57,7 @@
 #include "xop/strategy/avellaneda.hpp"
 #include "xop/strategy/glft.hpp"
 #include "xop/strategy/reservation_offset.hpp"
+#include "xop/strategy/target_gap.hpp"
 
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
@@ -7172,6 +7173,35 @@ void Engine::step_update_analytics(BlockHeight block_height)
 // [T3-24] Gates on market_data_valid flag from Step 1.
 void Engine::step_compute_quotes(BlockHeight block_height)
 {
+    // [TARGET-GAP 2026-10-26] The targeted portfolio, valued once per
+    // heartbeat for the bid floor below (xop/strategy/target_gap.hpp): the
+    // wallet-confirmed balances Step 8 cached, at the XCH marks the drift
+    // guard reads.  A targeted coin with no validated balance, or with a
+    // balance and no mark, leaves it unusable and every floor 0.
+    strategy::target_gap::Valuation gap_valuation{};
+    if (config_.strategy.target_gap_sizing_enabled) {
+        std::vector<strategy::target_gap::Holding> gap_holdings;
+        for (const auto& [gap_key, gap_target] : config_.strategy.asset_target_allocations) {
+            strategy::target_gap::Holding gap_holding{};
+            gap_holding.key = gap_key;
+            gap_holding.target = gap_target;
+            const auto gap_id = pace_asset_id_for_key(gap_key);
+            const auto gap_cached = gap_id ? cached_wallet_balances_.find(*gap_id)
+                                           : cached_wallet_balances_.end();
+            if (gap_cached != cached_wallet_balances_.end() && gap_cached->second.fields_validated) {
+                const Mojo gap_confirmed = gap_cached->second.confirmed;
+                const double gap_rate = (*gap_id == "xch")
+                    ? 1.0 : state_->get_asset_xch_rate(AssetId{*gap_id});
+                gap_holding.valued = gap_confirmed == 0 || gap_rate > 0.0;
+                gap_holding.xch_value = gap_holding.valued
+                    ? static_cast<double>(gap_confirmed) * gap_rate / static_cast<double>(kMojosPerXch)
+                    : 0.0;
+            }
+            gap_holdings.push_back(std::move(gap_holding));
+        }
+        gap_valuation = strategy::target_gap::value_targeted(gap_holdings);
+    }
+
     for (auto& [pair_name, pcs] : cycle_) {
         // [T3-24] Dependency-aware gating: skip pairs where Step 1 failed.
         // Quoting with invalid/stale market data risks adverse selection.
@@ -7385,6 +7415,41 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         // Invoke the per-pair strategy to produce raw quotes.
         pcs.raw_quote = strategy.compute_quotes(mid, sigma, q, block_height);
         pcs.quote_valid = true;  // Mark as valid for steps 5-8.
+
+        // [TARGET-GAP 2026-10-26] The strategy's bid is q_max - the WHOLE base
+        // holding, blind to the targets: raise it, never lower it, to what
+        // moves both coins toward their targets -- min(base deficit, quote
+        // excess), in base units.  Before Step 6, so every limit and cap still
+        // applies; Step 7's pace post-pass re-sizes a pace-managed pair's bid
+        // tiers anyway.
+        if (config_.strategy.target_gap_sizing_enabled && gap_valuation.ok) {
+            const auto gap_slash = pair_name.find('/');
+            if (gap_slash != std::string::npos) {
+                std::string gap_base_key = pair_name.substr(0, gap_slash);
+                std::string gap_quote_key = pair_name.substr(gap_slash + 1);
+                for (auto& c : gap_base_key) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                for (auto& c : gap_quote_key) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                // XCH per base display unit, at the mark the valuation used.
+                const double gap_base_xch_per_unit = (pair_cfg->base_asset_id == "xch")
+                    ? 1.0
+                    : state_->get_asset_xch_rate(AssetId{pair_cfg->base_asset_id})
+                          * static_cast<double>(pair_cfg->base_mojos_per_unit)
+                          / static_cast<double>(kMojosPerXch);
+                const double gap_floor = strategy::target_gap::bid_floor_units(
+                    gap_valuation, gap_base_key, gap_quote_key, gap_base_xch_per_unit);
+                if (gap_floor > 0.0 && gap_floor > pcs.raw_quote.bid_size) {
+                    spdlog::info("[Engine] Step 4: {} target-gap bid floor: bid_size {:.6f} -> {:.6f} "
+                                 "({} {:.1f}% vs target {:.1f}%, {} {:.1f}% vs target {:.1f}%, q={:.6f} q_max={:.6f})",
+                                 pair_name, pcs.raw_quote.bid_size, gap_floor,
+                                 gap_base_key, gap_valuation.xch_by_key.at(gap_base_key) / gap_valuation.total_xch * 100.0,
+                                 gap_valuation.target_by_key.at(gap_base_key) * 100.0,
+                                 gap_quote_key, gap_valuation.xch_by_key.at(gap_quote_key) / gap_valuation.total_xch * 100.0,
+                                 gap_valuation.target_by_key.at(gap_quote_key) * 100.0,
+                                 q, effective_q_max(*pair_cfg, config_.strategy));
+                    pcs.raw_quote.bid_size = gap_floor;
+                }
+            }
+        }
 
         // [STEP6-CAUSE 2026-09-13] Keep q and the q_max this pair's strategy
         // was built with.  Avellaneda sizes the bid from TOTAL base holdings

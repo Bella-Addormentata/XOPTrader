@@ -4431,3 +4431,26 @@ TEST(ConfigParserTest, PegGuard_IsWaivedOnlyTogetherWithRevive) {
     pc.peg_guard = true;
     EXPECT_FALSE(xop::peg_guard_is_waived(pc));
 }
+
+// [TARGET-GAP 2026-10-26] strategy.target_gap_sizing_enabled: on by default --
+// for a config that never names the key, the live one among them -- and the
+// rollback is to write `false`.
+TEST(ConfigParserTest, TargetGapSizing_DefaultsOnAndParsesFalse) {
+    {
+        TempYaml tmp(kMinimalValidYaml);
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_TRUE(cfg.strategy.target_gap_sizing_enabled);
+    }
+    EXPECT_TRUE(xop::StrategyConfig{}.target_gap_sizing_enabled)
+        << "a default-constructed StrategyConfig agrees with the parser";
+    {
+        TempYaml tmp(pace_with_strategy("  target_gap_sizing_enabled: false\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_FALSE(cfg.strategy.target_gap_sizing_enabled);
+    }
+    {
+        TempYaml tmp(pace_with_strategy("  target_gap_sizing_enabled: ~\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_TRUE(cfg.strategy.target_gap_sizing_enabled) << "null keeps the default";
+    }
+}

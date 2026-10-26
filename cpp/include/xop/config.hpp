@@ -1329,6 +1329,17 @@ struct StrategyConfig {
     /// side.  Must be > 1.0.
     double   asset_drift_guard_max_factor{2.0};
 
+    /// [TARGET-GAP 2026-10-26] When true, Step 4 raises each pair's bid size
+    /// to at least min(base coin's deficit below its target, quote coin's
+    /// excess above its target), valued in XCH from wallet-confirmed
+    /// balances over the `asset_target_allocations` coins
+    /// (xop/strategy/target_gap.hpp).  The strategy sizes the bid as
+    /// q_max - TOTAL base held, so without this a coin held past q_max gets
+    /// no bid however far below its target it is.  Runs before the Step 6
+    /// risk limits, so every limit and cap still applies; prices are
+    /// untouched.  No effect without targets.  Applies live.  Default true.
+    bool     target_gap_sizing_enabled{true};
+
     // -- [PACE 2026-09-13] Pace controller (default OFF) -------------------
     // Sells an overweight CAT QUOTE asset toward its asset_target_allocations
     // band, at a bounded daily budget, through the bid ladder of its XCH/<K>
