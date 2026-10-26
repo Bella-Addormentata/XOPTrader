@@ -29,12 +29,12 @@
 //
 // Everything here drives the PURE functions get_ticker() is built from, so no
 // HTTP is involved.  NOT reachable from here: the Engine call sites that hand
-// best_bid / best_ask to ingest_dexie and to the OFI snapshot -- nothing in
-// cpp/tests constructs an Engine -- and get_ticker()'s glue around GET
-// /v1/pairs: when it claims a fetch, what it stores or marks failed, and that
-// it hands the cached quote to orient_market_ticker().  DexieClient has no
-// HTTP seam; the parse, the lookup and the cache that glue calls are driven
-// below.
+// best_bid / best_ask / volume_base_daily to ingest_dexie and to the OFI
+// snapshot -- nothing in cpp/tests constructs an Engine -- and get_ticker()'s
+// glue around GET /v1/pairs: when it claims a fetch, what it stores or marks
+// failed, and that it hands the cached quote to orient_market_ticker().
+// DexieClient has no HTTP seam; the parse, the lookup and the cache that
+// glue calls are driven below.
 //
 // MUTATION CHECK -- red sets predicted from the arithmetic before the run,
 // then each run from a fresh build (the PR carries the table):
@@ -118,6 +118,11 @@
 //      -> PairsCacheFetchesEveryTtlAndRetriesAfterAFailure.
 //   M20 parse_pairs_response() keeps an entry whose id is empty
 //      -> PairsResponseParsesAndSkipsMalformedEntries.
+//   M21 Case A leaves volume_base_daily as the listed token's
+//      -> CaseAXchBycBidIsOurOwnRestingBid.
+//   M22 the parse takes volume_base_daily from the market key's volume
+//      -> CaseBBycXchIsReturnedAsListed,
+//         XchQuotedPairWithBothListingsTheXchKeyedOneIsUsed.
 // ---------------------------------------------------------------------------
 
 #include <chrono>
@@ -364,9 +369,11 @@ TEST(DexieMarketTicker, CaseAXchBycBidIsOurOwnRestingBid)
     EXPECT_DOUBLE_EQ(t.price_last, 2.0);
     EXPECT_EQ(t.code, "BYC");
     EXPECT_EQ(t.pair_id, "xch");
-    // Volumes stay keyed as listed: XCH under "xch", BYC for the token.
+    // Volumes stay keyed as listed: XCH under "xch", BYC for the token.  The
+    // base's is the key's here.
     EXPECT_DOUBLE_EQ(t.volume_xch_daily, 80.0);
     EXPECT_DOUBLE_EQ(t.volume_quote_daily, 100.0);
+    EXPECT_DOUBLE_EQ(t.volume_base_daily, 80.0) << "XCH, the pair's base";
 
     // The listing is kept exactly as served.
     EXPECT_DOUBLE_EQ(match->listed.best_ask, 0.6891798759476223);
@@ -405,6 +412,7 @@ TEST(DexieMarketTicker, CaseBBycXchIsReturnedAsListed)
     EXPECT_DOUBLE_EQ(t.price_last, 0.5);
     EXPECT_DOUBLE_EQ(t.price_high, 0.8);
     EXPECT_DOUBLE_EQ(t.price_low, 0.5);
+    EXPECT_DOUBLE_EQ(t.volume_base_daily, 100.0) << "BYC, the pair's base";
 }
 
 TEST(DexieMarketTicker, CaseBBycWusdcbJunkAskIsTheAsk)
@@ -624,7 +632,9 @@ TEST(DexieMarketTicker, AMarketQuoteIsIgnoredForAnXchPairOrWhenItNamesNeitherAss
 // An XCH-QUOTED pair listed under both keys reads the "xch" listing too --
 // Case B for this pair -- and with it the right `last`.  Case A would read the
 // BYC-keyed listing and invert its 0.5 to 2.0 XCH per BYC, outside even the
-// xch-keyed listing's own 0.5-0.8 daily range.
+// xch-keyed listing's own 0.5-0.8 daily range.  The listing read also decides
+// which volume field holds the base's: here the token's 100 BYC, not the 80
+// XCH under the key, which is what the engine used to take for every pair.
 TEST(DexieMarketTicker, XchQuotedPairWithBothListingsTheXchKeyedOneIsUsed)
 {
     auto m = nlohmann::json::parse(kXchMarkets);
@@ -641,6 +651,8 @@ TEST(DexieMarketTicker, XchQuotedPairWithBothListingsTheXchKeyedOneIsUsed)
         << "Case A would have inverted the BYC-keyed listing's 0.5 to 2.0";
     EXPECT_DOUBLE_EQ(match->oriented.best_bid, 0.3);
     EXPECT_DOUBLE_EQ(match->oriented.best_ask, 0.6891798759476223);
+    EXPECT_DOUBLE_EQ(match->oriented.volume_base_daily, 100.0)
+        << "BYC, the pair's base";
 }
 
 TEST(DexieMarketTicker, MissingSideStaysZeroWhenInverted)

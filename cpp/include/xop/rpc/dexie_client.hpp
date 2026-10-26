@@ -168,7 +168,8 @@ struct OffersPage {
 ///   * parse_market_ticker() / get_tickers(): the pair AS LISTED --
 ///     base = the token (id), quote = the market key (pair_id).
 ///   * orient_market_ticker() / get_ticker(): the pair that was requested.
-/// The volume fields are NOT oriented; they stay keyed as listed.
+/// volume_xch_daily and volume_quote_daily are NOT oriented; they stay keyed
+/// as listed.  volume_base_daily is oriented like the prices.
 struct TickerData {
     std::string id;           ///< Listed token's asset id ("xch" under a CAT key).
     std::string code;
@@ -181,6 +182,11 @@ struct TickerData {
     double volume_xch_daily = 0.0;
     /// Daily volume in the listed token.
     double volume_quote_daily = 0.0;
+    /// [CHURN 2026-10-26] Daily volume in the BASE of the pair the struct
+    /// describes: the listed token's as listed, the market key's once Case A
+    /// inverts the listing.  What ingest_dexie() takes, whichever listing
+    /// was read -- volume_xch_daily is the base's under Case A only.
+    double volume_base_daily = 0.0;
 
     /// Depth-0 bid and ask (see above).  0.0 means no offer on that side.
     double best_bid   = 0.0;

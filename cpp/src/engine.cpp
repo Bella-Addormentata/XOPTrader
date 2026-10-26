@@ -5595,12 +5595,16 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
             // request -- nullopt, or a throw into the per-pair catch --
             // stamps nothing, and the window closes on its own.
             dexie_last_success_at_ = std::chrono::steady_clock::now();
+            // [CHURN 2026-10-26] Volume in the pair's BASE, as ingest_dexie()
+            // documents.  volume_xch_daily is the market key's asset: the
+            // quote for every pair Dexie keys by its quote (BYC/wUSDC.b,
+            // wmilliETH.b/XCH), and it changed units with the listing read.
             market_data_->ingest_dexie(
                 pair.name,
                 ticker->best_bid,
                 ticker->best_ask,
                 ticker->price_last,
-                ticker->volume_xch_daily);
+                ticker->volume_base_daily);
 
             // [T3-24] Mark pair data as valid if ticker returned prices.
             if (ticker->price_last > 0.0) {
@@ -5615,9 +5619,9 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                 market_data_->ingest_book_snapshot_for_ofi(
                     pair.name,
                     ticker->best_bid,
-                    ticker->volume_xch_daily,   // bid-side depth proxy
+                    ticker->volume_base_daily,   // bid-side depth proxy
                     ticker->best_ask,
-                    ticker->volume_xch_daily);  // ask-side depth proxy
+                    ticker->volume_base_daily);  // ask-side depth proxy
             }
         }
 

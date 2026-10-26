@@ -611,6 +611,8 @@ TickerData parse_market_ticker(const nlohmann::json& j,
             t.volume_quote_daily = json_number_or<double>(vol[t.id], "daily", 0.0);
         }
     }
+    // As listed, the token is the base.
+    t.volume_base_daily = t.volume_quote_daily;
 
     // Prices, in market-key units per token.  Dexie names the depth arrays
     // for the TAKER: "buy" is what buying the token costs -- its ASK -- and
@@ -694,6 +696,8 @@ std::optional<MarketTickerMatch> orient_market_ticker(
                 match.oriented.price_last = invert(match.listed.price_last);
                 match.oriented.price_high = invert(match.listed.price_low);
                 match.oriented.price_low  = invert(match.listed.price_high);
+                // [CHURN 2026-10-26] The pair's base is the market key here.
+                match.oriented.volume_base_daily = match.listed.volume_xch_daily;
                 return match;
             }
         }

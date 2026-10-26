@@ -44,7 +44,10 @@ every 6 hours). Whichever listing it ends up reading, the last price keeps the
 market's units, so a CAT/CAT pair entered the other way round from Dexie
 (wUSDC.b/BYC, say) gets the right prices too. Pairs with XCH as the base read
 the same listing as before. TODO S53, which suspected the opposite
-orientation, is resolved against our own settled BYC/wUSDC.b fills.
+orientation, is resolved against our own settled BYC/wUSDC.b fills. The daily
+volume the bot takes from Dexie (for the market allocator and the whale and
+order-flow signals) is now in each pair's base asset whichever listing it
+reads; for BYC/wUSDC.b and wmilliETH.b/XCH it used to be in the quote asset.
 
 `ttl_cancel_mode` and `price_cancel_mode` keep their old defaults. The GUI's
 Settings page does not show these keys, and a Settings save drops keys added
