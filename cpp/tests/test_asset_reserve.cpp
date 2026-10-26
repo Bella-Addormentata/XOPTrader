@@ -9,9 +9,12 @@
 #include <gtest/gtest.h>
 
 #include <xop/execution/asset_reserve.hpp>
+#include <xop/execution/exposure_gate.hpp>
+#include <xop/types.hpp>
 
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -81,6 +84,76 @@ TEST(AssetReserveTest, NoReserveCapsAtTheBalanceAndClampsNegatives) {
     EXPECT_EQ(cap_pool_above_reserve(9'000, 5'000, 0), 5'000);
     EXPECT_EQ(cap_pool_above_reserve(-10, 5'000, 0), 0);
     EXPECT_EQ(cap_pool_above_reserve(9'000, -5, 0), 0);
+}
+
+// -- [PAIRMIN 2026-10-26] the reserve Step 7 sizes CAT pools to ------------
+
+TEST(SizingReserveTest, AnEntryBindsWhateverTheCapSwitchSays) {
+    const std::unordered_map<std::string, double> per_asset{{kWmilliEth, 3.0}};
+    EXPECT_DOUBLE_EQ(
+        sizing_reserve_units(per_asset, 0.1, true, kWmilliEth).value_or(-1.0), 3.0);
+    EXPECT_DOUBLE_EQ(
+        sizing_reserve_units(per_asset, 0.1, false, kWmilliEth).value_or(-1.0), 3.0);
+    // An entry of 0 still binds: Step 7 caps at the balance itself.
+    const std::unordered_map<std::string, double> exempt{{kByc, 0.0}};
+    EXPECT_DOUBLE_EQ(
+        sizing_reserve_units(exempt, 1.0, false, kByc).value_or(-1.0), 0.0);
+}
+
+TEST(SizingReserveTest, TheGlobalReserveBindsWhileTheCatCapsAreOn) {
+    EXPECT_DOUBLE_EQ(
+        sizing_reserve_units({}, 0.1, true, kWmilliEth).value_or(-1.0), 0.1);
+    const std::unordered_map<std::string, double> other{{kByc, 3.0}};
+    EXPECT_DOUBLE_EQ(
+        sizing_reserve_units(other, 0.1, true, kWmilliEth).value_or(-1.0), 0.1)
+        << "another asset's entry changes nothing";
+    // Caps opted out and no entry: Step 7 leaves the asset uncapped.
+    EXPECT_FALSE(sizing_reserve_units({}, 0.1, false, kWmilliEth).has_value());
+    EXPECT_FALSE(sizing_reserve_units(other, 0.1, false, kWmilliEth).has_value());
+}
+
+TEST(SizingReserveTest, IsStep8sReserveWhereverStep7Caps) {
+    // Step 8's gates hold effective_reserve_units back for every asset; a
+    // ladder Step 7 sizes to a different figure breaches them as a side.
+    const std::unordered_map<std::string, double> per_asset{{kWmilliEth, 3.0}};
+    for (const std::string& asset : {kWmilliEth, kByc}) {
+        for (const bool caps : {true, false}) {
+            const auto sized = sizing_reserve_units(per_asset, 0.1, caps, asset);
+            if (sized.has_value()) {
+                EXPECT_DOUBLE_EQ(*sized,
+                                 effective_reserve_units(per_asset, 0.1, asset));
+            }
+        }
+    }
+}
+
+TEST(SizingReserveTest, OneUnitHeldPostsAHalfUnitAskInsteadOfNone) {
+    // wmilliETH.b/XCH on 2026-10-26: 1.0 held (1,000 mojos), the global
+    // 0.1 reserve, every ask tier up-scaled to the pair's minimum.
+    constexpr Mojo kHeld = 1'000;
+    const auto units = sizing_reserve_units({}, 0.1, true, kWmilliEth);
+    ASSERT_TRUE(units.has_value());
+    const Mojo reserve = reserve_units_to_mojos(*units, 1'000);
+    ASSERT_EQ(reserve, 100);
+    const Mojo budget = cap_pool_above_reserve(kHeld, kHeld, reserve);
+    EXPECT_EQ(budget, 900);
+
+    // Before: a 1.0 minimum and the whole balance as the budget kept one
+    // 1,000-mojo ask, and Step 8 suppressed it -- 1,000 - 1,000 < 100.
+    EXPECT_EQ(xop::tiers_within_budget({1'000, 1'000}, kHeld), 1u);
+    EXPECT_TRUE(exposure_breaches_reserve(kHeld, 0, 1'000, reserve));
+
+    // After, at the pair's 0.5 minimum: the floored 500-mojo pool is under
+    // the cap, the budget keeps the first up-scaled tier, and Step 8 passes it.
+    EXPECT_EQ(cap_pool_above_reserve(500, kHeld, reserve), 500);
+    EXPECT_EQ(xop::tiers_within_budget({500, 500, 500, 500, 500, 500}, budget), 1u);
+    EXPECT_FALSE(exposure_breaches_reserve(kHeld, 0, 500, reserve));
+
+    // A pool at the whole balance is cut to 900, so tier 0 (the whole pool
+    // on a CAT base) still fits instead of being dropped.
+    EXPECT_EQ(cap_pool_above_reserve(kHeld, kHeld, reserve), 900);
+    EXPECT_EQ(xop::tiers_within_budget({900, 500}, budget), 1u);
+    EXPECT_FALSE(exposure_breaches_reserve(kHeld, 0, 900, reserve));
 }
 
 // -- [review] the reserve kept SPENDABLE: coins held out of offers ---------

@@ -10037,12 +10037,13 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         }
 
         // -- Deploy-idle-inventory floor: when risk/allocator scaling has
-        // collapsed a side's pool below `min_offer_size_units` despite the
-        // wallet holding ample balance to back at least one full tier,
-        // raise that pool up to the minimum so the ladder is not silently
-        // suppressed downstream by the dust filter.  Respects ratio
-        // rebalance mode: only the "acquire" side is floored in non-neutral
-        // modes (matches the intent of one-sided ratio rebalancing).
+        // collapsed a side's pool below the pair's minimum offer size
+        // despite the wallet holding ample balance to back at least one
+        // full tier, raise that pool up to the minimum so the ladder is not
+        // silently suppressed downstream by the dust filter.  Respects
+        // ratio rebalance mode: only the "acquire" side is floored in
+        // non-neutral modes (matches the intent of one-sided ratio
+        // rebalancing).
         //
         // Respects the drift guard's hard zero: a side tapered to exactly
         // 0.0 was deliberately STOPPED because the acquired asset is past
@@ -10050,13 +10051,22 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         // would convert the stop into an indefinite min-size bleed (one
         // more fill per heartbeat, forever) -- on a revived pair with no
         // book to price against, that bleed is bounded only by the wallet.
+        //
+        // [PAIRMIN 2026-10-26] The minimum is the one the up-scale and dust
+        // filter below enforce (effective_min_offer_units).  It was the
+        // global strategy.min_offer_size_units, so a pair whose override
+        // sat below the global was floored to the global size.
+        const double floor_min_units = pair_cfg
+            ? effective_min_offer_units(*pair_cfg,
+                                        config_.strategy.min_offer_size_units)
+            : 0.0;
         if (pair_cfg
             && config_.strategy.deploy_idle_inventory_enabled
             && pair_cfg->base_mojos_per_unit > 0
-            && config_.strategy.min_offer_size_units > 0.0)
+            && floor_min_units > 0.0)
         {
             const Mojo min_pool = static_cast<Mojo>(std::llround(
-                config_.strategy.min_offer_size_units
+                floor_min_units
                 * static_cast<double>(pair_cfg->base_mojos_per_unit)));
 
             // Determine ratio mode (Neutral by default if rebalancing off).
@@ -10095,7 +10105,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                     static_cast<double>(quote_bal)
                     / static_cast<double>(pair_cfg->quote_mojos_per_unit);
                 const double required_quote_units =
-                    config_.strategy.min_offer_size_units * market_mid;
+                    floor_min_units * market_mid;
                 const Mojo floored = apply_deploy_idle_floor(
                     avail_capital, min_pool, floor_bid, drift_bid_scale,
                     quote_units >= required_quote_units);
@@ -10109,7 +10119,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                                  quote_units,
                                  pair_cfg->quote_asset_id,
                                  required_quote_units,
-                                 config_.strategy.min_offer_size_units);
+                                 floor_min_units);
                     avail_capital = floored;
                 }
             }
@@ -10137,7 +10147,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                                  static_cast<double>(base_bal)
                                      / static_cast<double>(pair_cfg->base_mojos_per_unit),
                                  pair_cfg->base_asset_id,
-                                 config_.strategy.min_offer_size_units);
+                                 floor_min_units);
                     avail_inventory = floored;
                 }
             }
@@ -10270,30 +10280,36 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         }
 
         // -- [GAS-RESERVE 2026-10-24] FINAL per-asset reserve caps ----------
-        // The CAT counterpart of the XCH caps just above, for assets with a
-        // strategy.asset_reserve_units entry (wmilliETH.b: the warp
-        // rebalancer unwraps it for Base gas).  Same placement and the same
-        // rule -- after every pool-raising transform, against
+        // The CAT counterpart of the XCH caps just above.  Same placement
+        // and the same rule -- after every pool-raising transform, against
         // confirmed-minus-reserve -- so the ladder is SIZED to leave the
         // reserve unsold; Step 8's reserve gates would otherwise see the
         // whole side breach and suppress it outright.  A balance never
         // observed skips (Step 8's gates still hold), exactly as the CAT
         // wallet caps above treat it.
-        if (pair_cfg && !config_.strategy.asset_reserve_units.empty()) {
+        //
+        // [PAIRMIN 2026-10-26] Every CAT, not only those with a
+        // strategy.asset_reserve_units entry (wmilliETH.b: the warp
+        // rebalancer unwraps it for Base gas): the rest carry
+        // strategy.min_reserve_units, which Step 8's gates hold back the
+        // same way (execution::sizing_reserve_units).  A 1.0 wmilliETH.b
+        // wallet against the 0.1 reserve had its only ask suppressed there
+        // every cycle.
+        if (pair_cfg) {
             const auto reserve_for = [&](const std::string& asset_id,
                                          Mojo mojos_per_unit)
                 -> std::optional<std::pair<Mojo, Mojo>> {
                 if (asset_id == "xch") return std::nullopt;
-                const auto rit =
-                    config_.strategy.asset_reserve_units.find(asset_id);
-                if (rit == config_.strategy.asset_reserve_units.end()) {
-                    return std::nullopt;
-                }
+                const auto reserve_units = execution::sizing_reserve_units(
+                    config_.strategy.asset_reserve_units,
+                    config_.strategy.min_reserve_units,
+                    config_.strategy.wallet_balance_caps_enabled, asset_id);
+                if (!reserve_units.has_value()) return std::nullopt;
                 const auto bit = cached_wallet_balances_.find(asset_id);
                 if (bit == cached_wallet_balances_.end()) return std::nullopt;
                 return std::make_pair(
                     bit->second.confirmed,
-                    execution::reserve_units_to_mojos(rit->second,
+                    execution::reserve_units_to_mojos(*reserve_units,
                                                       mojos_per_unit));
             };
 
@@ -11994,8 +12010,8 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             // This prevents emergency posting of sub-min dust tiers and
             // caps oversized tiers that over-concentrate inventory.
             // Per-pair override takes precedence over default.
-            const double eff_min_units = pair_cfg->min_offer_size_units_override.value_or(
-                xch_base_pair ? 1.0 : config_.strategy.min_offer_size_units);
+            const double eff_min_units = effective_min_offer_units(
+                *pair_cfg, config_.strategy.min_offer_size_units);
             const Mojo min_base_mojos = static_cast<Mojo>(std::llround(
                 eff_min_units * static_cast<double>(pair_cfg->base_mojos_per_unit)));
             const double eff_max_units = (xch_base_pair && config_.strategy.max_offer_size_units > 0.0) ? config_.strategy.max_offer_size_units : 0.0;
@@ -12136,26 +12152,29 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                     // reserve does for XCH just above: the up-scale and
                     // pace passes can raise tiers past the reserve-capped
                     // pool, and this filter is what drops them.
-                    const auto rit =
-                        config_.strategy.asset_reserve_units.find(asset_id);
-                    const bool reserved =
-                        rit != config_.strategy.asset_reserve_units.end();
-                    if (!config_.strategy.wallet_balance_caps_enabled
-                        && !reserved) {
+                    // [PAIRMIN 2026-10-26] So does min_reserve_units for
+                    // every other CAT while the caps are on -- the reserve
+                    // the final caps sized the pools to.  An up-scaled tier
+                    // that spent the whole balance used to pass here, and
+                    // Step 8 then suppressed its whole side.
+                    const auto reserve_units = execution::sizing_reserve_units(
+                        config_.strategy.asset_reserve_units,
+                        config_.strategy.min_reserve_units,
+                        config_.strategy.wallet_balance_caps_enabled, asset_id);
+                    if (!reserve_units.has_value()) {
                         return std::nullopt;  // CAT caps opted out
                     }
                     auto it = cached_wallet_balances_.find(asset_id);
                     if (it == cached_wallet_balances_.end()) {
                         return std::nullopt;  // never observed
                     }
-                    if (!reserved) return it->second.confirmed;
                     const Mojo mpu = (asset_id == pair_cfg->base_asset_id)
                         ? pair_cfg->base_mojos_per_unit
                         : pair_cfg->quote_mojos_per_unit;
                     const Mojo confirmed = it->second.confirmed;
                     return execution::cap_pool_above_reserve(
                         confirmed, confirmed,
-                        execution::reserve_units_to_mojos(rit->second, mpu));
+                        execution::reserve_units_to_mojos(*reserve_units, mpu));
                 };
 
                 for (const Side side : {Side::Ask, Side::Bid}) {
@@ -27649,10 +27668,8 @@ asio::awaitable<void> Engine::step_revive_maintenance(BlockHeight block_height)
             revive_price_ineligible_.count(pc.name) > 0, snap.mid_price > 0);
         if (config_.strategy.revive_max_offer_size_units > 0.0) {
             if (thin) {
-                const bool xch_base = pc.base_asset_id == "xch"
-                                   || pc.base_asset_id == "XCH";
-                const double min_units = pc.min_offer_size_units_override.value_or(
-                    xch_base ? 1.0 : config_.strategy.min_offer_size_units);
+                const double min_units = effective_min_offer_units(
+                    pc, config_.strategy.min_offer_size_units);
                 r.size_limit = std::max(
                     revive::cap_units_to_mojos(
                         config_.strategy.revive_max_offer_size_units,
