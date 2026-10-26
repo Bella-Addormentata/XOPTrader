@@ -2973,6 +2973,11 @@ private:
     /// immediately before it runs.
     bool wallet_holds_warp_send(std::int64_t wallet_id,
                                 BlockHeight block_height, bool fresh = false);
+    /// [review] Every warp jobs database the accounting scans read: the
+    /// configured one, then each store the GUI names beside the guard's
+    /// database (<warp_jobs_db>.retained: work kept across a config switch,
+    /// finishing there) -- a completion is booked from no other file.
+    std::vector<std::string> warp_store_paths() const;
 
     // -- Wallet unsync auto-recovery [WALLET-RESTART-LIVELOCK 2026-09-22] --
     // Step 8 restarts the wallet service only when

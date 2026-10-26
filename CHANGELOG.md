@@ -47,7 +47,9 @@ waits while a job or a Dexie take is open (the banner says so): a pointer
 file beside the configured store names every store still holding work
 (one per line, carrying what the previous store's own pointer named; a
 pointer that cannot be read is left standing and blocks rather than
-vanishing) -- written as the
+vanishing; a store whose work just closed stays named for two days so the
+engine's accounting scans, which read every named store, book what
+finished there) -- written as the
 switch happens and again before any engine is launched on the new config,
 never left to the next tick -- so an engine started on the new config
 guards both from its first cleanup and a GUI restarted on it finds the kept
@@ -57,7 +59,8 @@ after a day of unreadable trade-record lookups counted from the last pending
 read, never from its age. While an engine this GUI launched runs, the
 bridge records in the jobs database that engine was launched with -- its
 config's directory and `warp.jobs_db` both -- whatever the GUI's current
-config names; under a live config save, `warp.jobs_db` and
+config names (an engine this GUI did not start pins the store configured
+when it was first seen); under a live config save, `warp.jobs_db` and
 `accounting.bridge_jobs_db_path` wait for an engine restart, so the guard's
 database never moves under a running engine.
 

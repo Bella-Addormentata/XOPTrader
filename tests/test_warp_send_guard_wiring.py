@@ -147,3 +147,24 @@ def test_the_guards_database_is_restart_only_under_live_reload():
     assert 'rr.push_back("warp.jobs_db")' in plan
     assert "m.accounting.warp_jobs_db_path = ra.warp_jobs_db_path;" in plan
     assert 'rr.push_back("accounting.bridge_jobs_db_path")' in plan
+
+
+def test_the_accounting_scans_read_every_warp_store():
+    """[review] A job finishing in a store kept across a config switch has
+    its booking records there: the bridge-flow and top-up-take scans read
+    the configured store AND every store the retained pointer names."""
+    text = _engine()
+    assert "std::vector<std::string> Engine::warp_store_paths() const" in text
+    paths = text.index("std::vector<std::string> Engine::warp_store_paths() const")
+    body = text[paths:text.index("\n}\n", paths)]
+    assert 'guard_db + ".retained"' in body and "std::getline(in, line)" in body
+    for fn in ("step_ingest_bridge_flows(", "step_ingest_secondary_bridge_flows(",
+               "step_ingest_topup_takes("):
+        start = text.index("Engine::" + fn)
+        fn_body = text[start:text.index("\nasio::awaitable<void> Engine::", start + 1)
+                       if "\nasio::awaitable<void> Engine::" in text[start + 1:] else None]
+        assert "warp_store_paths()" in fn_body, fn
+        assert "read_bridge_job_rows(acc.bridge_jobs_db_path)" not in fn_body, fn
+        assert "read_topup_take_rows(acc.bridge_jobs_db_path)" not in fn_body, fn
+    hpp = ENGINE_HPP.read_text(encoding="utf-8")
+    assert "std::vector<std::string> warp_store_paths() const;" in hpp

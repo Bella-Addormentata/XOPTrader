@@ -649,6 +649,17 @@ class WarpJobStore:
             parts.append(f"{int(open_takes)} open Dexie take(s)")
         return " and ".join(parts)
 
+    def last_written_at(self) -> Optional[str]:
+        """[review] The newest ``updated_at`` across jobs and takes -- when
+        this store last changed; None for a store that never held either.
+        A store idle but recently written stays named for the engine's
+        accounting scans (service._RETAINED_LINGER_S)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(t) FROM (SELECT MAX(updated_at) AS t FROM warp_jobs "
+                "UNION ALL SELECT MAX(updated_at) AS t FROM dexie_takes)").fetchone()
+        return str(row[0]) if row is not None and row[0] else None
+
     def list_jobs(self, limit: int = 50) -> list[WarpJob]:
         """Most-recent jobs first (open and closed), for the GUI table."""
         with self._lock:

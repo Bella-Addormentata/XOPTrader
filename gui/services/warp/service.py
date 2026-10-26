@@ -6576,6 +6576,19 @@ def _same_path(a: str, b: str) -> bool:
 # (engine.cpp refresh_warp_send_guard) and guards both, and a GUI restarted
 # on this config finds the kept store again.
 _RETAINED_POINTER_SUFFIX = ".retained"
+# [review] How long a store with no open work stays named after it was last
+# written: a job that finished there after the configuration moved on has
+# its booking records there and nowhere else, and the engine's accounting
+# scans read the stores the pointer names (engine.cpp warp_store_paths).
+# Naming an idle store costs no protection (nothing in flight, nothing
+# guarded), so it lingers until the engine has had this long to book it.
+_RETAINED_LINGER_S: int = 48 * 3600
+# [review] What EngineBridge hands the worker for an engine this GUI did not
+# start (found on the metrics endpoint): its config, hence the store its
+# guard reads, is unknown, so the worker pins the store the configuration
+# names at that moment rather than move reservations away from a guard it
+# cannot see.
+ATTACHED_ENGINE_STORE = "<an engine this GUI did not start>"
 
 
 class RetainedPointerError(WarpError):
@@ -6630,25 +6643,34 @@ def _read_retained_pointer(pointer: Optional[Path]) -> tuple:
         return [], False
     try:
         text = pointer.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         _log.warning("warp: could not read %s (%s)", pointer, exc)
         return [], True
     entries = [line.strip() for line in text.splitlines() if line.strip()]
     return entries, not entries
 
 
-def _store_open_work(path: str) -> Optional[str]:
-    """The open work in the store at *path* (:meth:`WarpJobStore.open_work_summary`):
-    "" when it is idle or the file is missing, None when it cannot be read."""
+def _store_status(path: str) -> Optional[tuple]:
+    """``(open_work, linger)`` for the store at *path*: its open work
+    (:meth:`WarpJobStore.open_work_summary`; "" when idle or the file is
+    missing) and, idle, why it is still named -- closed work written within
+    ``_RETAINED_LINGER_S`` that the engine's accounting scans may not have
+    booked yet ("" once that has passed).  None when the store cannot be
+    read."""
     if not Path(path).is_file():
-        return ""
+        return "", ""
     try:
         with WarpJobStore(path) as store:
-            return store.open_work_summary()
+            work = store.open_work_summary()
+            last = None if work else store.last_written_at()
     except Exception as exc:  # noqa: BLE001 -- unreadable: unknown
         _log.warning("warp: could not read the job store %s (%s)", path, exc)
         return None
-
+    if work:
+        return work, ""
+    if last and _age_s(last) < _RETAINED_LINGER_S:
+        return "", f"closed work awaiting the engine's accounting (last written {last})"
+    return "", ""
 
 def _carried_entries(stores: Iterable[str]) -> tuple:
     """[review] ``(entries, unreadable_pointers)``: every store named by the
@@ -6691,6 +6713,9 @@ class RetainedStores:
     def __init__(self) -> None:
         self.named: List[str] = []
         self.reasons: Dict[str, str] = {}
+        #: The named stores that hold OPEN work (a subset of ``reasons``);
+        #: the rest are named for their closed work's accounting only.
+        self.open: Dict[str, str] = {}
         self.unreadable: bool = False
         self.unreadable_carried: List[str] = []
         self.write_error: Optional[str] = None
@@ -6720,6 +6745,7 @@ def sync_retained_pointer(wanted: str, candidates: Iterable[str]) -> RetainedSto
     carried, bad = _carried_entries([*entries, *candidates])
     st.unreadable_carried = bad
     keep: Dict[str, str] = {}
+    open_: Dict[str, str] = {}
     want_norm = _norm_store_path(wanted)
     for cand in [*entries, *candidates, *carried]:
         cand = str(cand or "").strip()
@@ -6728,13 +6754,18 @@ def sync_retained_pointer(wanted: str, candidates: Iterable[str]) -> RetainedSto
         norm = _norm_store_path(cand)
         if norm in keep or norm == want_norm or cand == wanted:
             continue
-        work = _store_open_work(cand)
-        if work is None:
-            keep[norm] = "work that could not be read"
-        elif work:
-            keep[norm] = work
+        status = _store_status(cand)
+        if status is None:
+            keep[norm] = open_[norm] = "work that could not be read"
+            continue
+        work, linger = status
+        if work:
+            keep[norm] = open_[norm] = work
+        elif linger:
+            keep[norm] = linger
     st.named = list(keep)
     st.reasons = keep
+    st.open = open_
     if st.named == [_norm_store_path(e) for e in entries]:
         return st                                            # as it stands
     try:
@@ -6819,6 +6850,7 @@ class _WarpWorker(QObject):
         # where this worker's sends are recorded, whatever config the GUI has
         # since switched to (EngineBridge keeps it current).
         self._engine_store: Optional[str] = None
+        self._engine_store_assumed: bool = False             # ATTACHED_ENGINE_STORE
         # The jobs database last opened, and why it is kept when the
         # configured one differs (open work must not vanish from monitoring).
         self._store_path: Optional[str] = None
@@ -6908,6 +6940,19 @@ class _WarpWorker(QObject):
         engine of ours is running: the GUI's config decides again.
         Delivered on the worker thread."""
         new = str(path) if path else None
+        if new == ATTACHED_ENGINE_STORE:
+            # [review] An engine this GUI did not start: its config, hence
+            # the store its guard reads, is unknown.  The store the
+            # configuration names NOW is taken for it and kept until it
+            # stops -- a jobs-database change must not move reservations
+            # away from a guard whose path cannot be seen.  A store already
+            # known (ours, or assumed earlier) stands.
+            if self._engine_store is not None:
+                return
+            self._engine_store_assumed = True
+            new = self._wanted_store_path()
+        else:
+            self._engine_store_assumed = False
         if new == self._engine_store:
             return
         before = self._wanted_store_path()
@@ -6969,13 +7014,14 @@ class _WarpWorker(QObject):
             return wanted
         use: Optional[str] = None
         if held and not (held == wanted or _same_path(held, wanted)):
-            if st.reasons.get(_norm_store_path(held)):
+            if st.open.get(_norm_store_path(held)):
                 use = held                                   # ours, still with work
         elif not held:
             # [review] A GUI restarted on this config: the pointer left beside
             # the configured store names the stores kept open last time, so
-            # their open work is found again rather than forgotten.
-            use = st.named[0] if st.named else None
+            # their open work is found again rather than forgotten (a store
+            # named only for its closed work's accounting is not resumed).
+            use = next((p for p in st.named if p in st.open), None)
         use_norm = _norm_store_path(use) if use else None
         others = [f"{p} ({st.reasons[p]})" for p in st.named if p != use_norm]
         extras = []
@@ -7867,8 +7913,14 @@ class _WarpWorker(QObject):
         snap["wallet_action_seq"] = self._wallet_action_seq
         if self._last_wallet_notice:
             snap["wallet_notice"] = self._last_wallet_notice
-        if getattr(self, "_store_hold", ""):
-            snap["store_notice"] = self._store_hold
+        notice = getattr(self, "_store_hold", "")
+        if getattr(self, "_engine_store_assumed", False):
+            assumed = (f"an engine this GUI did not start is running: the bridge takes "
+                       f"{self._engine_store} for the job store its guard reads and keeps "
+                       "recording there until it stops")
+            notice = f"{assumed}; {notice}" if notice else assumed
+        if notice:
+            snap["store_notice"] = notice
         if getattr(self, "_store_path", None):
             # [review] EngineBridge reads it back before a launch: the store
             # the worker records in may need naming beside the new engine's.

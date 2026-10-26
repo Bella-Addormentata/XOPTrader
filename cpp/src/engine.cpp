@@ -87,6 +87,7 @@
 #include <cstdlib>
 #include <functional>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -21079,6 +21080,45 @@ void Engine::refresh_warp_send_guard(BlockHeight block_height, bool fresh)
 // Whether a warp job has a Chia send in flight on @p wallet_id.  True when
 // the database could not be read (fail closed: a delayed cleanup is cheap,
 // a deleted warp send is a two-hour stall and an operator retry).
+std::vector<std::string> Engine::warp_store_paths() const
+{
+    const auto& acc = config_.accounting;
+    std::vector<std::string> paths;
+    if (!acc.bridge_jobs_db_path.empty()) paths.push_back(acc.bridge_jobs_db_path);
+    // [review] The stores the GUI kept across a config switch (the pointer
+    // refresh_warp_send_guard reads): a job finishing in one of them has
+    // its booking records there and nowhere else, so the accounting scans
+    // read them too.  Bookings dedupe by (job id, created_at) and by trade
+    // id, so a store already booked while it was the configured one books
+    // nothing twice.  The list is flat; a pointer that cannot be read adds
+    // nothing here (the guard already fails closed on it).
+    const std::string& guard_db = acc.warp_jobs_db_path.empty()
+        ? acc.bridge_jobs_db_path : acc.warp_jobs_db_path;
+    if (guard_db.empty()) return paths;
+    std::error_code ec;
+    const std::string retained_ptr = guard_db + ".retained";
+    if (!std::filesystem::exists(retained_ptr, ec) || ec) return paths;
+    std::ifstream in(retained_ptr);
+    std::string line;
+    while (in && std::getline(in, line)) {
+        while (!line.empty()
+               && (line.back() == '\r' || line.back() == '\n'
+                   || line.back() == ' ' || line.back() == '\t')) {
+            line.pop_back();
+        }
+        std::size_t start = 0;
+        while (start < line.size() && (line[start] == ' ' || line[start] == '\t')) {
+            ++start;
+        }
+        const std::string store = line.substr(start);
+        if (store.empty()) continue;
+        if (std::find(paths.begin(), paths.end(), store) == paths.end()) {
+            paths.push_back(store);
+        }
+    }
+    return paths;
+}
+
 bool Engine::wallet_holds_warp_send(std::int64_t wallet_id,
                                     BlockHeight block_height, bool fresh)
 {
@@ -21220,8 +21260,18 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     // at the tail still runs (review round 10) -- with Step 8 and
     // Step 11 both excluding this asset, a permanently unreadable jobs
     // DB must not leave its inventory without any maintainer.
-    std::vector<accounting::BridgeJobRow> jobs =
-        read_bridge_job_rows(acc.bridge_jobs_db_path);
+    std::vector<accounting::BridgeJobRow> jobs = [&] {
+        // [review] Every warp store: the configured one and those kept
+        // across a config switch (warp_store_paths), where a job may still
+        // finish; (job id, created_at) dedupes, so nothing books twice.
+        std::vector<accounting::BridgeJobRow> all;
+        for (const auto& store : warp_store_paths()) {
+            auto more = read_bridge_job_rows(store);
+            all.insert(all.end(), std::make_move_iterator(more.begin()),
+                       std::make_move_iterator(more.end()));
+        }
+        return all;
+    }();
 
     // wUSDC.b is the $1.00 numeraire (peg MONITORED, not priced in -- the
     // AccountingConfig peg-monitor doctrine), so no price feed is needed
@@ -21649,8 +21699,18 @@ asio::awaitable<void> Engine::step_ingest_secondary_bridge_flows(
     std::set<std::string> rebase_assets;
 
     // -- Book this scan's flows ----------------------------------------------
-    const std::vector<accounting::BridgeJobRow> jobs =
-        read_bridge_job_rows(acc.bridge_jobs_db_path);
+    const std::vector<accounting::BridgeJobRow> jobs = [&] {
+        // [review] Every warp store: the configured one and those kept
+        // across a config switch (warp_store_paths), where a job may still
+        // finish; (job id, created_at) dedupes, so nothing books twice.
+        std::vector<accounting::BridgeJobRow> all;
+        for (const auto& store : warp_store_paths()) {
+            auto more = read_bridge_job_rows(store);
+            all.insert(all.end(), std::make_move_iterator(more.begin()),
+                       std::make_move_iterator(more.end()));
+        }
+        return all;
+    }();
     const auto  now        = std::chrono::system_clock::now();
     std::size_t booked     = 0;
     double      booked_usd = 0.0;
@@ -21983,7 +22043,15 @@ asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)
         co_return validated;
     };
 
-    for (const auto& row : read_topup_take_rows(acc.bridge_jobs_db_path)) {
+    // [review] Every warp store (warp_store_paths): a take settled in a store
+    // kept across a config switch is booked from there; the trade id dedupes.
+    std::vector<accounting::TopupTakeRow> take_rows;
+    for (const auto& store : warp_store_paths()) {
+        auto more = read_topup_take_rows(store);
+        take_rows.insert(take_rows.end(), std::make_move_iterator(more.begin()),
+                         std::make_move_iterator(more.end()));
+    }
+    for (const auto& row : take_rows) {
         const auto legs = accounting::classify_topup_take(row);
         const auto skip_once = [&](const std::string& why) {
             if (topup_warned_ids_.insert(row.id).second) {

@@ -36,6 +36,7 @@ from gui.services.database_service import DatabaseService
 from gui.services.metrics_service import MetricsService
 from gui.services.wallet_service import WalletService
 from gui.services.warp.service import (
+    ATTACHED_ENGINE_STORE,
     RetainedPointerError,
     WarpService,
     publish_retained_pointer,
@@ -747,8 +748,10 @@ class EngineBridge(QObject):
         except RetainedPointerError as exc:
             _log.error("warp: %s", exc)
             return str(exc)
-        except Exception as exc:  # noqa: BLE001 -- never break a launch
-            _log.debug("retained warp store not published: %s", exc)
+        except Exception as exc:  # noqa: BLE001 -- unknown: fail closed too
+            _log.error("warp: the retained job stores could not be published (%s)", exc)
+            return ("the retained job stores could not be checked or named for the "
+                    f"engine's guard ({exc})")
         return None
 
     def _sync_warp_engine_store(self) -> None:
@@ -762,7 +765,16 @@ class EngineBridge(QObject):
         switch, and from the master tick (an engine that died on its own is
         noticed there)."""
         running = self.engine_running_locally and self.launched_config_path is not None
-        store = getattr(self, "_launched_warp_db", None) if running else None
+        if running:
+            store = getattr(self, "_launched_warp_db", None)
+        elif self._is_engine_reachable():
+            # [review] An engine this GUI did not start answers on the
+            # metrics endpoint (a service manager, a shell): its config is
+            # unknown, so the worker pins the store it uses now rather than
+            # move reservations away from a guard whose path it cannot see.
+            store = ATTACHED_ENGINE_STORE
+        else:
+            store = None
         try:
             self._warp_svc.set_engine_store(store)
         except Exception as exc:  # noqa: BLE001 -- never break the caller

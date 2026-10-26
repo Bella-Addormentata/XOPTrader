@@ -3677,12 +3677,14 @@ def test_the_worker_follows_the_running_engines_store(tmp_path):
     assert closed[-1] == 3 and worker._wanted_store_path() == three
 
 
-def test_a_store_with_open_work_is_kept_across_a_switch(tmp_path):
+def test_a_store_with_open_work_is_kept_across_a_switch(tmp_path, monkeypatch):
     """[review] A config switch (or a warp.jobs_db change) must not make a
     bridge job or an open Dexie take vanish from monitoring: the store in use
     is kept until its work closes, the banner says so, and a NEW send waits
     only while an engine of ours guards the other store."""
     from gui.services.warp.jobs import WarpJobStore
+
+    monkeypatch.setattr(S, "_RETAINED_LINGER_S", 0)       # closed work: no linger here
 
     old = tmp_path / "one" / "data" / "warp_jobs.db"
     with WarpJobStore(old) as s:
@@ -3854,12 +3856,14 @@ def test_publish_retained_pointer_fails_closed_when_the_pointer_cannot_be_writte
     assert isinstance(S.RetainedPointerError("x"), S.WarpError)
 
 
-def test_every_store_with_open_work_is_named_for_the_guard(tmp_path):
+def test_every_store_with_open_work_is_named_for_the_guard(tmp_path, monkeypatch):
     """[review] Two stores hold work (the previous engine's and an older one
     the worker kept): both are named, one per line, so an engine launched on
     a third config guards both; an entry is dropped only once its store is
     idle; a worker restarted on that config resumes the first named store."""
     from gui.services.warp.jobs import WarpJobStore
+
+    monkeypatch.setattr(S, "_RETAINED_LINGER_S", 0)       # closed work: no linger here
 
     a = tmp_path / "a" / "data" / "warp_jobs.db"
     b = tmp_path / "b" / "data" / "warp_jobs.db"
@@ -3955,3 +3959,72 @@ def test_a_previous_pointers_entries_are_carried_into_the_new_one(tmp_path):
     assert "could not be read" in worker._store_hold and worker._retained_ok is False
     assert pointer.read_text(encoding="utf-8").split() == [str(a.resolve()), str(b.resolve())], \
         "what C's pointer already names is kept"
+
+
+def test_a_store_whose_work_just_closed_stays_named_for_the_accounting(tmp_path, monkeypatch):
+    """[review] A job that finished in a kept store after the configuration
+    moved on has its booking records there and nowhere else: the store stays
+    named (the engine's accounting scans read the named stores) until the
+    engine has had _RETAINED_LINGER_S to book it -- at no protection cost,
+    and without a restarted worker resuming it."""
+    from gui.services.warp.jobs import WarpJobStore
+
+    done = tmp_path / "a" / "warp_jobs.db"
+    with WarpJobStore(done) as s:
+        job = s.create_job("mainnet", status=JobStatus.FUNDING_CLAIM, state={})
+        s.update_job(job.id, status=JobStatus.COMPLETED, expected_status=JobStatus.FUNDING_CLAIM)
+    wanted = str(tmp_path / "c" / "data" / "warp_jobs.db")
+    assert S.publish_retained_pointer(wanted, [str(done)]) == [str(done.resolve())]
+    st = S.sync_retained_pointer(wanted, [])
+    assert "awaiting the engine's accounting" in st.reasons[str(done.resolve())]
+    assert not st.open
+    worker = S._WarpWorker(secrets_path=tmp_path / "c" / "secrets.yaml")
+    worker._config = {"warp": {"enabled": True}}
+    assert worker._store_path_in_use() == wanted and not worker._store_pinned
+    assert "awaiting the engine's accounting" in worker._store_hold
+    # The linger over: dropped, pointer gone.
+    monkeypatch.setattr(S, "_RETAINED_LINGER_S", 0)
+    assert S.publish_retained_pointer(wanted, []) == []
+    assert not Path(wanted + S._RETAINED_POINTER_SUFFIX).exists()
+    with WarpJobStore(done) as s:
+        assert s.last_written_at() is not None
+    with WarpJobStore(tmp_path / "empty" / "warp_jobs.db") as s:
+        assert s.last_written_at() is None
+
+
+def test_a_pointer_that_is_not_utf8_blocks_too(tmp_path):
+    """[review] Invalid bytes in a pointer are "cannot be read", never an
+    exception that escapes publication and lets a launch proceed."""
+    wanted = str(tmp_path / "two" / "data" / "warp_jobs.db")
+    pointer = Path(wanted + S._RETAINED_POINTER_SUFFIX)
+    pointer.parent.mkdir(parents=True)
+    pointer.write_bytes(b"\xff\xfe\xfd")
+    assert S._read_retained_pointer(pointer) == ([], True)
+    with pytest.raises(S.RetainedPointerError, match="cannot be read"):
+        S.publish_retained_pointer(wanted, [])
+    assert pointer.exists()
+
+
+def test_an_engine_this_gui_did_not_start_pins_the_configured_store(tmp_path):
+    """[review] An engine found on the metrics endpoint has a guard path the
+    GUI cannot see: the store the configuration names at that moment is
+    taken for it and kept while it runs, so a jobs-database change moves no
+    reservation away from that guard; the banner says so."""
+    worker = S._WarpWorker(secrets_path=tmp_path / "one" / "secrets.yaml")
+    worker._config = {"warp": {"enabled": True, "jobs_db": "data/old.db"}}
+    one_old = str(tmp_path / "one" / "data" / "old.db")
+    worker.set_engine_store(S.ATTACHED_ENGINE_STORE)
+    assert worker._engine_store == one_old and worker._engine_store_assumed
+    worker._config = {"warp": {"enabled": True, "jobs_db": "data/new.db"}}   # a jobs_db change
+    assert worker._wanted_store_path() == one_old, "no move while the guard's path is unknown"
+    assert "did not start" in worker._snapshot_or_error()["store_notice"]
+    worker.set_engine_store(S.ATTACHED_ENGINE_STORE)                       # still there
+    assert worker._engine_store == one_old
+    worker.set_engine_store(None)                                          # it stopped
+    assert worker._wanted_store_path() == str(tmp_path / "one" / "data" / "new.db")
+    assert not worker._engine_store_assumed
+    assert "store_notice" not in worker._snapshot_or_error()
+    # A store already known (ours) stands when such an engine is also seen.
+    worker.set_engine_store(one_old)
+    worker.set_engine_store(S.ATTACHED_ENGINE_STORE)
+    assert worker._engine_store == one_old and not worker._engine_store_assumed

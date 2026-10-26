@@ -96,6 +96,7 @@ def test_switching_config_moves_the_database_path(app, tmp_path):
         # database of the engine this GUI launched for as long as it runs --
         # the one its stuck-transaction guard reads, resolved from the
         # LAUNCHED config (directory and warp.jobs_db) at launch time.
+        bridge._is_engine_reachable = lambda: False         # no engine of anyone's
         assert bridge._warp_svc.engine_store is None
         assert bridge._configured_warp_db() == str(second.parent / "data" / "warp_jobs.db")
         bridge._engine_process = SimpleNamespace(poll=lambda: None, pid=1)
@@ -107,6 +108,16 @@ def test_switching_config_moves_the_database_path(app, tmp_path):
         bridge.update_config_path(str(second))
         assert bridge._warp_svc.engine_store == str(first.parent / "data" / "old.db")
         bridge._engine_process = None                        # the engine stopped
+        bridge._sync_warp_engine_store()
+        assert bridge._warp_svc.engine_store is None
+        # [review] An engine this GUI did not start (it answers on the metrics
+        # endpoint): the worker is told so and pins the store it uses.
+        from gui.services.warp.service import ATTACHED_ENGINE_STORE
+
+        bridge._is_engine_reachable = lambda: True
+        bridge._sync_warp_engine_store()
+        assert bridge._warp_svc.engine_store == ATTACHED_ENGINE_STORE
+        bridge._is_engine_reachable = lambda: False
         bridge._sync_warp_engine_store()
         assert bridge._warp_svc.engine_store is None
         # [review] Before an engine starts here (and as the GUI switched
@@ -321,6 +332,12 @@ def test_an_unpublishable_retained_store_blocks_the_engine_launch(app, tmp_path,
         bridge.start_engine()
         assert launched == [], "no launch while the kept store cannot be named"
         assert errors and "Engine not started" in errors[0] and "old.db" in errors[0]
+        # [review] An unexpected failure of the publication fails closed too.
+        monkeypatch.setattr(eb, "publish_retained_pointer",
+                            lambda wanted, candidates: (_ for _ in ()).throw(
+                                RuntimeError("disk vanished")))
+        bridge.start_engine()
+        assert launched == [] and "disk vanished" in errors[-1]
         # Nothing to name (or named): the launch proceeds.
         monkeypatch.setattr(eb, "publish_retained_pointer", lambda wanted, candidates: None)
         bridge.start_engine()
