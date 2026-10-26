@@ -55,10 +55,11 @@ Error taxonomy (raised by handlers, classified by the dispatcher):
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Iterable
 
 from PySide6.QtCore import (
     QMutex,
@@ -194,6 +195,27 @@ _CANCELLABLE = frozenset(
 # because that is the flag saying "already sent, do not send again".
 _FUNDING_TX_UNKNOWN: str = "sent-id-unknown"
 
+# [WARP-LOST-SEND 2026-10-25] Automatic Chia fees.  A warp fee key left at 0
+# means: at least the engine's offer fee (strategy.offer_fee_mojos), more when
+# the node's own estimate for inclusion within _AUTO_FEE_TARGET_S says the
+# mempool demands it, never more than _AUTO_FEE_CAP_MULTIPLE times the floor.
+# The costs are CLVM cost ceilings for the two spend shapes warp sends (a
+# plain XCH send measured 10.57M on 2026-10-24; a CAT spend is roughly three
+# times that), so the estimate is for the bundle actually sent.
+_AUTO_FEE_TARGET_S: int = 300
+_AUTO_FEE_CAP_MULTIPLE: int = 10
+_COST_XCH_SEND: int = 12_000_000
+_COST_CAT_SPEND: int = 40_000_000
+
+#: A recorded Chia send that is in no wallet and no mempool, with the coins it
+#: spent still unspent, MAY still surface from a peer.  It is never sent again
+#: on the handler's own authority (a replacement spends other coins, so both
+#: could land; a second burn is a real loss): the job waits, fails at its
+#: pending deadline, and the operator's Retry is the authority to send again
+#: (_retry_tx_reset).  Only a send the chain PROVES dead -- an input spent by
+#: another transaction, at confirmation depth, with no output of ours -- is
+#: replaced automatically.
+
 # The only two states whose behaviour depends on whether the job is a rehearsal.
 # Everywhere else the flag is never consulted, so a row that predates the freeze
 # is harmless there and must not be refused.
@@ -242,6 +264,11 @@ class WarpParams:
     # existing enabled inbound config on upgrade.  0 == explicit unlimited.
     max_unwrap_micros: int = -1
     unwrap_chia_fee_mojos: int = 0
+    # [WARP-LOST-SEND 2026-10-25] strategy.offer_fee_mojos: the floor of
+    # every Chia fee warp sets automatically (a fee key left at 0).  A
+    # fee-less send sits at the bottom of a full mempool, and anything that
+    # sits for ~10 minutes used to meet the engine's force-delete.
+    offer_fee_mojos: int = 10_000_000
     # Altruistic relay (opt-in): deliver strangers' stuck xch -> bse messages
     # by paying their ~145k relay gas. Inert by default.
     altruistic_relay: bool = False
@@ -299,11 +326,31 @@ def _millieth_topup_minimums(max_fee_per_gas: int,
     return int(units), int(mojos)
 
 
-def _unwrap_xch_need(net: Any, params: Any) -> int:
-    """The spendable XCH an unwrap needs at G10: the toll plus the extra
-    Chia fee TWICE (once on the cat_spend, once on the toll funding send)."""
-    return int(net.chia_toll_mojos) + 2 * int(
-        getattr(params, "unwrap_chia_fee_mojos", 0) or 0)
+def _unwrap_xch_need(net: Any, fee_mojos: int) -> int:
+    """The spendable XCH an unwrap needs at G10: the toll plus the Chia fee
+    TWICE (once on the cat_spend, once on the toll funding send)."""
+    return int(net.chia_toll_mojos) + 2 * max(0, int(fee_mojos))
+
+
+_DEFAULT_OFFER_FEE_MOJOS: int = 10_000_000
+
+
+def _offer_fee_floor_mojos(config: Optional[dict]) -> int:
+    """strategy.offer_fee_mojos as the engine reads it (default 10,000,000),
+    the floor of warp's automatic Chia fees.  Garbage reads as the default:
+    a typo there must not make warp send fee-less.  [review] Nor may a zero
+    or negative value: the engine refuses those at startup
+    (config.cpp: "offer_fee_mojos must be > 0"), and here a zero floor would
+    cap even a positive node estimate at zero."""
+    strat = (config or {}).get("strategy") or {}
+    raw = strat.get("offer_fee_mojos", _DEFAULT_OFFER_FEE_MOJOS)
+    if isinstance(raw, bool):
+        return _DEFAULT_OFFER_FEE_MOJOS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_OFFER_FEE_MOJOS
+    return value if value > 0 else _DEFAULT_OFFER_FEE_MOJOS
 
 
 def _top_up_withdraw_short(eth_wei: int, max_fee_per_gas: int) -> bool:
@@ -522,6 +569,7 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
         portal_hint=(str(warp.get("portal_hint")) if warp.get("portal_hint") else None),
         max_unwrap_micros=_parse_unwrap_cap(warp),
         unwrap_chia_fee_mojos=int(warp.get("unwrap_chia_fee_mojos", 0) or 0),
+        offer_fee_mojos=_offer_fee_floor_mojos(config),
         altruistic_relay=_parse_config_bool(
             "altruistic_relay", warp.get("altruistic_relay"), False
         ),
@@ -681,7 +729,39 @@ def _job_dict(job: Optional[WarpJob]) -> Optional[dict]:
         "retry_count": job.retry_count,
         "last_error": job.last_error,
         "next_retry_at": job.next_retry_at,
+        # [review] What Sweep found and whether every Chia send the job made
+        # is ruled out: a Sweep that recovered the coin but could not close
+        # the job was otherwise invisible to the operator.
+        "swept": job.state.get("swept"),
+        "sweep_status": job.state.get("sweep_status"),
+        "attempts_open": _open_attempts(job.state),
+        "attempts_presumed": _presumed_attempts(job.state),
     }
+
+
+def _settled_ids(state: dict, tx_key: str) -> set:
+    """Retired attempts that no longer keep a job open: proven dead, or
+    presumed gone after the grace (kept apart: a presumed-gone send's coins
+    are still unspent, so Sweep stays available for it)."""
+    return ({t for t in (state.get(f"{tx_key}_prior_dead") or []) if t}
+            | {t for t in (state.get(f"{tx_key}_prior_presumed") or []) if t})
+
+
+def _open_attempts(state: dict) -> int:
+    """How many replaced Chia sends of a job are not yet proven dead or
+    presumed gone (the ones that keep Sweep / completion waiting)."""
+    n = 0
+    for tx_key in ("funding_tx_id", "burn_tx_id"):
+        done = _settled_ids(state, tx_key)
+        n += sum(1 for t in (state.get(f"{tx_key}_prior") or []) if t and t not in done)
+    return n
+
+
+def _presumed_attempts(state: dict) -> int:
+    """How many replaced Chia sends were presumed gone with their coins
+    still unspent -- the reason Sweep stays offered on a closed job."""
+    return sum(len([t for t in (state.get(f"{k}_prior_presumed") or []) if t])
+               for k in ("funding_tx_id", "burn_tx_id"))
 
 
 # --------------------------------------------------------------------------- #
@@ -736,6 +816,11 @@ class WarpEngine:
         self._relay_key = relay_key
         self._heartbeat_publisher = heartbeat_publisher
         self._relay_state_saver = relay_state_saver
+        # [review] Why a NEW Chia send must wait, or None (the worker wires
+        # it): the job store in use is not the one the running engine's
+        # stuck-transaction guard reads, so a send recorded here would be
+        # unprotected.  Consulted with the wallet-sync gate before every send.
+        self.send_hold: Optional[Callable[[], Optional[str]]] = None
         self._next_relay_sweep: float = 0.0
         self._relay_report: Dict[str, Any] = {}
         self._relay_activity: Dict[str, Any] = {}
@@ -887,6 +972,27 @@ class WarpEngine:
         if polls < limit:
             return None
         hours = polls * float(self._params.poll_interval_s) / 3600.0
+        if job.status == JobStatus.CLAIMING and self._claim_completed(job):
+            # [review] The claim DID land; the wait is for a replaced funding
+            # send to be ruled out.  "Sweep recovers the funding coin" would
+            # misread: that coin is spent.
+            return (
+                f"the claim completed, but a replaced funding send is not ruled "
+                f"out after {polls} polls (~{hours:.1f}h); handing over to the "
+                "operator -- Sweep recovers a coin that landed, Retry resumes "
+                "the wait, Abandon closes the job"
+            )
+        if job.state.get("delivered_by"):
+            # [WARP-LOST-SEND] The unwrap WAS delivered; the wait is for a
+            # replaced toll send to be ruled out before the job may close
+            # (_unwrap_delivered).  The generic remedy would misread as an
+            # undelivered relay.
+            return (
+                f"the unwrap was delivered, but a replaced toll send is not "
+                f"ruled out after {polls} polls (~{hours:.1f}h); handing over "
+                "to the operator -- Sweep recovers a toll coin that landed, "
+                "Retry resumes the wait, Abandon closes the job"
+            )
         # No Sweep suggestion for the Base-side states: they have no funding
         # coin, and pointing the operator at Sweep there aimed them straight at
         # the close-over-a-live-bridge hazard the sweep guard now blocks.
@@ -1616,39 +1722,71 @@ class WarpEngine:
         if coin is not None:
             return _advance(
                 JobStatus.CLAIM_FUNDED,
-                state={"security_coin_id": coin.name().hex()},
+                state={"security_coin_id": coin.name().hex(),
+                       **self._landed_patch(job, "funding_tx_id", coin)},
                 message=f"security coin funded ({expected} mojos)",
             )
 
-        # Cheapest guard first: we already recorded a funding send for this job.
-        # The coin is not on chain yet (checked above), so it is still in flight.
-        # This marker was previously written and never read, which meant every
-        # resume re-derived the decision from the history scan alone.
-        prior = job.state.get("funding_tx_id")
-        if prior:
-            return _stay(message=f"funding tx {prior} already sent; awaiting the coin")
-
         security_ph = claim.security_coin_puzzle_hash(sk)
-        existing = self._find_existing_funding(security_ph.hex(), expected)
+
+        # Cheapest guard first: we already recorded a funding send for this job.
+        # The coin is not on chain yet (checked above).  [WARP-LOST-SEND] The
+        # send is JUDGED, not assumed in flight: the wallet may have deleted
+        # it, or a coin it spent may have gone to another transaction (job 4,
+        # 2026-10-24), in which case it is sent again below.
+        resend: Dict[str, Any] = {}
+        if job.state.get("funding_tx_id"):
+            step, resend = self._judge_recorded_send(
+                job, tx_key="funding_tx_id", label="funding tx",
+                out_ph_hex=security_ph.hex(), out_amount=expected,
+                unique_output=True,
+                scan=lambda dead, **kw: self._find_existing_funding(
+                    security_ph.hex(), expected, exclude_ids=dead,
+                    **{**self._history_filters(job, "funding_tx_id"), **kw}),
+            )
+            if step is not None:
+                return step
+
+        priors = [t for t in (resend.get("funding_tx_id_prior")
+                              or job.state.get("funding_tx_id_prior") or []) if t]
+        existing = self._find_existing_funding(
+            security_ph.hex(), expected, exclude_ids=priors,
+            **self._history_filters(job, "funding_tx_id", pending=resend))
         if existing:
             return _stay(
                 # funding_amount travels with the id here too: a job that
                 # resumes through this branch would otherwise leave every
                 # later lookup recomputing the amount from live config.
-                state={"funding_tx_id": existing, "funding_amount": expected},
+                state={**resend, "funding_tx_id": existing,
+                       "funding_amount": expected},
                 message="funding tx already in flight (dedupe hit)",
             )
 
         # Re-check ON THE TICK THAT SENDS: the wrap gates ran long ago and
         # the claim amount (post_tip + claim fee) comes out of spendable XCH.
+        fee = self._chia_send_fee(p.chia_funding_fee_mojos, cost=_COST_XCH_SEND)
+        self._require_wallet_synced("claim security-coin funding")
         self._require_spendable_xch(
-            expected + p.chia_funding_fee_mojos,
+            expected + fee,
             context="claim security-coin funding",
         )
         self._wallet.log_in()
         address = cu.encode_puzzle_hash(security_ph, net.chia_prefix)
-        record = self._wallet.send_transaction(
-            1, expected, address, fee_mojos=p.chia_funding_fee_mojos
+        resend = {**resend, **self._refresh_exclusions(
+            job, tx_key="funding_tx_id", out_ph_hex=security_ph.hex(),
+            out_amount=expected, pending=resend)}
+        exclude = [c for c in ((resend if "funding_tx_id_exclude" in resend
+                               else job.state).get("funding_tx_id_exclude") or [])
+                   if c]
+        record = self._send_reserved(
+            job, tx_key="funding_tx_id",
+            # funding_amount travels with the reservation: a timed-out RPC
+            # must leave the amount Sweep looks for, not today's config.
+            reserve_patch={**resend, "funding_amount": expected},
+            send=lambda: self._wallet.send_transaction(
+                1, expected, address, fee_mojos=fee,
+                **({"exclude_coin_ids": exclude} if exclude else {}),
+            ),
         )
         # [WARP-DUP-FUND 2026-08-08] send_transaction returned, so the coin is
         # on its way whether or not the wallet named the transaction. Persisting
@@ -1665,23 +1803,103 @@ class WarpEngine:
                 job.id,
                 tx_id,
             )
+        from . import chia_send as cs
+
         return _stay(
             # Record what was actually sent. A later Sweep must look for *this*
             # amount, not whatever claim_fee_mojos happens to say at the time.
-            state={"funding_tx_id": tx_id, "funding_amount": expected},
-            message=f"funded {expected} mojos to the security coin",
+            # The coins it spent let a later tick prove the send dead.
+            state={**resend, "funding_tx_id": tx_id, "funding_amount": expected,
+                   "funding_tx_id_removals": list(cs.removal_ids(record)) or None,
+                   "funding_tx_id_orphan_polls": 0, "funding_fee_mojos": fee,
+                   "funding_tx_id_exclude": None, "funding_tx_id_wallet_absent": None},
+            message=f"funded {expected} mojos to the security coin (fee {fee})",
         )
+
+    def _security_coin_for(self, job: WarpJob, sk: bytes, expected: int):
+        """The job's security coin: the one ``security_coin_id`` pins while it
+        is unspent, else the key's first unspent coin of the funded amount.
+
+        [review] Two coins at the key is now a designed state (a replaced
+        funding send landing beside its replacement), and the coinset's
+        listing order is not stable: without the pin, consecutive ticks
+        could build the claim around different coins -- a second bundle
+        conflicting on the message coin, our own claim later read as a
+        third party's.  A pinned coin not indexed yet falls back to the
+        scan (it may simply predate the index); a spent one returns None,
+        which the callers read as "awaiting the final CAT coin".
+        """
+        from . import claim, drivers
+
+        pinned = _hx(job.state.get("security_coin_id") or "")
+        if pinned:
+            try:
+                rec = self._coinset.get_coin_record_by_name(pinned)
+            except Exception:  # noqa: BLE001 -- the scan below decides
+                rec = None
+            if rec is not None:
+                # The record must BE the pinned coin (a by-name lookup that
+                # answered with something else is not evidence about it).
+                from . import clvm_utils as cu
+
+                try:
+                    same = cu.coin_name(
+                        bytes.fromhex(_hx(rec.coin.parent_coin_info)),
+                        bytes.fromhex(_hx(rec.coin.puzzle_hash)),
+                        int(rec.coin.amount)).hex() == pinned
+                except Exception:  # noqa: BLE001 -- malformed: not evidence
+                    same = False
+                if not same:
+                    rec = None
+            if rec is None:
+                # [review] Not indexed by name yet, or the lookup failed: the
+                # SAME coin by its computed name among the key's records --
+                # never another coin of the amount, which would rebuild the
+                # claim around a different security coin and overwrite
+                # final_cat_coin_id while the first claim may still land.
+                try:
+                    from . import clvm_utils as cu
+
+                    ph = claim.security_coin_puzzle_hash(sk)
+                    for cand in self._coinset.get_coin_records_by_puzzle_hash(
+                            _hx(ph), include_spent=True):
+                        if cu.coin_name(
+                                bytes.fromhex(_hx(cand.coin.parent_coin_info)),
+                                ph, int(cand.coin.amount)).hex() == pinned:
+                            rec = cand
+                            break
+                except Exception:  # noqa: BLE001 -- then it is awaited
+                    rec = None
+            if rec is None:
+                # The key scan too, accepted only when it names the pinned
+                # coin itself: any other coin of the amount is awaited past.
+                try:
+                    cand = claim.find_security_coin(self._coinset, sk, expected)
+                except Exception:  # noqa: BLE001
+                    cand = None
+                if cand is not None and _hx(cand.name().hex()) == pinned:
+                    return cand
+                return None
+            if rec.spent:
+                return None
+            return drivers.Coin(
+                bytes.fromhex(_hx(rec.coin.parent_coin_info)),
+                bytes.fromhex(_hx(rec.coin.puzzle_hash)),
+                int(rec.coin.amount),
+            )
+        return claim.find_security_coin(self._coinset, sk, expected)
 
     def _h_claim_funded(self, job: WarpJob) -> _Step:
         """Wait for the security coin to reach the Chia confirmation depth."""
-        from . import claim
-
         net = self._net
         sk = self._load_ephemeral_sk(job)
         expected = self._funded_amount(job)
 
-        coin = claim.find_security_coin(self._coinset, sk, expected)
+        coin = self._security_coin_for(job, sk, expected)
         if coin is None:
+            # [review] Off chain again (a shallow reorg): landed evidence
+            # recorded for it is withdrawn, so the guard protects the send.
+            self._clear_landed(job, "funding_tx_id")
             raise WarpPending("security coin not yet on chain")
         depth = self._chia_depth(coin.name().hex())
         if depth is None:
@@ -1692,7 +1910,8 @@ class WarpEngine:
             )
         return _advance(
             JobStatus.COLLECTING_SIGS,
-            state={"security_coin_id": coin.name().hex()},
+            state={"security_coin_id": coin.name().hex(),
+                   **self._landed_patch(job, "funding_tx_id", coin, depth=depth)},
             message=f"security coin confirmed ({depth} blocks)",
         )
 
@@ -1768,12 +1987,71 @@ class WarpEngine:
                 raise WarpPending(
                     f"claim {depth}/{net.chia_confirmation_min_height} confirmations"
                 )
+            # [WARP-LOST-SEND] COMPLETED frees the slot and offers no Sweep,
+            # so a replaced funding send that could still land -- or already
+            # did, leaving a second coin at the key -- keeps the job here: a
+            # landed one is swept now, an undecided one waited out.
+            settled, note = self._prior_sends_settled(job)
+            if not settled:
+                extra = claim.find_security_coin(self._coinset, sk, expected)
+                if extra is not None:
+                    _resolved, status = self._sweep_security(job, extra, sk)
+                    return _stay(
+                        state={"sweep_status": status},
+                        message=(f"claim confirmed at {depth} confirmations; a "
+                                 f"replaced funding send landed too -- {status}"),
+                    )
+                return _stay(
+                    message=f"claim confirmed at {depth} confirmations; {note}",
+                )
             return _advance(
                 JobStatus.COMPLETED,
                 message=f"claim confirmed at {depth} confirmations",
             )
 
-        coin = claim.find_security_coin(self._coinset, sk, expected)
+        # [WARP-LOST-SEND] A third-party claim already paid the receiver and
+        # our funding was swept (persisted above): only the replaced funding
+        # sends remain to be ruled out.  A landed one is swept here; once all
+        # are settled the job completes.
+        if job.state.get("third_party_claim"):
+            if not job.state.get("swept"):
+                # [review] The recovery sweep was pushed but not confirmed when
+                # that tick ended (swept False).  Once the security coin is
+                # spent it is swept; until then the same bundle is pushed
+                # again.  Falling through to the claim wait instead would have
+                # the job await its own final CAT coin, which a third-party
+                # claim means can never appear.
+                sec_id = job.state.get("security_coin_id")
+                spent = bool(sec_id) and claim.security_coin_spent(
+                    self._coinset, bytes.fromhex(sec_id))
+                if spent:
+                    self._store.update_job(job.id, expected_status=job.status,
+                                           state_patch={"swept": True})
+                else:
+                    coin = self._security_coin_for(job, sk, expected)
+                    if coin is not None:
+                        resolved, status = self._sweep_security(job, coin, sk)
+                        return _stay(
+                            state={"swept": resolved, "sweep_status": status},
+                            message=(f"third-party claim paid the receiver; {status}; "
+                                     + ("funding swept back" if resolved else "retrying")),
+                        )
+                    return _stay(message="third-party claim paid the receiver; awaiting "
+                                         "the sweep of our funding coin")
+            settled, note = self._prior_sends_settled(job)
+            if settled:
+                return _advance(
+                    JobStatus.COMPLETED,
+                    message="third-party claim paid the receiver; funding swept back",
+                )
+            extra = claim.find_security_coin(self._coinset, sk, expected)
+            if extra is not None:
+                _resolved, status = self._sweep_security(job, extra, sk)
+                return _stay(state={"sweep_status": status},
+                             message=f"a replaced funding send landed -- {status}")
+            return _stay(message=f"third-party claim paid the receiver; {note}")
+
+        coin = self._security_coin_for(job, sk, expected)
         if coin is None:
             sec_id = job.state.get("security_coin_id")
             if sec_id and claim.security_coin_spent(
@@ -1841,6 +2119,26 @@ class WarpEngine:
             contents=self._claim_contents(job),
         ):
             resolved, status = self._sweep_security(job, coin, sk)
+            if resolved:
+                # [WARP-LOST-SEND] ...and no replaced funding send of this job
+                # could still land: COMPLETED would leave its XCH no Sweep.
+                # The resolved sweep is PERSISTED FIRST ([review]: the
+                # settlement check below can raise -- a wallet login, an
+                # output lookup -- and later ticks, which find no unspent
+                # security coin, must resume from the checkpoint rather than
+                # pend on a coin that is gone).
+                self._store.update_job(
+                    job.id, expected_status=job.status,
+                    state_patch={"third_party_claim": True, "swept": True,
+                                 "sweep_status": status})
+                settled, note = self._prior_sends_settled(job)
+                if not settled:
+                    return _stay(
+                        state={"third_party_claim": True, "swept": True,
+                               "sweep_status": status},
+                        message=(f"third-party claim paid the receiver; funding "
+                                 f"swept back; {note}"),
+                    )
             if not resolved:
                 # The deposit landed, but our funding coin is still unspent and
                 # the node was unreachable. COMPLETED is a closed state, so
@@ -1952,8 +2250,55 @@ class WarpEngine:
             return {"receiver_address": "", "receiver_source": f"unavailable: {exc}"}
         return {"receiver_address": address, "receiver_source": "wallet"}
 
-    def _find_existing_funding(self, security_ph_hex: str, expected: int) -> Optional[str]:
+    @staticmethod
+    def _history_hit_excluded(tx: dict, *, exclude_coin_sets: Sequence[Sequence[str]],
+                              exclude_coins: Sequence[str],
+                              require_coins: Sequence[str]) -> bool:
+        """[review] Whether a wallet-history record is some OTHER attempt's
+        (its coins exactly a retired attempt's set, or overlapping an attempt
+        still on the books), or cannot be attributed to the attempt sought
+        (*require_coins* known, and the record's coins unknown or disjoint).
+        A record without a removals list is excluded only when attribution
+        is required."""
+        from . import chia_send as cs
+
+        coins = {_hx(c) for c in cs.removal_ids(tx)}
+        if coins:
+            if any(coins == {_hx(c) for c in s if c} for s in exclude_coin_sets if s):
+                return True
+            if coins.intersection(_hx(c) for c in exclude_coins if c):
+                return True
+        wanted = {_hx(c) for c in require_coins if c}
+        if wanted and not coins.intersection(wanted):
+            return True
+        return False
+
+    def _history_filters(self, job: WarpJob, tx_key: str,
+                         pending: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """The attempts on the books, as the history scanners' exclusions:
+        every retired attempt's exact coin set, and the coins of the attempts
+        not proven dead.  *pending* is a state patch not yet written."""
+        st = {**job.state, **(pending or {})}
+        prior_removals = dict(st.get(f"{tx_key}_prior_removals") or {})
+        live, sets = self._attempt_books(prior_removals, list(_settled_ids(st, tx_key)))
+        return {"exclude_coin_sets": sets, "exclude_coins": live}
+
+    def _find_existing_funding(self, security_ph_hex: str, expected: int,
+                               exclude_ids: Sequence[str] = (), *,
+                               exclude_coin_sets: Sequence[Sequence[str]] = (),
+                               exclude_coins: Sequence[str] = (),
+                               require_coins: Sequence[str] = ()) -> Optional[str]:
         """Scan wallet history for an already-broadcast funding of this coin.
+
+        ``exclude_ids`` are sends already proven dead ([WARP-LOST-SEND]): the
+        wallet may keep retrying one whose coin is spent elsewhere, and
+        adopting it again would wait forever.  [review] A record that is a
+        RETIRED attempt's (its coins exactly one of ``exclude_coin_sets``, or
+        overlapping ``exclude_coins`` -- an attempt still on the books) is
+        never a hit either: a retired unnamed attempt's real record would
+        otherwise be adopted as the current one's.  With ``require_coins``
+        (the current attempt's own recorded coins) a hit must spend one of
+        them.
 
         Fails **closed**. This scan is the only thing standing between a lost
         ``send_transaction`` response and a second send of the same amount to the
@@ -1963,11 +2308,18 @@ class WarpEngine:
         ``last_error``, and crucially no send.
         """
         try:
-            # Keep the window wide. This bot's wallet is busy, so a funding tx
-            # can be pushed well down the history while the job waits on
-            # confirmations -- a short window would miss it and re-send. The
-            # timeout risk is handled by the client's timeout, not by looking
-            # at less evidence.
+            # [WARP-LOST-SEND] The UNCONFIRMED set first, explicitly: the
+            # daemon sorts unconfirmed records LAST, so on a busy wallet a
+            # just-sent funding pages out of any windowed scan (the hazard
+            # _find_existing_burn already guards against) -- and a miss here
+            # is what the unnamed-send path counts toward sending again.
+            pending = self._wallet.get_transactions(
+                1, start=0, end=200, reverse=True, confirmed=False)
+            # Then the wide mixed window.  This bot's wallet is busy, so a
+            # funding tx can be pushed well down the history while the job
+            # waits on confirmations -- a short window would miss it and
+            # re-send. The timeout risk is handled by the client's timeout,
+            # not by looking at less evidence.
             txs = self._wallet.get_transactions(1, start=0, end=200, reverse=True)
         except Exception as exc:  # noqa: BLE001 -- never read as "not funded"
             raise WarpRetryable(
@@ -1975,13 +2327,1277 @@ class WarpEngine:
                 "prior funding transaction already exists"
             ) from exc
         want = _hx(security_ph_hex)
-        for tx in txs or []:
+        dead = {_hx(t) for t in exclude_ids if t}
+        for tx in list(pending or []) + list(txs or []):
+            if _hx(tx.get("name") or tx.get("transaction_id") or "") in dead:
+                continue
+            if self._history_hit_excluded(
+                    tx, exclude_coin_sets=exclude_coin_sets,
+                    exclude_coins=exclude_coins, require_coins=require_coins):
+                continue
             for add in tx.get("additions") or []:
                 if _hx(add.get("puzzle_hash", "")) == want and int(
                     add.get("amount", -1)
                 ) == expected:
                     return tx.get("name") or tx.get("transaction_id")
         return None
+
+    # -- [WARP-LOST-SEND 2026-10-25] Chia sends that may not land ---------- #
+
+    def _chia_send_fee(self, configured: int, *, cost: int) -> int:
+        """The fee a warp Chia send pays.
+
+        A configured fee (> 0) is paid as stated.  0 means automatic: at
+        least the engine's offer fee (``strategy.offer_fee_mojos``), raised
+        to the node's own estimate for inclusion within _AUTO_FEE_TARGET_S
+        when the mempool demands more, capped at _AUTO_FEE_CAP_MULTIPLE
+        times the floor.  An unavailable estimate pays the floor.
+        """
+        if int(configured) > 0:
+            return int(configured)
+        floor = max(0, int(getattr(self._params, "offer_fee_mojos", 0) or 0))
+        estimate = 0
+        try:
+            est = self._coinset.get_fee_estimate(
+                cost=int(cost), target_times=[_AUTO_FEE_TARGET_S])
+            estimate = max(0, int(est[0])) if est else 0
+        except Exception as exc:  # noqa: BLE001 -- the floor still applies
+            _log.debug("warp: fee estimate unavailable (%s); paying the floor", exc)
+        return max(floor, min(estimate, floor * _AUTO_FEE_CAP_MULTIPLE))
+
+    def _unwrap_xch_budget(self) -> int:
+        """The spendable XCH an unwrap needs (G10): the toll plus the fee
+        its cat_spend will pay plus the fee its toll funding send will pay,
+        each estimated at its own spend's cost."""
+        configured = self._params.unwrap_chia_fee_mojos
+        return int(self._net.chia_toll_mojos) + (
+            self._chia_send_fee(configured, cost=_COST_CAT_SPEND)
+            + self._chia_send_fee(configured, cost=_COST_XCH_SEND))
+
+    def _sweep_fee_for(self, job: WarpJob) -> int:
+        """A sweep's fee, taken from the recovered coin: the automatic fee,
+        never more than half the coin.  A fee-less sweep is what a busy
+        mempool drops ([WARP-SWEEP-VERIFY])."""
+        try:
+            amount = int(self._funded_amount(job))
+        except Exception:  # noqa: BLE001 -- no amount, no fee
+            return 0
+        return min(self._chia_send_fee(0, cost=_COST_XCH_SEND), max(0, amount // 2))
+
+    def _send_reserved(self, job: WarpJob, *, tx_key: str,
+                       send: Callable[[], dict],
+                       reserve_patch: Optional[Dict[str, Any]] = None) -> dict:
+        """Run *send* (one wallet RPC) with a DURABLE reservation first.
+
+        The engine's stuck-transaction guard reads this job's markers from
+        warp_jobs.db; a marker written only after the RPC returns leaves the
+        send unprotected while it is being made (and while the engine may be
+        mid-heartbeat).  So *tx_key* is set to _FUNDING_TX_UNKNOWN before
+        the RPC and replaced with the real id by the caller.
+
+        *reserve_patch* is what a REPLACEMENT send has already decided (the
+        dead id joining ``<tx_key>_prior``, the cleared removals and output
+        pin); it is persisted with the reservation, atomically, so an RPC
+        that times out after broadcasting leaves a state the unnamed-send
+        path can finish from.  A daemon refusal (``... failed: ...``) means
+        nothing was sent: the marker and poll count the tick started with
+        are restored, so a replacement is judged again next tick (and keeps
+        its coin exclusions) while a first-ever send reverts to no marker.
+        A transport failure (``request failed``) may have broadcast, so the
+        reservation stands and the history scan decides next tick.
+        """
+        from .wallet import WalletError
+
+        polls_key = f"{tx_key}_orphan_polls"
+        patch = {**{k: v for k, v in (reserve_patch or {}).items()
+                    if not k.startswith("_")},
+                 tx_key: _FUNDING_TX_UNKNOWN, polls_key: 0,
+                 f"{tx_key}_wallet_absent": None, f"{tx_key}_landed": None}
+        # Everything the reservation changes, as the tick found it: a refusal
+        # puts it ALL back (the marker, its polls, removals, priors and pin),
+        # so the next tick judges the same send with the same evidence.
+        previous = {key: job.state.get(key) for key in patch}
+        self._store.update_job(job.id, expected_status=job.status,
+                               state_patch=patch)
+        try:
+            return send()
+        except Exception as exc:
+            # Only the daemon's own rejection ("<endpoint> failed: <error>",
+            # WalletClient._post's success=false form) proves nothing was
+            # sent.  A transport failure ("request failed") or a malformed
+            # reply ("unexpected response") may follow a broadcast: the
+            # reservation stands and the history scan decides next tick.
+            text = str(exc)
+            low = text.lower()
+            refused = (isinstance(exc, WalletError)
+                       and re.match(r"^\S+ failed: ", text) is not None
+                       and "request failed" not in low)
+            # [review] A connection that was never made (refused, no route,
+            # no such host) carried no bytes: nothing was sent either, and
+            # keeping the reservation would leave an attempt nothing can
+            # ever rule out.  A timeout or a reset after the request went
+            # out is different -- the daemon may have acted on it.
+            never_sent = (isinstance(exc, WalletError) and "request failed" in low
+                          and any(t in low for t in _NEVER_CONNECTED_MARKERS))
+            if refused or never_sent:
+                self._store.update_job(job.id, expected_status=job.status,
+                                       state_patch=previous)
+            raise
+
+    def _require_wallet_synced(self, context: str) -> None:
+        """Pend until the Chia wallet reports synced and not syncing.
+
+        Job 4's funding send went out 29 s after the wallet refused the
+        first attempt as unsynced, while it was still flapping; the coin it
+        selected was one an offer created in the same window also used.
+        A send waits for a settled wallet.
+        """
+        hold = self.send_hold() if self.send_hold is not None else None
+        if hold:
+            raise WarpPending(f"{context}: {hold}")
+        try:
+            # The configured fingerprint first: the daemon answers for the
+            # key that is logged in, which another client may have changed.
+            self._wallet.log_in()
+            status = self._wallet.get_sync_status()
+        except Exception as exc:  # noqa: BLE001 -- unknown is not synced
+            raise WarpRetryable(
+                f"{context}: wallet sync status unavailable ({exc})") from exc
+        if status.get("synced") is not True or status.get("syncing") is True:
+            raise WarpPending(f"{context}: the Chia wallet is syncing; waiting")
+
+    def _landed_patch(self, job: WarpJob, tx_key: str, coin: Any, *,
+                      depth: Optional[int] = None) -> Dict[str, Any]:
+        """[review] ``{<tx_key>_landed: True}`` when *coin* -- the coin that
+        carries the job forward -- descends from a coin the CURRENT attempt
+        spent AND sits at the Chia confirmation depth: its own output is on
+        chain for good, so its wallet record is confirmed and the engine's
+        guard may release the wallet.  ``{}`` when an earlier attempt's coin
+        carried the job (the current one may still be confirming, and stays
+        protected), the attempt's coins are not known, or the coin is still
+        shallow or unindexed -- a reorg could yet take it back, so nothing
+        tentative is recorded; the depth wait that follows sets the flag.
+        *depth* is the coin's confirmations when the caller holds its record;
+        else the coin is looked up.  Cleared by every new attempt
+        (_send_reserved) and withdrawn by _clear_landed when the coin is
+        gone."""
+        parent = getattr(coin, "parent_coin_info", None)
+        if parent is None:
+            return {}
+        phex = parent.hex() if isinstance(parent, (bytes, bytearray)) else _hx(str(parent))
+        mine = {_hx(c) for c in (job.state.get(f"{tx_key}_removals") or []) if c}
+        if not phex or phex not in mine:
+            return {}
+        if depth is None:
+            try:
+                if hasattr(coin, "name"):
+                    name = coin.name().hex()
+                else:
+                    from . import clvm_utils as cu
+
+                    ph = getattr(coin, "puzzle_hash")
+                    name = cu.coin_name(
+                        bytes.fromhex(phex),
+                        ph if isinstance(ph, (bytes, bytearray))
+                        else bytes.fromhex(_hx(str(ph))),
+                        int(getattr(coin, "amount"))).hex()
+                depth = self._chia_depth(name)
+            except Exception:  # noqa: BLE001 -- unknown depth: not recorded
+                depth = None
+        if depth is None or int(depth) < int(self._net.chia_confirmation_min_height):
+            return {}
+        return {f"{tx_key}_landed": True}
+
+    def _record_confirmations(self, rec: Any) -> Optional[int]:
+        """Confirmations of a coin record's creation, or None when the peak
+        or the record's height is unknown."""
+        try:
+            return int(self._coinset.get_peak_height()) - int(rec.confirmed_block_index) + 1
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _clear_landed(self, job: WarpJob, tx_key: str) -> None:
+        """[review] The coin that set ``<tx_key>_landed`` is not on chain (or
+        not indexed) any more: the evidence is withdrawn, and the engine's
+        guard protects the attempt's wallet record again.  Best effort."""
+        key = f"{tx_key}_landed"
+        if not job.state.get(key):
+            return
+        try:
+            self._store.update_job(job.id, expected_status=job.status,
+                                   state_patch={key: None})
+            _log.info("warp job %s: %s withdrawn; its coin is not on chain any more",
+                      job.id, key)
+        except Exception as exc:  # noqa: BLE001 -- withdrawn on a later tick
+            _log.debug("warp job %s: could not withdraw %s (%s)", job.id, key, exc)
+
+    def _coin_spent_depth(self, coin_id_hex: str) -> Optional[int]:
+        """Confirmations of the spend of a coin: 0 when unspent, None when
+        the coin is not indexed or the peak is unknown (then the depth
+        cannot be told, and a spend must not count as proof)."""
+        rec = self._coinset.get_coin_record_by_name(coin_id_hex)
+        if rec is None:
+            return None
+        return self._record_spent_depth(rec)
+
+    @staticmethod
+    def _unnamed(tx_id: str) -> bool:
+        """Whether *tx_id* is a send the daemon accepted but never named:
+        the live sentinel, or a retired attempt's ``<sentinel>#n`` key."""
+        return str(tx_id or "").startswith(_FUNDING_TX_UNKNOWN)
+
+    def _send_probes(self, tx_id: str) -> tuple:
+        """``(wallet_record, mempool_item)`` probes for *tx_id*.  An unnamed
+        send has no transaction id to ask the hash-based RPCs about (their
+        error would read as "could not tell" forever): the wallet is known
+        to hold no record of that name and no mempool item carries it, so
+        its recorded coins decide."""
+        if self._unnamed(tx_id):
+            return (lambda: None), (lambda: None)
+        return ((lambda: self._wallet.get_transaction_or_none(tx_id)),
+                (lambda: self._coinset.get_mempool_item_by_tx_id(tx_id)))
+
+    def _identify_unnamed(self, scan: Callable[[Sequence[str]], Any], *,
+                          exclude_ids: Sequence[str],
+                          live_coins: Sequence[str],
+                          recorded_sets: Sequence[Sequence[str]]) -> Optional[tuple]:
+        """``(tx_id, removals)`` for a send the daemon never named, read back
+        from the wallet history ([review]: its coin may have appeared before
+        the next tick, leaving the sentinel with no coins).
+
+        One-to-one: a transaction already identified for another attempt
+        (*exclude_ids*), one whose coins are those of an attempt still on
+        the books (*live_coins*: the coins of every attempt not proven
+        dead), or one that IS another attempt's record (its coins exactly
+        one of *recorded_sets*) is never handed out again -- one swept
+        output must not settle two attempts.  Overlap with a proven-dead
+        predecessor's SURVIVING coins is allowed: a replacement may reuse
+        them, and refusing its record would block completion for good.
+        ``None`` when nothing identifies it or the scan could not run.
+        """
+        from . import chia_send as cs
+
+        used = [t for t in exclude_ids if t]
+        live = {_hx(c) for c in live_coins if c}
+        recorded = [frozenset(_hx(c) for c in cs_ if c) for cs_ in recorded_sets if cs_]
+        for _ in range(16):
+            # [review] A lookup that could not run PROPAGATES: "could not
+            # look" must never read as "absent", or the absence-based grace
+            # below would settle a send the wallet may still hold.
+            found = scan(used)
+            if not found:
+                return None
+            tx_id = str(found[0] if isinstance(found, tuple) else found)
+            rec = self._wallet.get_transaction_or_none(tx_id)
+            removals = [_hx(c) for c in cs.removal_ids(rec)] if rec else []
+            if removals and (live.intersection(removals)
+                             or frozenset(removals) in recorded):
+                used.append(tx_id)            # already an attempt on the books
+                continue
+            return tx_id, removals
+        return None
+
+    @staticmethod
+    def _attempt_books(prior_removals: Dict[str, Any],
+                       dead: Sequence[str]) -> tuple:
+        """``(live_coins, recorded_sets)`` for :meth:`_identify_unnamed`
+        from the attempts' recorded coins and the proven-dead list."""
+        dead_set = {t for t in dead if t}
+        live = [c for t, cs_ in prior_removals.items()
+                if t not in dead_set for c in (cs_ or [])]
+        sets = [list(cs_ or []) for cs_ in prior_removals.values()]
+        return live, sets
+
+    def _identify_unnamed_funding(self, out_ph_hex: str, out_amount: int, *,
+                                  exclude_ids: Sequence[str],
+                                  live_coins: Sequence[str] = (),
+                                  recorded_sets: Sequence[Sequence[str]] = (),
+                                  require_coins: Sequence[str] = ()
+                                  ) -> Optional[tuple]:
+        return self._identify_unnamed(
+            lambda used: self._find_existing_funding(
+                out_ph_hex, int(out_amount), exclude_ids=used,
+                require_coins=require_coins),
+            exclude_ids=exclude_ids, live_coins=live_coins,
+            recorded_sets=recorded_sets)
+
+    def _identify_unnamed_burn(self, job: WarpJob, out_ph_hex: str, out_amount: int, *,
+                               exclude_ids: Sequence[str],
+                               live_coins: Sequence[str] = (),
+                               recorded_sets: Sequence[Sequence[str]] = (),
+                               require_coins: Sequence[str] = ()
+                               ) -> Optional[tuple]:
+        """The cat_spend counterpart of :meth:`_identify_unnamed_funding`."""
+        wid = int(job.state["cat_wallet_id"])
+        return self._identify_unnamed(
+            lambda used: self._find_existing_burn(
+                wid, out_ph_hex, int(out_amount), exclude_ids=used,
+                require_coins=require_coins),
+            exclude_ids=exclude_ids, live_coins=live_coins,
+            recorded_sets=recorded_sets)
+
+    def _identify_retired_by_coins(self, job: WarpJob, tx_key: str, tx_id: str,
+                                   coins: Sequence[str], *, ph: str, amount: int,
+                                   named: Sequence[str], live_coins: Sequence[str],
+                                   recorded_sets: Sequence[Sequence[str]]) -> Optional[str]:
+        """[review] A retired UNNAMED attempt whose coins are recorded is
+        probed as absent by construction (the sentinel is no transaction
+        id); before any absence-based settlement the wallet history is asked
+        for a record spending those very coins, and a hit re-keys the
+        attempt under its real id so the wallet and the mempool answer for
+        it.  Returns the real id, or None.  A lookup that could not run
+        propagates (never absence)."""
+        own_sets = [s for s in recorded_sets if set(_hx(c) for c in s) != set(_hx(c) for c in coins)]
+        own_live = [c for c in live_coins if _hx(c) not in {_hx(x) for x in coins}]
+        if tx_key == "burn_tx_id":
+            ident = self._identify_unnamed_burn(
+                job, ph, amount, exclude_ids=named, live_coins=own_live,
+                recorded_sets=own_sets, require_coins=coins)
+        else:
+            ident = self._identify_unnamed_funding(
+                ph, amount, exclude_ids=named, live_coins=own_live,
+                recorded_sets=own_sets, require_coins=coins)
+        if not ident or not ident[0]:
+            return None
+        found = str(ident[0])
+        self._persist_identified_attempt(job, tx_key, tx_id, found,
+                                         list(ident[1]) or list(coins))
+        return found
+
+    def _refresh_exclusions(self, job: WarpJob, *, tx_key: str, out_ph_hex: str,
+                            out_amount: int, pending: Dict[str, Any]) -> Dict[str, Any]:
+        """Re-judge the retained replaced attempts on the tick that sends.
+
+        [review] An orphan retired by Retry keeps its coins excluded; if a
+        later conflicting spend proves it dead, those coins are released
+        here -- otherwise its surviving input, were it the only coin large
+        enough, would starve every replacement.  Returns the state to merge
+        (the dead list and the refreshed exclusions), or {} when nothing
+        changed or the chain could not be read.
+        """
+        from . import chia_send as cs
+
+        st = {**job.state, **pending}
+        prior_key, prior_removals_key, dead_key, exclude_key = (
+            f"{tx_key}_prior", f"{tx_key}_prior_removals",
+            f"{tx_key}_prior_dead", f"{tx_key}_exclude")
+        priors = [t for t in (st.get(prior_key) or []) if t]
+        prior_removals = dict(st.get(prior_removals_key) or {})
+        dead = [t for t in (st.get(dead_key) or []) if t]
+        done = _settled_ids(st, tx_key) | set(dead)
+        retained = [t for t in priors if t not in done and prior_removals.get(t)]
+        if not retained:
+            return {}
+        try:
+            outputs = list(self._coinset.get_coin_records_by_puzzle_hash(
+                out_ph_hex, include_spent=True))
+        except Exception:  # noqa: BLE001 -- keep the exclusions as they are
+            return {}
+        min_depth = int(self._net.chia_confirmation_min_height)
+        changed = False
+        for tx_id in retained:
+            probe_wallet, probe_mempool = self._send_probes(tx_id)
+            ev = cs.gather(
+                wallet_record=probe_wallet, mempool_item=probe_mempool,
+                coin_spent=self._coin_spent_depth, outputs_at=lambda: outputs,
+                known_removals=prior_removals.get(tx_id) or [],
+                out_amount=int(out_amount), unique_output=False, min_depth=min_depth,
+            )
+            if cs.judge(ev)[0] is cs.Verdict.DEAD:
+                dead.append(tx_id)
+                changed = True
+        if not changed:
+            return {}
+        done = done | set(dead)
+        exclude = sorted({c for t, cs_ in prior_removals.items()
+                          if t not in done for c in cs_ if c})
+        return {dead_key: dead or None, exclude_key: exclude or None}
+
+    def _unnamed_attempt_key(self, job: WarpJob, tx_key: str) -> str:
+        """A distinct key for the unnamed attempt being retired, so each
+        is settled on its own evidence ([review]: merged under one key, one
+        attempt's dead input would have settled them all)."""
+        # [review] Never a key in use, nor one ever used: counting the
+        # unnamed entries would hand out "#2" again once "#1" was re-keyed
+        # under its real id, and retiring another send under a live key
+        # overwrites that attempt's coins.  The highest number ever seen in
+        # any book (and a persisted sequence, for re-keyed ones) plus one.
+        st = job.state
+        prefix = f"{_FUNDING_TX_UNKNOWN}#"
+        seen = int(st.get(f"{tx_key}_unnamed_seq") or 0)
+
+        def _num(t: Any) -> int:
+            t = str(t or "")
+            if not t.startswith(prefix):
+                return 0
+            try:
+                return int(t[len(prefix):])
+            except ValueError:
+                return 0
+
+        for key in (f"{tx_key}_prior", f"{tx_key}_prior_dead"):
+            for t in (st.get(key) or []):
+                seen = max(seen, _num(t))
+        for key in (f"{tx_key}_prior_removals", f"{tx_key}_prior_retired_at"):
+            for t in (st.get(key) or {}).keys():
+                seen = max(seen, _num(t))
+        return f"{prefix}{seen + 1}"
+
+    def _unnamed_group_dead(self, coins: Sequence[str], min_depth: int) -> bool:
+        """A legacy entry that merged several unnamed attempts' coins under
+        the bare sentinel is dead only when EVERY coin is spent at depth."""
+        for cid in coins:
+            depth = self._coin_spent_depth(cid)
+            if depth is None or depth < int(min_depth):
+                return False
+        return True
+
+    def _record_spent_depth(self, rec: Any) -> Optional[int]:
+        """Confirmations of a coin record's spend: 0 when unspent, None when
+        the peak or the spend height is unknown."""
+        if not rec.spent:
+            return 0
+        peak = int(self._coinset.get_peak_height() or 0)
+        spent_at = int(getattr(rec, "spent_block_index", 0) or 0)
+        if peak <= 0 or spent_at <= 0 or peak < spent_at:
+            return None
+        return peak - spent_at + 1
+
+    def _outputs_settled(self, outputs: Sequence[Any], *, amount: int,
+                         removals: Sequence[str], min_depth: int) -> tuple:
+        """``(settled, why)`` for a landed send's own outputs: every spent
+        one must be spent at the network's confirmation depth.
+
+        [review] A recovery spend (a sweep, a claim) one block deep can still
+        be reorged out; a job closed on it would leave the coin at the key
+        with Sweep gone.  An unspent output is the caller's business (Sweep
+        again, or the completion scan); an unknown depth is not proof.
+        """
+        mine = {_hx(r) for r in removals if r}
+        for rec in outputs:
+            coin = getattr(rec, "coin", None)
+            if coin is None or int(getattr(coin, "amount", -1)) != int(amount):
+                continue
+            if _hx(getattr(coin, "parent_coin_info", "")) not in mine:
+                continue
+            depth = self._record_spent_depth(rec)
+            if depth is None:
+                return False, "the depth of its coin's spend is unknown"
+            if 0 < depth < int(min_depth):
+                return False, (f"its coin's spend has {depth}/{min_depth} "
+                               "confirmations")
+        return True, ""
+
+    def _replacement_patch(self, job: WarpJob, *, tx_key: str, tx_id: str,
+                           removals: Sequence[str],
+                           also_clear: Sequence[str] = (),
+                           dead: bool = False) -> Dict[str, Any]:
+        """State that retires the send recorded as *tx_id* and prepares its
+        replacement: the marker and its polls cleared, the id added to
+        ``<tx_key>_prior`` with the coins it spent in
+        ``<tx_key>_prior_removals`` (Sweep asks whether it could still land
+        before closing the job), those coins in ``<tx_key>_exclude`` so the
+        replacement never reuses them, and *also_clear* (an output pin) set
+        to None."""
+        st = job.state
+        prior_key, prior_removals_key, dead_key = (
+            f"{tx_key}_prior", f"{tx_key}_prior_removals", f"{tx_key}_prior_dead")
+        priors = [t for t in (st.get(prior_key) or []) if t]
+        prior_removals = dict(st.get(prior_removals_key) or {})
+        proven_dead = [t for t in (st.get(dead_key) or []) if t]
+        settled_ids = _settled_ids(st, tx_key) | set(proven_dead)
+        retired_at = dict(st.get(f"{tx_key}_prior_retired_at") or {})
+        retired_at.setdefault(tx_id, float(self._now()))
+        seq_patch: Dict[str, Any] = {}
+        prefix = f"{_FUNDING_TX_UNKNOWN}#"
+        if tx_id.startswith(prefix):
+            try:
+                seq_patch[f"{tx_key}_unnamed_seq"] = max(
+                    int(st.get(f"{tx_key}_unnamed_seq") or 0), int(tx_id[len(prefix):]))
+            except ValueError:
+                pass
+        coins = [c for c in removals if c]
+        if coins:
+            prior_removals[tx_id] = coins
+        if dead and tx_id not in proven_dead:
+            proven_dead.append(tx_id)
+        # [review] The replacement excludes the coins of every replaced
+        # attempt that COULD STILL LAND, not only the latest: with A
+        # replaced by B and B by C, A may still surface, and C must not
+        # compete with it either.  A send the chain proved dead can never
+        # confirm, so its surviving inputs stay selectable: one conflicting
+        # input makes the verdict, and excluding the rest of a multi-input
+        # send could starve every replacement.  Every attempt's coins stay
+        # on the books for the settlement accounting regardless.
+        if dead:
+            settled_ids.add(tx_id)
+        exclude = sorted({c for t, cs_ in prior_removals.items()
+                          if t not in settled_ids for c in cs_ if c})
+        return {
+            tx_key: None, f"{tx_key}_orphan_polls": 0,
+            f"{tx_key}_removals": None,
+            prior_key: priors + ([tx_id] if tx_id not in priors else []),
+            prior_removals_key: prior_removals or None,
+            dead_key: proven_dead or None,
+            f"{tx_key}_prior_retired_at": retired_at or None,
+            f"{tx_key}_exclude": exclude or None,
+            f"{tx_key}_wallet_absent": None,
+            f"{tx_key}_landed": None,
+            **seq_patch,
+            **{key: None for key in also_clear},
+        }
+
+    def _persist_identified_attempt(self, job: WarpJob, tx_key: str, old_key: str,
+                                    tx_id: str, removals: Sequence[str]) -> None:
+        """[review] A retired unnamed attempt identified from the wallet
+        history is re-keyed under its real id, with the coins it spent, in
+        every book (<tx_key>_prior, _prior_removals, _prior_dead,
+        _prior_retired_at; the hit is a sighting, so its absence clock in
+        _prior_absent_since is dropped): later probes then ask the wallet
+        and the mempool about THAT id and judge it by those coins -- it is
+        never "unobservable" again, so a record that later drops out of the
+        history cannot start the absence-based grace while the bundle may
+        still sit in a mempool.  Best effort: this tick judges it anyway."""
+        # [review] The LATEST books, not the caller's snapshot: a settlement
+        # pass may re-key several attempts, and each write must build on the
+        # previous one or the earlier identification is lost.
+        try:
+            fresh = self._store.get_job(job.id)
+        except Exception as exc:  # noqa: BLE001 -- judged this tick regardless
+            _log.debug("warp job %s: could not re-read before re-keying (%s)", job.id, exc)
+            return
+        st = fresh.state
+        patch: Dict[str, Any] = {}
+        priors = [t for t in (st.get(f"{tx_key}_prior") or []) if t]
+        if old_key in priors:
+            patch[f"{tx_key}_prior"] = [
+                (tx_id if t == old_key else t) for t in priors
+                if not (t == tx_id and old_key != tx_id)]
+        removal_book = dict(st.get(f"{tx_key}_prior_removals") or {})
+        removal_book.pop(old_key, None)
+        removal_book[tx_id] = [_hx(c) for c in removals if c]
+        patch[f"{tx_key}_prior_removals"] = removal_book
+        dead = [t for t in (st.get(f"{tx_key}_prior_dead") or []) if t]
+        if old_key in dead:
+            patch[f"{tx_key}_prior_dead"] = [(tx_id if t == old_key else t) for t in dead]
+        stamps = dict(st.get(f"{tx_key}_prior_retired_at") or {})
+        if old_key in stamps:
+            stamps[tx_id] = stamps.pop(old_key)
+            patch[f"{tx_key}_prior_retired_at"] = stamps
+        absent = dict(st.get(f"{tx_key}_prior_absent_since") or {})
+        dropped = [absent.pop(k, None) for k in {old_key, tx_id}]
+        if any(d is not None for d in dropped):
+            patch[f"{tx_key}_prior_absent_since"] = absent or None
+        try:
+            self._store.update_job(job.id, expected_status=fresh.status, state_patch=patch)
+            if old_key == tx_id:
+                _log.info("warp job %s: learned the coins of retired %s (%d)",
+                          job.id, tx_id[:16], len(removal_book[tx_id]))
+            else:
+                _log.info("warp job %s: retired %s identified as %s (%d coins)",
+                          job.id, old_key, tx_id, len(removal_book[tx_id]))
+        except Exception as exc:  # noqa: BLE001 -- judged this tick regardless
+            _log.debug("warp job %s: could not persist the identified attempt (%s)",
+                       job.id, exc)
+
+    def _mark_attempts_dead(self, job: WarpJob, tx_key: str, ids: Sequence[str], *,
+                            presumed: bool = False) -> None:
+        """[review] Record retired attempts proven dead -- or presumed gone
+        after the grace -- in ``<tx_key>_prior_dead``, from the latest books:
+        the engine's guard protects only attempts not listed there, the
+        replacement exclusions skip them, and Abandon's record names only the
+        rest.  A verdict found during settlement must not be forgotten by
+        the next tick.  Best effort."""
+        new = [t for t in ids if t]
+        if not new:
+            return
+        # [review] Presumed-gone attempts are listed apart from proven-dead
+        # ones: their coins are still unspent, so a job closed over them
+        # keeps Sweep available.
+        key = f"{tx_key}_prior_presumed" if presumed else f"{tx_key}_prior_dead"
+        try:
+            fresh = self._store.get_job(job.id)
+            dead = [t for t in (fresh.state.get(key) or []) if t]
+            add = [t for t in new if t not in dead]
+            if not add:
+                return
+            self._store.update_job(fresh.id, expected_status=fresh.status,
+                                   state_patch={key: dead + add})
+            _log.info("warp job %s: attempt(s) %s %s", job.id,
+                      ", ".join(t[:16] for t in add),
+                      "presumed gone after the grace" if presumed else "proven dead")
+        except Exception as exc:  # noqa: BLE001 -- judged this tick regardless
+            _log.debug("warp job %s: could not record dead attempts (%s)", job.id, exc)
+
+    def _unobservable_settled(self, job: WarpJob, tx_key: str, tx_id: str, *,
+                              coins_known: bool = False) -> tuple:
+        """``(settled, note)`` for a RETIRED attempt observed absent on THIS
+        pass: no wallet record and no mempool item (an unnamed one: no
+        history record), and either no recorded coins or coins still
+        unspent (an orphan).  Presumed gone once
+        ``_UNOBSERVABLE_ATTEMPT_GRACE_S`` of ESTABLISHED absence has passed;
+        until then it keeps the job open.  [review] The clock
+        (``<tx_key>_prior_absent_since``) starts at the first probe that
+        finds the attempt absent -- never at its retirement, after which it
+        may stay alive for hours -- and :meth:`_absence_broken` drops it
+        whenever the attempt is seen alive or a probe does not answer: the
+        grace is absence actually established, not age.  An orphan with
+        coins is bounded the same way: unbounded, a finished claim would sit
+        in CLAIMING until the operator abandoned it; its coins stay on the
+        books, so were it to land after all, Sweep (available on a COMPLETED
+        job) recovers it."""
+        key = f"{tx_key}_prior_absent_since"
+        since = (job.state.get(key) or {}).get(tx_id)
+        now = float(self._now())
+        if not isinstance(since, (int, float)) or isinstance(since, bool):
+            # The latest books: several attempts may start their clocks on
+            # one pass, and each write must keep the earlier ones.
+            try:
+                fresh = self._store.get_job(job.id)
+                stamps = dict(fresh.state.get(key) or {})
+                stamps[tx_id] = now
+                self._store.update_job(fresh.id, expected_status=fresh.status,
+                                       state_patch={key: stamps})
+            except Exception as exc:  # noqa: BLE001 -- the clock starts next pass
+                _log.debug("warp job %s: could not stamp attempt %s absent (%s)",
+                           job.id, tx_id, exc)
+            since = now
+        waited = now - float(since)
+        hours = _UNOBSERVABLE_ATTEMPT_GRACE_S // 3600
+        what = ("its coins unspent" if coins_known else "no coins on record")
+        if waited >= _UNOBSERVABLE_ATTEMPT_GRACE_S:
+            _log.warning("warp job %s: attempt %s has had no wallet record and no "
+                         "mempool item for %.1fh (%s); presumed gone",
+                         job.id, tx_id[:16], waited / 3600.0, what)
+            return True, ""
+        if coins_known:
+            return False, (f"attempt {tx_id[:16]}... could still land (its coins are "
+                           "unspent, though it is in no wallet record and no mempool); "
+                           f"presumed gone after {hours}h ({waited / 3600.0:.1f}h so far) "
+                           "-- Sweep again later")
+        return False, (f"attempt {tx_id[:16]}... is nowhere to be seen (no coins on "
+                       f"record); presumed gone after {hours}h "
+                       f"({waited / 3600.0:.1f}h so far) -- Sweep again later")
+
+    def _absence_broken(self, job: WarpJob, tx_key: str, tx_id: str) -> None:
+        """[review] Attempt *tx_id* was seen alive on this pass (a wallet
+        record, a mempool item, its output, a history record), was settled
+        by the chain, or a probe for it did not answer: whatever absence
+        clock it had is dropped, and the next pass that finds it absent
+        starts a new one.  Best effort."""
+        key = f"{tx_key}_prior_absent_since"
+        if tx_id not in (job.state.get(key) or {}):
+            return
+        try:
+            fresh = self._store.get_job(job.id)
+            stamps = dict(fresh.state.get(key) or {})
+            if stamps.pop(tx_id, None) is None:
+                return
+            self._store.update_job(fresh.id, expected_status=fresh.status,
+                                   state_patch={key: stamps or None})
+            _log.info("warp job %s: attempt %s is not established absent; its "
+                      "absence clock restarts", job.id, tx_id[:16])
+        except Exception as exc:  # noqa: BLE001 -- dropped on a later pass
+            _log.debug("warp job %s: could not drop the absence clock of %s (%s)",
+                       job.id, tx_id, exc)
+
+    def _absence_broken_all(self, job: WarpJob, tx_key: str) -> None:
+        """[review] A probe every attempt shares failed (the wallet login, the
+        key's coin records, or a history read the pass cannot go on without):
+        nothing was established about ANY attempt on this pass, so every
+        absence clock under *tx_key* is dropped -- an outage must not count
+        toward the grace.  Best effort."""
+        key = f"{tx_key}_prior_absent_since"
+        try:
+            fresh = self._store.get_job(job.id)
+            if not fresh.state.get(key):
+                return
+            self._store.update_job(fresh.id, expected_status=fresh.status,
+                                   state_patch={key: None})
+            _log.info("warp job %s: a shared probe failed; every %s absence clock "
+                      "restarts", job.id, tx_key)
+        except Exception as exc:  # noqa: BLE001 -- dropped on a later pass
+            _log.debug("warp job %s: could not drop the absence clocks (%s)", job.id, exc)
+
+    def _prior_sends_settled(self, job: WarpJob,
+                             tx_key: str = "funding_tx_id") -> tuple:
+        """``(settled, note)``: once a funding send was REPLACED, whether
+        every attempt -- the replaced ones and the current one -- can be
+        ruled out, so Sweep (or a completed claim) may close the job.
+
+        A replacement spends other coins, so any attempt not proven dead
+        could still land after the job closes -- XCH at the ephemeral key
+        with no Sweep left to recover it; and the current attempt may be
+        the one still pending when a replaced one lands first and is swept.
+        An attempt is settled when the chain proves it dead, or when its own
+        output (an output whose parent is one of the coins it spent) is on
+        chain and spent (swept or claimed).  An unspent coin at the key means
+        "Sweep again"; a wallet-only confirmation, unknown coins, or a send
+        still in flight mean "wait".  A job that never replaced its send is
+        settled: this is the accounting of replacements.
+        """
+        from . import chia_send as cs, claim
+
+        st = job.state
+        priors = [t for t in (st.get(f"{tx_key}_prior") or []) if t]
+        if not priors:
+            return True, ""
+        try:
+            ph = claim.security_coin_puzzle_hash(self._load_ephemeral_sk(job)).hex()
+            amount = int(self._funded_amount(job))
+        except Exception as exc:  # noqa: BLE001 -- cannot judge: not settled
+            self._absence_broken_all(job, tx_key)
+            return False, f"a replaced funding send cannot be judged ({exc})"
+        try:
+            self._wallet.log_in()
+            outputs = list(self._coinset.get_coin_records_by_puzzle_hash(
+                ph, include_spent=True))
+        except Exception:
+            # [review] Shared by every attempt: an outage here established
+            # nothing, and must not count toward any attempt's grace.
+            self._absence_broken_all(job, tx_key)
+            raise
+        unspent = [r for r in outputs
+                   if int(r.coin.amount) == amount and not r.spent]
+        if unspent:
+            return False, ("XCH from a replaced funding send is still at the "
+                           "ephemeral key; Sweep again")
+        prior_removals = dict(st.get(f"{tx_key}_prior_removals") or {})
+        attempts = list(priors)
+        current = str(st.get(tx_key) or "")
+        if current:
+            # [review] The current attempt too: a replaced send that landed
+            # first and was swept must not close the job over it.
+            # [review] The current attempt's OWN coins, named or not -- an
+            # unnamed one under a key of its own, so the legacy merged-group
+            # rule (the bare sentinel) never reads one multi-input send as a
+            # group of attempts.
+            if current == _FUNDING_TX_UNKNOWN:
+                current = f"{_FUNDING_TX_UNKNOWN}#current"
+            attempts.append(current)
+            prior_removals.setdefault(
+                current, list(st.get(f"{tx_key}_removals") or []))
+        min_depth = int(self._net.chia_confirmation_min_height)
+        # [review] Identification is one-to-one: every named attempt, every
+        # id handed to an unnamed one, every coin of an attempt still on
+        # the books, and every attempt's own record are excluded from the
+        # next identification -- while a proven-dead predecessor's
+        # surviving coins may legitimately reappear in its replacement.
+        named = [t for t in attempts if not self._unnamed(t)]
+        dead = list(_settled_ids(st, tx_key))
+        proven_dead = {t for t in (st.get(f"{tx_key}_prior_dead") or []) if t}
+        live_coins, recorded_sets = self._attempt_books(prior_removals, dead)
+        # [review] EVERY attempt is judged on every pass, and the first
+        # thing that keeps the job open is reported: a verdict found behind
+        # an unsettled attempt is kept, and each attempt's absence clock is
+        # started, kept or dropped from what THIS pass saw of it.
+        notes: list = []
+        for tx_id in attempts:
+            if tx_id in proven_dead and tx_id != current:
+                # [review] Proven dead at depth: nothing to identify or
+                # probe.  Looked for by its coins, a replacement that reused
+                # one of its surviving inputs could be handed to it once its
+                # own record is gone from the history -- and the dead marker
+                # with it, leaving the replacement unable to adopt its own
+                # record and the job unable to settle.
+                continue
+            probe_id, coins = tx_id, list(prior_removals.get(tx_id) or [])
+            if self._unnamed(tx_id) and coins and tx_id != current:
+                # [review] Retired, unnamed, coins known: the history may
+                # still name it (its record reappeared, or paged back in);
+                # named, it is probed for real instead of read as absent.
+                try:
+                    found = self._identify_retired_by_coins(
+                        job, tx_key, tx_id, coins, ph=ph, amount=amount, named=named,
+                        live_coins=live_coins, recorded_sets=recorded_sets)
+                except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
+                    self._absence_broken_all(job, tx_key)
+                    return False, (f"the wallet history could not be read ({exc}); "
+                                   f"attempt {tx_id[:16]}... is not ruled out")
+                if found:
+                    probe_id = found
+                    named.append(found)
+            if self._unnamed(tx_id) and not coins:
+                # [review] With its coins recorded it is judged like any
+                # other attempt (dead once they are spent elsewhere, landed
+                # by its output's parent).  Without them the wallet history
+                # may still name it -- its coin appeared before the tick
+                # that would have adopted the id -- and the current marker is
+                # then persisted under that name; otherwise nothing can rule
+                # it out.
+                try:
+                    ident = self._identify_unnamed_funding(
+                        ph, amount, exclude_ids=named, live_coins=live_coins,
+                        recorded_sets=recorded_sets)
+                except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
+                    self._absence_broken_all(job, tx_key)
+                    return False, (f"the wallet history could not be read ({exc}); "
+                                   f"attempt {tx_id[:16]}... is not ruled out")
+                if ident and ident[0] and not ident[1]:
+                    # [review] Identified, but its coins could not be read
+                    # (the record vanished between the scan and the by-id
+                    # lookup): keep the id now and PROBE it next pass -- the
+                    # wallet and the mempool answer for a named id -- rather
+                    # than fall into the absence rule on this tick.
+                    found_id = str(ident[0])
+                    if tx_id == current:
+                        try:
+                            self._store.update_job(
+                                job.id, expected_status=job.status,
+                                state_patch={tx_key: found_id})
+                        except Exception as exc:  # noqa: BLE001
+                            _log.debug("warp job %s: could not keep the identified "
+                                       "id (%s)", job.id, exc)
+                    else:
+                        self._persist_identified_attempt(job, tx_key, tx_id, found_id, [])
+                    named.append(found_id)
+                    notes.append(f"attempt {tx_id[:16]}... identified as "
+                                 f"{found_id[:16]}...; its coins are being read")
+                    continue
+                if not ident or not ident[1]:
+                    if tx_id != current:
+                        if tx_id in dead:
+                            continue                         # presumed gone already
+                        # [review] Retired and unobservable: the grace clock,
+                        # and the presumed-gone record Sweep access relies on.
+                        gone, note = self._unobservable_settled(job, tx_key, tx_id)
+                        if gone:
+                            self._mark_attempts_dead(job, tx_key, [tx_id], presumed=True)
+                            continue
+                        notes.append(note)
+                        continue
+                    notes.append("a send the wallet never named, whose coins are "
+                                 "not known, cannot be ruled out; Sweep again "
+                                 "later or Abandon")
+                    continue
+                probe_id, coins = ident
+                named.append(probe_id)
+                live_coins = [*live_coins, *coins]
+                recorded_sets = [*recorded_sets, list(coins)]
+                if tx_id == f"{_FUNDING_TX_UNKNOWN}#current":
+                    try:
+                        self._store.update_job(
+                            job.id, expected_status=job.status,
+                            state_patch={tx_key: probe_id, f"{tx_key}_removals": coins})
+                    except Exception as exc:  # noqa: BLE001 -- judged anyway
+                        _log.debug("warp job %s: could not persist the identified "
+                                   "send (%s)", job.id, exc)
+                else:
+                    self._persist_identified_attempt(job, tx_key, tx_id, probe_id, coins)
+            # unique_output=False: the key holds other attempts' coins too,
+            # so an output is THIS send's only when its parent is one of the
+            # coins this send spent.  A send whose coins are unknown can
+            # therefore never read as landed.
+            probe_wallet, probe_mempool = self._send_probes(probe_id)
+            ev = cs.gather(
+                wallet_record=probe_wallet,
+                mempool_item=probe_mempool,
+                coin_spent=self._coin_spent_depth,
+                outputs_at=lambda: outputs,
+                known_removals=coins,
+                out_amount=amount, unique_output=False, min_depth=min_depth,
+            )
+            verdict, why = cs.judge(ev)
+            if ev.removals and not coins:
+                # [review] A record that reappeared taught the coins this
+                # attempt spent: kept in its book, so a record that vanishes
+                # again is judged by them (never presumed gone by absence).
+                learned = [_hx(c) for c in ev.removals]
+                if tx_id == current:
+                    if not self._unnamed(tx_id):
+                        try:
+                            self._store.update_job(
+                                job.id, expected_status=job.status,
+                                state_patch={f"{tx_key}_removals": learned})
+                        except Exception as exc:  # noqa: BLE001 -- judged anyway
+                            _log.debug("warp job %s: could not keep the learned coins "
+                                       "(%s)", job.id, exc)
+                else:
+                    self._persist_identified_attempt(job, tx_key, tx_id, tx_id, learned)
+                coins = learned
+            if tx_id != current and verdict is not cs.Verdict.ORPHAN:
+                # [review] Seen alive, settled by the chain, or unanswered:
+                # not an absent observation, so no absence clock survives it.
+                self._absence_broken(job, tx_key, tx_id)
+            if verdict is cs.Verdict.ORPHAN and tx_id != current:
+                # [review] Retired and nowhere -- wallet and mempool both
+                # answered "no".  With no coins on record (a send recorded
+                # before coins were kept whose record the wallet has since
+                # deleted) nothing can ever prove it either way; with coins
+                # still unspent it could in principle still land, but no
+                # node holds a transaction for hours without including it.
+                # Either way it is presumed gone after the grace rather than
+                # keeping a finished job open for good; its coins stay on
+                # the books, so a landing after all is still sweepable.
+                if tx_id in dead:
+                    continue                                 # presumed gone already
+                gone, note = self._unobservable_settled(
+                    job, tx_key, tx_id, coins_known=bool(ev.removals))
+                if gone:
+                    self._mark_attempts_dead(job, tx_key, [tx_id], presumed=True)
+                    continue
+                notes.append(note)
+                continue
+            if verdict is cs.Verdict.DEAD:
+                if (tx_id == _FUNDING_TX_UNKNOWN and len(ev.removals) > 1
+                        and not self._unnamed_group_dead(ev.removals, min_depth)):
+                    notes.append("unnamed funding sends share one record; not "
+                                 "every coin of theirs is spent yet; Sweep "
+                                 "again later")
+                    continue
+                if tx_id != current and tx_id not in dead:
+                    # [review] A verdict found here is kept: the guard and the
+                    # exclusions read <tx_key>_prior_dead.
+                    self._mark_attempts_dead(job, tx_key, [tx_id])
+                    dead.append(tx_id)
+                continue
+            # [review] Landed ON CHAIN (its own output exists and, by the
+            # check above, is spent -- at depth, or the recovery could yet be
+            # reorged out); the wallet's word alone keeps waiting.
+            if verdict is cs.Verdict.LANDED and ev.output_landed:
+                if (tx_id == _FUNDING_TX_UNKNOWN and len(ev.removals) > 1
+                        and not self._unnamed_group_dead(ev.removals, min_depth)):
+                    notes.append("unnamed funding sends share one record; one "
+                                 "landed but not every coin of theirs is spent "
+                                 "yet; Sweep again later")
+                    continue
+                deep, depth_why = self._outputs_settled(
+                    outputs, amount=amount, removals=ev.removals,
+                    min_depth=min_depth)
+                if deep:
+                    continue
+                notes.append(f"funding send {tx_id[:16]}... landed and "
+                             f"{depth_why}; Sweep again later")
+                continue
+            notes.append(f"funding send {tx_id[:16]}... could still land "
+                         f"({why}); Sweep again later")
+        if notes:
+            return False, notes[0]
+        return True, ""
+
+    def _attempt_coins(self, job: WarpJob, tx_key: str) -> set:
+        """Every coin any attempt recorded under *tx_key* spent: the current
+        send's and each replaced one's."""
+        st = job.state
+        coins = {_hx(c) for c in (st.get(f"{tx_key}_removals") or []) if c}
+        for removals in (st.get(f"{tx_key}_prior_removals") or {}).values():
+            coins.update(_hx(c) for c in (removals or []) if c)
+        return coins
+
+    def _burn_priors_settled(self, job: WarpJob) -> tuple:
+        """``(settled, note)``: whether every REPLACED cat_spend of *job* is
+        ruled out.  A replaced burn is settled when the chain proves it dead,
+        or when its own burn CAT (an output at the burn puzzle whose parent
+        is one of the coins it spent) exists -- the completion scan then
+        carries the unwrap forward.  Anything else could still land."""
+        from . import chia_send as cs
+
+        st = job.state
+        priors = [t for t in (st.get("burn_tx_id_prior") or []) if t]
+        if not priors:
+            return True, ""
+        ph = str(st.get("burn_cat_ph") or "")
+        amount = int(job.amount_mojos)
+        try:
+            self._wallet.log_in()
+            outputs = list(self._coinset.get_coin_records_by_puzzle_hash(
+                ph, include_spent=True))
+        except Exception:
+            # [review] Shared by every attempt (see _prior_sends_settled).
+            self._absence_broken_all(job, "burn_tx_id")
+            raise
+        prior_removals = st.get("burn_tx_id_prior_removals") or {}
+        min_depth = int(self._net.chia_confirmation_min_height)
+        named = [t for t in priors if not self._unnamed(t)]
+        books = dict(prior_removals)
+        current = str(st.get("burn_tx_id") or "")
+        if current:
+            if not self._unnamed(current):
+                named.append(current)
+            books.setdefault(current, list(st.get("burn_tx_id_removals") or []))
+        dead = list(_settled_ids(st, "burn_tx_id"))
+        proven_dead = {t for t in (st.get("burn_tx_id_prior_dead") or []) if t}
+        live_coins, recorded_sets = self._attempt_books(books, dead)
+        # [review] Every attempt judged on every pass, as for the funding
+        # sends: verdicts kept, absence clocks maintained, the first thing
+        # that keeps the job open reported.
+        notes: list = []
+        for tx_id in priors:
+            if tx_id in proven_dead:
+                # [review] Proven dead: neither looked for by its coins (a
+                # replacement that reused a survivor would be handed to it,
+                # see _prior_sends_settled) nor probed again.
+                continue
+            probe_id, coins = tx_id, list(prior_removals.get(tx_id) or [])
+            if self._unnamed(tx_id) and coins:
+                try:
+                    found = self._identify_retired_by_coins(
+                        job, "burn_tx_id", tx_id, coins, ph=ph, amount=amount, named=named,
+                        live_coins=live_coins, recorded_sets=recorded_sets)
+                except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
+                    self._absence_broken_all(job, "burn_tx_id")
+                    return False, (f"the wallet history could not be read ({exc}); "
+                                   "an earlier cat_spend is not ruled out")
+                if found:
+                    probe_id = found
+                    named.append(found)
+            if self._unnamed(tx_id) and not coins:
+                try:
+                    ident = self._identify_unnamed_burn(
+                        job, ph, amount, exclude_ids=named, live_coins=live_coins,
+                        recorded_sets=recorded_sets)
+                except Exception as exc:  # noqa: BLE001 -- unavailable, not absent
+                    self._absence_broken_all(job, "burn_tx_id")
+                    return False, (f"the wallet history could not be read ({exc}); "
+                                   f"an earlier cat_spend is not ruled out")
+                if ident and ident[0] and not ident[1]:
+                    # [review] Identified without coins: keep the id, probe it
+                    # next pass (see _prior_sends_settled).
+                    self._persist_identified_attempt(job, "burn_tx_id", tx_id, str(ident[0]), [])
+                    named.append(str(ident[0]))
+                    notes.append(f"an earlier cat_spend identified as "
+                                 f"{str(ident[0])[:16]}...; its coins are being read")
+                    continue
+                if not ident or not ident[1]:
+                    notes.append("an earlier cat_spend the wallet never named, "
+                                 "whose coins are not known, cannot be ruled out")
+                    continue
+                probe_id, coins = ident
+                self._persist_identified_attempt(job, "burn_tx_id", tx_id, probe_id, coins)
+                named.append(probe_id)
+                live_coins = [*live_coins, *coins]
+                recorded_sets = [*recorded_sets, list(coins)]
+            probe_wallet, probe_mempool = self._send_probes(probe_id)
+            ev = cs.gather(
+                wallet_record=probe_wallet,
+                mempool_item=probe_mempool,
+                coin_spent=self._coin_spent_depth,
+                outputs_at=lambda: outputs,
+                known_removals=coins,
+                out_amount=amount, unique_output=False, min_depth=min_depth,
+            )
+            verdict, why = cs.judge(ev)
+            if ev.removals and not coins:
+                # [review] As for the funding sends: coins a reappearing
+                # record taught are kept in the attempt's book.
+                self._persist_identified_attempt(
+                    job, "burn_tx_id", tx_id, tx_id, [_hx(c) for c in ev.removals])
+            if verdict is not cs.Verdict.ORPHAN:
+                # [review] Not an absent observation: no absence clock
+                # survives it (see _prior_sends_settled).
+                self._absence_broken(job, "burn_tx_id", tx_id)
+            if verdict is cs.Verdict.ORPHAN:
+                # [review] A retired cat_spend that is nowhere: the same
+                # bounded grace as the funding sends (a retired burn is
+                # DEAD-only by construction, so this is a legacy shape).
+                if tx_id in dead:
+                    continue                                 # presumed gone already
+                gone, note = self._unobservable_settled(
+                    job, "burn_tx_id", tx_id, coins_known=bool(ev.removals))
+                if gone:
+                    self._mark_attempts_dead(job, "burn_tx_id", [tx_id], presumed=True)
+                    continue
+                notes.append(note)
+                continue
+            if verdict is cs.Verdict.DEAD:
+                if (tx_id == _FUNDING_TX_UNKNOWN and len(ev.removals) > 1
+                        and not self._unnamed_group_dead(ev.removals, min_depth)):
+                    notes.append("unnamed cat_spends share one record; not "
+                                 "every coin of theirs is spent yet")
+                    continue
+                if tx_id not in dead:
+                    self._mark_attempts_dead(job, "burn_tx_id", [tx_id])
+                    dead.append(tx_id)
+                continue
+            if verdict is cs.Verdict.LANDED and ev.output_landed:
+                if (tx_id == _FUNDING_TX_UNKNOWN and len(ev.removals) > 1
+                        and not self._unnamed_group_dead(ev.removals, min_depth)):
+                    notes.append("unnamed cat_spends share one record; one "
+                                 "landed but not every coin of theirs is spent "
+                                 "yet")
+                    continue
+                deep, depth_why = self._outputs_settled(
+                    outputs, amount=amount, removals=ev.removals,
+                    min_depth=min_depth)
+                if deep:
+                    continue
+                notes.append(f"an earlier cat_spend {tx_id[:16]}... landed "
+                             f"and {depth_why}")
+                continue
+            notes.append(f"an earlier cat_spend {tx_id[:16]}... could still "
+                         f"land ({why})")
+        if notes:
+            return False, notes[0]
+        return True, ""
+
+    def _recorded_send_verdict(self, job: WarpJob, *, tx_key: str,
+                               out_ph_hex: str, out_amount: int,
+                               unique_output: bool) -> tuple:
+        """``(Verdict, reason, evidence)`` for the send recorded under
+        *tx_key* (chia_send.py).  The configured fingerprint is selected
+        first; a login failure propagates (it is not absence)."""
+        from . import chia_send as cs
+
+        self._wallet.log_in()
+        tx_id = str(job.state.get(tx_key) or "")
+        # [review] An unnamed send is never asked about over the hash RPCs
+        # (_send_probes); the history scan the caller ran is its only wallet
+        # handle, and its recorded coins decide.
+        wallet_record, mempool_item = self._send_probes(tx_id)
+        if job.state.get(f"{tx_key}_prior"):
+            # [review] Once a send was replaced the key holds other attempts'
+            # coins too: a replaced send that landed and was swept must not
+            # make a dead current one read as landed.  An output is this
+            # send's only when its parent is one of the coins it spent.
+            unique_output = False
+        ev = cs.gather(
+            wallet_record=wallet_record,
+            mempool_item=mempool_item,
+            coin_spent=self._coin_spent_depth,
+            outputs_at=lambda: self._coinset.get_coin_records_by_puzzle_hash(
+                out_ph_hex, include_spent=True),
+            known_removals=job.state.get(f"{tx_key}_removals") or [],
+            out_amount=int(out_amount), unique_output=unique_output,
+            # [review] A conflicting spend is proof only at the depth the
+            # network treats as final: shallower, a reorg could hand the
+            # coin back and make the judged send valid again.
+            min_depth=int(self._net.chia_confirmation_min_height),
+        )
+        verdict, why = cs.judge(ev)
+        return verdict, why, ev
+
+    def _judge_recorded_send(
+        self, job: WarpJob, *, tx_key: str, label: str, out_ph_hex: str,
+        out_amount: int, unique_output: bool, scan: Callable[[Sequence[str]], Any],
+        also_clear: Sequence[str] = (),
+    ) -> tuple:
+        """Judge the Chia send recorded under *tx_key* on this tick.
+
+        Returns ``(step, patch)``.  A step means "return it" (the send is
+        alive, landed, orphaned, or undecided).  ``step is None`` means the
+        chain PROVED the send dead and the caller sends again, merging
+        *patch* into the state it records: the dead id joins
+        ``<tx_key>_prior`` (so the dedupe scans skip it) with the coins it
+        spent in ``<tx_key>_prior_removals`` (so Sweep can later tell whether
+        it could still land), and ``<tx_key>_exclude`` names coins the
+        replacement must not reuse.  The configured fingerprint is selected
+        first: another client may have switched the daemon's key, and the
+        configured wallet's own pending send must not read as absent.
+
+        *scan* is the fail-closed wallet-history dedupe scan (given the ids
+        already proven dead to skip; returns a tx id or falsy; raises when
+        it could not run), used for a send the wallet accepted but never
+        named (_FUNDING_TX_UNKNOWN): the history is the only handle on it.
+        *also_clear* names state the dead send pinned and a replacement must
+        not inherit (the burn's output coin id).
+        """
+        from . import chia_send as cs
+
+        self._wallet.log_in()
+        st = job.state
+        tx_id = str(st.get(tx_key) or "")
+        polls_key, removals_key, prior_key = (
+            f"{tx_key}_orphan_polls", f"{tx_key}_removals", f"{tx_key}_prior")
+        polls = int(st.get(polls_key) or 0)
+        priors = [t for t in (st.get(prior_key) or []) if t]
+
+        if tx_id == _FUNDING_TX_UNKNOWN:
+            recorded = [c for c in (st.get(removals_key) or []) if c]
+            # [review] A hit must be THIS attempt's record: never a retired
+            # attempt's (the scan knows their coin sets), and, when the
+            # daemon listed the coins this send spent, one spending them.
+            found = scan(priors, require_coins=recorded)
+            found_id = found[0] if isinstance(found, tuple) else found
+            if found_id:
+                # The coins it spent are kept (or re-learned from the record).
+                adopted = {tx_key: str(found_id), polls_key: 0,
+                           removals_key: recorded or None}
+                # [review] The burn scan also names the output coin: pinned,
+                # as the dedupe branch pins it, so a later unpinned scan
+                # cannot adopt an unrelated CAT of the same receiver and
+                # amount in its place.
+                if (isinstance(found, tuple) and len(found) > 1 and found[1]
+                        and also_clear):
+                    adopted[also_clear[0]] = str(found[1])
+                return _stay(
+                    state=adopted,
+                    message=(f"{label} identified as {found_id} in the wallet "
+                             "history; awaiting the coin"),
+                ), {}
+            polls += 1
+            if recorded:
+                # [review] The daemon listed the coins it spent: the chain
+                # can still prove the send dead (a coin spent elsewhere at
+                # depth, no output of ours), and then it is sent again under
+                # its own retired key; anything short of that waits.
+                verdict, why, ev = self._recorded_send_verdict(
+                    job, tx_key=tx_key, out_ph_hex=out_ph_hex,
+                    out_amount=out_amount, unique_output=unique_output)
+                if verdict is cs.Verdict.DEAD:
+                    _log.warning("warp job %s: unnamed %s is dead (%s); sending again",
+                                 job.id, label, why)
+                    return None, self._replacement_patch(
+                        job, tx_key=tx_key,
+                        tx_id=self._unnamed_attempt_key(job, tx_key),
+                        removals=recorded, also_clear=also_clear, dead=True)
+                return _stay(
+                    state={polls_key: polls},
+                    message=(f"{label} unnamed by the wallet and absent from its "
+                             f"history (poll {polls}): {why}; waiting"),
+                ), {}
+            hint = (("its coins are unknown, so it can never be proven dead; "
+                     "Abandon (once the job fails at its deadline) closes it")
+                    if tx_key == "burn_tx_id"
+                    else "Retry (once the job fails at its deadline) sends it again")
+            return _stay(
+                state={polls_key: polls},
+                message=(f"{label} unnamed by the wallet and absent from its "
+                         f"history (poll {polls}); waiting -- {hint}"),
+            ), {}
+
+        verdict, why, ev = self._recorded_send_verdict(
+            job, tx_key=tx_key, out_ph_hex=out_ph_hex, out_amount=out_amount,
+            unique_output=unique_output)
+        learned: Dict[str, Any] = {}
+        if ev.removals and not st.get(removals_key):
+            learned[removals_key] = list(ev.removals)
+        # [review] Whether the wallet holds the send, as of THIS judgement:
+        # the engine's guard protects a wallet record, so a send the wallet
+        # answered "no record" for protects nothing until the wallet holds it
+        # again -- whatever the verdict (ORPHAN, then SHALLOW with the record
+        # back).  Unanswered leaves the last answer standing.
+        if ev.wallet_known is True:
+            learned[f"{tx_key}_wallet_absent"] = False
+        elif ev.wallet_known is False:
+            learned[f"{tx_key}_wallet_absent"] = True
+        if verdict is cs.Verdict.DEAD:
+            _log.warning("warp job %s: %s %s is dead (%s); sending again",
+                         job.id, label, tx_id, why)
+            return None, self._replacement_patch(
+                job, tx_key=tx_key, tx_id=tx_id,
+                removals=list(ev.removals) or (st.get(removals_key) or []),
+                also_clear=also_clear, dead=True)
+        if verdict is cs.Verdict.ORPHAN:
+            polls += 1
+            hint = (("it is sent again once those coins are spent by anything "
+                     "else, which proves it dead; Abandon (once the job fails at "
+                     "its deadline) closes it")
+                    if tx_key == "burn_tx_id"
+                    else "Retry (once the job fails at its deadline) sends it again")
+            return _stay(
+                state={**learned, polls_key: polls},
+                message=f"{label} {tx_id} is {why} (poll {polls}); waiting -- {hint}",
+            ), {}
+        if verdict in (cs.Verdict.UNKNOWN, cs.Verdict.SHALLOW):
+            return _stay(
+                state=learned or None,
+                message=f"{label} {tx_id}: {why}; awaiting the coin",
+            ), {}
+        # LANDED or ALIVE: the completion scan above picks the coin up.
+        return _stay(
+            state={**learned, polls_key: 0},
+            message=f"{label} {tx_id} {why}; awaiting the coin",
+        ), {}
 
     def _load_ephemeral_sk(self, job: WarpJob) -> bytes:
         """Decrypt the per-job ephemeral BLS private key (32 bytes)."""
@@ -2043,7 +3659,28 @@ class WarpEngine:
         still open the raw is kept and the retry just resumes polling it.
         """
         target = job.state.get("failed_from")
+        if target in (JobStatus.BURN_SENT, JobStatus.FUNDING_CLAIM,
+                      JobStatus.BURNING):
+            # [WARP-LOST-SEND 2026-10-25] A Chia send that is nowhere -- not
+            # in the wallet, not in the mempool, its coins unspent -- is never
+            # sent again on the handler's own authority: a replacement spends
+            # other coins, so both could land.  For the XCH funding sends the
+            # operator's Retry is that authority (the surplus is sweepable);
+            # a cat_spend is replaced only once the chain proves it dead, by
+            # the handler itself, so Retry leaves an orphaned burn in place.
+            # The marker is cleared (the coins it spent become the
+            # replacement's exclusions and are kept for Sweep's accounting),
+            # so the handler runs its fail-closed history scan and, finding
+            # nothing, sends.  A send the wallet or the mempool still holds
+            # is kept.
+            return self._release_recorded_send(job, target)
         if target == JobStatus.RELAYING:
+            if job.state.get("delivered_by"):
+                # [WARP-LOST-SEND] Delivered already: the job failed waiting
+                # for a replaced toll send to settle, not for the relay.  A
+                # fresh relay would only revert "!nonce" and burn its gas;
+                # the mined one is re-polled and the wait resumes.
+                return {}
             # Unconditional, and safe ONLY here: a relay re-signed at a
             # fresh nonce cannot double-deliver -- the second attempt
             # reverts "!nonce". The bridge below has no such guard, which
@@ -2091,6 +3728,87 @@ class WarpEngine:
                 "bridge_prior_hashes": None,
             }
         return {"approve_raw": None, "approve_tx_hash": None, "approve_status_polls": None}
+
+    def _release_recorded_send(self, job: WarpJob, target: str) -> Dict[str, Any]:
+        """Retry's reset for a job that failed waiting on a Chia send: the
+        replacement patch when the send is proven dead (an XCH funding send
+        also when it is orphaned), {} when it is still alive somewhere, has
+        landed, or is a cat_spend the chain has not proven dead."""
+        from . import chia_send as cs, claim
+
+        tx_key = "burn_tx_id" if target == JobStatus.BURN_SENT else "funding_tx_id"
+        tx_id = str(job.state.get(tx_key) or "")
+        if not tx_id:
+            # [review] Nothing recorded, nothing to release -- and nothing
+            # to derive: a BURNING job that failed generating its toll key
+            # has no ephemeral blob to load, and Retry must still work.
+            return {}
+        if target == JobStatus.BURN_SENT:
+            unique = False
+            out_ph = str(job.state["burn_cat_ph"])
+            out_amount = int(job.amount_mojos)
+            also_clear: tuple = ("burn_cat_coin_id",)
+            wid = int(job.state["cat_wallet_id"])
+            scan = lambda dead, **kw: self._find_existing_burn(  # noqa: E731
+                wid, out_ph, out_amount, exclude_ids=dead,
+                **{**self._history_filters(job, tx_key), **kw})
+        else:
+            unique, also_clear = True, ()
+            out_ph = claim.security_coin_puzzle_hash(
+                self._load_ephemeral_sk(job)).hex()
+            out_amount = (int(self._net.chia_toll_mojos)
+                          if target == JobStatus.BURNING
+                          else int(self._funded_amount(job)))
+            scan = lambda dead, **kw: self._find_existing_funding(  # noqa: E731
+                out_ph, out_amount, exclude_ids=dead,
+                **{**self._history_filters(job, tx_key), **kw})
+        priors = [t for t in (job.state.get(f"{tx_key}_prior") or []) if t]
+        # [review] A cat_spend is replaced ONLY when the chain proves it dead:
+        # a replacement spends other coins, so an orphaned burn that surfaced
+        # later would put a second CAT on the forward-only burn puzzle with
+        # nothing to bridge it.  The XCH funding sends may be replaced while
+        # orphaned -- their surplus is XCH at a key Sweep recovers from.
+        burn = target == JobStatus.BURN_SENT
+        if tx_id == _FUNDING_TX_UNKNOWN:
+            self._wallet.log_in()
+            recorded = sorted({_hx(c) for c in (job.state.get(f"{tx_key}_removals") or []) if c})
+            found = scan(priors, require_coins=recorded)
+            found_id = found[0] if isinstance(found, tuple) else found
+            if found_id:
+                return {}
+            # [review] The daemon may have named no transaction yet listed
+            # the coins it spent: they are the replacement's exclusions and
+            # the attempt's own handle for the settlement accounting, kept
+            # under a key of its own.  With them the send is judged like a
+            # named one (a cat_spend still only replaced when dead); without
+            # them only an XCH funding send may be sent again.
+            key = self._unnamed_attempt_key(job, tx_key)
+            if recorded:
+                verdict, _why, ev = self._recorded_send_verdict(
+                    job, tx_key=tx_key, out_ph_hex=out_ph, out_amount=out_amount,
+                    unique_output=unique)
+                allowed = ((cs.Verdict.DEAD,) if burn
+                           else (cs.Verdict.DEAD, cs.Verdict.ORPHAN))
+                if verdict in allowed:
+                    return self._replacement_patch(
+                        job, tx_key=tx_key, tx_id=key, removals=recorded,
+                        also_clear=also_clear, dead=verdict is cs.Verdict.DEAD)
+                return {}
+            if burn:
+                return {}
+            return self._replacement_patch(
+                job, tx_key=tx_key, tx_id=key, removals=[],
+                also_clear=also_clear)
+        verdict, _why, ev = self._recorded_send_verdict(
+            job, tx_key=tx_key, out_ph_hex=out_ph, out_amount=out_amount,
+            unique_output=unique)
+        allowed = ((cs.Verdict.DEAD,) if burn
+                   else (cs.Verdict.DEAD, cs.Verdict.ORPHAN))
+        if verdict in allowed:
+            return self._replacement_patch(
+                job, tx_key=tx_key, tx_id=tx_id, removals=list(ev.removals),
+                also_clear=also_clear, dead=verdict is cs.Verdict.DEAD)
+        return {}
 
     def _bridge_hashes(self, job: WarpJob) -> list:
         """Every hash this job's bridge nonce has been signed under, newest first."""
@@ -2554,12 +4272,13 @@ class WarpEngine:
         # a nonzero fee pass here and stall mid-burn with the CAT already
         # committed to the burn address.  Harmless at the default fee of 0,
         # which is exactly why it survived until the 2026-08 fee study.
-        toll_need = _unwrap_xch_need(net, p)
+        toll_need = self._unwrap_xch_budget()
         if int(xch.get("spendable_balance") or 0) < toll_need:
             raise WarpPending(
                 f"spendable XCH below the unwrap budget of {toll_need} mojos "
-                "(toll + 2x unwrap_chia_fee_mojos: the fee is paid on both "
-                "the cat_spend and the toll funding send)"
+                "(the toll plus a fee for the cat_spend and one for the toll "
+                "funding send -- automatic, at least strategy.offer_fee_mojos "
+                "each, unless unwrap_chia_fee_mojos pins them)"
             )
 
         burn_inner_ph = drivers.expected_burn_inner_puzzle_hash(
@@ -2598,7 +4317,10 @@ class WarpEngine:
         )
 
     def _find_existing_burn(self, wallet_id: int, burn_cat_ph_hex: str,
-                            amount: int):
+                            amount: int, exclude_ids: Sequence[str] = (), *,
+                            exclude_coin_sets: Sequence[Sequence[str]] = (),
+                            exclude_coins: Sequence[str] = (),
+                            require_coins: Sequence[str] = ()):
         """An in-flight or live transaction that already created OUR burn CAT.
 
         Two hazards shaped this, both reproduced by review:
@@ -2616,8 +4338,18 @@ class WarpEngine:
 
         Returns ``(tx_id, coin_id_hex or None)`` or ``None``.
         """
+        dead = {_hx(t) for t in exclude_ids if t}
+
         def _scan(txs):
             for tx in txs:
+                # [WARP-LOST-SEND] Never a send already proven dead.
+                if _hx(tx.get("name") or tx.get("transaction_id") or "") in dead:
+                    continue
+                # [review] Nor another attempt's record (see _find_existing_funding).
+                if self._history_hit_excluded(
+                        tx, exclude_coin_sets=exclude_coin_sets,
+                        exclude_coins=exclude_coins, require_coins=require_coins):
+                    continue
                 for add in tx.get("additions") or []:
                     if _hx(str(add.get("puzzle_hash") or "")) != burn_cat_ph_hex:
                         continue
@@ -2666,27 +4398,108 @@ class WarpEngine:
             if rec is not None and not rec.spent:
                 return _advance(
                     JobStatus.BURNING,
-                    state={"burn_cat_parent": _hx(rec.coin.parent_coin_info)},
+                    state={"burn_cat_parent": _hx(rec.coin.parent_coin_info),
+                           **self._landed_patch(job, "burn_tx_id", rec.coin,
+                                                depth=self._record_confirmations(rec))},
                     message="burn CAT is on chain; the unwrap is now forward-only",
                 )
-        else:
-            for rec in self._coinset.get_coin_records_by_puzzle_hash(burn_cat_ph):
-                if int(rec.coin.amount) == amount and not rec.spent:
-                    return _advance(
-                        JobStatus.BURNING,
-                        state={"burn_cat_parent": _hx(rec.coin.parent_coin_info)},
-                        message="burn CAT is on chain; the unwrap is now forward-only",
-                    )
+            # [WARP-LOST-SEND] The pin names a coin that never appeared (its
+            # send was replaced); an EARLIER attempt's burn CAT may be there
+            # instead.  Any unspent coin of the amount whose parent is a coin
+            # one of this job's attempts spent carries the unwrap forward,
+            # re-pinned with its provenance.
+            mine = self._attempt_coins(job, "burn_tx_id")
+            if mine:
+                from . import clvm_utils as cu
 
-        # b) The persisted marker.
-        prior = job.state.get("burn_tx_id")
-        if prior:
-            return _stay(message=f"cat_spend {prior} already sent; awaiting the coin")
+                for rec in self._coinset.get_coin_records_by_puzzle_hash(burn_cat_ph):
+                    parent = _hx(rec.coin.parent_coin_info)
+                    if (int(rec.coin.amount) == amount and not rec.spent
+                            and parent in mine):
+                        coin_id = cu.coin_name(
+                            bytes.fromhex(parent), bytes.fromhex(burn_cat_ph),
+                            amount).hex()
+                        return _advance(
+                            JobStatus.BURNING,
+                            state={"burn_cat_parent": parent,
+                                   "burn_cat_coin_id": coin_id},
+                            message=("an earlier cat_spend's burn CAT is on "
+                                     "chain; the unwrap is now forward-only"),
+                        )
+        else:
+            # [review] Unpinned (a replacement whose response named no coin,
+            # or timed out after broadcasting): once this job has attempts
+            # on record, a coin is adopted only with provenance -- its parent
+            # is one of the coins an attempt spent, or the wallet history
+            # names it as the output of our cat_spend.  A bare ph+amount
+            # match could otherwise bridge an unrelated CAT of the same
+            # receiver and amount while our own replacement lands untracked.
+            mine = self._attempt_coins(job, "burn_tx_id")
+            attempted = bool(mine or job.state.get("burn_tx_id_prior"))
+            known_ids: set = set()
+            if attempted and not job.state.get("burn_tx_id_removals"):
+                # The current attempt's inputs are unknown: the wallet
+                # history is the only way to name its output.  [review] The
+                # configured fingerprint first: another client may have
+                # switched the daemon's key, and another wallet's same-amount
+                # burn must not read as ours.
+                try:
+                    self._wallet.log_in()
+                    found = self._find_existing_burn(
+                        int(job.state["cat_wallet_id"]), burn_cat_ph, amount,
+                        exclude_ids=[t for t in (job.state.get("burn_tx_id_prior") or []) if t],
+                        **self._history_filters(job, "burn_tx_id"))
+                except Exception:  # noqa: BLE001 -- then nothing is adopted here
+                    found = None
+                if found and found[1]:
+                    known_ids.add(_hx(found[1]))
+            from . import clvm_utils as cu
+
+            for rec in self._coinset.get_coin_records_by_puzzle_hash(burn_cat_ph):
+                if int(rec.coin.amount) != amount or rec.spent:
+                    continue
+                parent = _hx(rec.coin.parent_coin_info)
+                coin_id = cu.coin_name(
+                    bytes.fromhex(parent), bytes.fromhex(burn_cat_ph), amount).hex()
+                if attempted and parent not in mine and coin_id not in known_ids:
+                    continue                      # not provably this job's
+                return _advance(
+                    JobStatus.BURNING,
+                    state={"burn_cat_parent": parent, "burn_cat_coin_id": coin_id,
+                           **self._landed_patch(job, "burn_tx_id", rec.coin,
+                                                depth=self._record_confirmations(rec))},
+                    message="burn CAT is on chain; the unwrap is now forward-only",
+                )
+
+        # b) The persisted marker.  [WARP-LOST-SEND] Judged, not assumed:
+        # a cat_spend whose coin went to another spend can never land and is
+        # sent again; one that merely vanished (no wallet, no mempool, coins
+        # unspent) is NOT -- not even on Retry: a replacement spends other
+        # coins, so both could land, and a second CAT at the forward-only
+        # burn puzzle has nothing to bridge it.  It waits until the chain
+        # proves it dead; Abandon closes the job.
+        resend: Dict[str, Any] = {}
+        if job.state.get("burn_tx_id"):
+            wid = int(job.state["cat_wallet_id"])
+            step, resend = self._judge_recorded_send(
+                job, tx_key="burn_tx_id", label="cat_spend",
+                out_ph_hex=burn_cat_ph, out_amount=amount, unique_output=False,
+                scan=lambda dead, **kw: self._find_existing_burn(
+                    wid, burn_cat_ph, amount, exclude_ids=dead,
+                    **{**self._history_filters(job, "burn_tx_id"), **kw}),
+                also_clear=("burn_cat_coin_id",),
+            )
+            if step is not None:
+                return step
+        priors = [t for t in (resend.get("burn_tx_id_prior")
+                              or job.state.get("burn_tx_id_prior") or []) if t]
 
         # c) Fail-closed history scan -- a lost response must not burn twice.
         try:
             found = self._find_existing_burn(
-                int(job.state["cat_wallet_id"]), burn_cat_ph, amount
+                int(job.state["cat_wallet_id"]), burn_cat_ph, amount,
+                exclude_ids=priors,
+                **self._history_filters(job, "burn_tx_id", pending=resend),
             )
         except Exception as exc:  # noqa: BLE001 -- cannot prove it was not sent
             raise WarpError(
@@ -2695,7 +4508,7 @@ class WarpEngine:
             ) from exc
         if found:
             tx_id, coin_id = found
-            patch = {"burn_tx_id": tx_id}
+            patch = {**resend, "burn_tx_id": tx_id}
             if coin_id:
                 patch["burn_cat_coin_id"] = coin_id
             return _stay(
@@ -2716,6 +4529,18 @@ class WarpEngine:
         if eth_target:
             step, size = self._rebalance_millieth_trim(
                 job, amount, int(eth_target))
+            if step is not None or size < amount:
+                # [review] Never CANCELLED -- a closed job, with no recovery
+                # action -- while an earlier cat_spend of this job could
+                # still land at the burn puzzle.  It waits until each is
+                # proven dead; one that lands is picked up by the completion
+                # scan above and the unwrap proceeds.
+                settled, note = self._burn_priors_settled(job)
+                if not settled:
+                    return _stay(
+                        message=(f"top-up no longer needed as sized, but {note}; "
+                                 "waiting before cancelling"),
+                    )
             if step is not None:
                 return step
             if size < amount:
@@ -2729,17 +4554,34 @@ class WarpEngine:
 
         # d) Send. Default coin selection ONLY -- it is what honours the trade
         # manager's offer locks (the client has no coins parameter, by design).
-        # The XCH fee (when configured) is re-checked on the sending tick;
-        # G10's budget ran at UNWRAP_CHECKS and collateral may have moved.
+        # The XCH fee is re-checked on the sending tick; G10's budget ran at
+        # UNWRAP_CHECKS and collateral may have moved.
+        fee = self._chia_send_fee(p.unwrap_chia_fee_mojos, cost=_COST_CAT_SPEND)
+        self._require_wallet_synced("cat_spend")
+        # [review] Not just this fee: after the burn the job is forward-only
+        # and must still fund the toll coin (toll + the send's fee).  Fees
+        # may have risen since G10, so the whole remaining budget is
+        # re-checked on the tick that commits.
+        toll_fee = self._chia_send_fee(p.unwrap_chia_fee_mojos, cost=_COST_XCH_SEND)
         self._require_spendable_xch(
-            p.unwrap_chia_fee_mojos, context="cat_spend fee"
+            int(net.chia_toll_mojos) + fee + toll_fee,
+            context="cat_spend (its fee, then the toll coin and its fee)",
         )
         self._wallet.log_in()
-        record = self._wallet.cat_spend(
-            int(job.state["cat_wallet_id"]),
-            amount,
-            job.state["burn_address"],
-            fee_mojos=p.unwrap_chia_fee_mojos,
+        resend = {**resend, **self._refresh_exclusions(
+            job, tx_key="burn_tx_id", out_ph_hex=burn_cat_ph,
+            out_amount=amount, pending=resend)}
+        exclude = [c for c in ((resend if "burn_tx_id_exclude" in resend
+                               else job.state).get("burn_tx_id_exclude") or []) if c]
+        record = self._send_reserved(
+            job, tx_key="burn_tx_id", reserve_patch=resend,
+            send=lambda: self._wallet.cat_spend(
+                int(job.state["cat_wallet_id"]),
+                amount,
+                job.state["burn_address"],
+                fee_mojos=fee,
+                **({"exclude_coin_ids": exclude} if exclude else {}),
+            ),
         )
         tx_id = record.get("name") or record.get("transaction_id")
         if not tx_id:
@@ -2750,7 +4592,12 @@ class WarpEngine:
             )
         # Provenance: the response's additions identify OUR burn CAT exactly,
         # which is what keeps repeat unwraps to one receiver disentangled.
-        patch = {"burn_tx_id": tx_id}
+        from . import chia_send as cs
+
+        patch = {**resend, "burn_tx_id": tx_id,
+                 "burn_tx_id_removals": list(cs.removal_ids(record)) or None,
+                 "burn_tx_id_orphan_polls": 0, "burn_fee_mojos": fee,
+                 "burn_tx_id_exclude": None, "burn_tx_id_wallet_absent": None}
         for add in record.get("additions") or []:
             if _hx(str(add.get("puzzle_hash") or "")) == burn_cat_ph \
                     and int(add.get("amount") or 0) == amount:
@@ -2832,47 +4679,125 @@ class WarpEngine:
                 raise WarpPending(
                     "pinned toll coin is spent; awaiting the bridging coin index"
                 )
+            else:
+                # [review] Not indexed yet: wait.  Re-electing another coin
+                # of the amount here (a replaced toll send that landed too)
+                # would rebuild the bundle around a different bridging coin
+                # than the nonce the job polls.  Landed evidence recorded for
+                # the toll send is withdrawn meanwhile.
+                self._clear_landed(job, "funding_tx_id")
+                raise WarpPending("pinned toll coin is not indexed yet; awaiting it")
         if sec is None:
             sec = claim.find_security_coin(self._coinset, sk, toll)
         if sec is None:
             # Fund it -- the same marker/dedupe/send ladder as the claim path,
             # with funding_amount persisted so Sweep just works.
-            prior = job.state.get("funding_tx_id")
-            if prior:
-                return _stay(message=f"toll tx {prior} sent; awaiting the coin")
             ph = claim.security_coin_puzzle_hash(sk)
+            resend: Dict[str, Any] = {}
+            if job.state.get("funding_tx_id"):
+                # [WARP-LOST-SEND] Judged, as the claim's funding is.
+                step, resend = self._judge_recorded_send(
+                    job, tx_key="funding_tx_id", label="toll tx",
+                    out_ph_hex=ph.hex(), out_amount=toll, unique_output=True,
+                    scan=lambda dead, **kw: self._find_existing_funding(
+                        ph.hex(), toll, exclude_ids=dead,
+                        **{**self._history_filters(job, "funding_tx_id"), **kw}),
+                )
+                if step is not None:
+                    return step
+            priors = [t for t in (resend.get("funding_tx_id_prior")
+                                  or job.state.get("funding_tx_id_prior") or [])
+                      if t]
             try:
-                existing = self._find_existing_funding(ph.hex(), toll)
+                existing = self._find_existing_funding(
+                    ph.hex(), toll, exclude_ids=priors,
+                    **self._history_filters(job, "funding_tx_id", pending=resend))
             except Exception as exc:  # noqa: BLE001
                 raise WarpError(
                     f"wallet history scan failed ({exc}); refusing to fund blindly"
                 ) from exc
             if existing:
                 return _stay(
-                    state={"funding_tx_id": existing, "funding_amount": toll},
+                    state={**resend, "funding_tx_id": existing,
+                           "funding_amount": toll},
                     message="toll funding already in flight (dedupe hit)",
                 )
-            self._require_spendable_xch(
-                toll + p.unwrap_chia_fee_mojos, context="toll funding"
-            )
+            fee = self._chia_send_fee(p.unwrap_chia_fee_mojos, cost=_COST_XCH_SEND)
+            self._require_wallet_synced("toll funding")
+            self._require_spendable_xch(toll + fee, context="toll funding")
             self._wallet.log_in()
-            record = self._wallet.send_transaction(
-                1, toll, cu.encode_puzzle_hash(ph, net.chia_prefix),
-                fee_mojos=p.unwrap_chia_fee_mojos,
+            resend = {**resend, **self._refresh_exclusions(
+                job, tx_key="funding_tx_id", out_ph_hex=ph.hex(),
+                out_amount=toll, pending=resend)}
+            exclude = [c for c in ((resend if "funding_tx_id_exclude" in resend
+                                   else job.state).get("funding_tx_id_exclude") or [])
+                       if c]
+            record = self._send_reserved(
+                job, tx_key="funding_tx_id",
+                reserve_patch={**resend, "funding_amount": toll},
+                send=lambda: self._wallet.send_transaction(
+                    1, toll, cu.encode_puzzle_hash(ph, net.chia_prefix),
+                    fee_mojos=fee,
+                    **({"exclude_coin_ids": exclude} if exclude else {}),
+                ),
             )
             tx_id = (record.get("name") or record.get("transaction_id")
                      or _FUNDING_TX_UNKNOWN)
+            from . import chia_send as cs
+
             return _stay(
-                state={"funding_tx_id": tx_id, "funding_amount": toll},
-                message=f"funded {toll} mojos to the toll coin",
+                state={**resend, "funding_tx_id": tx_id, "funding_amount": toll,
+                       "funding_tx_id_removals": list(cs.removal_ids(record)) or None,
+                       "funding_tx_id_orphan_polls": 0, "funding_fee_mojos": fee,
+                       "funding_tx_id_exclude": None, "funding_tx_id_wallet_absent": None},
+                message=f"funded {toll} mojos to the toll coin (fee {fee})",
             )
 
         # The burn CAT (created by the cat_spend; unspent until our bundle).
+        # [review] By the coin BURN_SENT pinned (burn_cat_coin_id, with its
+        # parent), never the first same-amount coin at the shared puzzle:
+        # burn_cat_ph is (net, receiver)-scoped, so an unrelated unwrap's
+        # CAT can sit there, and a bundle that consumed it would complete
+        # this job while its own CAT stayed stranded.  A pinned coin that is
+        # not indexed yet, or already spent, waits (a landed bundle resolves
+        # via the nonce check next tick).  Only a job pinned before coin
+        # ids were recorded falls back to the parent / the bare scan.
         burn_cat = None
-        for rec in self._coinset.get_coin_records_by_puzzle_hash(
-            job.state["burn_cat_ph"]
-        ):
-            if int(rec.coin.amount) == amount and not rec.spent:
+        burn_ph_hex = _hx(job.state["burn_cat_ph"])
+        pinned_cat = _hx(job.state.get("burn_cat_coin_id") or "")
+        pinned_parent = _hx(job.state.get("burn_cat_parent") or "")
+        candidates = list(self._coinset.get_coin_records_by_puzzle_hash(burn_ph_hex))
+        if pinned_cat:
+            rec = self._coinset.get_coin_record_by_name(pinned_cat)
+            if rec is None:
+                # The by-name index may lag the puzzle-hash index: the same
+                # coin, recognised by its computed name.
+                for cand in candidates:
+                    if cu.coin_name(
+                            bytes.fromhex(_hx(cand.coin.parent_coin_info)),
+                            bytes.fromhex(burn_ph_hex),
+                            int(cand.coin.amount)).hex() == pinned_cat:
+                        rec = cand
+                        break
+            if rec is None:
+                self._clear_landed(job, "burn_tx_id")
+                raise WarpPending("the job's burn CAT is not indexed yet; awaiting it")
+            if rec.spent:
+                raise WarpPending(
+                    "the job's burn CAT is spent; awaiting the bridging coin index "
+                    "(a landed bundle resolves via the nonce check next tick)"
+                )
+            burn_cat = drivers.Coin(
+                bytes.fromhex(_hx(rec.coin.parent_coin_info)),
+                bytes.fromhex(burn_ph_hex),
+                int(rec.coin.amount),
+            )
+        else:
+            for rec in candidates:
+                if int(rec.coin.amount) != amount or rec.spent:
+                    continue
+                if pinned_parent and _hx(rec.coin.parent_coin_info) != pinned_parent:
+                    continue
                 burn_cat = drivers.Coin(
                     bytes.fromhex(_hx(rec.coin.parent_coin_info)),
                     bytes.fromhex(_hx(rec.coin.puzzle_hash)),
@@ -2900,6 +4825,8 @@ class WarpEngine:
             state_patch={
                 "unwrap_nonce": out.nonce.hex(),
                 "security_coin_id": sec.name().hex(),
+                **self._landed_patch(job, "funding_tx_id", sec),
+                **self._landed_patch(job, "burn_tx_id", burn_cat),
             },
         )
         kind, status = claim.push_burn_bundle(self._coinset, out.bundle)
@@ -2991,6 +4918,12 @@ class WarpEngine:
         from . import evm
 
         net = self._net
+        # [WARP-LOST-SEND] Delivered already: settlement resumes directly,
+        # with no re-signing and no threshold check (see the external path).
+        if job.state.get("delivered_by"):
+            return self._unwrap_delivered(
+                job, by=str(job.state["delivered_by"]), tx_hash=job.bridge_tx_hash)
+
         nonce = bytes.fromhex(job.bridge_nonce)
 
         raw = job.state.get("relay_raw")
@@ -3098,6 +5031,14 @@ class WarpEngine:
 
         net = self._net
 
+        # [WARP-LOST-SEND] Delivered already (the job waits only for replaced
+        # toll sends to settle): no relay prerequisite applies any more, and
+        # a threshold change must not send a delivered message back to
+        # signature collection.  Settlement resumes directly.
+        if job.state.get("delivered_by"):
+            return self._unwrap_delivered(
+                job, by=str(job.state["delivered_by"]), tx_hash=job.bridge_tx_hash)
+
         # Threshold drift invalidates the packed blob exactly as in RELAYING;
         # signatures never expire, so bouncing back to collection is lossless.
         live = int(self._evm.get_signature_threshold())
@@ -3169,6 +5110,39 @@ class WarpEngine:
 
     def _unwrap_delivered(self, job: WarpJob, *, by: str, tx_hash=None) -> _Step:
         post_tip = job.state.get("post_tip_base_units")
+        if job.state.get("funding_tx_id_prior"):
+            # [WARP-LOST-SEND] COMPLETED offers no Sweep: a replaced toll
+            # send that could still land keeps the job open, and one that
+            # landed is swept here first.
+            from . import claim
+
+            columns = {"bridge_tx_hash": tx_hash} if tx_hash else None
+            # [review] Delivery is on disk BEFORE the fallible lookups below:
+            # were they to keep failing until the state's deadline, Retry
+            # would otherwise clear the mined relay and prepare another,
+            # which can only revert "!nonce".
+            if (job.state.get("delivered_by") != by
+                    or (tx_hash and job.bridge_tx_hash != tx_hash)):
+                self._store.update_job(job.id, expected_status=job.status,
+                                       columns=columns,
+                                       state_patch={"delivered_by": by})
+            settled, note = self._prior_sends_settled(job)
+            if not settled:
+                sk = self._load_ephemeral_sk(job)
+                extra = claim.find_security_coin(
+                    self._coinset, sk, int(self._funded_amount(job)))
+                if extra is not None:
+                    _resolved, status = self._sweep_security(job, extra, sk)
+                    return _stay(
+                        columns=columns,
+                        state={"delivered_by": by, "sweep_status": status},
+                        message=(f"unwrap delivered ({by}); a replaced toll "
+                                 f"send landed too -- {status}"),
+                    )
+                return _stay(
+                    columns=columns, state={"delivered_by": by},
+                    message=f"unwrap delivered ({by}); {note}",
+                )
         return _advance(
             JobStatus.COMPLETED,
             columns={"bridge_tx_hash": tx_hash} if tx_hash else None,
@@ -3321,22 +5295,140 @@ class WarpEngine:
         """
         from . import claim
 
+        # [WARP-LOST-SEND] One fee per job, fixed on the first sweep: the
+        # bundle is a pure function of (coin, destination, fee), so a later
+        # Sweep re-pushes the SAME bundle (an idempotent "pending") instead
+        # of a differently-priced twin the mempool would reject as a
+        # conflict with the first.
+        # [review] Per security coin: replaced funding sends can leave more
+        # than one coin at the key, each swept on its own.  The same coin
+        # re-pushes the identical bundle; another coin prices its own.
+        cid = coin.name().hex()
+        pins = dict(job.state.get("sweep_fee_by_coin") or {})
+        pushed = dict(job.state.get("sweep_pushed_by_coin") or {})
+        fee = pins.get(cid)
+        if not isinstance(fee, int) or isinstance(fee, bool) or fee < 0:
+            fee = self._sweep_fee_for(job)
+            pins[cid] = int(fee)
+            try:
+                self._store.update_job(
+                    job.id, expected_status=job.status,
+                    state_patch={"sweep_fee_by_coin": pins},
+                )
+            except Exception as exc:  # noqa: BLE001 -- [review] then no push
+                # Unrecorded, a later Sweep could reprice over a bundle a
+                # node may hold.  Nothing is broadcast until the pin is on
+                # disk.
+                return False, f"could not record the sweep fee ({exc}); not swept"
+
+        # [review] Recorded BEFORE the push: a push that times out may still
+        # have reached a node, and a later definitive rejection must not
+        # reprice over a bundle that could be pending there.  Only a push
+        # that no earlier submission precedes may release the pin.
+        # [review] The destination is resolved first: its wallet lookup can
+        # fail without any bundle going out, and that must not read as a
+        # possible broadcast (it would keep a rejected fee pinned for good).
+        # And PERSISTED per coin before the first push: the bundle is a
+        # function of (coin, destination, fee), so a destination re-resolved
+        # after an engine rebuild (the wallet's receive address may have
+        # advanced) would make a DIFFERENT bundle that conflicts with the
+        # pending one instead of replaying it.
+        dests = dict(job.state.get("sweep_destination_by_coin") or {})
+        dest_hex = dests.get(cid)
+        if isinstance(dest_hex, str) and len(dest_hex) == 64:
+            destination_ph = bytes.fromhex(dest_hex)
+        else:
+            try:
+                destination_ph = self._sweep_destination_ph()
+            except Exception as exc:  # noqa: BLE001 -- nothing was submitted
+                return False, f"sweep failed: {exc}"
+            dests[cid] = _hx(destination_ph)
+            try:
+                self._store.update_job(job.id, expected_status=job.status,
+                                       state_patch={"sweep_destination_by_coin": dests})
+            except Exception as patch_exc:  # noqa: BLE001 -- then no push
+                return False, (f"could not record the sweep destination "
+                               f"({patch_exc}); not swept")
+        prior_push = pushed.get(cid)
+        if not prior_push:
+            pushed[cid] = "uncertain"
+            try:
+                self._store.update_job(job.id, expected_status=job.status,
+                                       state_patch={"sweep_pushed_by_coin": pushed})
+            except Exception as patch_exc:  # noqa: BLE001 -- [review] then no push
+                return False, (f"could not record the sweep submission "
+                               f"({patch_exc}); not swept")
         try:
             kind, status = claim.build_and_push_sweep(
                 self._coinset,
                 self._net,
                 security_coin=coin,
-                destination_puzzle_hash=self._sweep_destination_ph(),
+                destination_puzzle_hash=destination_ph,
                 ephemeral_sk=sk,
-                sweep_fee=0,
+                sweep_fee=int(fee),
             )
         except Exception as exc:  # noqa: BLE001 -- operator can re-sweep later
-            return False, f"sweep failed: {exc}"
+            text = str(exc)
+            low = text.lower()
+            # A DEFINITIVE fee rejection of a bundle no node ever accepted:
+            # the pin is released so the next Sweep reprices from a fresh
+            # estimate.  Once a push was accepted or its outcome is unknown,
+            # the pin stays -- a repriced twin would only conflict with it.
+            fee_rejected = ("request failed" not in low and any(
+                t in low for t in ("invalid_fee", "fee_too_low", "low_fee",
+                                   "fee too low")))
+            if fee_rejected:
+                # [review] A definitive rejection of the IDENTICAL bundle by
+                # the node we push through proves it holds no copy (a copy
+                # it held answers "pending"), and a copy that confirmed
+                # shows as the coin spent -- checked first.  Only then is
+                # the pin released; an earlier uncertain or accepted push
+                # must not keep a bundle the node has since dropped pinned
+                # at a fee it now rejects, or the coin is never swept.
+                try:
+                    if claim.security_coin_spent(self._coinset, coin.name()):
+                        return True, f"{text}; the security coin is already spent"
+                except Exception as probe_exc:  # noqa: BLE001 -- not proof
+                    return False, (f"sweep rejected for its fee ({text}); the "
+                                   f"coin's fate is unknown ({probe_exc}); "
+                                   "run Sweep again")
+                pins.pop(cid, None)
+                pushed.pop(cid, None)
+                try:
+                    self._store.update_job(
+                        job.id, expected_status=job.status,
+                        state_patch={"sweep_fee_by_coin": pins,
+                                     "sweep_pushed_by_coin": pushed or None})
+                except Exception as patch_exc:  # noqa: BLE001
+                    _log.warning("warp job %s: could not release the sweep fee (%s)",
+                                 job.id, patch_exc)
+                return False, (f"sweep rejected for its fee ({text}); it is "
+                               "repriced on the next Sweep")
+            return False, f"sweep failed: {text}"
+        if kind in ("accepted", "pending") and pushed.get(cid) is not True:
+            pushed[cid] = True
+            try:
+                self._store.update_job(job.id, expected_status=job.status,
+                                       state_patch={"sweep_pushed_by_coin": pushed})
+            except Exception as patch_exc:  # noqa: BLE001
+                _log.warning("warp job %s: could not record the sweep push (%s)",
+                             job.id, patch_exc)
 
         if kind == "conflict":
-            # The coin is already spent -- by our own claim, or a prior sweep.
-            # Nothing left to recover, so this genuinely is resolved.
-            return True, status
+            # The coin is spent -- by our own claim, a prior sweep -- or a
+            # pending spend of it is in the mempool (an earlier sweep that
+            # has not mined).  Only an ON-CHAIN spend means nothing is left
+            # to recover; a mempool conflict alone must not close the job
+            # over a coin that could still be evicted unspent ([review]).
+            try:
+                if claim.security_coin_spent(self._coinset, coin.name()):
+                    return True, status
+            except Exception as exc:  # noqa: BLE001 -- unknown is not resolved
+                return False, f"sweep conflicted ({status}); the coin's fate is unknown: {exc}"
+            return False, (
+                f"sweep conflicts with a pending spend of the coin ({status}); "
+                "run Sweep again once it confirms"
+            )
 
         # [WARP-SWEEP-VERIFY 2026-08-08] "accepted" and "pending" only say the
         # node took the bundle into its mempool. Treating that as resolved
@@ -3370,6 +5462,28 @@ class WarpEngine:
                     return True, "security coin already spent; nothing left to sweep"
             except Exception as exc:  # noqa: BLE001 -- unknown is not resolved
                 return False, f"could not confirm the security coin's fate: {exc}"
+        # [review] The recorded send is judged, so the status names its fate
+        # and the remedy (job 4's shape read "may not be indexed yet").
+        tx_id = str(job.state.get("funding_tx_id") or "")
+        if tx_id and tx_id != _FUNDING_TX_UNKNOWN:
+            from . import chia_send as cs
+
+            try:
+                ph = claim.security_coin_puzzle_hash(self._load_ephemeral_sk(job)).hex()
+                verdict, why, _ev = self._recorded_send_verdict(
+                    job, tx_key="funding_tx_id", out_ph_hex=ph,
+                    out_amount=int(self._funded_amount(job)), unique_output=True)
+            except Exception as exc:  # noqa: BLE001 -- the generic text below
+                verdict, why = None, str(exc)
+            if verdict is cs.Verdict.DEAD:
+                return False, (f"the recorded funding send can never confirm ({why}); "
+                               "Retry sends it again")
+            if verdict is cs.Verdict.ORPHAN:
+                return False, (f"the recorded funding send is {why}; Retry sends it "
+                               "again (its coins are excluded from the replacement)")
+            if verdict is cs.Verdict.ALIVE:
+                return False, (f"the recorded funding send is still in flight ({why}); "
+                               "Retry resumes waiting for its coin")
         return False, (
             "no unspent security coin at the expected amount -- it may not be "
             "indexed yet, or claim_fee_mojos changed since funding. Leaving the "
@@ -3618,10 +5732,31 @@ class WarpEngine:
             "last_error": job.last_error,
             "portal": self._net.status_url,
         }
-        if job.bridge_nonce:
+        # [review] Abandon is also the exit for a job whose claim completed
+        # or whose unwrap was delivered but whose replaced Chia sends could
+        # not be ruled out; the record must say so, not that the message
+        # was never claimed.
+        unsettled = self._unsettled_attempts_note(job)
+        # [review] Completion is judged ONCE and reused for the record and the
+        # closing status: two lookups could disagree (the second timing out)
+        # and write CANCELLED over a claim the record calls completed.
+        delivered = bool(job.state.get("delivered_by"))
+        claim_done = bool(job.bridge_nonce) and self._claim_completed(job)
+        if delivered:
+            detail = (f"the unwrap was delivered ({job.state['delivered_by']}); "
+                      f"closed by the operator{unsettled}")
+        elif job.bridge_nonce and job.state.get("third_party_claim"):
+            detail = (f"a third party's claim paid the attested receiver (message "
+                      f"nonce {job.bridge_nonce} is consumed); closed by the "
+                      f"operator{unsettled}")
+        elif claim_done:
+            detail = (f"the claim completed (final CAT coin "
+                      f"{job.state.get('final_cat_coin_id')}); closed by the "
+                      f"operator{unsettled}")
+        elif job.bridge_nonce:
             detail = (
                 f"message nonce {job.bridge_nonce} was never claimed and remains "
-                f"claimable at {self._net.status_url}"
+                f"claimable at {self._net.status_url}{unsettled}"
             )
         elif job.state.get("bridge_raw"):
             if not mismatch or same_wallet:
@@ -3643,9 +5778,13 @@ class WarpEngine:
         else:
             detail = "no bridge message was ever attested"
         note = f"operator abandoned: {detail}"
+        # [review] A delivered unwrap or a landed claim is a completed bridge:
+        # closed as COMPLETED (the engine's accounting books the inbound mint
+        # from that event), with the abandonment on the record.
+        done = delivered or claim_done
         self._store.update_job(
             job.id,
-            status=JobStatus.CANCELLED,
+            status=JobStatus.COMPLETED if done else JobStatus.CANCELLED,
             # The job's own status, not FAILED: a binding-refused job is
             # abandonable from whatever state it is frozen in.
             expected_status=job.status,
@@ -3654,6 +5793,40 @@ class WarpEngine:
             event=("abandon", note, recovery),
         )
         return _job_dict(self._store.get_job(job.id))
+
+    def _claim_completed(self, job: WarpJob) -> bool:
+        """Whether the bridge completed: the job's final CAT coin is on chain
+        (our claim landed), or a third party's claim paid the attested
+        receiver (the persisted ``third_party_claim`` checkpoint -- that
+        claim creates no final CAT coin of ours, yet the deposit is paid and
+        the mint happened)."""
+        if job.state.get("third_party_claim"):
+            return True
+        final = job.state.get("final_cat_coin_id")
+        if not final:
+            return False
+        try:
+            return self._coinset.get_coin_record_by_name(str(final)) is not None
+        except Exception:  # noqa: BLE001 -- unknown is not "completed"
+            return False
+
+    def _unsettled_attempts_note(self, job: WarpJob) -> str:
+        """The replaced Chia sends of *job* not proven dead, for the audit
+        record of a close; "" when there are none."""
+        parts = []
+        for tx_key, label in (("funding_tx_id", "funding"), ("burn_tx_id", "cat_spend")):
+            priors = [t for t in (job.state.get(f"{tx_key}_prior") or []) if t]
+            done = _settled_ids(job.state, tx_key)
+            open_ = [t for t in priors if t not in done]
+            if open_:
+                parts.append(f"{len(open_)} replaced {label} send(s) not ruled out: "
+                             + ", ".join(t[:16] for t in open_))
+            presumed = [t for t in (job.state.get(f"{tx_key}_prior_presumed") or []) if t]
+            if presumed:
+                parts.append(f"{len(presumed)} replaced {label} send(s) presumed gone "
+                             "with coins still unspent (Sweep stays available): "
+                             + ", ".join(t[:16] for t in presumed))
+        return ("; " + "; ".join(parts)) if parts else ""
 
     def request_unwrap(
         self, amount_mojos: int, receiver: str, external_relay: bool = False,
@@ -3801,7 +5974,13 @@ class WarpEngine:
                     event=(
                         "retry",
                         f"operator retry -> {target}"
-                        + (" (re-signing: the previous nonce is spent)" if reset else ""),
+                        + ((" (the vanished send is cleared; it will be sent "
+                            "again)")
+                           if reset and target in (JobStatus.BURN_SENT,
+                                                   JobStatus.FUNDING_CLAIM,
+                                                   JobStatus.BURNING)
+                           else (" (re-signing: the previous nonce is spent)"
+                                 if reset else "")),
                         None,
                     ),
                 )
@@ -3833,7 +6012,11 @@ class WarpEngine:
             # input to the claim the machine may still be building, so a race
             # could pull it out from under an in-flight job. Enforce it here
             # too, where the state is authoritative.
-            if job.status not in _SWEEPABLE:
+            if job.status not in _SWEEPABLE and not (
+                    job.status == JobStatus.CANCELLED and _presumed_attempts(job.state)):
+                # [review] A CANCELLED job that was closed over attempts
+                # presumed gone keeps Sweep: their coins are still unspent,
+                # and one that lands after all leaves XCH at the key.
                 raise WarpError(
                     f"cannot sweep a job in {job.status}; the security coin is "
                     "still an input to the claim being built"
@@ -3891,6 +6074,17 @@ class WarpEngine:
             coin = claim.find_security_coin(self._coinset, sk, expected)
             if coin is None:
                 resolved, status = self._funding_provably_gone(job)
+                if not resolved and job.state.get("funding_tx_id_prior"):
+                    # [review] Replaced sends: when the chain proves EVERY
+                    # attempt dead and no coin of the funded amount exists,
+                    # nothing was ever funded -- resolved, nothing to sweep.
+                    settled, _note = self._prior_sends_settled(job)
+                    if settled:
+                        resolved, status = True, (
+                            "every funding attempt is settled on chain (proven "
+                            "dead, presumed gone, or landed and already spent) "
+                            "and no coin of the funded amount remains; nothing "
+                            "to sweep")
             else:
                 coin_id = coin.name().hex()
                 resolved, status = self._sweep_security(job, coin, sk)
@@ -3907,7 +6101,18 @@ class WarpEngine:
         # where one exists; closing an outbound job is Abandon's job, which
         # writes the recovery blob first.
         outbound = job.state.get("direction") == "out"
-        close = resolved and job.status == JobStatus.FAILED and not outbound
+        # [WARP-LOST-SEND] A replaced funding send that could still land
+        # keeps the job open: closed, its XCH would have no Sweep.
+        settled, settled_note = (self._prior_sends_settled(job)
+                                 if resolved else (True, ""))
+        if resolved and not settled:
+            status = f"{status}; {settled_note}"
+        close = (resolved and settled and job.status == JobStatus.FAILED
+                 and not outbound)
+        # [review] A claim that landed is a completed bridge whatever kept the
+        # job open afterwards: it closes as COMPLETED (the engine's bridge
+        # accounting books the mint from that event), never CANCELLED.
+        completed = close and self._claim_completed(job)
         if outbound and resolved:
             status = (
                 f"{status}; outbound job left open -- Retry resumes it, "
@@ -3923,9 +6128,14 @@ class WarpEngine:
             # None once the sweep mines, and _funding_provably_gone had nothing
             # to check.
             patch["security_coin_id"] = coin_id
+        if completed:
+            status = f"{status}; " + (
+                "a third party's claim had paid the attested receiver"
+                if job.state.get("third_party_claim")
+                else "the claim had completed (final CAT coin on chain)")
         self._store.update_job(
             job.id,
-            status=JobStatus.CANCELLED if close else None,
+            status=(JobStatus.COMPLETED if completed else JobStatus.CANCELLED) if close else None,
             expected_status=job.status,
             columns={"next_retry_at": None},
             state_patch=patch,
@@ -4187,6 +6397,31 @@ def _trade_status_name(status: Any) -> str:
 #: A submitted Dexie take the wallet still cannot read after this long is
 #: settled as failed (its record is lost), so it cannot block every later buy.
 _TAKE_UNKNOWN_FAIL_S: int = 3600
+# [review] How long an unknown-outcome take's trade record must stay
+# unreadable -- since it went unknown, or since it was last read pending
+# (``unknown_since``) -- before it is released as failed: a Chia transaction
+# still unconfirmed after a day is gone from every mempool, and a take that
+# did land shows up as CAT held (and as a readable trade record first).
+# Never its age: one unanswered lookup on an old take releases nothing.
+_TAKE_UNKNOWN_RELEASE_S: int = 24 * 3600
+# [review] A retired attempt with no recorded coins, no wallet record and no
+# mempool item -- a send recorded before coins were kept whose record the
+# wallet has since deleted, or one that never left the GUI -- can never be
+# proven anything: there is nothing to watch.  Left as "not ruled out" it
+# would keep the job open for good and the engine's cleanup guard with it.
+# After this long absent from wallet and mempool it is presumed gone: no node
+# holds a transaction that long without including it.
+_UNOBSERVABLE_ATTEMPT_GRACE_S: int = 6 * 3600
+# Transport failures that prove the request never reached the daemon (the
+# connection was never made), so a reservation may be released.  A timeout or
+# a reset AFTER the request went out is not among them.
+_NEVER_CONNECTED_MARKERS: tuple = (
+    "connection refused", "connectionrefused", "actively refused",
+    "errno 111", "errno 10061", "winerror 10061", "connecttimeouterror",
+    "failed to establish a new connection", "newconnectionerror",
+    "name or service not known", "getaddrinfo failed", "nodename nor servname",
+    "no route to host", "network is unreachable",
+)
 
 
 def _age_s(iso: str) -> float:
@@ -4228,10 +6463,44 @@ def _job_db_path(
     of the CWD-relative-default class fixed for installed mode.
     """
     warp = (config or {}).get("warp") or {}
-    raw = Path(str(warp.get("jobs_db") or (Path("data") / jobs.DB_FILENAME)))
+    # [WARP-LOST-SEND] Expanded as the engine expands its own copy of this
+    # path (config.cpp expand_env_vars + expand_tilde): ``${VAR}`` and
+    # ``${VAR:-default}`` references, then a leading ``~``.  The two
+    # processes must open the SAME file, or the engine's stuck-transaction
+    # guard protects a database no job is written to.
+    text = _expand_config_path(
+        str(warp.get("jobs_db") or (Path("data") / jobs.DB_FILENAME)))
+    raw = Path(text)
     if raw.is_absolute() or anchor is None:
         return str(raw)
     return str(Path(anchor) / raw)
+
+
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _expand_config_path(text: str) -> str:
+    """``${VAR}`` / ``${VAR:-default}`` from the environment, then ``~`` to
+    the home directory -- the engine's reading of a configured path.  An
+    unset ``${VAR}`` with no default is a config error, as it is there."""
+    import os
+
+    def _ref(m: "re.Match[str]") -> str:
+        value = os.environ.get(m.group(1))
+        if value is None:
+            if m.group(2) is not None:
+                return m.group(2)
+            raise WarpError(
+                f"warp.jobs_db references ${{{m.group(1)}}}, which is not set")
+        return value
+
+    expanded = _ENV_REF.sub(_ref, text)
+    if expanded.startswith("~"):
+        home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+        if home:
+            return home + expanded[1:]
+        return os.path.expanduser(expanded)
+    return expanded
 
 
 def _coinset_url(config: Optional[dict], net: constants.WarpNet) -> str:
@@ -4293,6 +6562,256 @@ class _SecretsFileIO:
 # Qt worker -- runs the blocking engine step on a background QThread.
 # ===================================================================== #
 
+def _same_path(a: str, b: str) -> bool:
+    """Whether two database paths name the same file."""
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except Exception:  # noqa: BLE001 -- unresolvable: not the same
+        return False
+
+
+# [review] Beside the CONFIGURED jobs database, a one-line file naming the
+# store the bridge kept open instead (work left there by a config switch).
+# The engine started on this config reads it with its own store
+# (engine.cpp refresh_warp_send_guard) and guards both, and a GUI restarted
+# on this config finds the kept store again.
+_RETAINED_POINTER_SUFFIX = ".retained"
+# [review] How long a store with no open work stays named after it was last
+# written: a job that finished there after the configuration moved on has
+# its booking records there and nowhere else, and the engine's accounting
+# scans read the stores the pointer names (engine.cpp warp_store_paths).
+# Naming an idle store costs no protection (nothing in flight, nothing
+# guarded), so it lingers until the engine has had this long to book it.
+_RETAINED_LINGER_S: int = 48 * 3600
+# [review] What EngineBridge hands the worker for an engine this GUI did not
+# start (found on the metrics endpoint): its config, hence the store its
+# guard reads, is unknown, so the worker pins the store the configuration
+# names at that moment rather than move reservations away from a guard it
+# cannot see.
+ATTACHED_ENGINE_STORE = "<an engine this GUI did not start>"
+
+
+class RetainedPointerError(WarpError):
+    """[review] Open work exists in a store the engine about to start would
+    not guard, and the pointer naming it could not be written: the launch
+    must not proceed (an empty configured store would read as "nothing to
+    protect")."""
+
+
+def _retained_pointer(wanted: str) -> Optional[Path]:
+    """The pointer file beside the configured store *wanted* (None for an
+    in-memory store)."""
+    if not wanted or wanted == ":memory:":
+        return None
+    return Path(wanted + _RETAINED_POINTER_SUFFIX)
+
+
+def _norm_store_path(path: str) -> str:
+    """One spelling per store file (the pointer's entries are compared by it)."""
+    try:
+        return str(Path(path).resolve())
+    except Exception:  # noqa: BLE001 -- unresolvable: as given
+        return str(path)
+
+
+def _write_retained_pointer(pointer: Path, paths: Sequence[str]) -> None:
+    """Name *paths* in *pointer*, one per line, atomically (the engine may
+    read it any time); the configured store's directory is created for it."""
+    from gui.services.config_split import _atomic_write_text
+
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(pointer, "".join(_norm_store_path(p) + "\n" for p in paths),
+                       newline="\n")
+
+
+def _drop_retained_pointer(pointer: Optional[Path]) -> None:
+    """Remove *pointer* if it exists (best effort)."""
+    if pointer is None:
+        return
+    try:
+        pointer.unlink(missing_ok=True)
+    except OSError as exc:
+        _log.debug("warp: could not remove %s (%s)", pointer, exc)
+
+
+def _read_retained_pointer(pointer: Optional[Path]) -> tuple:
+    """``(entries, failed)``: the stores *pointer* names, or ``failed`` when
+    the file stands but cannot be read -- or names nothing, which is a
+    write that never finished.  Such a pointer is never removed here: a
+    store it named may hold work, and the engine fails closed on it."""
+    if pointer is None or not pointer.exists():
+        return [], False
+    try:
+        text = pointer.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        _log.warning("warp: could not read %s (%s)", pointer, exc)
+        return [], True
+    entries = [line.strip() for line in text.splitlines() if line.strip()]
+    return entries, not entries
+
+
+def _store_status(path: str) -> Optional[tuple]:
+    """``(open_work, linger)`` for the store at *path*: its open work
+    (:meth:`WarpJobStore.open_work_summary`; "" when idle or the file is
+    missing) and, idle, why it is still named -- closed work written within
+    ``_RETAINED_LINGER_S`` that the engine's accounting scans may not have
+    booked yet ("" once that has passed).  None when the store cannot be
+    read."""
+    if not Path(path).is_file():
+        return "", ""
+    try:
+        with WarpJobStore(path) as store:
+            work = store.open_work_summary()
+            last = None if work else store.last_written_at()
+    except Exception as exc:  # noqa: BLE001 -- unreadable: unknown
+        _log.warning("warp: could not read the job store %s (%s)", path, exc)
+        return None
+    if work:
+        return work, ""
+    if last and _age_s(last) < _RETAINED_LINGER_S:
+        return "", f"closed work awaiting the engine's accounting (last written {last})"
+    return "", ""
+
+def _carried_entries(stores: Iterable[str]) -> tuple:
+    """[review] ``(entries, unreadable_pointers)``: every store named by the
+    pointer beside each of *stores*, followed transitively with a visited
+    set -- a previously configured store's pointer names what was kept
+    before IT, and that must not be lost when the configuration moves on;
+    the lists are flat by construction, but a hand-edited file might not
+    be, so a cycle ends at the first repeat.  Pointers that stand but cannot
+    be read are reported: the stores they name are unknown."""
+    seen: set = set()
+    out: List[str] = []
+    bad: List[str] = []
+    queue = [str(s) for s in stores if s]
+    while queue:
+        store = queue.pop(0)
+        norm = _norm_store_path(store)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        pointer = _retained_pointer(store)
+        entries, failed = _read_retained_pointer(pointer)
+        if failed:
+            bad.append(str(pointer))
+            continue
+        for entry in entries:
+            if _norm_store_path(entry) not in seen:
+                out.append(entry)
+                queue.append(entry)
+    return out, bad
+
+
+class RetainedStores:
+    """[review] The result of :func:`sync_retained_pointer`: the stores the
+    pointer beside the configured one now names (resolved paths, in order)
+    with what keeps each (``reasons``), whether the pointer stands but
+    could not be read (``unreadable``: nothing was changed), the pointers
+    beside carried stores that could not be read (``unreadable_carried``:
+    what they name is unknown), and a write that failed (``write_error``)."""
+
+    def __init__(self) -> None:
+        self.named: List[str] = []
+        self.reasons: Dict[str, str] = {}
+        #: The named stores that hold OPEN work (a subset of ``reasons``);
+        #: the rest are named for their closed work's accounting only.
+        self.open: Dict[str, str] = {}
+        self.unreadable: bool = False
+        self.unreadable_carried: List[str] = []
+        self.write_error: Optional[str] = None
+
+
+def sync_retained_pointer(wanted: str, candidates: Iterable[str]) -> RetainedStores:
+    """[review] Make the pointer beside *wanted* name EVERY store -- its
+    current entries and *candidates*, *wanted* itself excepted -- that still
+    holds open work or cannot be read (fail closed), one per line, and no
+    other: an engine started on this config guards each of them
+    (engine.cpp refresh_warp_send_guard reads the whole list; it is flat, so
+    a named store's own pointer is never followed and there is no cycle).
+    What the pointer beside each entry and candidate names is carried in
+    too (_carried_entries): a previously configured store's own list must
+    survive the move to this one.  An entry is dropped only once its store
+    is established idle or gone.  Never raises: a pointer that cannot be
+    read is left exactly as it is, and a failed write is reported."""
+    st = RetainedStores()
+    pointer = _retained_pointer(wanted)
+    if pointer is None:
+        return st
+    entries, failed = _read_retained_pointer(pointer)
+    if failed:
+        st.unreadable = True
+        return st
+    candidates = [str(c) for c in candidates if c]
+    carried, bad = _carried_entries([*entries, *candidates])
+    st.unreadable_carried = bad
+    keep: Dict[str, str] = {}
+    open_: Dict[str, str] = {}
+    want_norm = _norm_store_path(wanted)
+    for cand in [*entries, *candidates, *carried]:
+        cand = str(cand or "").strip()
+        if not cand:
+            continue
+        norm = _norm_store_path(cand)
+        if norm in keep or norm == want_norm or cand == wanted:
+            continue
+        status = _store_status(cand)
+        if status is None:
+            keep[norm] = open_[norm] = "work that could not be read"
+            continue
+        work, linger = status
+        if work:
+            keep[norm] = open_[norm] = work
+        elif linger:
+            keep[norm] = linger
+    st.named = list(keep)
+    st.reasons = keep
+    st.open = open_
+    if st.named == [_norm_store_path(e) for e in entries]:
+        return st                                            # as it stands
+    try:
+        if st.named:
+            _write_retained_pointer(pointer, st.named)
+            _log.info("warp: %s names %s for the engine's guard", pointer,
+                      "; ".join(f"{p} ({r})" for p, r in keep.items()))
+        else:
+            _drop_retained_pointer(pointer)
+    except Exception as exc:  # noqa: BLE001 -- reported, never raised
+        st.write_error = str(exc)
+        _log.warning("warp: could not write %s (%s)", pointer, exc)
+    return st
+
+
+def publish_retained_pointer(wanted: str, candidates: Iterable[str]) -> List[str]:
+    """[review] BEFORE an engine that guards *wanted* starts (and as the GUI
+    switches to the config naming it): name beside *wanted* every store
+    among the pointer's entries and *candidates* that still holds open work
+    (:func:`sync_retained_pointer`), so the engine's startup cleanup already
+    guards each of them -- the worker publishes the same pointer on its own
+    thread, but that update is queued, and a send aged past the prune
+    threshold must not sit unguarded in the window between the launch and
+    it.  Returns the stores named ([] when none holds work).  Raises
+    :class:`RetainedPointerError` -- and only that -- when the protection
+    cannot be ensured: the pointer stands but cannot be read, or a store
+    holds work and the pointer cannot be written.  The caller must not
+    launch then."""
+    st = sync_retained_pointer(wanted, candidates)
+    if st.unreadable:
+        raise RetainedPointerError(
+            f"the retained-store pointer beside {wanted} cannot be read (or names "
+            "nothing); the stores it named may hold open work -- fix or remove the "
+            "file by hand once they have none")
+    if st.unreadable_carried:
+        raise RetainedPointerError(
+            f"the retained-store pointer(s) {', '.join(st.unreadable_carried)} cannot "
+            "be read (or name nothing); the stores they name may hold open work -- fix "
+            "or remove them by hand once they have none")
+    if st.write_error:
+        raise RetainedPointerError(
+            f"open work in {', '.join(st.named)} could not be named beside {wanted} "
+            f"for the engine's guard ({st.write_error})")
+    return list(st.named)
+
+
 class _WarpWorker(QObject):
     """Background worker that owns the :class:`WarpEngine` and ticks it.
 
@@ -4321,8 +6840,23 @@ class _WarpWorker(QObject):
         self._engine: Optional[WarpEngine] = None
         self._engine_error: Optional[str] = None
         # Base hot-wallet plumbing (independent of the engine -- see
-        # wallet_action). Set once before moveToThread, never mutated after.
+        # wallet_action), and the anchor of every config-relative path
+        # (_config_home).  Set before moveToThread; changed afterwards only
+        # through the set_secrets_path slot, on this thread.
         self._secrets_path: Optional[Path] = secrets_path
+        # [review] The jobs database the RUNNING engine (ours) reads for its
+        # stuck-transaction guard -- resolved from the config it was launched
+        # with, directory AND warp.jobs_db -- or None: while it runs, that is
+        # where this worker's sends are recorded, whatever config the GUI has
+        # since switched to (EngineBridge keeps it current).
+        self._engine_store: Optional[str] = None
+        self._engine_store_assumed: bool = False             # ATTACHED_ENGINE_STORE
+        # The jobs database last opened, and why it is kept when the
+        # configured one differs (open work must not vanish from monitoring).
+        self._store_path: Optional[str] = None
+        self._store_hold: str = ""
+        self._store_pinned: bool = False
+        self._retained_ok: bool = True
         self._last_wallet_notice: str = ""
         self._rebalance_params = rb.RebalanceParams()
         self._rebalance_error: str = ""
@@ -4351,6 +6885,7 @@ class _WarpWorker(QObject):
         self._config = dict(config or {})
         self._drop_engine()
         self._engine_error = None
+        self._refresh_store_hold()
         # Fail-closed rebalance parse: a malformed block disables the
         # rebalancer WITH a banner, never a silently-defaulted band.
         try:
@@ -4362,6 +6897,73 @@ class _WarpWorker(QObject):
             self._rebalance_params = rb.RebalanceParams()
             self._rebalance_error = str(exc)
             _log.error("rebalance disabled: %s", exc)
+
+    def set_secrets_path(self, path: object) -> None:
+        """Follow a config switch (EngineBridge.update_config_path).
+
+        [review] The secrets path anchors the jobs database (_config_home):
+        left at the directory fixed at construction, a switched config
+        would have this worker recording live sends in the OLD directory's
+        store while the C++ engine, restarted on the new config, reads an
+        empty store in the new one -- and cleans up a wallet with a warp
+        send in flight.  The engine is rebuilt against the new directory's
+        store on the next tick.  Delivered on the worker thread.
+        """
+        new = Path(str(path)) if path else None
+        if new == self._secrets_path:
+            return
+        _log.info("warp: config home changed (%s -> %s); reopening the job store there",
+                  self._secrets_path.parent if self._secrets_path else None,
+                  new.parent if new else None)
+        self._secrets_path = new
+        self._drop_engine()
+        self._engine_error = None
+        self._refresh_store_hold()
+
+    def _refresh_store_hold(self) -> None:
+        """[review] Re-evaluate the store in use the moment the configured
+        store changes, not lazily at the next engine build: the pointer the
+        engine's guard reads and the banner's notice are published as the
+        paths diverge.  Never raises."""
+        try:
+            self._store_path_in_use()
+        except Exception as exc:  # noqa: BLE001 -- evaluated again at the build
+            _log.debug("warp: store hold not refreshed (%s)", exc)
+
+    @Slot(object)
+    def set_engine_store(self, path: object) -> None:
+        """[review] Follow the jobs database the RUNNING engine (ours) reads
+        for its stuck-transaction guard -- EngineBridge resolves it from the
+        config the engine was launched with, directory AND warp.jobs_db, as
+        the engine does: while it runs this worker records there, whatever
+        config (and jobs_db) the GUI switched to meanwhile.  None when no
+        engine of ours is running: the GUI's config decides again.
+        Delivered on the worker thread."""
+        new = str(path) if path else None
+        if new == ATTACHED_ENGINE_STORE:
+            # [review] An engine this GUI did not start: its config, hence
+            # the store its guard reads, is unknown.  The store the
+            # configuration names NOW is taken for it and kept until it
+            # stops -- a jobs-database change must not move reservations
+            # away from a guard whose path cannot be seen.  A store already
+            # known (ours, or assumed earlier) stands.
+            if self._engine_store is not None:
+                return
+            self._engine_store_assumed = True
+            new = self._wanted_store_path()
+        else:
+            self._engine_store_assumed = False
+        if new == self._engine_store:
+            return
+        before = self._wanted_store_path()
+        self._engine_store = new
+        if self._wanted_store_path() != before:
+            _log.info("warp: the job store follows %s",
+                      f"the running engine's ({new})" if new
+                      else "the GUI's config (no engine of ours is running)")
+            self._drop_engine()
+            self._engine_error = None
+            self._refresh_store_hold()
 
     def _drop_engine(self) -> None:
         """Discard the engine, closing its sqlite connection first."""
@@ -4375,13 +6977,105 @@ class _WarpWorker(QObject):
         (tests), which preserves the old CWD-relative behaviour there."""
         return self._secrets_path.parent if self._secrets_path else None
 
+    def _wanted_store_path(self) -> str:
+        """[review] The jobs database the configuration calls for: the one the
+        RUNNING engine (ours) guards while it runs (set_engine_store --
+        directory and warp.jobs_db both, since the GUI's current config may
+        name another file), else warp.jobs_db of the GUI's config anchored at
+        its directory."""
+        engine_store = getattr(self, "_engine_store", None)
+        if engine_store:
+            return engine_store
+        return str(_job_db_path(self._config, anchor=self._config_home()))
+
+    def _store_path_in_use(self) -> str:
+        """[review] The jobs database to open: the configured one, unless the
+        store last used (another directory's after a config switch, another
+        file after a warp.jobs_db change) still holds open work -- an active
+        job, or a Dexie take not yet settled -- or cannot be read (fail
+        closed).  That store is kept until the work closes, so no bridge job
+        or take vanishes from monitoring, and the banner says so.  The
+        pointer beside the configured store is synchronised at the same
+        time (sync_retained_pointer): it names every store still holding
+        work, so an engine started on this config guards them all; a GUI
+        restarted on this config resumes the first store it names; a pointer
+        that cannot be read is left alone and blocks instead of vanishing."""
+        wanted = self._wanted_store_path()
+        held = getattr(self, "_store_path", None)
+        st = sync_retained_pointer(wanted, [held] if held else [])
+        self._retained_ok = not (st.unreadable or st.unreadable_carried or st.write_error)
+        if st.unreadable:
+            self._store_pinned = False
+            self._store_hold = (
+                f"the retained-store pointer beside {wanted} cannot be read or names "
+                "nothing; an engine on this config keeps every wallet's cleanup off "
+                "while it stands -- fix or remove the file by hand once the stores it "
+                "named have no open work")
+            return wanted
+        use: Optional[str] = None
+        if held and not (held == wanted or _same_path(held, wanted)):
+            if st.open.get(_norm_store_path(held)):
+                use = held                                   # ours, still with work
+        elif not held:
+            # [review] A GUI restarted on this config: the pointer left beside
+            # the configured store names the stores kept open last time, so
+            # their open work is found again rather than forgotten (a store
+            # named only for its closed work's accounting is not resumed).
+            use = next((p for p in st.named if p in st.open), None)
+        use_norm = _norm_store_path(use) if use else None
+        others = [f"{p} ({st.reasons[p]})" for p in st.named if p != use_norm]
+        extras = []
+        if st.unreadable_carried:
+            extras.append("the retained-store pointer(s) " + ", ".join(st.unreadable_carried)
+                          + " could not be read; the stores they name may hold work -- "
+                          "fix or remove them by hand")
+        if st.write_error:
+            extras.append(f"the pointer naming them could not be written ({st.write_error})")
+        if use is None:
+            self._store_pinned = False
+            notes = []
+            if others:
+                notes.append("stores still holding work, guarded by an engine on this "
+                             "config: " + "; ".join(others)
+                             + " -- switch to their config to finish them")
+            self._store_hold = "; ".join(notes + extras)
+            return wanted
+        self._store_pinned = True
+        self._store_hold = (f"the bridge keeps its job store {use} until "
+                            f"{st.reasons.get(use_norm, 'its work')} closes; the configured "
+                            f"store is {wanted} (an engine started on this config guards both)")
+        if others:
+            self._store_hold += "; other stores still holding work, guarded too: " + "; ".join(others)
+        if extras:
+            self._store_hold += "; " + "; ".join(extras)
+        if st.write_error:
+            self._store_hold += " -- new Chia sends wait while an engine runs on this config"
+        return use
+
+    def _send_hold_reason(self) -> Optional[str]:
+        """[review] Why a NEW Chia send must wait, or None: the store in use
+        is not the one beside the running engine's config, and the pointer
+        that makes the engine guard it too could not be written, so a send
+        recorded here would be unprotected.  With the pointer in place the
+        engine guards both stores and the held store's job may finish (a
+        Retry's send included); with no engine of ours running nothing
+        cleans the wallet."""
+        if (not getattr(self, "_engine_store", None)
+                or not getattr(self, "_store_pinned", False)
+                or getattr(self, "_retained_ok", True)):
+            return None
+        return ("the engine's stuck-transaction guard reads its own job store "
+                f"({self._engine_store}), and the pointer that would make it guard "
+                f"this job's store ({self._store_path}) too could not be written; restart "
+                "the engine on the config this job was started under, or close the job "
+                "(Sweep / Abandon) first")
+
     # -- altruistic-relay ledger persistence (survives process restart) ----- #
 
     def _relay_state_path(self) -> Optional[Path]:
         try:
-            return Path(_job_db_path(self._config, anchor=self._config_home())).with_name(
-                "warp_relay_state.json"
-            )
+            # Beside the jobs database the configuration calls for.
+            return Path(self._wanted_store_path()).with_name("warp_relay_state.json")
         except Exception:  # noqa: BLE001 -- no path is a safe "don't persist"
             return None
 
@@ -4436,6 +7130,15 @@ class _WarpWorker(QObject):
             engine.refresh_relay_activity_if_due()
 
         snap = self._guarded(_run)
+        if getattr(self, "_store_pinned", False) and self._engine is not None:
+            # [review] The held store's work closed: the configured store is
+            # opened on the next tick.
+            try:
+                if not self._engine._store.open_work_summary():
+                    self._drop_engine()
+                    self._engine_error = None
+            except Exception as exc:  # noqa: BLE001 -- checked again next tick
+                _log.debug("warp: could not re-check the held store (%s)", exc)
         if self._engine is None:
             # [review] Submitted Dexie takes settle whatever the switch that
             # authorises NEW warp work says: with warp disabled (or the
@@ -4812,13 +7515,16 @@ class _WarpWorker(QObject):
         store only when its file exists, and the wallet only when a take is
         still open. Contracted never to raise."""
         try:
-            path = Path(_job_db_path(self._config, anchor=self._config_home()))
+            path = Path(self._store_path_in_use())
             if not path.is_file():
                 return
             with WarpJobStore(str(path)) as store:
+                # [review] "unknown" takes too: they settle for real, or are
+                # released, only through this path when no engine is built.
                 if not (store.list_takes(status=jobs.TAKE_SUBMITTED, limit=1)
                         or store.list_takes(status=jobs.TAKE_SUBMITTING,
-                                            limit=1)):
+                                            limit=1)
+                        or store.list_takes(status=jobs.TAKE_UNKNOWN, limit=1)):
                     return
                 from types import SimpleNamespace
 
@@ -4864,22 +7570,27 @@ class _WarpWorker(QObject):
         failed, so a lost trade record cannot stop every later buy.
         """
         in_flight = False
-        for take in engine._store.list_takes(status=jobs.TAKE_SUBMITTING):
+        # [review] EVERY open take (limit=-1 is SQLite's "no limit"): the
+        # default page would let newer rows hide an older one from
+        # settlement for good -- a confirmed purchase never booked.
+        for take in engine._store.list_takes(status=jobs.TAKE_SUBMITTING, limit=-1):
             # The take RPC's outcome never reached the store (a lost
             # response, a crash): no wallet trade id to look up. It blocks
-            # buys until _TAKE_UNKNOWN_FAIL_S, then settles as failed -- by
+            # buys until _TAKE_UNKNOWN_FAIL_S, then moves to "unknown" -- by
             # then a buy that did land shows up as wmilliETH.b held, so the
-            # planner no longer asks for one.
+            # planner no longer asks for one.  [review] Not "failed": its
+            # transactions are not proven dead, and the engine's guard keeps
+            # protecting its wallets until they are (_settle_unknown_takes).
             if _age_s(take.created_at) > _TAKE_UNKNOWN_FAIL_S:
                 engine._store.settle_take(
-                    take.trade_id, jobs.TAKE_FAILED,
+                    take.trade_id, jobs.TAKE_UNKNOWN,
                     error="the take's outcome was never recorded")
                 _log.warning("Dexie take of %s: outcome unknown after %ds; "
-                             "settled as failed (check the wallet)",
+                             "no longer blocking buys (check the wallet)",
                              take.offer_id, _TAKE_UNKNOWN_FAIL_S)
             else:
                 in_flight = True
-        submitted = engine._store.list_takes(status=jobs.TAKE_SUBMITTED)
+        submitted = engine._store.list_takes(status=jobs.TAKE_SUBMITTED, limit=-1)
         if submitted:
             # [review] The configured key first, OUTSIDE the per-take handler:
             # after a restart the daemon may be logged out or on another key,
@@ -4892,10 +7603,10 @@ class _WarpWorker(QObject):
             except Exception as exc:  # noqa: BLE001 -- unknown stays in flight
                 if _age_s(take.created_at) > _TAKE_UNKNOWN_FAIL_S:
                     engine._store.settle_take(
-                        take.trade_id, jobs.TAKE_FAILED,
+                        take.trade_id, jobs.TAKE_UNKNOWN,
                         error=f"the wallet has no readable trade record ({exc})")
                     _log.warning("Dexie take %s: no trade record after %ds; "
-                                 "settled as failed", take.trade_id,
+                                 "no longer blocking buys", take.trade_id,
                                  _TAKE_UNKNOWN_FAIL_S)
                     continue
                 _log.debug("Dexie take %s: status unknown (%s)",
@@ -4920,7 +7631,70 @@ class _WarpWorker(QObject):
                 _log.warning("Dexie take %s %s", take.trade_id, status.lower())
             else:
                 in_flight = True
+        self._settle_unknown_takes(engine)
         return in_flight
+
+    def _settle_unknown_takes(self, engine: "WarpEngine") -> None:
+        """[review] Takes the planner stopped waiting for are still open for
+        the engine's guard: each is settled for real once its trade record
+        reads CONFIRMED or FAILED, and released as failed only after
+        ``_TAKE_UNKNOWN_RELEASE_S`` of unreadable lookups since it went
+        unknown or was last read pending (its ``unknown_since``) -- a Chia
+        transaction unconfirmed for a day is gone from every mempool.
+        Never blocks a buy."""
+        unknown = engine._store.list_takes(status=jobs.TAKE_UNKNOWN, limit=-1)
+        if not unknown:
+            return
+        # [review] The configured key first, outside the per-take handler: a
+        # lookup against another client's selected fingerprint reads as "no
+        # record", and a login failure must defer settlement, never count
+        # toward the release.
+        engine._wallet.log_in()
+        for take in unknown:
+            status = None
+            readable = False
+            try:
+                record = engine._wallet.get_offer(take.trade_id)
+                status = _trade_status_name(record.get("status"))
+                readable = True
+            except Exception as exc:  # noqa: BLE001 -- still unknown
+                _log.debug("Dexie take %s: still unknown (%s)", take.trade_id, exc)
+            if status == "CONFIRMED":
+                height = record.get("confirmed_at_index")
+                engine._store.settle_take(
+                    take.trade_id, jobs.TAKE_CONFIRMED,
+                    confirmed_height=(int(height) if isinstance(height, int)
+                                      and not isinstance(height, bool)
+                                      and height > 0 else None))
+                _log.info("Dexie take %s confirmed after all", take.trade_id)
+            elif status in ("FAILED", "CANCELLED"):
+                engine._store.settle_take(
+                    take.trade_id, jobs.TAKE_FAILED,
+                    error=f"wallet reports {status}")
+            elif readable:
+                # [review] A record that reads PENDING_* is positive evidence
+                # the take is live: it stays protected however old it is,
+                # until the wallet calls it confirmed or failed -- and its
+                # unknown-duration clock restarts, so the release below needs
+                # a full _TAKE_UNKNOWN_RELEASE_S of unreadable lookups AFTER
+                # this sighting, never one unanswered lookup on an old take.
+                try:
+                    engine._store.take_still_live(take.trade_id)
+                except Exception as exc:  # noqa: BLE001 -- restarts next pass
+                    _log.debug("Dexie take %s: could not restart its clock (%s)",
+                               take.trade_id, exc)
+                _log.debug("Dexie take %s: wallet reports %s; still open",
+                           take.trade_id, status)
+            elif _age_s(take.unknown_since or take.updated_at) > _TAKE_UNKNOWN_RELEASE_S:
+                # [review] Unreadable for a day since it went unknown or was
+                # last read pending (a row from before the stamp existed:
+                # since it was last written, which was that transition).
+                engine._store.settle_take(
+                    take.trade_id, jobs.TAKE_FAILED,
+                    error=(f"outcome unknown for {_TAKE_UNKNOWN_RELEASE_S // 3600}h; "
+                           "released (an unconfirmed transaction that old is gone)"))
+                _log.warning("Dexie take %s: unknown for %dh; released as failed",
+                             take.trade_id, _TAKE_UNKNOWN_RELEASE_S // 3600)
 
     def _dexie_buy(self, engine: "WarpEngine", want_mojos: int,
                    src: "rb.WmilliethSource", *, min_mojos: int = 1) -> str:
@@ -4964,7 +7738,7 @@ class _WarpWorker(QObject):
         # what the unwrap of this very purchase will need (G10): a buy that
         # spent that too would leave the CAT stuck at the unwrap gate.
         keep = max(_engine_xch_fee_reserve_mojos(self._config),
-                   _unwrap_xch_need(engine._net, engine._params))
+                   engine._unwrap_xch_budget())
         spendable = int(
             engine._wallet.get_wallet_balance(1).get("spendable_balance") or 0)
         budget = max(0, min(src.max_spend_xch_mojos, spendable - keep)
@@ -5096,16 +7870,25 @@ class _WarpWorker(QObject):
         to the operator, who sees an enabled button that silently does nothing.
         """
         action_error: Optional[str] = None
+        notice: Optional[str] = None
         try:
             engine = self._ensure_engine()
             if engine is not None:
-                fn(engine)
+                result = fn(engine)
+                # [review] A Sweep that did not close the job says why only
+                # in state.sweep_status: surface it as a notice, as an error
+                # would be, or the operator sees a click do nothing.
+                if isinstance(result, dict) and result.get("sweep_status") \
+                        and result.get("status") == JobStatus.FAILED:
+                    notice = f"Sweep: {result['sweep_status']}"
         except Exception as exc:  # noqa: BLE001 -- never kill the worker
             action_error = str(exc)
             _log.warning("warp worker step failed: %s", exc)
         snap = self._snapshot_or_error()
         if action_error:
             snap["action_error"] = action_error
+        elif notice:
+            snap["action_notice"] = notice
         return snap
 
     def _snapshot_or_error(self) -> dict:
@@ -5130,6 +7913,18 @@ class _WarpWorker(QObject):
         snap["wallet_action_seq"] = self._wallet_action_seq
         if self._last_wallet_notice:
             snap["wallet_notice"] = self._last_wallet_notice
+        notice = getattr(self, "_store_hold", "")
+        if getattr(self, "_engine_store_assumed", False):
+            assumed = (f"an engine this GUI did not start is running: the bridge takes "
+                       f"{self._engine_store} for the job store its guard reads and keeps "
+                       "recording there until it stops")
+            notice = f"{assumed}; {notice}" if notice else assumed
+        if notice:
+            snap["store_notice"] = notice
+        if getattr(self, "_store_path", None):
+            # [review] EngineBridge reads it back before a launch: the store
+            # the worker records in may need naming beside the new engine's.
+            snap["store_path"] = self._store_path
         if self._rebalance_params.enabled or self._rebalance_error:
             snap["rebalance"] = {
                 "enabled": self._rebalance_params.enabled,
@@ -5195,12 +7990,16 @@ class _WarpWorker(QObject):
         # raise -- a missing hot-wallet key is the ordinary case. Without this,
         # each failed build leaked a connection, and _ensure_engine is retried
         # on every config reload.
-        store = WarpJobStore(_job_db_path(self._config, anchor=self._config_home()))
+        path = self._store_path_in_use()
+        store = WarpJobStore(path)
         try:
-            return self._build_engine_with(net, params, store)
+            engine = self._build_engine_with(net, params, store)
         except Exception:
             store.close()
             raise
+        self._store_path = path
+        engine.send_hold = self._send_hold_reason
+        return engine
 
     def _build_engine_with(
         self, net: Any, params: WarpParams, store: WarpJobStore
@@ -5404,7 +8203,7 @@ class _WarpWorker(QObject):
 
         if self._engine is not None:
             return self._engine._store.get_active_job()
-        db = Path(_job_db_path(self._config, anchor=self._config_home()))
+        db = Path(self._store_path_in_use())
         if not db.is_file():
             return None
         try:
@@ -5522,6 +8321,8 @@ class WarpService(QObject):
     _trigger_unwrap = Signal(int, str, bool, str)
     _trigger_action = Signal(int, str)
     _trigger_wallet = Signal(str, dict)
+    _trigger_secrets = Signal(object)
+    _trigger_engine_store = Signal(object)
 
     def __init__(
         self,
@@ -5534,6 +8335,8 @@ class WarpService(QObject):
         self._mutex = QMutex()
         self._snapshot: dict = {}
         self._tick_in_flight: bool = False
+        self._secrets_path: Optional[Path] = Path(secrets_path) if secrets_path else None
+        self._engine_store: Optional[str] = None
 
         self._thread = QThread(self)
         self._thread.setObjectName("WarpWorkerThread")
@@ -5550,6 +8353,8 @@ class WarpService(QObject):
         self._trigger_unwrap.connect(self._worker.request_unwrap)
         self._trigger_action.connect(self._worker.job_action)
         self._trigger_wallet.connect(self._worker.wallet_action)
+        self._trigger_secrets.connect(self._worker.set_secrets_path)
+        self._trigger_engine_store.connect(self._worker.set_engine_store)
 
         self._trigger_params.emit(dict(config or {}))
 
@@ -5579,6 +8384,40 @@ class WarpService(QObject):
 
     def update_config(self, config: dict) -> None:
         self._trigger_params.emit(dict(config or {}))
+
+    @property
+    def secrets_path(self) -> Optional[Path]:
+        """The secrets file beside the active config: the anchor of the
+        worker's config-relative paths (the jobs database among them)."""
+        return self._secrets_path
+
+    def set_secrets_path(self, path: Optional[Path]) -> None:
+        """[review] Follow a config switch so the worker's job store moves
+        with the config, as the engine's does (EngineBridge.update_config_path)."""
+        new = Path(path) if path else None
+        if new == self._secrets_path:
+            return
+        self._secrets_path = new
+        self._trigger_secrets.emit(new)
+
+    @property
+    def engine_store(self) -> Optional[str]:
+        """The jobs database the engine this GUI launched reads for its guard
+        (EngineBridge resolves it at launch), or None: the worker's job store
+        follows it while that engine runs."""
+        return self._engine_store
+
+    def set_engine_store(self, path: Optional[str]) -> None:
+        """[review] Tell the worker which jobs database the engine WE launched
+        guards (None when none runs): the worker records there while that
+        engine runs, since its stuck-transaction guard reads that file --
+        directory and warp.jobs_db of the LAUNCHED config, not of whatever
+        config the GUI switched to."""
+        new = str(path) if path else None
+        if new == self._engine_store:
+            return
+        self._engine_store = new
+        self._trigger_engine_store.emit(new)
 
     def tick(self) -> None:
         """Trigger one bridge step on the worker thread (dropped if in flight)."""

@@ -293,17 +293,34 @@ CREATE TABLE IF NOT EXISTS dexie_takes (
     xch_mojos    INTEGER NOT NULL,          -- paid to the maker
     fee_mojos    INTEGER NOT NULL,          -- our network fee
     status       TEXT    NOT NULL,          -- submitting | submitted |
-                                            -- confirmed | failed
+                                            -- unknown | confirmed | failed
     confirmed_at TEXT,
     confirmed_height INTEGER,               -- chain block the trade landed in
-    last_error   TEXT
+    last_error   TEXT,
+    unknown_since TEXT                      -- [review] since when its outcome
+                                            -- has been unreadable: set as it
+                                            -- settles unknown, restarted by
+                                            -- every pending read
 )
 """
+
+# [review] Columns added to dexie_takes after the table first shipped: a
+# store opened on an older file adds them (CREATE TABLE IF NOT EXISTS leaves
+# an existing table as it is).
+_DEXIE_TAKE_COLUMNS_ADDED: tuple = (
+    ("confirmed_height", "INTEGER"),
+    ("unknown_since", "TEXT"),
+)
 
 TAKE_SUBMITTING = "submitting"   # recorded before the take RPC
 TAKE_SUBMITTED = "submitted"
 TAKE_CONFIRMED = "confirmed"
 TAKE_FAILED = "failed"
+# [review] Its outcome never became readable within the planner's hour: the
+# planner moves on (a buy that landed shows up as CAT held), but the take's
+# wallet transactions are NOT proven dead, so the engine's guard keeps its
+# wallets protected until it is settled for real or released after a day.
+TAKE_UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -321,6 +338,7 @@ class DexieTake:
     confirmed_at: Optional[str]
     last_error: Optional[str]
     confirmed_height: Optional[int] = None
+    unknown_since: Optional[str] = None     # [review] the release clock's start
 
 
 _JOB_COLUMNS = (
@@ -383,12 +401,30 @@ class WarpJobStore:
 
     def _init_schema(self) -> None:
         with self._lock, self._conn:
+            # [review] One opener at a time: the GUI and its worker (or two
+            # GUIs) may open the same older file together, and both would
+            # see a column missing and race the ALTER.  BEGIN IMMEDIATE takes
+            # the write lock first (the other waits on busy_timeout), so the
+            # second opener inspects a finished migration; a duplicate column
+            # is tolerated regardless -- the end state is what matters.
+            self._conn.execute("BEGIN IMMEDIATE")
             self._conn.execute(_CREATE_JOBS)
             self._conn.execute(_CREATE_ACTIVE_INDEX)
             self._conn.execute(_CREATE_EVENTS)
             self._conn.execute(_CREATE_EVENTS_INDEX)
             self._conn.execute(_CREATE_META)
             self._conn.execute(_CREATE_DEXIE_TAKES)
+            have = {str(r["name"]) for r in self._conn.execute(
+                "PRAGMA table_info(dexie_takes)").fetchall()}
+            for name, decl in _DEXIE_TAKE_COLUMNS_ADDED:
+                if name in have:
+                    continue
+                try:
+                    self._conn.execute(
+                        f"ALTER TABLE dexie_takes ADD COLUMN {name} {decl}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
             row = self._conn.execute(
                 "SELECT value FROM warp_meta WHERE key = 'schema_version'"
             ).fetchone()
@@ -596,6 +632,34 @@ class WarpJobStore:
             ).fetchone()
         return _row_to_job(row) if row is not None else None
 
+    def open_work_summary(self) -> str:
+        """[review] What keeps this store in use -- the active job and the
+        Dexie takes not yet settled -- as a phrase ("job 4 (CLAIMING) and 1
+        open Dexie take(s)"); "" when nothing is open.  A store with open
+        work is not left behind by a config switch."""
+        parts = []
+        job = self.get_active_job()
+        if job is not None:
+            parts.append(f"job {job.id} ({job.status})")
+        with self._lock:
+            open_takes = self._conn.execute(
+                "SELECT COUNT(*) FROM dexie_takes WHERE status IN (?, ?, ?)",
+                (TAKE_SUBMITTING, TAKE_SUBMITTED, TAKE_UNKNOWN)).fetchone()[0]
+        if open_takes:
+            parts.append(f"{int(open_takes)} open Dexie take(s)")
+        return " and ".join(parts)
+
+    def last_written_at(self) -> Optional[str]:
+        """[review] The newest ``updated_at`` across jobs and takes -- when
+        this store last changed; None for a store that never held either.
+        A store idle but recently written stays named for the engine's
+        accounting scans (service._RETAINED_LINGER_S)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(t) FROM (SELECT MAX(updated_at) AS t FROM warp_jobs "
+                "UNION ALL SELECT MAX(updated_at) AS t FROM dexie_takes)").fetchone()
+        return str(row[0]) if row is not None and row[0] else None
+
     def list_jobs(self, limit: int = 50) -> list[WarpJob]:
         """Most-recent jobs first (open and closed), for the GUI table."""
         with self._lock:
@@ -709,13 +773,21 @@ class WarpJobStore:
     def settle_take(self, trade_id: str, status: str,
                     error: Optional[str] = None,
                     confirmed_height: Optional[int] = None) -> DexieTake:
-        """Move an open take to ``confirmed`` or ``failed``, once. Only a
-        ``submitted`` take (one with a wallet trade record) can confirm."""
-        if status not in (TAKE_CONFIRMED, TAKE_FAILED):
+        """Move an open take to ``confirmed``, ``failed`` or ``unknown``,
+        once. Only a take with a wallet trade record (``submitted``, or
+        ``unknown`` after one) can confirm; ``unknown`` is the open state of
+        a take whose outcome the planner stopped waiting for, and stamps
+        ``unknown_since`` -- the release clock :meth:`take_still_live`
+        restarts on every pending read."""
+        if status not in (TAKE_CONFIRMED, TAKE_FAILED, TAKE_UNKNOWN):
             raise WarpJobStoreError(f"a take cannot settle as {status!r}")
         take = self.get_take(trade_id)
-        allowed = ((TAKE_SUBMITTED,) if status == TAKE_CONFIRMED
-                   else (TAKE_SUBMITTED, TAKE_SUBMITTING))
+        if status == TAKE_CONFIRMED:
+            allowed: tuple = (TAKE_SUBMITTED, TAKE_UNKNOWN)
+        elif status == TAKE_FAILED:
+            allowed = (TAKE_SUBMITTED, TAKE_SUBMITTING, TAKE_UNKNOWN)
+        else:
+            allowed = (TAKE_SUBMITTED, TAKE_SUBMITTING)
         if take.status not in allowed:
             raise StaleJobError(
                 f"Dexie take {take.trade_id} is {take.status}; cannot settle "
@@ -724,13 +796,31 @@ class WarpJobStore:
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE dexie_takes SET status = ?, updated_at = ?, "
-                "confirmed_at = ?, confirmed_height = ?, last_error = ? "
-                "WHERE trade_id = ? AND status = ?",
+                "confirmed_at = ?, confirmed_height = ?, last_error = ?, "
+                "unknown_since = ? WHERE trade_id = ? AND status = ?",
                 (status, now, now if status == TAKE_CONFIRMED else None,
                  confirmed_height if status == TAKE_CONFIRMED else None,
-                 error, take.trade_id, take.status),
+                 error, now if status == TAKE_UNKNOWN else None,
+                 take.trade_id, take.status),
             )
         return self.get_take(take.trade_id)
+
+    def take_still_live(self, trade_id: str) -> DexieTake:
+        """[review] An ``unknown`` take whose trade record read as live
+        (PENDING_*) on this pass: ``unknown_since`` restarts, so the release
+        needs a full run of unreadable lookups after this sighting, never
+        one unanswered lookup on an old take."""
+        tid = _norm_hex(trade_id)
+        now = self._now()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE dexie_takes SET unknown_since = ?, updated_at = ? "
+                "WHERE trade_id = ? AND status = ?",
+                (now, now, tid, TAKE_UNKNOWN),
+            )
+            if cur.rowcount != 1:
+                raise StaleJobError(f"Dexie take {tid} is not unknown")
+        return self.get_take(tid)
 
     # -- meta (portal-coin hint, schema version, misc singletons) ------------ #
 
@@ -766,7 +856,8 @@ class WarpJobStore:
 
 _TAKE_COLUMNS = (
     "id, trade_id, offer_id, created_at, updated_at, asset_id, cat_mojos, "
-    "xch_mojos, fee_mojos, status, confirmed_at, last_error, confirmed_height"
+    "xch_mojos, fee_mojos, status, confirmed_at, last_error, confirmed_height, "
+    "unknown_since"
 )
 
 
@@ -785,6 +876,7 @@ def _row_to_take(row: sqlite3.Row) -> DexieTake:
         last_error=row["last_error"],
         confirmed_height=(int(row["confirmed_height"])
                           if row["confirmed_height"] is not None else None),
+        unknown_since=row["unknown_since"],
     )
 
 

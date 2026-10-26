@@ -106,6 +106,10 @@ class FakeEngine:
     def _resolve_cat_wallet_id(self, asset_id=None):
         return 9
 
+    def _unwrap_xch_budget(self):
+        return self._net.chia_toll_mojos + 2 * int(
+            getattr(self._params, "unwrap_chia_fee_mojos", 0) or 0)
+
     def _cat_wallet_ids(self, asset_id=None):
         return list(self.cat_wallets)
 
@@ -241,7 +245,166 @@ def test_an_unreadable_take_stays_in_flight_then_fails_after_an_hour(monkeypatch
     assert w._settle_dexie_takes(eng) is True
     monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_FAIL_S + 1)
     assert w._settle_dexie_takes(eng) is False
+    # [review] Not failed: its transactions are not proven dead, so the
+    # engine's guard keeps protecting its wallets ("unknown").
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+    assert w._settle_dexie_takes(eng) is False
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_RELEASE_S + 1)
+    w._settle_dexie_takes(eng)
     assert eng._store.get_take(OUR_TID).status == J.TAKE_FAILED
+
+
+def test_an_unknown_take_settles_for_real_once_its_record_reads(monkeypatch):
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    w._maybe_rebalance(eng)
+    real = eng._wallet.get_offer
+
+    def lost(trade_id):
+        raise RuntimeError("trade not found")
+
+    eng._wallet.get_offer = lost
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_FAIL_S + 1)
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+    eng._wallet.get_offer = real
+    eng._wallet.trade_status = "CONFIRMED"
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_CONFIRMED
+
+
+def test_a_readable_pending_unknown_take_is_never_released(monkeypatch):
+    """[review] PENDING_* is positive evidence the take is live: it stays
+    open (protected) past the release age, until confirmed or failed."""
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    w._maybe_rebalance(eng)
+    real = eng._wallet.get_offer
+
+    def lost(trade_id):
+        raise RuntimeError("trade not found")
+
+    eng._wallet.get_offer = lost
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_FAIL_S + 1)
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+    eng._wallet.get_offer = real
+    eng._wallet.trade_status = "PENDING_CONFIRM"
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_RELEASE_S + 1)
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+    eng._wallet.trade_status = "CONFIRMED"
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_CONFIRMED
+
+
+def test_a_pending_read_restarts_the_unknown_takes_release_clock(monkeypatch):
+    """[review] The release clock is the take's own unknown-duration stamp,
+    restarted by every readable PENDING_* record: one unanswered lookup
+    after a pending one releases nothing, however old the take; a full day
+    of unreadable lookups after the last pending read does."""
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    clock = ["t0"]
+    eng._store._now = lambda: clock[0]
+    w._maybe_rebalance(eng)                                  # created_at t0
+    ages = {}
+    monkeypatch.setattr(S, "_age_s", lambda iso: ages.get(iso, 0.0))
+    real = eng._wallet.get_offer
+    eng._wallet.get_offer = lambda tid: (_ for _ in ()).throw(RuntimeError("lost"))
+    clock[0], ages["t0"] = "t1", S._TAKE_UNKNOWN_FAIL_S + 1
+    w._settle_dexie_takes(eng)
+    take = eng._store.get_take(OUR_TID)
+    assert take.status == J.TAKE_UNKNOWN and take.unknown_since == "t1"
+    clock[0] = "t2"
+    eng._wallet.get_offer = real
+    eng._wallet.trade_status = "PENDING_CONFIRM"
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).unknown_since == "t2", "restarted by the pending read"
+    # The take and its first unknown stamp are a day old; the pending read
+    # was a minute ago.  One lost lookup releases nothing.
+    eng._wallet.get_offer = lambda tid: (_ for _ in ()).throw(RuntimeError("lost"))
+    ages.update({"t0": S._TAKE_UNKNOWN_RELEASE_S + 1, "t1": S._TAKE_UNKNOWN_RELEASE_S + 1,
+                 "t2": 60.0})
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+    ages["t2"] = S._TAKE_UNKNOWN_RELEASE_S + 1                # a day unreadable since t2
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_FAILED
+
+
+def test_an_older_takes_table_gains_the_added_columns(tmp_path):
+    """[review] A jobs database whose dexie_takes predates confirmed_height
+    and unknown_since is read and written by this store: the columns are
+    added on open, and the unknown clock works on it."""
+    import sqlite3
+
+    path = tmp_path / "warp_jobs.db"
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+CREATE TABLE dexie_takes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id TEXT NOT NULL UNIQUE,
+    offer_id TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    asset_id TEXT NOT NULL, cat_mojos INTEGER NOT NULL, xch_mojos INTEGER NOT NULL,
+    fee_mojos INTEGER NOT NULL, status TEXT NOT NULL, confirmed_at TEXT, last_error TEXT
+);
+INSERT INTO dexie_takes(trade_id, offer_id, created_at, updated_at, asset_id,
+                        cat_mojos, xch_mojos, fee_mojos, status)
+VALUES ('aa', 'bb', 't0', 't0', 'cc', 1, 2, 3, 'submitted');
+""")
+    conn.close()
+    clock = ["t1"]
+    with J.WarpJobStore(path, now=lambda: clock[0]) as store:
+        take = store.get_take("aa")
+        assert take.confirmed_height is None and take.unknown_since is None
+        assert store.settle_take("aa", J.TAKE_UNKNOWN, error="lost").unknown_since == "t1"
+        clock[0] = "t2"
+        assert store.take_still_live("aa").unknown_since == "t2"
+        done = store.settle_take("aa", J.TAKE_CONFIRMED, confirmed_height=5)
+        assert done.unknown_since is None and done.confirmed_height == 5
+        with pytest.raises(J.StaleJobError):
+            store.take_still_live("aa")                      # not unknown any more
+
+
+def test_unknown_takes_select_the_configured_key_first(monkeypatch):
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    w._maybe_rebalance(eng)
+    eng._wallet.get_offer = lambda tid: (_ for _ in ()).throw(RuntimeError("lost"))
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_FAIL_S + 1)
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+    calls = []
+    eng._wallet.log_in = lambda: calls.append(1) or (_ for _ in ()).throw(
+        RuntimeError("daemon unreachable"))
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_RELEASE_S + 1)
+    with pytest.raises(RuntimeError):
+        w._settle_dexie_takes(eng)
+    assert calls and eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+
+
+def test_settlement_without_an_engine_still_processes_unknown_takes(monkeypatch):
+    """[review] With Warp disabled, only the engine-less path settles or
+    releases an unknown take; its gate must see them."""
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    w._maybe_rebalance(eng)
+    eng._wallet.get_offer = lambda tid: (_ for _ in ()).throw(RuntimeError("lost"))
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_FAIL_S + 1)
+    w._settle_dexie_takes(eng)
+    assert eng._store.get_take(OUR_TID).status == J.TAKE_UNKNOWN
+    seen = []
+    monkeypatch.setattr(w, "_settle_dexie_takes", lambda e: seen.append(e))
+    monkeypatch.setattr(S, "_job_db_path", lambda cfg, anchor=None: "x.db")
+    monkeypatch.setattr(S.Path, "is_file", lambda self: True)
+    monkeypatch.setattr(S, "WarpJobStore", lambda p: eng._store)
+    monkeypatch.setattr(w, "_chia_wallet_client", lambda: eng._wallet)
+    monkeypatch.setattr(w, "_config_home", lambda: ".")
+    msgs = []
+    monkeypatch.setattr(S._log, "debug", lambda *a, **k: msgs.append(a))
+    w._settle_takes_without_engine()
+    assert len(seen) == 1, msgs
 
 
 def test_takes_settle_even_with_the_source_switched_off(monkeypatch):
@@ -366,7 +529,7 @@ def test_the_intent_is_recorded_before_the_take(monkeypatch):
     # An hour later, unresolved, it settles as failed.
     monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_FAIL_S + 1)
     assert w._settle_dexie_takes(eng) is False
-    assert eng._store.list_takes()[0].status == J.TAKE_FAILED
+    assert eng._store.list_takes()[0].status == J.TAKE_UNKNOWN
 
 
 def test_an_accepted_take_is_rekeyed_to_the_wallet_trade_id(monkeypatch):
@@ -747,3 +910,26 @@ def test_completed_offers_of_ours_are_excluded_too():
     ids = WalletClient({}, poster=poster).get_my_offer_trade_ids()
     assert ids == {"c" * 64}
     assert bodies[0]["include_completed"] is True
+
+
+def test_settlement_reads_every_open_take_not_a_page(monkeypatch):
+    """[review] Fifty newer unknown takes must not hide an older one from
+    settlement for good."""
+    _http(monkeypatch)
+    w, eng = _worker(_params(buy=True)), FakeEngine()
+    w._maybe_rebalance(eng)
+    eng._wallet.get_offer = lambda tid: (_ for _ in ()).throw(RuntimeError("lost"))
+    monkeypatch.setattr(S, "_age_s", lambda iso: S._TAKE_UNKNOWN_FAIL_S + 1)
+    w._settle_dexie_takes(eng)
+    seen = []
+    real = eng._store.list_takes
+
+    def spy(status=None, limit=50):
+        seen.append((status, limit))
+        return real(status=status, limit=limit)
+
+    eng._store.list_takes = spy
+    w._settle_dexie_takes(eng)
+    assert (J.TAKE_SUBMITTING, -1) in seen
+    assert (J.TAKE_SUBMITTED, -1) in seen
+    assert (J.TAKE_UNKNOWN, -1) in seen

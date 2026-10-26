@@ -90,7 +90,9 @@ is completely untouched.
   `wallet_key_path`). No new Chia config is needed. wUSDC.b lands in this wallet.
 - **A little XCH** in that wallet for the claim fee (default 0.0001 XCH per claim,
   `claim_fee_mojos`) plus the attested amount, which is sent to the ephemeral
-  claim coin and comes back to you as wUSDC.b.
+  claim coin and comes back to you as wUSDC.b, plus the funding send's own
+  network fee (automatic by default: at least `strategy.offer_fee_mojos`,
+  raised to the node's estimate when the mempool demands it).
 - **A Base RPC endpoint.** The public `https://mainnet.base.org` works but rate
   limits; a free Alchemy/Infura Base key in `base_rpc_url` is more reliable.
 - **A little ETH on Base** in the hot wallet for gas: each bridge spends the
@@ -296,8 +298,12 @@ Only after a clean `DRY_RUN_OK`.
    COMPLETED`.
 4. Check at each stage: the approve and bridge transactions confirm on BaseScan;
    `MESSAGE_SENT` attests the exact post-tip amount; `FUNDING_CLAIM` sends
-   **exactly one** funding transaction (verify in your Chia wallet); signatures
-   reach 6 of 10; the wUSDC.b lands at the receiver on SpaceScan.
+   **one** funding transaction (verify in your Chia wallet) and sends it again
+   only when the chain proves the first can never confirm (a coin it spent went
+   to another transaction), or when you Retry a job whose send vanished from
+   the wallet and the mempool; every attempt stays on the job's books until it
+   is ruled out; signatures reach 6 of 10; the wUSDC.b lands at the receiver on
+   SpaceScan.
 5. Only after that succeeds, raise `max_auto_bridge_usdc` incrementally. Leave
    `auto_bridge: false` for at least one more manual round-trip before enabling
    it. Restart to apply any change.
@@ -361,9 +367,15 @@ Right-click a job in the table:
 A **FAILED** job deliberately holds the single active-job slot until you resolve
 it, so a failure can't be silently buried under a new job. **Sweep is the usual escape:**
 a sweep that *resolves* — the coin was recovered, was already spent, or never
-existed — moves the job to **Cancelled** and frees the slot. A sweep that could
-not reach the chain leaves the job FAILED so you can try again with the funds
-still known recoverable.
+existed — moves the job to **Cancelled** and frees the slot, **once every Chia
+send the job ever made is ruled out**: a replaced funding send that is not yet
+proven dead keeps the job open (it is presumed gone after six hours of
+established absence from the wallet and the mempool: the clock starts at the
+first probe that finds it absent, and restarts whenever it is seen alive or a
+probe goes unanswered), and the status cell's tooltip says what Sweep
+found. A sweep that could not reach the chain leaves the job FAILED so you can
+try again with the funds still known recoverable. Sweep is also available on a
+**Completed** job, should a replaced send land after the fact.
 
 Some failures cannot be swept at all. The three attested-terms anchors run
 *after* `bridgeToChia` confirms and *before* the ephemeral key is minted, so a
@@ -394,16 +406,17 @@ claimed through warp.green's own UI (see [Known limitations](#10-known-limitatio
 | `min_auto_bridge_usdc` | `100` | **Auto-bridge floor only.** "Bridge now" ignores it and bridges any positive balance. |
 | `max_auto_bridge_usdc` | *required* | Blast-radius cap. Applies to **manual bridges too**; the excess stays in the hot wallet. There is no default: with `warp.enabled: true` the bridge refuses to start unless this is set, because an absent value previously meant *no cap*, not `10000`. Set `unlimited` to allow any balance. |
 | `claim_fee_mojos` | `100000000` | XCH fee reserved for the Chia claim spend (0.0001 XCH). |
-| `chia_funding_fee_mojos` | `0` | Extra fee on the wallet→claim funding send. |
+| `chia_funding_fee_mojos` | `0` | Fee on the wallet→claim funding send. `0` = automatic: at least `strategy.offer_fee_mojos`, raised to the node's own estimate when the mempool demands it (capped at ten times the floor); a number pins it. |
 | `poll_interval_s` | `15` | How long a healthy "still waiting" step sleeps before it is re-checked. The GUI's own tick cadence (~30 s) is separate and not configurable here. |
 | `coinset_url` | `""` | Override the coinset API base. Blank ⇒ network default. |
+| `jobs_db` | `data/warp_jobs.db` | The bridge's own job database. A relative path anchors at the config file's directory; the engine reads the same file for its stuck-transaction guard (`accounting.bridge_jobs_db_path` follows this key when unset). While an engine started by this GUI runs, the bridge records in *that* engine's jobs database (its config's directory and `jobs_db`), whatever config the GUI has switched to since; a move to another database waits until the current one has no open job or Dexie take (the banner says so), and a `.retained` pointer file beside the configured database names every database still holding work (one per line), so an engine started on the new config guards them all; the engine does not start while such work cannot be named for it. |
 | `chia_receiver_address` | `""` | Where wUSDC.b lands. Blank ⇒ the bot's own wallet address, resolved once at startup and shown in the tab. |
 | `expected_asset_id` | `fa4a180a…a6b7a99d` | Correctness anchor, checked **at startup** before any client is built. A mismatch blocks the engine with a banner. |
 | `max_unwrap_usdc` | *unset* | Unwrap blast-radius cap. Must be stated (or `unlimited`, explicitly) before the Unwrap button does anything. |
 | `rebalance.enabled` | `false` | Target-band rebalancer master switch. Fail-closed: enabling with a malformed block disables it with a banner. |
 | `rebalance.usdc` / `rebalance.eth` | unset | `{target, tolerance_pct}` per asset (USDC units / ETH). Acts only outside the band, back to target: USDC excess bridges, USDC deficit unwraps to the hot wallet (needs `max_unwrap_usdc`), ETH excess wraps to milliETH, ETH deficit unwraps held milliETH. ETH band bottom must clear the relay-gas floor; half-width at least 2x that floor. USDC `tolerance_pct` >= 1 (absorbs the 0.3% unwrap tip) and half-width >= 0.001 USDC (one mojo). **Rollout:** enable the USDC band only after the first live 0.001-USDC micro-unwrap protocol test -- the deficit leg fires real burns. |
 | `rebalance.cooldown_s` | `600` | Minimum seconds between automatic actions (min 60); starts on failure too. |
-| `unwrap_chia_fee_mojos` | `0` | Extra XCH fee on the burn bundle, on top of the 0.001 XCH toll. |
+| `unwrap_chia_fee_mojos` | `0` | XCH fee on the unwrap's cat_spend and on its toll funding send (each). `0` = automatic, as `chia_funding_fee_mojos`; a number pins both. The burn bundle itself is paid by the toll. |
 | `altruistic_relay` | `false` | Opt-in: volunteer this node to deliver **strangers'** stuck xch→bse messages by paying their ~145k relay gas (see [9c](#9c-altruistic-relay--chia-only-unwraps)). |
 | `relay_grace_min` | `30` | Never touch a stuck message younger than this — ~98% are delivered by their own senders within minutes. |
 | `relay_daily_gas_budget_eth` | `0.0002` | Hard daily ceiling on volunteer gas spend. |
@@ -471,8 +484,10 @@ All four are in `SECRET_KEYS`, so a Settings-page save round-trips them into
   Set a private `base_rpc_url`.
 - **Fees, by chain of origin** — the message toll is paid in the SOURCE
   chain's native asset: 0.001 XCH per unwrap burn (consensus-curried into the
-  burn puzzle; it doubles as the bundle's mempool fee, so no separate Chia fee
-  is needed at the default `unwrap_chia_fee_mojos: 0`) and ~0.00001 ETH per
+  burn puzzle; it doubles as the bundle's mempool fee). The cat_spend that
+  creates the burn CAT and the send that funds the toll coin each pay the
+  automatic fee (at least `strategy.offer_fee_mojos`) at the default
+  `unwrap_chia_fee_mojos: 0`, and ~0.00001 ETH per
   wrap (owner-mutable `Portal.messageToll`, read live at signing). The 0.3%
   tip is taken from the bridged asset itself in both directions and needs no
   reserve. Warp's XCH draws (tolls + claim fees) come from SPENDABLE balance

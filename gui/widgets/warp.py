@@ -732,6 +732,19 @@ class WarpWidget(QWidget):
                 f"<br><span style='color:{WARNING_YELLOW};'>Last action failed: "
                 f"{_html.escape(str(action_error))}</span>"
             )
+        elif snap.get("action_notice"):
+            text += (
+                f"<br><span style='color:{TEXT_SECONDARY};'>"
+                f"{_html.escape(str(snap['action_notice']))}</span>"
+            )
+        if snap.get("store_notice"):
+            # [review] A config switch found open work: the store in use is
+            # kept, and the operator reads here why and what the switch waits
+            # for.
+            text += (
+                f"<br><span style='color:{WARNING_YELLOW};'>Job store: "
+                f"{_html.escape(str(snap['store_notice']))}</span>"
+            )
         self._banner.setText(text + badge)
         self._banner.setStyleSheet(
             f"""
@@ -854,8 +867,10 @@ class WarpWidget(QWidget):
             self._bridge_btn.setToolTip(
                 "The last bridge job failed and still holds the single job slot. "
                 "Right-click it in the table: Retry re-attempts it, Sweep recovers "
-                "its funding coin and closes it, and Abandon closes a job neither "
-                "of those can resolve (the recovery details go to the audit log)."
+                "its funding coin and closes the job once every Chia send it made "
+                "is ruled out (the status cell's tooltip shows what Sweep found), "
+                "and Abandon closes a job neither of those can resolve (the "
+                "recovery details go to the audit log)."
             )
         elif active_open:
             self._bridge_btn.setToolTip(
@@ -928,9 +943,21 @@ class WarpWidget(QWidget):
             status = str(job.get("status") or "")
             status_item = QTableWidgetItem(_STATUS_LABELS.get(status, status or "—"))
             status_item.setForeground(_status_brush(status))
+            tips = []
             last_error = job.get("last_error")
             if last_error:
-                status_item.setToolTip(str(last_error))
+                tips.append(str(last_error))
+            # [review] What Sweep found, and the Chia sends still being ruled
+            # out: the reasons a FAILED or COMPLETED-looking job is still open.
+            if job.get("sweep_status"):
+                tips.append(f"Sweep: {job['sweep_status']}")
+            if job.get("attempts_open"):
+                n = int(job["attempts_open"])
+                tips.append(f"{n} replaced Chia send{'s' if n != 1 else ''} not yet "
+                            "ruled out (the job waits for each to be proven dead, "
+                            "or presumed gone after six hours)")
+            if tips:
+                status_item.setToolTip("\n".join(tips))
             table.setItem(row, 0, status_item)
 
             out_mojos = job.get("post_tip_mojos") or job.get("amount_mojos")
@@ -1085,7 +1112,11 @@ class WarpWidget(QWidget):
                 lambda _=False, j=int(job_id): self.job_action_requested.emit(j, "cancel")
             )
             menu.addAction(act_cancel)
-        if status in (_ST_FAILED, _ST_COMPLETED) and job_id is not None:
+        # [review] A cancelled job closed over sends presumed gone keeps Sweep:
+        # their coins are unspent, and one that lands leaves XCH at the key.
+        sweepable = status in (_ST_FAILED, _ST_COMPLETED) or (
+            status == "CANCELLED" and int(job.get("attempts_presumed") or 0) > 0)
+        if sweepable and job_id is not None:
             act_sweep = QAction("Sweep security coin", menu)
             act_sweep.triggered.connect(
                 lambda _=False, j=int(job_id): self.job_action_requested.emit(j, "sweep")

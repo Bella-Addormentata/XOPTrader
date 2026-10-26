@@ -316,3 +316,81 @@ def test_partial_index_exists(store: WarpJobStore):
     ).fetchone()
     assert row is not None
     assert "WHERE active = 1" in row["sql"]
+
+
+def test_schema_migration_runs_under_an_immediate_transaction(tmp_path, monkeypatch):
+    """[review] Two openers of the same older file (the GUI and its worker)
+    must not race the ALTER: the schema statements run under BEGIN
+    IMMEDIATE, so the second opener waits and sees the finished migration --
+    and a duplicate column is tolerated regardless."""
+    import sqlite3 as _sqlite3
+
+    from gui.services.warp import jobs as J
+
+    path = tmp_path / "warp_jobs.db"
+    conn = _sqlite3.connect(path)
+    conn.executescript("""
+CREATE TABLE dexie_takes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id TEXT NOT NULL UNIQUE,
+    offer_id TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    asset_id TEXT NOT NULL, cat_mojos INTEGER NOT NULL, xch_mojos INTEGER NOT NULL,
+    fee_mojos INTEGER NOT NULL, status TEXT NOT NULL, confirmed_at TEXT, last_error TEXT
+);
+""")
+    conn.close()
+
+    executed: list = []
+    real_connect = J.sqlite3.connect
+
+    class Spy:
+        def __init__(self, real):
+            object.__setattr__(self, "_real", real)
+
+        def execute(self, sql, *args):
+            executed.append(str(sql).strip())
+            return self._real.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._real, name, value)
+
+        def __enter__(self):
+            return self._real.__enter__()
+
+        def __exit__(self, *exc):
+            return self._real.__exit__(*exc)
+
+    monkeypatch.setattr(J.sqlite3, "connect", lambda *a, **k: Spy(real_connect(*a, **k)))
+    with J.WarpJobStore(path) as store:
+        assert store.get_take_count() if hasattr(store, "get_take_count") else True
+    first_schema = next(i for i, s in enumerate(executed) if s.startswith("CREATE TABLE"))
+    assert "BEGIN IMMEDIATE" in executed[:first_schema], executed[:first_schema + 1]
+    assert any(s.startswith("ALTER TABLE dexie_takes ADD COLUMN unknown_since") for s in executed)
+    # The second opener finds the column (no ALTER), and one racing an ALTER
+    # anyway (the column already there) is not stopped by it.
+    executed.clear()
+    with J.WarpJobStore(path):
+        pass
+    assert not any(s.startswith("ALTER TABLE") for s in executed)
+    monkeypatch.setattr(J.sqlite3, "connect", real_connect)
+
+    from types import SimpleNamespace
+
+    class BlindSpy(Spy):
+        """A PRAGMA that still reports the columns missing (the other opener
+        added them meanwhile): the ALTER runs, fails as a duplicate, and the
+        store opens all the same."""
+
+        def execute(self, sql, *args):
+            if str(sql).startswith("PRAGMA table_info"):
+                executed.append(str(sql).strip())
+                return SimpleNamespace(fetchall=lambda: [])
+            return super().execute(sql, *args)
+
+    executed.clear()
+    monkeypatch.setattr(J.sqlite3, "connect", lambda *a, **k: BlindSpy(real_connect(*a, **k)))
+    with J.WarpJobStore(path) as store:
+        assert store.list_takes() == []
+    assert any(s.startswith("ALTER TABLE dexie_takes ADD COLUMN unknown_since") for s in executed)

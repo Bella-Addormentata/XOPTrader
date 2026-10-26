@@ -35,7 +35,12 @@ from gui.services.config_split import split_and_save
 from gui.services.database_service import DatabaseService
 from gui.services.metrics_service import MetricsService
 from gui.services.wallet_service import WalletService
-from gui.services.warp.service import WarpService
+from gui.services.warp.service import (
+    ATTACHED_ENGINE_STORE,
+    RetainedPointerError,
+    WarpService,
+    publish_retained_pointer,
+)
 
 # ---------------------------------------------------------------------------
 # Module-level logger and constants
@@ -635,6 +640,16 @@ class EngineBridge(QObject):
         # [LIVECFG] The settings a running engine cannot adopt take effect
         # for the GUI at the same moment as for the engine: now.
         self._follow_restart_only_settings()
+        # [review] BEFORE the launch: the engine's startup cleanup runs
+        # against the store beside this config, and a store the warp worker
+        # still records in elsewhere must already be named there -- or the
+        # engine does not start (fail closed).
+        blocked = self._publish_retained_warp_store()
+        if blocked:
+            self.error.emit(
+                f"Engine not started: {blocked}; finish or close that work, or start "
+                "the engine on the config it was started under.")
+            return
         if self._start_engine_process():
             _log.info("Engine started via start_engine().")
             self.engine_launched.emit()
@@ -688,6 +703,82 @@ class EngineBridge(QObject):
         except OSError as exc:
             _log.error("Failed to create pause flag: %s", exc)
             self.error.emit(f"Could not pause trading: {exc}")
+
+    def _configured_warp_db(self) -> Optional[str]:
+        """[review] The jobs database an engine launched on the CURRENT config
+        guards: ``warp.jobs_db`` resolved against the config's directory, as
+        the engine resolves it (config.cpp follow_warp_jobs_db) and as the
+        warp worker does (service._job_db_path)."""
+        try:
+            from gui.services.warp.service import _job_db_path
+
+            return str(_job_db_path(self._config_svc.get_full_config(),
+                                    anchor=self._config_path.parent))
+        except Exception as exc:  # noqa: BLE001 -- unknown: the worker follows the GUI
+            _log.debug("could not resolve the warp jobs database (%s)", exc)
+            return None
+
+    def _publish_retained_warp_store(self) -> Optional[str]:
+        """[review] Synchronously, before an engine starts on the current
+        config and as the GUI switches to it: if the store the warp worker
+        has been recording in -- the one the previous engine was launched
+        with, or the one the worker last reported -- still holds open work
+        and is not the one the new engine guards, name it beside the new one
+        NOW (service.publish_retained_pointer), so the engine's first cleanup
+        already guards it.  The worker publishes the same pointer on its own
+        thread; that update is queued, and this closes the window between
+        the launch and it.  Returns None when the engine may start, else why
+        it must not: open work exists in a store it would not guard and the
+        pointer naming that store could not be written (fail closed -- an
+        empty configured store would read as "nothing to protect")."""
+        wanted = self._configured_warp_db()
+        if not wanted:
+            return None
+        snap = self._warp_svc.get_snapshot() or {}
+        # [review] The previous engine's store, the store the previously
+        # configured config used, and the store the worker reports -- and,
+        # through publish_retained_pointer, everything the pointer beside
+        # each of them names: a store kept across an earlier switch must not
+        # be lost at the next one, nor before the worker has reported.
+        candidates = [getattr(self, "_launched_warp_db", None),
+                      getattr(self, "_previous_warp_db", None),
+                      snap.get("store_path")]
+        try:
+            publish_retained_pointer(wanted, [c for c in candidates if c])
+        except RetainedPointerError as exc:
+            _log.error("warp: %s", exc)
+            return str(exc)
+        except Exception as exc:  # noqa: BLE001 -- unknown: fail closed too
+            _log.error("warp: the retained job stores could not be published (%s)", exc)
+            return ("the retained job stores could not be checked or named for the "
+                    f"engine's guard ({exc})")
+        return None
+
+    def _sync_warp_engine_store(self) -> None:
+        """[review] Tell the warp worker which jobs database the engine WE
+        launched guards (None when none runs): the one resolved from the
+        LAUNCHED config at launch (_launched_warp_db) -- directory and
+        warp.jobs_db both, since the GUI's current config may name another
+        file.  The worker records there while that engine runs; a send
+        recorded elsewhere would be unprotected from its stuck-transaction
+        cleanup.  Cheap; called at every engine start and stop, on a config
+        switch, and from the master tick (an engine that died on its own is
+        noticed there)."""
+        running = self.engine_running_locally and self.launched_config_path is not None
+        if running:
+            store = getattr(self, "_launched_warp_db", None)
+        elif self._is_engine_reachable():
+            # [review] An engine this GUI did not start answers on the
+            # metrics endpoint (a service manager, a shell): its config is
+            # unknown, so the worker pins the store it uses now rather than
+            # move reservations away from a guard whose path it cannot see.
+            store = ATTACHED_ENGINE_STORE
+        else:
+            store = None
+        try:
+            self._warp_svc.set_engine_store(store)
+        except Exception as exc:  # noqa: BLE001 -- never break the caller
+            _log.debug("warp engine-store sync failed: %s", exc)
 
     @property
     def launched_config_path(self):
@@ -1035,6 +1126,10 @@ class EngineBridge(QObject):
             # Path unchanged; just reload in case the file changed on disk.
             self.reload_config()
             return
+        # [review] The store this config has been using: a candidate for the
+        # retained-store pointer beside the new one, with everything ITS own
+        # pointer names (_publish_retained_warp_store).
+        previous_warp_db = self._configured_warp_db()
 
         _log.info(
             "Config path changed: %s → %s",
@@ -1049,6 +1144,24 @@ class EngineBridge(QObject):
             # pointing into the previous config's directory -- handing
             # consumers a new config paired with the old database.
             self._apply_configured_database_path()
+            # [review] The warp worker's anchor too: its jobs database is
+            # config-relative as well, and the C++ engine (restarted on the
+            # new config) reads the store beside THAT config for its
+            # stuck-transaction guard -- both must move together, or a live
+            # warp send is recorded where the engine does not look.  While
+            # an engine of ours still runs on the PREVIOUS config, the worker
+            # keeps recording in THAT engine's jobs database
+            # (_sync_warp_engine_store): the running engine's guard reads
+            # nothing else.
+            self._warp_svc.set_secrets_path(resolved.parent / "secrets.yaml")
+            self._previous_warp_db = previous_warp_db
+            self._sync_warp_engine_store()
+            # [review] The previous engine's store may hold open work: name
+            # it beside this config's store now, so an engine started here
+            # later -- or a GUI reopened here -- finds it at once.
+            blocked = self._publish_retained_warp_store()
+            if blocked:
+                self.error.emit(f"Warp: {blocked}")
         if success:
             _log.info("Config path updated and reloaded.")
         else:
@@ -1153,6 +1266,7 @@ class EngineBridge(QObject):
         # warp is disabled or has no active job; overlapping ticks are
         # dropped by the service's in-flight guard.
         if self._tick_count % 6 == 5:
+            self._sync_warp_engine_store()
             self._warp_svc.tick()
 
         # [LIVECFG] The engine's answer to a Settings save, once it lands.
@@ -1417,6 +1531,12 @@ class EngineBridge(QObject):
                 self._launched_config_path = (
                     self._config_path if self._config_path.is_file() else None
                 )
+                # [review] ...and the jobs database it guards, resolved NOW
+                # from this config: the GUI may switch to a config naming
+                # another one while this engine runs.
+                self._launched_warp_db = (
+                    self._configured_warp_db() if self._launched_config_path else None
+                )
                 # [LIVECFG] A reload still waiting was addressed to the
                 # engine this one replaces, and this one loads the saved file
                 # whole at startup. An answer the old engine left behind
@@ -1427,6 +1547,7 @@ class EngineBridge(QObject):
                               self._reload_request_id)
                 self._reload_request_id = None
                 self._reload_deferred_reported = False
+                self._sync_warp_engine_store()
                 self._engine_keep_supported = keep_supported
                 self._engine_binary_path = engine_path
                 self._engine_keep_reprobed = False
@@ -1451,6 +1572,7 @@ class EngineBridge(QObject):
                 self._engine_process = None
                 self._engine_keep_supported = False
                 self._engine_binary_path = None
+                self._sync_warp_engine_store()
 
         return False
 
@@ -1552,6 +1674,7 @@ class EngineBridge(QObject):
         self._engine_launch_dir = None
         self._engine_keep_supported = False
         self._engine_binary_path = None
+        self._sync_warp_engine_store()
         return outcome
 
     def _stop_running_engine(

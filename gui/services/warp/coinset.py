@@ -18,7 +18,7 @@ on the way in (matching the RPC's expectation), so callers never juggle prefixes
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 # (url, json_body) -> parsed JSON dict.
 Poster = Callable[[str, dict], dict]
@@ -180,6 +180,7 @@ class CoinsetClient:
     # is the expected answer while a job waits on confirmation.
     _NOT_FOUND = ("COIN_RECORD_NOT_FOUND",)
     _NOT_SPENT = ("PUZZLE_SOLUTION_FAILED",)
+    _NOT_IN_MEMPOOL = ("TX_NOT_IN_MEMPOOL",)
 
     def get_blockchain_state(self) -> dict:
         data = self._post("get_blockchain_state", {}) or {}
@@ -227,6 +228,29 @@ class CoinsetClient:
         # no benign-code mapping needed.
         data = self._post("get_coin_records_by_puzzle_hash", body) or {}
         return [_coin_record(r) for r in (data.get("coin_records") or [])]
+
+    def get_mempool_item_by_tx_id(self, tx_id: str) -> Optional[dict]:
+        """The node's mempool item for a spend bundle, or ``None`` when the
+        mempool does not hold it (a benign answer: the bundle confirmed, was
+        evicted, or was never broadcast). The item carries ``removals`` and
+        ``additions`` as coin dicts and the bundle's ``fee`` and ``cost``."""
+        data = self._post(
+            "get_mempool_item_by_tx_id", {"tx_id": _0x(tx_id)},
+            empty_codes=self._NOT_IN_MEMPOOL,
+        )
+        if data is None:
+            return None
+        item = data.get("mempool_item")
+        return item if isinstance(item, dict) else None
+
+    def get_fee_estimate(self, *, cost: int, target_times: Sequence[int]) -> list[int]:
+        """The node's fee estimates (mojos) for a bundle of ``cost`` to be
+        included within each of ``target_times`` seconds, in that order."""
+        data = self._post(
+            "get_fee_estimate",
+            {"cost": int(cost), "target_times": [int(t) for t in target_times]},
+        ) or {}
+        return [max(0, int(e)) for e in (data.get("estimates") or [])]
 
     def get_puzzle_and_solution(self, coin_id: str, height: int) -> CoinSolution:
         data = self._post(

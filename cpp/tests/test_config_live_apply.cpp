@@ -204,6 +204,30 @@ TEST(ConfigLiveApply, turning_the_ledger_on_waits_turning_it_off_does_not)
     EXPECT_FALSE(plan.merged.accounting.ledger_enabled);
 }
 
+TEST(ConfigLiveApply, the_warp_jobs_database_is_restart_only)
+{
+    // [review] The stuck-transaction guard reads warp.jobs_db, and the GUI's
+    // warp worker records in the database this engine was LAUNCHED with: a
+    // guard moved live would read an empty file as "nothing to protect".
+    const auto running = running_config();
+    auto saved = running;
+    saved.accounting.warp_jobs_db_path   = "elsewhere/warp.db";
+    saved.accounting.bridge_jobs_db_path = "elsewhere/warp.db";
+    const auto plan = xop::plan_live_config(running, saved);
+    EXPECT_TRUE(lists(plan.restart_required, "warp.jobs_db"));
+    EXPECT_TRUE(lists(plan.restart_required, "accounting.bridge_jobs_db_path"));
+    EXPECT_EQ(plan.merged.accounting.warp_jobs_db_path,
+              running.accounting.warp_jobs_db_path);
+    EXPECT_EQ(plan.merged.accounting.bridge_jobs_db_path,
+              running.accounting.bridge_jobs_db_path);
+    // The switch itself applies live: an existing database is always read.
+    auto toggled = running;
+    toggled.accounting.warp_enabled = !running.accounting.warp_enabled;
+    const auto live = xop::plan_live_config(running, toggled);
+    EXPECT_TRUE(live.restart_required.empty());
+    EXPECT_EQ(live.merged.accounting.warp_enabled, toggled.accounting.warp_enabled);
+}
+
 TEST(ConfigLiveApply, a_retained_revive_pair_still_refuses_batching)
 {
     // The file drops a Revive pair and turns batching on: fine on its own,

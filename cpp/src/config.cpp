@@ -24,6 +24,7 @@
 // disagree about the threshold.
 #include "xop/execution/offer_min_input_coin.hpp"
 
+#include <filesystem>
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
 
@@ -3362,7 +3363,59 @@ AccountingConfig parse_accounting(const YAML::Node& root)
     const std::string sec = "accounting";
     AccountingConfig cfg;  // All fields have sensible defaults.
 
+    // [WARP-LOST-SEND 2026-10-25] The jobs database the GUI actually opens is
+    // warp.jobs_db (gui/services/warp/service.py _job_db_path); the engine's
+    // own key, accounting.bridge_jobs_db_path, defaults to the same file.
+    // When only the GUI's key is set, follow it: the bridge accounting and
+    // the stuck-transaction guard would otherwise read a database no job is
+    // written to -- and the guard would let a wallet-wide delete through
+    // while a warp send is in flight.  Both set and different is a warning:
+    // the engine's key wins, as before.
+    const auto follow_warp_jobs_db = [&](bool explicit_engine_path) {
+        const YAML::Node warp = root["warp"];
+        if (!warp || !warp.IsMap()) return;
+        // [review] Whether warp jobs may exist at all: with warp enabled a
+        // missing jobs database is not "no warp", and the engine's
+        // stuck-transaction guard must not read it as such.
+        if (warp["enabled"] && warp["enabled"].IsDefined()
+            && !warp["enabled"].IsNull()) {
+            try {
+                cfg.warp_enabled = warp["enabled"].as<bool>();
+            } catch (const YAML::Exception&) {
+                cfg.warp_enabled = false;
+            }
+        }
+        if (!warp["jobs_db"] || !warp["jobs_db"].IsDefined()
+            || warp["jobs_db"].IsNull()) {
+            return;
+        }
+        std::string gui_path;
+        try {
+            gui_path = warp["jobs_db"].as<std::string>();
+        } catch (const YAML::Exception&) {
+            return;  // not a string: the GUI refuses it too
+        }
+        if (gui_path.empty()) return;
+        // The same two expansions read_string gives the engine's own key,
+        // in the same order: ${VAR} / ${VAR:-default} first, then ~.
+        gui_path = expand_tilde(expand_env_vars(gui_path));
+        // The guard reads the GUI's file whatever the accounting override.
+        cfg.warp_jobs_db_path = gui_path;
+        if (!explicit_engine_path) {
+            cfg.bridge_jobs_db_path = gui_path;
+            spdlog::info("accounting.bridge_jobs_db_path follows warp.jobs_db "
+                         "({})", gui_path);
+        } else if (gui_path != cfg.bridge_jobs_db_path) {
+            spdlog::warn("accounting.bridge_jobs_db_path ({}) differs from "
+                         "warp.jobs_db ({}): the engine reads the former, the "
+                         "GUI writes the latter -- bridge accounting and the "
+                         "stuck-transaction guard see no warp jobs",
+                         cfg.bridge_jobs_db_path, gui_path);
+        }
+    };
+
     if (!root[sec] || !root[sec].IsMap()) {
+        follow_warp_jobs_db(/*explicit_engine_path=*/false);
         return cfg;
     }
     const YAML::Node& node = root[sec];
@@ -3400,6 +3453,7 @@ AccountingConfig parse_accounting(const YAML::Node& root)
     // operative values (see config.hpp for the measured calibration).
     read_bool("reward_ingest_enabled",  cfg.reward_ingest_enabled);
     read_bool("bridge_ingest_enabled",  cfg.bridge_ingest_enabled);
+    bool explicit_jobs_db = false;
     if (node["bridge_jobs_db_path"] && node["bridge_jobs_db_path"].IsDefined()
         && !node["bridge_jobs_db_path"].IsNull()) {
         // Same treatment as database.path (review round 26): ${VAR}
@@ -3408,7 +3462,9 @@ AccountingConfig parse_accounting(const YAML::Node& root)
         // database that disables ingestion while it reports enabled.
         cfg.bridge_jobs_db_path = expand_tilde(
             read_string(node, "bridge_jobs_db_path", "accounting"));
+        explicit_jobs_db = true;
     }
+    follow_warp_jobs_db(explicit_jobs_db);
     if (node["bridge_asset_id"] && node["bridge_asset_id"].IsDefined()
         && !node["bridge_asset_id"].IsNull()) {
         cfg.bridge_asset_id = node["bridge_asset_id"].as<std::string>();
@@ -5128,6 +5184,20 @@ AppConfig load_config(const std::string& path,
     cfg.fees       = parse_fees(root);
     cfg.inventory_aging = parse_inventory_aging(root);
     cfg.accounting = parse_accounting(root);
+    // [review] The GUI anchors a relative warp.jobs_db at the config file's
+    // directory (gui/services/warp/service.py _job_db_path); the engine must
+    // open the SAME file whatever its working directory, or its
+    // stuck-transaction guard protects a database no job is written to.
+    {
+        const std::filesystem::path base = std::filesystem::path(path).parent_path();
+        for (std::string* p : {&cfg.accounting.bridge_jobs_db_path,
+                               &cfg.accounting.warp_jobs_db_path}) {
+            const std::filesystem::path db(*p);
+            if (!db.empty() && db.is_relative() && !base.empty()) {
+                *p = (base / db).lexically_normal().string();
+            }
+        }
+    }
     cfg.market_data = parse_market_data(root);
 
     // [S27 review round 3] Since usd_per_xch() now prefers the external

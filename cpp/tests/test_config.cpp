@@ -11,6 +11,7 @@
 // ISO/IEC 27001:2022 -- no real secrets in test fixtures.
 // ISO/IEC 5055       -- deterministic tests; no undefined behaviour.
 
+#include <filesystem>
 #include <gtest/gtest.h>
 
 #include <xop/config.hpp>
@@ -30,6 +31,15 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+// [review] A relative jobs-db path anchors at the config file's directory,
+// as the GUI anchors warp.jobs_db.
+static std::string anchored(const std::string& config_path, const char* rel)
+{
+    const auto base = std::filesystem::path(config_path).parent_path();
+    if (base.empty()) return rel;          // a bare file name: CWD-relative stays as given
+    return (base / rel).lexically_normal().string();
+}
 
 namespace {
 
@@ -206,10 +216,147 @@ accounting:
     // [S19] Bridge-ingest keys (review round 5: non-default values so a
     // key rename or conversion regression is caught here, not live).
     EXPECT_FALSE(cfg.accounting.bridge_ingest_enabled);
-    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, "elsewhere/warp.db");
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, anchored(tmp.path(), "elsewhere/warp.db"));
     EXPECT_EQ(cfg.accounting.bridge_asset_id,
               "aabbccddeeff00112233445566778899"
               "aabbccddeeff00112233445566778899");
+}
+
+// [WARP-LOST-SEND 2026-10-25] The engine reads the jobs database the GUI
+// writes: warp.jobs_db when accounting.bridge_jobs_db_path is not set.
+TEST(ConfigParserTest, BridgeJobsDbPath_FollowsWarpJobsDbWhenUnset) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+warp:
+  enabled: false
+  jobs_db: custom/jobs.db
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, anchored(tmp.path(), "custom/jobs.db"));
+
+    // ...and with an accounting section that leaves the key unset.
+    std::string yaml2 = std::string(kMinimalValidYaml) + R"(
+accounting:
+  ledger_enabled: true
+warp:
+  enabled: false
+  jobs_db: custom/jobs.db
+)";
+    TempYaml tmp2(yaml2.c_str());
+    auto cfg2 = xop::load_config(tmp2.path());
+    EXPECT_EQ(cfg2.accounting.bridge_jobs_db_path, anchored(tmp2.path(), "custom/jobs.db"));
+}
+
+TEST(ConfigParserTest, BridgeJobsDbPath_FromWarpExpandsTilde) {
+    const char* home = std::getenv("HOME");
+#ifdef _WIN32
+    if (!home) home = std::getenv("USERPROFILE");
+#endif
+    if (!home) GTEST_SKIP() << "no home directory in this environment";
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+warp:
+  enabled: false
+  jobs_db: ~/warp_jobs.db
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path,
+              std::string(home) + "/warp_jobs.db");
+}
+
+TEST(ConfigParserTest, BridgeJobsDbPath_FromWarpExpandsEnvRefs) {
+    // ${VAR:-default} needs no variable set, so this runs anywhere.
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+warp:
+  enabled: false
+  jobs_db: ${XOP_TEST_UNSET_JOBS_DIR:-elsewhere}/jobs.db
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, anchored(tmp.path(), "elsewhere/jobs.db"));
+}
+
+TEST(ConfigParserTest, BridgeJobsDbPath_AnchorsAtTheConfigDirectory) {
+    // [review] The GUI anchors a relative warp.jobs_db at the config file's
+    // directory; the engine must open the same file from any CWD.
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path("test_config_anchor_dir");
+    fs::create_directories(dir);
+    const fs::path file = dir / "config.yaml";
+    {
+        std::ofstream ofs(file.string());
+        ofs << kMinimalValidYaml << R"(
+warp:
+  enabled: false
+  jobs_db: custom/jobs.db
+)";
+    }
+    auto cfg = xop::load_config(file.string());
+    fs::remove_all(dir);
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path,
+              (dir / "custom/jobs.db").lexically_normal().string());
+    // An absolute path is left alone.
+    const fs::path abs_db = fs::absolute(fs::path("abs_jobs.db"));
+    std::string yaml = std::string(kMinimalValidYaml)
+                       + "\nwarp:\n  enabled: false\n  jobs_db: "
+                       + abs_db.generic_string() + "\n";
+    TempYaml tmp(yaml.c_str());
+    EXPECT_EQ(xop::load_config(tmp.path()).accounting.bridge_jobs_db_path,
+              abs_db.generic_string());
+}
+
+TEST(ConfigParserTest, WarpJobsDbPath_KeepsTheGuiDefaultUnderAnAccountingOverride) {
+    // [review] The guard's file is the GUI's default when warp.jobs_db is
+    // absent, whatever accounting.bridge_jobs_db_path was overridden to.
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+accounting:
+  bridge_jobs_db_path: elsewhere/warp.db
+warp:
+  enabled: true
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, anchored(tmp.path(), "elsewhere/warp.db"));
+    EXPECT_EQ(cfg.accounting.warp_jobs_db_path, anchored(tmp.path(), "data/warp_jobs.db"));
+    // ...and an empty warp.jobs_db keeps the default too.
+    std::string yaml2 = std::string(kMinimalValidYaml) + R"(
+accounting:
+  bridge_jobs_db_path: elsewhere/warp.db
+warp:
+  enabled: true
+  jobs_db: ""
+)";
+    TempYaml tmp2(yaml2.c_str());
+    EXPECT_EQ(xop::load_config(tmp2.path()).accounting.warp_jobs_db_path,
+              anchored(tmp2.path(), "data/warp_jobs.db"));
+}
+
+TEST(ConfigParserTest, WarpEnabledIsReadForTheGuard) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+warp:
+  enabled: true
+  jobs_db: custom/jobs.db
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_TRUE(cfg.accounting.warp_enabled);
+    TempYaml plain(kMinimalValidYaml);
+    EXPECT_FALSE(xop::load_config(plain.path()).accounting.warp_enabled);
+}
+
+TEST(ConfigParserTest, BridgeJobsDbPath_ExplicitEngineKeyWins) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+accounting:
+  bridge_jobs_db_path: elsewhere/warp.db
+warp:
+  enabled: false
+  jobs_db: custom/jobs.db
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, anchored(tmp.path(), "elsewhere/warp.db"));
+    // [review] The guard's file is the GUI's whatever the accounting override.
+    EXPECT_EQ(cfg.accounting.warp_jobs_db_path, anchored(tmp.path(), "custom/jobs.db"));
 }
 
 TEST(ConfigParserTest, BridgeAssetWithoutEnabledPair_AutoDisables) {

@@ -14,6 +14,7 @@ private self-signed CA).
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Optional
 
 # (url, json_body) -> parsed JSON dict.
@@ -122,12 +123,18 @@ class WalletClient:
         *,
         fee_mojos: int = 0,
         memos: Optional[list[str]] = None,
+        exclude_coin_ids: Optional[list[str]] = None,
     ) -> dict:
         """Send XCH; returns the daemon's transaction record (incl. ``transaction_id``).
 
         The caller is responsible for de-duplication (scan by destination puzzle
         hash before sending) -- this method issues one RPC and never retries, so
         a resumed job cannot double-fund by calling it again blindly.
+
+        ``exclude_coin_ids`` keeps named coins out of the daemon's selection
+        (still its own selection, so offer locks are honoured): a send that
+        replaces one that vanished unconfirmed names the first send's coins,
+        so the two can never conflict with each other.
         """
         body: dict[str, Any] = {
             "wallet_id": int(wallet_id),
@@ -137,6 +144,14 @@ class WalletClient:
         }
         if memos:
             body["memos"] = list(memos)
+        if exclude_coin_ids:
+            # The daemon's coin-selection field (tx_config) is
+            # ``excluded_coin_ids``, as the engine's create_offer_for_ids
+            # payload spells it.
+            body["excluded_coin_ids"] = [
+                c if str(c).startswith("0x") else "0x" + str(c)
+                for c in exclude_coin_ids
+            ]
         data = self._post("send_transaction", body)
         tx = data.get("transaction")
         return tx if isinstance(tx, dict) else data
@@ -177,6 +192,7 @@ class WalletClient:
         *,
         fee_mojos: int = 0,
         memos: Optional[list[str]] = None,
+        exclude_coin_ids: Optional[list[str]] = None,
     ) -> dict:
         """Move CAT units to an arbitrary inner puzzle hash (bech32m-encoded).
 
@@ -193,6 +209,11 @@ class WalletClient:
         to an open offer. This omission is the entire coin-conflict mitigation
         (docs/warp-unwrap-design.md §6.1/§7).
 
+        ``exclude_coin_ids`` (the daemon's ``excluded_coin_ids``) keeps named
+        coins OUT of its selection -- still its selection, so offer locks are
+        honoured -- for a replacement of a vanished cat_spend that must not
+        reuse the first one's coins.
+
         Like send_transaction, this issues one RPC and never retries; the
         caller owns de-duplication.
         """
@@ -204,6 +225,11 @@ class WalletClient:
         }
         if memos:
             body["memos"] = list(memos)
+        if exclude_coin_ids:
+            body["excluded_coin_ids"] = [
+                c if str(c).startswith("0x") else "0x" + str(c)
+                for c in exclude_coin_ids
+            ]
         data = self._post("cat_spend", body)
         tx = data.get("transaction")
         return tx if isinstance(tx, dict) else data
@@ -211,6 +237,33 @@ class WalletClient:
     def get_transaction(self, transaction_id: str) -> dict:
         data = self._post("get_transaction", {"transaction_id": str(transaction_id)})
         return data.get("transaction") or {}
+
+    def get_transaction_or_none(self, transaction_id: str) -> Optional[dict]:
+        """The daemon's record of one transaction, or ``None`` when the
+        daemon no longer knows it (deleted, or never recorded). Any other
+        failure still raises: an unanswered lookup is not "gone"."""
+        try:
+            data = self._post(
+                "get_transaction", {"transaction_id": str(transaction_id)})
+        except WalletError as exc:
+            # [review] Only the DAEMON's own answer means "gone": its
+            # success=false form is "<endpoint> failed: <error>".  A transport
+            # failure ("<endpoint> request failed: HTTP 404 Not Found", a
+            # timeout) is re-raised -- an unanswered lookup is not absence,
+            # and reading it as one would let Retry replace a send whose
+            # record was never checked.
+            text = str(exc)
+            low = text.lower()
+            if (re.match(r"^\S+ failed: ", text) and "not found" in low
+                    and "request failed" not in low):
+                return None
+            raise
+        tx = data.get("transaction")
+        return tx if isinstance(tx, dict) else None
+
+    def get_sync_status(self) -> dict:
+        """``{"synced": bool, "syncing": bool, ...}`` from the daemon."""
+        return self._post("get_sync_status", {})
 
     def get_transactions(
         self,

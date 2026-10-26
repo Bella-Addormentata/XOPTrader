@@ -5,6 +5,65 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — the bridge judges its Chia sends instead of assuming them
+
+### Lost Chia sends recovered, and never caused again (#191)
+
+On 2026-10-24 a USDC claim's fee-less funding send spent a coin an engine
+offer also used; the offer's spend landed, the engine's stuck-transaction
+cleanup deleted the wallet's unconfirmed transactions, and the job waited two
+hours for a coin that could never appear.
+
+**Judged, not assumed.** Every Chia send a warp job records (the claim's
+funding coin, an unwrap's toll coin, its cat_spend) is judged each tick from
+the wallet and the chain. A send the chain proves dead is sent again at once;
+one that merely vanished waits for Retry (an XCH funding send) or for proof
+of death (a cat_spend -- two burns can never both confirm). Every attempt
+stays on the job's books until it is proven dead, presumed gone after six
+hours of established absence from the wallet and the mempool (counted from
+the first absent probe, restarted by any sighting or unanswered probe), or
+landed and spent; only then
+does Sweep close the job, a claim complete, or an unwrap finish. Abandon
+records what actually happened.
+
+**Every send pays a fee.** `chia_funding_fee_mojos` and `unwrap_chia_fee_mojos`
+left at `0` are automatic: at least `strategy.offer_fee_mojos`, raised to the
+node's estimate when the mempool demands it. Sends wait for a synced wallet.
+
+**The engine leaves warp's sends alone.** It reads the bridge's job database
+(`warp.jobs_db`, anchored at the config file's directory) each heartbeat and
+excludes any wallet with a warp send in flight -- or a Dexie take whose
+outcome is not yet readable (the new `unknown` take status; the store adds
+its new columns to an older file under one immediate transaction, so two
+openers never race the migration) -- from its
+stuck-transaction cleanup, fails closed when the database cannot be read,
+and keeps that protection across a config switch. The current attempt
+protects its wallet in every active status -- an earlier attempt's coin may
+carry the job forward while it is still confirming -- until the wallet
+drops its record or its own output is on chain at confirmation depth
+(evidence recorded only then, and withdrawn if the coin is reorged away). The bridge records its jobs
+beside the config the running engine was launched with, and a store move
+waits while a job or a Dexie take is open (the banner says so): a pointer
+file beside the configured store names every store still holding work
+(one per line, carrying what the previous store's own pointer named; a
+pointer that cannot be read is left standing and blocks rather than
+vanishing; a store whose work just closed stays named for two days so the
+engine's accounting scans, which read every named store, book what
+finished there) -- written as the
+switch happens and again before any engine is launched on the new config,
+never left to the next tick -- so an engine started on the new config
+guards both from its first cleanup and a GUI restarted on it finds the kept
+work again; an engine is not started at all while open work in another
+store cannot be named for its guard. An `unknown` take is released only
+after a day of unreadable trade-record lookups counted from the last pending
+read, never from its age. While an engine this GUI launched runs, the
+bridge records in the jobs database that engine was launched with -- its
+config's directory and `warp.jobs_db` both -- whatever the GUI's current
+config names (an engine this GUI did not start pins the store configured
+when it was first seen); under a live config save, `warp.jobs_db` and
+`accounting.bridge_jobs_db_path` wait for an engine restart, so the guard's
+database never moves under a running engine.
+
 ## [0.10.31] — 2026-10-24 — a Wallet Link page for the Chia wallet and Sage
 
 ### Settings → Wallet Link (#188)

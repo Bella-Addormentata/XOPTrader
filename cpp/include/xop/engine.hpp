@@ -110,6 +110,9 @@
 // Startup market analysis
 #include "xop/data/market_analyzer.hpp"
 
+// [WARP-LOST-SEND 2026-10-25] Wallets warp has a Chia send in flight on
+#include "xop/execution/warp_send_guard.hpp"
+
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -2942,6 +2945,39 @@ private:
     // than relying on the transaction-scanning heuristic.
     uint32_t consecutive_pending_blocks_{0};
     static constexpr uint32_t kForceDeletePendingBlocks{12};  // ~10 min
+
+    // [WARP-LOST-SEND 2026-10-25] Which wallets the GUI's warp jobs have a
+    // Chia send in flight on, read from warp_jobs.db once per heartbeat
+    // (execution/warp_send_guard.hpp).  Those wallets' pending_change IS
+    // the warp send, so it must not count toward the force-delete, and
+    // neither the periodic prune nor the force-delete may clear their
+    // unconfirmed transactions: on 2026-10-24 the force-delete took a
+    // claim's funding send with it (job 4) and the job stalled for two
+    // hours on a coin that could never appear.  An unreadable database
+    // protects every wallet (fail closed).
+    execution::WarpSendGuard warp_send_guard_{};
+    BlockHeight warp_send_guard_block_{0};
+    bool        warp_send_guard_read_{false};
+    /// [review] warp.enabled with no warp_jobs.db fails closed (the GUI may
+    /// be writing a file this process cannot see), but a HEADLESS engine --
+    /// no GUI, so no file ever -- must not lose its stuck-transaction
+    /// cleanup for good: after this many heartbeats of a missing file the
+    /// absence is read as "no warp", with one warning naming the way out.
+    static constexpr std::uint32_t kWarpDbMissingGraceHeartbeats = 60;
+    std::uint32_t warp_db_missing_heartbeats_{0};
+    bool          warp_db_missing_warned_{false};
+    void refresh_warp_send_guard(BlockHeight block_height, bool fresh = false);
+    /// @p fresh re-reads warp_jobs.db instead of using this heartbeat's
+    /// cached read: the GUI may have reserved a send since (it writes the
+    /// marker BEFORE its wallet RPC), so every destructive RPC asks again
+    /// immediately before it runs.
+    bool wallet_holds_warp_send(std::int64_t wallet_id,
+                                BlockHeight block_height, bool fresh = false);
+    /// [review] Every warp jobs database the accounting scans read: the
+    /// configured one, then each store the GUI names beside the guard's
+    /// database (<warp_jobs_db>.retained: work kept across a config switch,
+    /// finishing there) -- a completion is booked from no other file.
+    std::vector<std::string> warp_store_paths() const;
 
     // -- Wallet unsync auto-recovery [WALLET-RESTART-LIVELOCK 2026-09-22] --
     // Step 8 restarts the wallet service only when

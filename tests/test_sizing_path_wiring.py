@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import os
 import sys
+import inspect
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -88,6 +90,65 @@ def test_switching_config_moves_the_database_path(app, tmp_path):
         assert (tmp_path / "two") in after.parents, (
             f"db path {after} still points at the previous config's directory"
         )
+        # [review] The warp worker's anchor (its jobs database) moves too.
+        assert bridge._warp_svc.secrets_path == second.parent / "secrets.yaml"
+        # [review] ...while the store the worker RECORDS in follows the jobs
+        # database of the engine this GUI launched for as long as it runs --
+        # the one its stuck-transaction guard reads, resolved from the
+        # LAUNCHED config (directory and warp.jobs_db) at launch time.
+        bridge._is_engine_reachable = lambda: False         # no engine of anyone's
+        assert bridge._warp_svc.engine_store is None
+        assert bridge._configured_warp_db() == str(second.parent / "data" / "warp_jobs.db")
+        bridge._engine_process = SimpleNamespace(poll=lambda: None, pid=1)
+        bridge._launched_config_path = first
+        bridge._launched_warp_db = str(first.parent / "data" / "old.db")   # first's jobs_db
+        bridge._sync_warp_engine_store()
+        assert bridge._warp_svc.engine_store == str(first.parent / "data" / "old.db")
+        bridge.update_config_path(str(first))                 # back and forth: unchanged
+        bridge.update_config_path(str(second))
+        assert bridge._warp_svc.engine_store == str(first.parent / "data" / "old.db")
+        bridge._engine_process = None                        # the engine stopped
+        bridge._sync_warp_engine_store()
+        assert bridge._warp_svc.engine_store is None
+        # [review] An engine this GUI did not start (it answers on the metrics
+        # endpoint): the worker is told so and pins the store it uses.
+        from gui.services.warp.service import ATTACHED_ENGINE_STORE
+
+        bridge._is_engine_reachable = lambda: True
+        bridge._sync_warp_engine_store()
+        assert bridge._warp_svc.engine_store == ATTACHED_ENGINE_STORE
+        bridge._is_engine_reachable = lambda: False
+        bridge._sync_warp_engine_store()
+        assert bridge._warp_svc.engine_store is None
+        # [review] Before an engine starts here (and as the GUI switched
+        # here), a previous engine's store with open work is named beside
+        # this config's store, synchronously -- the engine's startup cleanup
+        # must find the pointer, not race the worker's queued update.
+        from gui.services.warp.jobs import WarpJobStore
+        from gui.services.warp.service import _RETAINED_POINTER_SUFFIX
+
+        old = first.parent / "data" / "old.db"
+        with WarpJobStore(old) as store:
+            store.create_job("mainnet", status="FUNDING_CLAIM", state={})
+        bridge._publish_retained_warp_store()
+        pointer = Path(bridge._configured_warp_db() + _RETAINED_POINTER_SUFFIX)
+        assert pointer.read_text(encoding="utf-8").strip() == str(old.resolve())
+        # [review] ...and what the PREVIOUS config's store pointed at is
+        # carried along: a store kept across an earlier switch is not lost
+        # at this one, even before the worker has reported a store.
+        assert bridge._previous_warp_db == str(first.parent / "data" / "warp_jobs.db")
+        kept_before = tmp_path / "x" / "warp_jobs.db"
+        with WarpJobStore(kept_before) as store:
+            store.create_job("mainnet", status="FUNDING_CLAIM", state={})
+        Path(bridge._previous_warp_db + _RETAINED_POINTER_SUFFIX).write_text(
+            f"{kept_before.resolve()}\n", encoding="utf-8")
+        bridge._publish_retained_warp_store()
+        assert pointer.read_text(encoding="utf-8").split() == [
+            str(old.resolve()), str(kept_before.resolve())]
+        src = inspect.getsource(EngineBridge.start_engine)
+        assert src.index("_publish_retained_warp_store()") < src.index("_start_engine_process()")
+        src = inspect.getsource(EngineBridge.update_config_path)
+        assert "_publish_retained_warp_store()" in src
     finally:
         bridge.deleteLater()
         app.processEvents()
@@ -240,3 +301,47 @@ def test_an_absent_or_blank_path_is_refused_in_a_bundle(value):
 
     with pytest.raises(RuntimeError):
         module._require_explicit("config", value)
+
+
+# ---------------------------------------------------------------------------
+# [review] an engine never starts over warp work it could not be told about
+# ---------------------------------------------------------------------------
+
+def test_an_unpublishable_retained_store_blocks_the_engine_launch(app, tmp_path, monkeypatch):
+    """Open work in a store the new engine would not guard, and no way to
+    name it for the guard: the launch does not happen, and the error says
+    so -- never a start whose first cleanup could prune the kept sends."""
+    from gui.services import engine_bridge as eb
+    from gui.services.engine_bridge import EngineBridge
+    from gui.services.warp.service import RetainedPointerError
+
+    cfg = _write_config(tmp_path / "two", "data/xop_trader.db")
+    bridge = EngineBridge(config_path=cfg)
+    try:
+        errors: list = []
+        bridge.error.connect(errors.append)
+        launched: list = []
+        monkeypatch.setattr(bridge, "_start_engine_process",
+                            lambda: launched.append(1) or True)
+
+        def refuse(wanted, candidates):
+            raise RetainedPointerError(
+                "open work (job 1 (FUNDING_CLAIM)) in one/data/old.db could not be named")
+
+        monkeypatch.setattr(eb, "publish_retained_pointer", refuse)
+        bridge.start_engine()
+        assert launched == [], "no launch while the kept store cannot be named"
+        assert errors and "Engine not started" in errors[0] and "old.db" in errors[0]
+        # [review] An unexpected failure of the publication fails closed too.
+        monkeypatch.setattr(eb, "publish_retained_pointer",
+                            lambda wanted, candidates: (_ for _ in ()).throw(
+                                RuntimeError("disk vanished")))
+        bridge.start_engine()
+        assert launched == [] and "disk vanished" in errors[-1]
+        # Nothing to name (or named): the launch proceeds.
+        monkeypatch.setattr(eb, "publish_retained_pointer", lambda wanted, candidates: None)
+        bridge.start_engine()
+        assert launched == [1]
+    finally:
+        bridge.deleteLater()
+        app.processEvents()
