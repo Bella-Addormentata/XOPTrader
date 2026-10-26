@@ -6593,13 +6593,22 @@ def _retained_pointer(wanted: str) -> Optional[Path]:
     return Path(wanted + _RETAINED_POINTER_SUFFIX)
 
 
-def _write_retained_pointer(pointer: Path, held: str) -> None:
-    """Name *held* in *pointer*, atomically (the engine may read it any
-    time); the configured store's directory is created for it."""
+def _norm_store_path(path: str) -> str:
+    """One spelling per store file (the pointer's entries are compared by it)."""
+    try:
+        return str(Path(path).resolve())
+    except Exception:  # noqa: BLE001 -- unresolvable: as given
+        return str(path)
+
+
+def _write_retained_pointer(pointer: Path, paths: Sequence[str]) -> None:
+    """Name *paths* in *pointer*, one per line, atomically (the engine may
+    read it any time); the configured store's directory is created for it."""
     from gui.services.config_split import _atomic_write_text
 
     pointer.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(pointer, str(Path(held).resolve()) + "\n", newline="\n")
+    _atomic_write_text(pointer, "".join(_norm_store_path(p) + "\n" for p in paths),
+                       newline="\n")
 
 
 def _drop_retained_pointer(pointer: Optional[Path]) -> None:
@@ -6612,43 +6621,122 @@ def _drop_retained_pointer(pointer: Optional[Path]) -> None:
         _log.debug("warp: could not remove %s (%s)", pointer, exc)
 
 
-def publish_retained_pointer(wanted: str, candidates: Iterable[str]) -> Optional[str]:
-    """[review] BEFORE an engine that guards *wanted* starts (and as the GUI
-    switches to the config naming it): name beside *wanted* the first store
-    among *candidates* that still holds open work, so the engine's startup
-    cleanup already guards that store -- the worker publishes the same
-    pointer on its own thread, but that update is queued, and a send aged
-    past the prune threshold must not sit unguarded in the window between
-    the launch and it.  Returns the store named, or None when no candidate
-    holds work.  Raises :class:`RetainedPointerError` -- and only that --
-    when a store holds work and the pointer cannot be written: the caller
-    must not launch then.  A store that cannot be read counts as holding
-    work (fail closed), a missing one as holding none."""
+def _read_retained_pointer(pointer: Optional[Path]) -> tuple:
+    """``(entries, failed)``: the stores *pointer* names, or ``failed`` when
+    the file stands but cannot be read -- or names nothing, which is a
+    write that never finished.  Such a pointer is never removed here: a
+    store it named may hold work, and the engine fails closed on it."""
+    if pointer is None or not pointer.exists():
+        return [], False
+    try:
+        text = pointer.read_text(encoding="utf-8")
+    except OSError as exc:
+        _log.warning("warp: could not read %s (%s)", pointer, exc)
+        return [], True
+    entries = [line.strip() for line in text.splitlines() if line.strip()]
+    return entries, not entries
+
+
+def _store_open_work(path: str) -> Optional[str]:
+    """The open work in the store at *path* (:meth:`WarpJobStore.open_work_summary`):
+    "" when it is idle or the file is missing, None when it cannot be read."""
+    if not Path(path).is_file():
+        return ""
+    try:
+        with WarpJobStore(path) as store:
+            return store.open_work_summary()
+    except Exception as exc:  # noqa: BLE001 -- unreadable: unknown
+        _log.warning("warp: could not read the job store %s (%s)", path, exc)
+        return None
+
+
+class RetainedStores:
+    """[review] The result of :func:`sync_retained_pointer`: the stores the
+    pointer beside the configured one now names (resolved paths, in order)
+    with what keeps each (``reasons``), whether the pointer stands but
+    could not be read (``unreadable``: nothing was changed), and a write
+    that failed (``write_error``)."""
+
+    def __init__(self) -> None:
+        self.named: List[str] = []
+        self.reasons: Dict[str, str] = {}
+        self.unreadable: bool = False
+        self.write_error: Optional[str] = None
+
+
+def sync_retained_pointer(wanted: str, candidates: Iterable[str]) -> RetainedStores:
+    """[review] Make the pointer beside *wanted* name EVERY store -- its
+    current entries and *candidates*, *wanted* itself excepted -- that still
+    holds open work or cannot be read (fail closed), one per line, and no
+    other: an engine started on this config guards each of them
+    (engine.cpp refresh_warp_send_guard reads the whole list; it is flat, so
+    a named store's own pointer is never followed and there is no cycle).
+    An entry is dropped only once its store is established idle or gone.
+    Never raises: a pointer that cannot be read is left exactly as it is,
+    and a failed write is reported."""
+    st = RetainedStores()
     pointer = _retained_pointer(wanted)
     if pointer is None:
-        return None
-    for cand in candidates:
-        cand = str(cand or "")
-        if not cand or cand == wanted or _same_path(cand, wanted):
+        return st
+    entries, failed = _read_retained_pointer(pointer)
+    if failed:
+        st.unreadable = True
+        return st
+    keep: Dict[str, str] = {}
+    want_norm = _norm_store_path(wanted)
+    for cand in [*entries, *candidates]:
+        cand = str(cand or "").strip()
+        if not cand:
             continue
-        if not Path(cand).is_file():
+        norm = _norm_store_path(cand)
+        if norm in keep or norm == want_norm or cand == wanted:
             continue
-        try:
-            with WarpJobStore(cand) as store:
-                work = store.open_work_summary()
-        except Exception as exc:  # noqa: BLE001 -- unreadable: kept
-            work = f"work that could not be read ({exc})"
-        if not work:
-            continue
-        try:
-            _write_retained_pointer(pointer, cand)
-        except Exception as exc:  # noqa: BLE001 -- fail closed: the launch waits
-            raise RetainedPointerError(
-                f"open work ({work}) in {cand} could not be named beside {wanted} "
-                f"for the engine's guard ({exc})") from exc
-        _log.info("warp: %s names %s (%s) for the engine's guard", pointer, cand, work)
-        return cand
-    return None
+        work = _store_open_work(cand)
+        if work is None:
+            keep[norm] = "work that could not be read"
+        elif work:
+            keep[norm] = work
+    st.named = list(keep)
+    st.reasons = keep
+    if st.named == [_norm_store_path(e) for e in entries]:
+        return st                                            # as it stands
+    try:
+        if st.named:
+            _write_retained_pointer(pointer, st.named)
+            _log.info("warp: %s names %s for the engine's guard", pointer,
+                      "; ".join(f"{p} ({r})" for p, r in keep.items()))
+        else:
+            _drop_retained_pointer(pointer)
+    except Exception as exc:  # noqa: BLE001 -- reported, never raised
+        st.write_error = str(exc)
+        _log.warning("warp: could not write %s (%s)", pointer, exc)
+    return st
+
+
+def publish_retained_pointer(wanted: str, candidates: Iterable[str]) -> List[str]:
+    """[review] BEFORE an engine that guards *wanted* starts (and as the GUI
+    switches to the config naming it): name beside *wanted* every store
+    among the pointer's entries and *candidates* that still holds open work
+    (:func:`sync_retained_pointer`), so the engine's startup cleanup already
+    guards each of them -- the worker publishes the same pointer on its own
+    thread, but that update is queued, and a send aged past the prune
+    threshold must not sit unguarded in the window between the launch and
+    it.  Returns the stores named ([] when none holds work).  Raises
+    :class:`RetainedPointerError` -- and only that -- when the protection
+    cannot be ensured: the pointer stands but cannot be read, or a store
+    holds work and the pointer cannot be written.  The caller must not
+    launch then."""
+    st = sync_retained_pointer(wanted, candidates)
+    if st.unreadable:
+        raise RetainedPointerError(
+            f"the retained-store pointer beside {wanted} cannot be read (or names "
+            "nothing); the stores it named may hold open work -- fix or remove the "
+            "file by hand once they have none")
+    if st.write_error:
+        raise RetainedPointerError(
+            f"open work in {', '.join(st.named)} could not be named beside {wanted} "
+            f"for the engine's guard ({st.write_error})")
+    return list(st.named)
 
 
 class _WarpWorker(QObject):
@@ -6693,6 +6781,7 @@ class _WarpWorker(QObject):
         # configured one differs (open work must not vanish from monitoring).
         self._store_path: Optional[str] = None
         self._store_hold: str = ""
+        self._store_pinned: bool = False
         self._retained_ok: bool = True
         self._last_wallet_notice: str = ""
         self._rebalance_params = rb.RebalanceParams()
@@ -6816,57 +6905,59 @@ class _WarpWorker(QObject):
         """[review] The jobs database to open: the configured one, unless the
         store last used (another directory's after a config switch, another
         file after a warp.jobs_db change) still holds open work -- an active
-        job, or a Dexie take not yet settled.  That store is kept until the
-        work closes, so no bridge job or take vanishes from monitoring, and
-        the banner says so; a store that cannot be read is kept too (fail
-        closed).  The move is made once nothing is open."""
+        job, or a Dexie take not yet settled -- or cannot be read (fail
+        closed).  That store is kept until the work closes, so no bridge job
+        or take vanishes from monitoring, and the banner says so.  The
+        pointer beside the configured store is synchronised at the same
+        time (sync_retained_pointer): it names every store still holding
+        work, so an engine started on this config guards them all; a GUI
+        restarted on this config resumes the first store it names; a pointer
+        that cannot be read is left alone and blocks instead of vanishing."""
         wanted = self._wanted_store_path()
-        pointer = _retained_pointer(wanted)
         held = getattr(self, "_store_path", None)
-        if not held and pointer is not None and pointer.is_file():
-            # [review] A GUI restarted on this config: the pointer left
-            # beside the configured store names the store kept open last
-            # time, so its open work is found again rather than forgotten.
-            try:
-                held = pointer.read_text(encoding="utf-8").strip() or None
-            except OSError as exc:
-                _log.warning("warp: could not read %s (%s)", pointer, exc)
-                held = None
-        if not held or held == wanted or _same_path(held, wanted):
-            self._store_hold = ""
-            self._retained_ok = True
-            _drop_retained_pointer(pointer)
+        st = sync_retained_pointer(wanted, [held] if held else [])
+        self._retained_ok = not (st.unreadable or st.write_error)
+        if st.unreadable:
+            self._store_pinned = False
+            self._store_hold = (
+                f"the retained-store pointer beside {wanted} cannot be read or names "
+                "nothing; an engine on this config keeps every wallet's cleanup off "
+                "while it stands -- fix or remove the file by hand once the stores it "
+                "named have no open work")
             return wanted
-        try:
-            with WarpJobStore(held) as old:
-                open_work = old.open_work_summary()
-        except Exception as exc:  # noqa: BLE001 -- unreadable: keep it
-            open_work = f"work that could not be read ({exc})"
-        if not open_work:
-            _log.info("warp: the job store moves %s -> %s (nothing open)", held, wanted)
-            self._store_hold = ""
-            self._retained_ok = True
-            _drop_retained_pointer(pointer)
+        use: Optional[str] = None
+        if held and not (held == wanted or _same_path(held, wanted)):
+            if st.reasons.get(_norm_store_path(held)):
+                use = held                                   # ours, still with work
+        elif not held:
+            # [review] A GUI restarted on this config: the pointer left beside
+            # the configured store names the stores kept open last time, so
+            # their open work is found again rather than forgotten.
+            use = st.named[0] if st.named else None
+        use_norm = _norm_store_path(use) if use else None
+        others = [f"{p} ({st.reasons[p]})" for p in st.named if p != use_norm]
+        if use is None:
+            self._store_pinned = False
+            notes = []
+            if others:
+                notes.append("stores still holding work, guarded by an engine on this "
+                             "config: " + "; ".join(others)
+                             + " -- switch to their config to finish them")
+            if st.write_error:
+                notes.append(f"the pointer naming them could not be written ({st.write_error})")
+            self._store_hold = "; ".join(notes)
             return wanted
-        self._store_hold = (f"the bridge keeps its job store {held} until {open_work} "
-                            f"closes; the configured store is {wanted} (an engine "
-                            "started on this config guards both)")
-        # [review] An engine started on this config guards the configured
-        # store; the pointer beside it names the held one, so the engine
-        # guards that too and the held job's already-submitted transactions
-        # (and the sends that finish it) are protected.  A pointer that could
-        # not be written holds new sends instead (fail closed).
-        if pointer is None:
-            self._retained_ok = True
-        else:
-            try:
-                _write_retained_pointer(pointer, held)
-                self._retained_ok = True
-            except Exception as exc:  # noqa: BLE001 -- then sends wait
-                self._retained_ok = False
-                _log.warning("warp: could not write %s (%s); new Chia sends wait "
-                             "while an engine runs on this config", pointer, exc)
-        return held
+        self._store_pinned = True
+        self._store_hold = (f"the bridge keeps its job store {use} until "
+                            f"{st.reasons.get(use_norm, 'its work')} closes; the configured "
+                            f"store is {wanted} (an engine started on this config guards both)")
+        if others:
+            self._store_hold += "; other stores still holding work, guarded too: " + "; ".join(others)
+        if st.write_error:
+            self._store_hold += (f"; the pointer naming them could not be written "
+                                 f"({st.write_error}) -- new Chia sends wait while an engine "
+                                 "runs on this config")
+        return use
 
     def _send_hold_reason(self) -> Optional[str]:
         """[review] Why a NEW Chia send must wait, or None: the store in use
@@ -6877,7 +6968,7 @@ class _WarpWorker(QObject):
         Retry's send included); with no engine of ours running nothing
         cleans the wallet."""
         if (not getattr(self, "_engine_store", None)
-                or not getattr(self, "_store_hold", "")
+                or not getattr(self, "_store_pinned", False)
                 or getattr(self, "_retained_ok", True)):
             return None
         return ("the engine's stuck-transaction guard reads its own job store "
@@ -6946,7 +7037,7 @@ class _WarpWorker(QObject):
             engine.refresh_relay_activity_if_due()
 
         snap = self._guarded(_run)
-        if getattr(self, "_store_hold", "") and self._engine is not None:
+        if getattr(self, "_store_pinned", False) and self._engine is not None:
             # [review] The held store's work closed: the configured store is
             # opened on the next tick.
             try:

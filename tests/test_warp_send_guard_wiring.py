@@ -130,6 +130,10 @@ def test_the_guard_follows_the_retained_store_pointer():
     assert "read_warp_send_guard(retained_db" in body
     assert "/*warp_enabled=*/true" in body, "a named store that is missing is unknown"
     assert body.count("warp_send_guard_.readable = false") >= 3
+    # [review] Every line names a store (a flat list: no pointer is followed
+    # from a named store, so no cycle); an empty list fails closed.
+    assert "while (in && std::getline(in, line))" in body
+    assert "if (named == 0) {" in body
     from gui.services.warp import service as S
     assert S._RETAINED_POINTER_SUFFIX == ".retained"
 

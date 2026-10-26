@@ -21019,20 +21019,28 @@ void Engine::refresh_warp_send_guard(BlockHeight block_height, bool fresh)
         if (pec) {
             warp_send_guard_.readable = false;
         } else if (pointed) {
-            std::string retained_db;
+            // [review] EVERY line names a store (the GUI lists each one still
+            // holding work: the previous engine's, an older one the worker
+            // kept, ...), and each is guarded.  The list is flat -- a named
+            // store's own pointer is never followed -- so there is no cycle;
+            // a line naming a store that cannot be read, or an empty list,
+            // fails closed.
             std::ifstream in(retained_ptr);
-            if (!in || !std::getline(in, retained_db)) retained_db.clear();
-            while (!retained_db.empty()
-                   && (retained_db.back() == '\r' || retained_db.back() == '\n'
-                       || retained_db.back() == ' ' || retained_db.back() == '\t')) {
-                retained_db.pop_back();
-            }
-            if (retained_db.empty()) {
-                warp_send_guard_.readable = false;
-                spdlog::warn("[Engine] {} names no job store; every wallet's "
-                             "unconfirmed transactions are left alone this "
-                             "heartbeat", retained_ptr);
-            } else {
+            std::size_t named = 0;
+            std::string line;
+            while (in && std::getline(in, line)) {
+                while (!line.empty()
+                       && (line.back() == '\r' || line.back() == '\n'
+                           || line.back() == ' ' || line.back() == '\t')) {
+                    line.pop_back();
+                }
+                std::size_t start = 0;
+                while (start < line.size() && (line[start] == ' ' || line[start] == '\t')) {
+                    ++start;
+                }
+                const std::string retained_db = line.substr(start);
+                if (retained_db.empty()) continue;
+                ++named;
                 const auto extra = read_warp_send_guard(retained_db,
                                                         acc.bridge_asset_id,
                                                         /*warp_enabled=*/true);
@@ -21043,6 +21051,12 @@ void Engine::refresh_warp_send_guard(BlockHeight block_height, bool fresh)
                 spdlog::debug("[Engine] warp keeps work in {} (named by {}); "
                               "guarding it too{}", retained_db, retained_ptr,
                               extra.readable ? "" : " -- it could not be read");
+            }
+            if (named == 0) {
+                warp_send_guard_.readable = false;
+                spdlog::warn("[Engine] {} names no job store (or could not be read); "
+                             "every wallet's unconfirmed transactions are left alone "
+                             "this heartbeat", retained_ptr);
             }
         }
     }

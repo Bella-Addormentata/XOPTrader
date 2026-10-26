@@ -3775,9 +3775,9 @@ def test_the_pointer_is_published_as_the_paths_diverge_not_at_the_next_build(tmp
 
 
 def test_publish_retained_pointer_names_the_store_with_open_work(tmp_path):
-    """[review] EngineBridge's pre-launch publish: the first candidate store
+    """[review] EngineBridge's pre-launch publish: every candidate store
     holding open work is named beside the store the new engine guards; a
-    missing or idle store is skipped; nothing to name returns None."""
+    missing or idle store is skipped; nothing to name returns []."""
     from gui.services.warp.jobs import WarpJobStore
 
     wanted = str(tmp_path / "two" / "data" / "warp_jobs.db")
@@ -3789,12 +3789,12 @@ def test_publish_retained_pointer_names_the_store_with_open_work(tmp_path):
         s.record_take(trade_id="aa" * 32, asset_id="bb" * 32, cat_mojos=1,
                       xch_mojos=2, fee_mojos=3)
     pointer = Path(wanted + S._RETAINED_POINTER_SUFFIX)
-    assert S.publish_retained_pointer(wanted, [None, str(idle), wanted]) is None
+    assert S.publish_retained_pointer(wanted, [None, str(idle), wanted]) == []
     assert not pointer.exists()
     assert S.publish_retained_pointer(
-        wanted, [str(tmp_path / "missing.db"), str(idle), str(busy)]) == str(busy)
+        wanted, [str(tmp_path / "missing.db"), str(idle), str(busy)]) == [str(busy.resolve())]
     assert pointer.read_text(encoding="utf-8").strip() == str(busy.resolve())
-    assert S.publish_retained_pointer(":memory:", [str(busy)]) is None
+    assert S.publish_retained_pointer(":memory:", [str(busy)]) == []
 
 
 def test_the_landed_flag_waits_for_depth_and_clears_when_the_coin_vanishes(monkeypatch):
@@ -3852,3 +3852,64 @@ def test_publish_retained_pointer_fails_closed_when_the_pointer_cannot_be_writte
     with pytest.raises(S.RetainedPointerError, match="could not be named"):
         S.publish_retained_pointer(wanted, [str(busy)])
     assert isinstance(S.RetainedPointerError("x"), S.WarpError)
+
+
+def test_every_store_with_open_work_is_named_for_the_guard(tmp_path):
+    """[review] Two stores hold work (the previous engine's and an older one
+    the worker kept): both are named, one per line, so an engine launched on
+    a third config guards both; an entry is dropped only once its store is
+    idle; a worker restarted on that config resumes the first named store."""
+    from gui.services.warp.jobs import WarpJobStore
+
+    a = tmp_path / "a" / "data" / "warp_jobs.db"
+    b = tmp_path / "b" / "data" / "warp_jobs.db"
+    with WarpJobStore(a) as s:
+        s.create_job("mainnet", status=JobStatus.FUNDING_CLAIM, state={})
+    with WarpJobStore(b) as s:
+        s.record_take(trade_id="aa" * 32, asset_id="bb" * 32, cat_mojos=1,
+                      xch_mojos=2, fee_mojos=3)
+    wanted = str(tmp_path / "c" / "data" / "warp_jobs.db")
+    pointer = Path(wanted + S._RETAINED_POINTER_SUFFIX)
+    named = S.publish_retained_pointer(wanted, [str(b), str(a)])
+    assert named == [str(b.resolve()), str(a.resolve())]
+    assert pointer.read_text(encoding="utf-8").split("\n")[:2] == named
+    # b's take settles: the next publication drops it; a stays (and a later
+    # publication that names nothing new keeps it).
+    with WarpJobStore(b) as s:
+        s.settle_take("aa" * 32, S.jobs.TAKE_FAILED, error="x")
+    assert S.publish_retained_pointer(wanted, []) == [str(a.resolve())]
+    assert pointer.read_text(encoding="utf-8").split() == [str(a.resolve())]
+    worker = S._WarpWorker(secrets_path=tmp_path / "c" / "secrets.yaml")
+    worker._config = {"warp": {"enabled": True}}
+    assert worker._store_path_in_use() == str(a.resolve()) and worker._store_pinned
+    assert "job 1" in worker._store_hold
+    # The worker on a's work while c is configured; a second store still
+    # holding work is named beside it and shown as "guarded too".
+    with WarpJobStore(b) as s:
+        s.create_job("mainnet", status=JobStatus.FUNDING_CLAIM, state={})
+    S.publish_retained_pointer(wanted, [str(b)])
+    worker._store_path = str(a)
+    assert worker._store_path_in_use() == str(a)
+    assert "guarded too" in worker._store_hold and str(b.resolve()) in worker._store_hold
+    assert pointer.read_text(encoding="utf-8").split() == [str(a.resolve()), str(b.resolve())]
+
+
+def test_an_unreadable_or_empty_pointer_blocks_rather_than_vanishes(tmp_path):
+    """[review] A GUI restarted on this config finds a pointer it cannot read
+    (or one that names nothing: a write that never finished): nothing is
+    removed -- a store it named may hold work, and the engine fails closed
+    on it -- the configured store is used, the banner says so, and the
+    bridge refuses to launch on it."""
+    wanted = str(tmp_path / "two" / "data" / "warp_jobs.db")
+    pointer = Path(wanted + S._RETAINED_POINTER_SUFFIX)
+    pointer.parent.mkdir(parents=True)
+    pointer.write_text("", encoding="utf-8")
+    worker = S._WarpWorker(secrets_path=tmp_path / "two" / "secrets.yaml")
+    worker._config = {"warp": {"enabled": True}}
+    assert worker._store_path_in_use() == wanted
+    assert pointer.exists(), "never removed on a failed read"
+    assert "cannot be read or names nothing" in worker._store_hold
+    assert worker._retained_ok is False and not worker._store_pinned
+    assert worker._send_hold_reason() is None, "an engine fails closed on it already"
+    with pytest.raises(S.RetainedPointerError, match="cannot be read"):
+        S.publish_retained_pointer(wanted, [])
