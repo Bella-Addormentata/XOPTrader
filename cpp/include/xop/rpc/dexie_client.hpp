@@ -168,7 +168,8 @@ struct OffersPage {
 ///   * parse_market_ticker() / get_tickers(): the pair AS LISTED --
 ///     base = the token (id), quote = the market key (pair_id).
 ///   * orient_market_ticker() / get_ticker(): the pair that was requested.
-/// The volume fields are NOT oriented; they stay keyed as listed.
+/// volume_xch_daily and volume_quote_daily are NOT oriented; they stay keyed
+/// as listed.  volume_base_daily is oriented like the prices.
 struct TickerData {
     std::string id;           ///< Listed token's asset id ("xch" under a CAT key).
     std::string code;
@@ -181,6 +182,11 @@ struct TickerData {
     double volume_xch_daily = 0.0;
     /// Daily volume in the listed token.
     double volume_quote_daily = 0.0;
+    /// [CHURN 2026-10-26] Daily volume in the BASE of the pair the struct
+    /// describes: the listed token's as listed, the market key's once Case A
+    /// inverts the listing.  What ingest_dexie() takes, whichever listing
+    /// was read -- volume_xch_daily is the base's under Case A only.
+    double volume_base_daily = 0.0;
 
     /// Depth-0 bid and ask (see above).  0.0 means no offer on that side.
     double best_bid   = 0.0;
@@ -198,8 +204,14 @@ struct MarketTickerMatch {
     /// The same entry oriented to the requested pair.
     TickerData oriented{};
     /// True when the market key is the requested BASE (Case A): every price
-    /// was replaced by its reciprocal and the sides exchanged.
+    /// was replaced by its reciprocal and the sides exchanged -- `last`
+    /// excepted when the listing is not the canonical one (below).
     bool inverted{false};
+    /// [CHURN 2026-10-26] True when the entry came from the market's
+    /// canonical listing.  When it did not, `oriented.price_last` is oriented
+    /// as the canonical listing would orient it, since Dexie serves the same
+    /// raw `last` in every listing of a market.
+    bool canonical_listing{true};
 };
 
 /// Parse one /v1/markets entry listed under `market_key`, AS LISTED:
@@ -218,13 +230,80 @@ struct MarketTickerMatch {
 ///   (B) key == quote (BYC/wUSDC.b under wUSDC.b's key): prices are already
 ///       quote per base, so the listing is returned as it is.
 ///
-/// (A) is searched under every key before (B), the order get_ticker always
-/// used.  An absent (zero) price stays zero.  nullopt when nothing matches
-/// or `markets` is not an object.
+/// [CHURN 2026-10-26] Dexie can list one market under BOTH keys.  Bid, ask,
+/// high and low are in each listing's own units, but `last` is the same raw
+/// number in both, in the units of the market's CANONICAL listing (TODO S53):
+///   * an XCH market: the listing under "xch" (`market_quote` is ignored);
+///   * a CAT/CAT market: the listing under `market_quote`, the asset Dexie
+///     prices the market in (cat_market_quote() over GET /v1/pairs; for
+///     BYC/wUSDC.b, wUSDC.b), or under the requested quote when
+///     `market_quote` is empty or names neither asset.
+/// The canonical listing is searched first.  When only the other one is
+/// there, its `last` is still oriented as the canonical listing's would be.
+/// An absent (zero) price stays zero.  nullopt when nothing matches or
+/// `markets` is not an object.
 [[nodiscard]] std::optional<MarketTickerMatch> orient_market_ticker(
     const nlohmann::json& markets,
     std::string_view      base_asset_id,
-    std::string_view      quote_asset_id);
+    std::string_view      quote_asset_id,
+    std::string_view      market_quote = {});
+
+/// [CHURN 2026-10-26] The entries of a GET /v1/pairs body, skipping any whose
+/// base or quote id is missing, empty or not a string.  Pure -- no I/O.
+[[nodiscard]] std::vector<PairInfo> parse_pairs_response(
+    const nlohmann::json& body);
+
+/// [CHURN 2026-10-26] The asset Dexie prices the CAT/CAT market {a, b} in:
+/// the quote of the one /v1/pairs entry that pairs them, in either order.
+/// nullopt when no entry pairs them, when both orders are listed, or when
+/// either asset is "xch".  /v1/pairs names XCH the BASE of XCH/wUSDC.b and
+/// XCH/BYC (2026-10-26), while /v1/markets serves every XCH market's `last`
+/// in XCH per token, so its orientation is not read for an XCH market.
+/// Pure -- no I/O.
+[[nodiscard]] std::optional<std::string> cat_market_quote(
+    const std::vector<PairInfo>& pairs,
+    std::string_view             a,
+    std::string_view             b);
+
+/// [CHURN 2026-10-26] What a CAT/CAT get_ticker() does about GET /v1/pairs.
+enum class PairsFetch {
+    None,        ///< not due: read the entries held now
+    Inline,      ///< the first fetch: wait for it, before the price snapshot
+    Background,  ///< any later fetch: run it beside the heartbeat and read
+                 ///< the entries held now (none before a good read)
+};
+
+/// [CHURN 2026-10-26] get_ticker()'s copy of /v1/pairs.  A fetch is due
+/// before the first one, kTtl after a good read and kRetry after a failed
+/// one, so an outage costs one request per kRetry rather than one per
+/// ticker.  claim_fetch() moves the due time on by kRetry, so concurrent
+/// tickers start one fetch between them.  Only the first fetch is waited
+/// for: a /v1/pairs that hangs through all its retries (by default four
+/// 30 s attempts) would otherwise hold up the heartbeat for two minutes at
+/// every refresh.  A failed read keeps the last good entries.  Thread-safe;
+/// the clock is passed in.
+class PairsOrientationCache {
+public:
+    using Clock = std::chrono::steady_clock;
+    static constexpr std::chrono::hours   kTtl{6};
+    static constexpr std::chrono::minutes kRetry{10};
+
+    /// Whether to fetch now, and how.  Anything but None moves the due time
+    /// on by kRetry; Inline only before the first fetch.
+    [[nodiscard]] PairsFetch claim_fetch(Clock::time_point now);
+    /// A good read: replace the entries; next fetch due at now + kTtl.
+    void store(std::vector<PairInfo> pairs, Clock::time_point now);
+    /// A failed read: keep the entries; next fetch due at now + kRetry.
+    void fail(Clock::time_point now);
+    /// cat_market_quote() over the entries held now.
+    [[nodiscard]] std::optional<std::string> quote_for(
+        std::string_view a, std::string_view b) const;
+
+private:
+    mutable std::mutex                    mu_;
+    std::vector<PairInfo>                 pairs_;
+    std::optional<Clock::time_point>      due_at_;  ///< nullopt: never fetched
+};
 
 /// [SYNTH 2026-10-22] One settled trade from Dexie's
 /// GET /v2/prices/historical_trades, for a "<asset_id>_xch" ticker.
@@ -506,7 +585,8 @@ public:
 
     /// GET /v1/markets  (filtered client-side for a single asset pair)
     /// Returns the ticker for the configured base and quote asset IDs,
-    /// oriented to that pair by orient_market_ticker().
+    /// oriented to that pair by orient_market_ticker().  A CAT/CAT pair
+    /// also reads GET /v1/pairs, as PairsOrientationCache schedules it.
     [[nodiscard]] boost::asio::awaitable<std::optional<TickerData>> get_ticker(
         std::string_view base_asset_id,
         std::string_view quote_asset_id);
@@ -610,6 +690,14 @@ private:
                               std::string&       response_body,
                               long&              http_status);
 
+    /// [CHURN 2026-10-26] GET /v1/pairs into pairs_cache_: store() on a
+    /// non-empty answer, fail() on anything else, timed from when it ends.
+    /// Never throws.  get_ticker() co_spawns every fetch after the first
+    /// one detached, so one can still be pending at close(), which
+    /// execute_request_() then refuses, and the client must outlive every
+    /// run of the io_context it was given (the Engine's does).
+    [[nodiscard]] boost::asio::awaitable<void> refresh_pairs_();
+
     /// Build a query-string from key-value pairs, URL-encoding values.
     [[nodiscard]] static std::string build_query_(
         const std::vector<std::pair<std::string, std::string>>& params);
@@ -630,6 +718,8 @@ private:
     // NOTE (MEDIUM-4): CurlMultiPtr multi_ removed -- was dead code.
     std::shared_ptr<spdlog::logger>      log_;
     SlidingWindowRateLimiter             limiter_;
+    /// [CHURN 2026-10-26] Dexie's market orientations, for CAT/CAT tickers.
+    PairsOrientationCache                pairs_cache_;
 
     /// Thread pool for offloading blocking CURL transfers.
     /// Created in open(), joined and destroyed in close().
