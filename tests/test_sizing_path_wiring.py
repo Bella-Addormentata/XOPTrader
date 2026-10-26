@@ -122,6 +122,18 @@ def test_switching_config_moves_the_database_path(app, tmp_path):
         bridge._publish_retained_warp_store()
         pointer = Path(bridge._configured_warp_db() + _RETAINED_POINTER_SUFFIX)
         assert pointer.read_text(encoding="utf-8").strip() == str(old.resolve())
+        # [review] ...and what the PREVIOUS config's store pointed at is
+        # carried along: a store kept across an earlier switch is not lost
+        # at this one, even before the worker has reported a store.
+        assert bridge._previous_warp_db == str(first.parent / "data" / "warp_jobs.db")
+        kept_before = tmp_path / "x" / "warp_jobs.db"
+        with WarpJobStore(kept_before) as store:
+            store.create_job("mainnet", status="FUNDING_CLAIM", state={})
+        Path(bridge._previous_warp_db + _RETAINED_POINTER_SUFFIX).write_text(
+            f"{kept_before.resolve()}\n", encoding="utf-8")
+        bridge._publish_retained_warp_store()
+        assert pointer.read_text(encoding="utf-8").split() == [
+            str(old.resolve()), str(kept_before.resolve())]
         src = inspect.getsource(EngineBridge.start_engine)
         assert src.index("_publish_retained_warp_store()") < src.index("_start_engine_process()")
         src = inspect.getsource(EngineBridge.update_config_path)

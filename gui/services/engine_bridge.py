@@ -734,7 +734,14 @@ class EngineBridge(QObject):
         if not wanted:
             return None
         snap = self._warp_svc.get_snapshot() or {}
-        candidates = [getattr(self, "_launched_warp_db", None), snap.get("store_path")]
+        # [review] The previous engine's store, the store the previously
+        # configured config used, and the store the worker reports -- and,
+        # through publish_retained_pointer, everything the pointer beside
+        # each of them names: a store kept across an earlier switch must not
+        # be lost at the next one, nor before the worker has reported.
+        candidates = [getattr(self, "_launched_warp_db", None),
+                      getattr(self, "_previous_warp_db", None),
+                      snap.get("store_path")]
         try:
             publish_retained_pointer(wanted, [c for c in candidates if c])
         except RetainedPointerError as exc:
@@ -1107,6 +1114,10 @@ class EngineBridge(QObject):
             # Path unchanged; just reload in case the file changed on disk.
             self.reload_config()
             return
+        # [review] The store this config has been using: a candidate for the
+        # retained-store pointer beside the new one, with everything ITS own
+        # pointer names (_publish_retained_warp_store).
+        previous_warp_db = self._configured_warp_db()
 
         _log.info(
             "Config path changed: %s → %s",
@@ -1131,6 +1142,7 @@ class EngineBridge(QObject):
             # (_sync_warp_engine_store): the running engine's guard reads
             # nothing else.
             self._warp_svc.set_secrets_path(resolved.parent / "secrets.yaml")
+            self._previous_warp_db = previous_warp_db
             self._sync_warp_engine_store()
             # [review] The previous engine's store may hold open work: name
             # it beside this config's store now, so an engine started here

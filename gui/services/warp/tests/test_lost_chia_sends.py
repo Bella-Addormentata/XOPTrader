@@ -3913,3 +3913,45 @@ def test_an_unreadable_or_empty_pointer_blocks_rather_than_vanishes(tmp_path):
     assert worker._send_hold_reason() is None, "an engine fails closed on it already"
     with pytest.raises(S.RetainedPointerError, match="cannot be read"):
         S.publish_retained_pointer(wanted, [])
+
+
+def test_a_previous_pointers_entries_are_carried_into_the_new_one(tmp_path):
+    """[review] Config P kept A and B (its pointer names both); the GUI moves
+    on to C with the worker on A (or before the worker reported anything):
+    B must not be lost -- every entry of P's pointer is carried into C's,
+    transitively and cycle-safe; a carried pointer that cannot be read
+    blocks the launch, and the worker says so."""
+    from gui.services.warp.jobs import WarpJobStore
+
+    a = tmp_path / "a" / "warp_jobs.db"
+    b = tmp_path / "b" / "warp_jobs.db"
+    p = tmp_path / "p" / "data" / "warp_jobs.db"
+    for store in (a, b):
+        with WarpJobStore(store) as s:
+            s.create_job("mainnet", status=JobStatus.FUNDING_CLAIM, state={})
+    with WarpJobStore(p):
+        pass                                                 # P itself is idle
+    Path(str(p) + S._RETAINED_POINTER_SUFFIX).write_text(
+        f"{a.resolve()}\n{b.resolve()}\n", encoding="utf-8")
+    # A hand-made cycle: a's pointer names p again.
+    Path(str(a) + S._RETAINED_POINTER_SUFFIX).write_text(f"{p.resolve()}\n", encoding="utf-8")
+    wanted = str(tmp_path / "c" / "data" / "warp_jobs.db")
+    # Only P is known (the worker reported nothing yet): A and B are carried.
+    assert S.publish_retained_pointer(wanted, [str(p)]) == [str(a.resolve()), str(b.resolve())]
+    pointer = Path(wanted + S._RETAINED_POINTER_SUFFIX)
+    assert pointer.read_text(encoding="utf-8").split() == [str(a.resolve()), str(b.resolve())]
+    # The worker on A, with A's own pointer naming P: nothing lost, no loop.
+    worker = S._WarpWorker(secrets_path=tmp_path / "c" / "secrets.yaml")
+    worker._config = {"warp": {"enabled": True}}
+    worker._store_path = str(a)
+    assert worker._store_path_in_use() == str(a) and worker._store_pinned
+    assert str(b.resolve()) in worker._store_hold
+    # P's pointer unreadable (empty): the launch is refused, the worker warns.
+    Path(str(p) + S._RETAINED_POINTER_SUFFIX).write_text("", encoding="utf-8")
+    with pytest.raises(S.RetainedPointerError, match="cannot be read"):
+        S.publish_retained_pointer(wanted, [str(p)])
+    worker._store_path = str(p)
+    assert worker._store_path_in_use() == wanted            # P is idle: not pinned
+    assert "could not be read" in worker._store_hold and worker._retained_ok is False
+    assert pointer.read_text(encoding="utf-8").split() == [str(a.resolve()), str(b.resolve())], \
+        "what C's pointer already names is kept"

@@ -6650,17 +6650,49 @@ def _store_open_work(path: str) -> Optional[str]:
         return None
 
 
+def _carried_entries(stores: Iterable[str]) -> tuple:
+    """[review] ``(entries, unreadable_pointers)``: every store named by the
+    pointer beside each of *stores*, followed transitively with a visited
+    set -- a previously configured store's pointer names what was kept
+    before IT, and that must not be lost when the configuration moves on;
+    the lists are flat by construction, but a hand-edited file might not
+    be, so a cycle ends at the first repeat.  Pointers that stand but cannot
+    be read are reported: the stores they name are unknown."""
+    seen: set = set()
+    out: List[str] = []
+    bad: List[str] = []
+    queue = [str(s) for s in stores if s]
+    while queue:
+        store = queue.pop(0)
+        norm = _norm_store_path(store)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        pointer = _retained_pointer(store)
+        entries, failed = _read_retained_pointer(pointer)
+        if failed:
+            bad.append(str(pointer))
+            continue
+        for entry in entries:
+            if _norm_store_path(entry) not in seen:
+                out.append(entry)
+                queue.append(entry)
+    return out, bad
+
+
 class RetainedStores:
     """[review] The result of :func:`sync_retained_pointer`: the stores the
     pointer beside the configured one now names (resolved paths, in order)
     with what keeps each (``reasons``), whether the pointer stands but
-    could not be read (``unreadable``: nothing was changed), and a write
-    that failed (``write_error``)."""
+    could not be read (``unreadable``: nothing was changed), the pointers
+    beside carried stores that could not be read (``unreadable_carried``:
+    what they name is unknown), and a write that failed (``write_error``)."""
 
     def __init__(self) -> None:
         self.named: List[str] = []
         self.reasons: Dict[str, str] = {}
         self.unreadable: bool = False
+        self.unreadable_carried: List[str] = []
         self.write_error: Optional[str] = None
 
 
@@ -6671,9 +6703,11 @@ def sync_retained_pointer(wanted: str, candidates: Iterable[str]) -> RetainedSto
     other: an engine started on this config guards each of them
     (engine.cpp refresh_warp_send_guard reads the whole list; it is flat, so
     a named store's own pointer is never followed and there is no cycle).
-    An entry is dropped only once its store is established idle or gone.
-    Never raises: a pointer that cannot be read is left exactly as it is,
-    and a failed write is reported."""
+    What the pointer beside each entry and candidate names is carried in
+    too (_carried_entries): a previously configured store's own list must
+    survive the move to this one.  An entry is dropped only once its store
+    is established idle or gone.  Never raises: a pointer that cannot be
+    read is left exactly as it is, and a failed write is reported."""
     st = RetainedStores()
     pointer = _retained_pointer(wanted)
     if pointer is None:
@@ -6682,9 +6716,12 @@ def sync_retained_pointer(wanted: str, candidates: Iterable[str]) -> RetainedSto
     if failed:
         st.unreadable = True
         return st
+    candidates = [str(c) for c in candidates if c]
+    carried, bad = _carried_entries([*entries, *candidates])
+    st.unreadable_carried = bad
     keep: Dict[str, str] = {}
     want_norm = _norm_store_path(wanted)
-    for cand in [*entries, *candidates]:
+    for cand in [*entries, *candidates, *carried]:
         cand = str(cand or "").strip()
         if not cand:
             continue
@@ -6732,6 +6769,11 @@ def publish_retained_pointer(wanted: str, candidates: Iterable[str]) -> List[str
             f"the retained-store pointer beside {wanted} cannot be read (or names "
             "nothing); the stores it named may hold open work -- fix or remove the "
             "file by hand once they have none")
+    if st.unreadable_carried:
+        raise RetainedPointerError(
+            f"the retained-store pointer(s) {', '.join(st.unreadable_carried)} cannot "
+            "be read (or name nothing); the stores they name may hold open work -- fix "
+            "or remove them by hand once they have none")
     if st.write_error:
         raise RetainedPointerError(
             f"open work in {', '.join(st.named)} could not be named beside {wanted} "
@@ -6916,7 +6958,7 @@ class _WarpWorker(QObject):
         wanted = self._wanted_store_path()
         held = getattr(self, "_store_path", None)
         st = sync_retained_pointer(wanted, [held] if held else [])
-        self._retained_ok = not (st.unreadable or st.write_error)
+        self._retained_ok = not (st.unreadable or st.unreadable_carried or st.write_error)
         if st.unreadable:
             self._store_pinned = False
             self._store_hold = (
@@ -6936,6 +6978,13 @@ class _WarpWorker(QObject):
             use = st.named[0] if st.named else None
         use_norm = _norm_store_path(use) if use else None
         others = [f"{p} ({st.reasons[p]})" for p in st.named if p != use_norm]
+        extras = []
+        if st.unreadable_carried:
+            extras.append("the retained-store pointer(s) " + ", ".join(st.unreadable_carried)
+                          + " could not be read; the stores they name may hold work -- "
+                          "fix or remove them by hand")
+        if st.write_error:
+            extras.append(f"the pointer naming them could not be written ({st.write_error})")
         if use is None:
             self._store_pinned = False
             notes = []
@@ -6943,9 +6992,7 @@ class _WarpWorker(QObject):
                 notes.append("stores still holding work, guarded by an engine on this "
                              "config: " + "; ".join(others)
                              + " -- switch to their config to finish them")
-            if st.write_error:
-                notes.append(f"the pointer naming them could not be written ({st.write_error})")
-            self._store_hold = "; ".join(notes)
+            self._store_hold = "; ".join(notes + extras)
             return wanted
         self._store_pinned = True
         self._store_hold = (f"the bridge keeps its job store {use} until "
@@ -6953,10 +7000,10 @@ class _WarpWorker(QObject):
                             f"store is {wanted} (an engine started on this config guards both)")
         if others:
             self._store_hold += "; other stores still holding work, guarded too: " + "; ".join(others)
+        if extras:
+            self._store_hold += "; " + "; ".join(extras)
         if st.write_error:
-            self._store_hold += (f"; the pointer naming them could not be written "
-                                 f"({st.write_error}) -- new Chia sends wait while an engine "
-                                 "runs on this config")
+            self._store_hold += " -- new Chia sends wait while an engine runs on this config"
         return use
 
     def _send_hold_reason(self) -> Optional[str]:
