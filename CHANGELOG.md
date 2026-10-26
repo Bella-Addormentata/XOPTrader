@@ -5,9 +5,9 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — offers stay up instead of being cancelled minutes after they are posted, and a small holding quotes a smaller ladder instead of nothing
+## [0.10.33] — 2026-10-26 — offers stay up instead of being cancelled minutes after they are posted, and a small holding quotes a smaller ladder instead of nothing
 
-### Fewer offers cancelled right after posting
+### Fewer offers cancelled right after posting (#194)
 
 In 17 hours of the live log (2026-10-25/26) the bot posted 746 offers and
 cancelled 675 of them, half within five minutes, with no fill in between.
@@ -56,7 +56,7 @@ Settings page does not show these keys, and a Settings save drops keys added
 to config.yaml after the GUI loaded it (TODO S79), so edit them with the GUI
 closed.
 
-### wmilliETH.b/XCH quotes again on a 1-unit balance
+### wmilliETH.b/XCH quotes again on a 1-unit balance (#193)
 
 wmilliETH.b/XCH stopped posting on 2026-10-25 with 1.0 wmilliETH.b held and
 `revive_market` on. Two Step 7 sizing rules disagreed with what came after
