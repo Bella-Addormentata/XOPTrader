@@ -330,6 +330,10 @@ pairs:
     quote_asset_id: "xch"
     name: "wmilliETH.b/XCH"
     enabled: true
+    # [OPTIONAL] Smallest offer, in wmilliETH.b.  One unit is about 1.6 XCH
+    # (late 2026), so the global 1-unit minimum made every tier a ~1.6 XCH
+    # offer; half a unit (~0.8 XCH) sits under the XCH-base pairs' 1 XCH.
+    min_offer_size_units_override: 0.5
     # [OPTIONAL, default: false] Revive a dead market.  Normally a pair whose
     # third-party offers all fail the 20% sanity filter has an empty book and
     # the engine refuses to quote it at all.  With revive_market the ladder is
@@ -624,7 +628,7 @@ strategy:
                                        # counts actual UTXO + fee-coin locks, so a requote burst can no
                                        # longer walk spendable XCH to zero.
   arb_reserve_coins: 2                 # [OPTIONAL, default: 2]   Coins kept unallocated for arb takes
-  min_reserve_units: 1.0               # [OPTIONAL, default: 1.0]  Absolute floor per coin (units)
+  min_reserve_units: 1.0               # [OPTIONAL, default: 1.0]  Absolute floor per coin (units); CAT offers are sized to leave it unsold
   # [OPTIONAL, default: none] Per-coin reserve in units, by CAT asset id; an
   # entry replaces min_reserve_units for that coin, and its offers are sized
   # to leave the reserve unsold (confirmed minus reserve), the way

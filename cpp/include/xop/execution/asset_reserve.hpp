@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -40,6 +41,28 @@ namespace xop::execution {
 {
     const auto it = per_asset.find(asset_id);
     return it != per_asset.end() ? it->second : global_units;
+}
+
+/// [PAIRMIN 2026-10-26] The reserve, in display units, Step 7 sizes a CAT's
+/// pools to leave unsold (its final caps and the post-up-scale budget
+/// filter), or nullopt when Step 7 leaves that CAT uncapped.  An
+/// asset_reserve_units entry always binds, whatever the CAT-cap switch says;
+/// otherwise strategy.min_reserve_units binds while
+/// strategy.wallet_balance_caps_enabled is on.  The figure is
+/// effective_reserve_units, which Step 8's reserve gates hold back for every
+/// asset: Step 7 used to size a CAT with no entry to its whole balance, so a
+/// small holding (1.0 wmilliETH.b against a 0.1 reserve) had its whole side
+/// suppressed in Step 8 every cycle where a smaller ladder fits.  XCH's
+/// reserve is fee_reserve_xch, applied by its own caps.
+[[nodiscard]] inline std::optional<double> sizing_reserve_units(
+    const std::unordered_map<std::string, double>& per_asset,
+    double global_units, bool wallet_caps_enabled,
+    const std::string& asset_id)
+{
+    const auto it = per_asset.find(asset_id);
+    if (it != per_asset.end()) return it->second;
+    if (!wallet_caps_enabled) return std::nullopt;
+    return global_units;
 }
 
 /// Display units to mojos, rounded to nearest.  A NaN, negative or
