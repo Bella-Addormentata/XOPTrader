@@ -1342,8 +1342,8 @@ struct StrategyConfig {
     /// targeted coin's balance is missing, unvalidated or older than
     /// pace_max_balance_age_blocks, or it has no XCH price (logged once per
     /// change); the pace balance refresh runs while this is on to keep those
-    /// balances fresh.  No effect without targets.  Applies live.  Default
-    /// true.
+    /// balances fresh, reading only from a synced wallet.  No effect without
+    /// targets.  Applies live.  Default true.
     bool     target_gap_sizing_enabled{true};
 
     // -- [PACE 2026-09-13] Pace controller (default OFF) -------------------

@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 
+#include <xop/peg_registry.hpp>  // to_mojo_checked, Step 6's range
 #include <xop/strategy/target_gap.hpp>
 
 #include <cstddef>
@@ -27,6 +28,7 @@ using xop::strategy::target_gap::Valuation;
 using xop::strategy::target_gap::deficit_xch;
 using xop::strategy::target_gap::excess_xch;
 using xop::strategy::target_gap::floor_units;
+using xop::strategy::target_gap::kMaxFloorBaseMojos;
 using xop::strategy::target_gap::shared_bid_floors_xch;
 using xop::strategy::target_gap::unshared_bid_floor_xch;
 using xop::strategy::target_gap::value_targeted;
@@ -293,17 +295,41 @@ TEST(TargetGapUnits, ConvertsXchToBaseUnits) {
     const Valuation v = value_targeted({held("XCH", 0.5, 160.0), held("WMILLIETH.B", 0.1, 2.0),
                                         held("WUSDC.B", 0.4, 38.0)}, kMaxAge);
     ASSERT_TRUE(v.ok);
-    EXPECT_NEAR(floor_units(unshared_bid_floor_xch(v, "WMILLIETH.B", "XCH"), 1.6), 11.25, 1e-9);
-    EXPECT_DOUBLE_EQ(floor_units(91.19, 1.0), 91.19) << "an XCH base: one XCH per unit";
+    EXPECT_NEAR(floor_units(unshared_bid_floor_xch(v, "WMILLIETH.B", "XCH"), 1.6, 1e3), 11.25, 1e-9);
+    EXPECT_DOUBLE_EQ(floor_units(91.19, 1.0, 1e12), 91.19) << "an XCH base: one XCH per unit";
+}
+
+TEST(TargetGapUnits, CapsTheSizeWhereStep6CanConvertIt) {
+    // 20,000 XCH and none of a 1,000-mojo CAT marked at 1e-12 XCH per unit,
+    // 50/50: a 10,000 XCH floor is 1e16 units, 1e19 mojos -- past the Mojo
+    // maximum, and Step 6 rounds the size to mojos before any cap.
+    const Valuation v = value_targeted({held("XCH", 0.5, 20'000.0), held("CAT", 0.5, 0.0)}, kMaxAge);
+    ASSERT_TRUE(v.ok);
+    const double floor_xch = unshared_bid_floor_xch(v, "CAT", "XCH");
+    ASSERT_DOUBLE_EQ(floor_xch, 10'000.0);
+    EXPECT_FALSE(xop::to_mojo_checked(floor_xch / 1e-12 * 1e3).has_value()) << "uncapped, it overflows";
+    const double units = floor_units(floor_xch, 1e-12, 1e3);
+    EXPECT_DOUBLE_EQ(units, kMaxFloorBaseMojos / 1e3);
+    ASSERT_TRUE(xop::to_mojo_checked(units * 1e3).has_value());
+    // With room for the pool's later scale-ups: the ratio rebalancer's 3x and
+    // the market allocator's 1.5x.
+    EXPECT_TRUE(xop::to_mojo_checked(units * 1e3 * 3.0 * 1.5).has_value());
+    // An XCH base caps at 2^53 mojos, about 9,007 XCH: far above six 5-XCH tiers.
+    EXPECT_NEAR(floor_units(50'000.0, 1.0, 1e12), 9007.199254740992, 1e-9);
+    // A rate so small the division overflows still gives a capped size.
+    EXPECT_DOUBLE_EQ(floor_units(1e300, 1e-300, 1e3), kMaxFloorBaseMojos / 1e3);
+    // Below the cap nothing changes.
+    EXPECT_DOUBLE_EQ(floor_units(91.19, 1.0, 1e12), 91.19);
 }
 
 TEST(TargetGapUnits, UnusableRatesAndFloorsGiveZero) {
     for (const double bad_rate : {0.0, -1.0, kNaN, kInf}) {
         SCOPED_TRACE(bad_rate);
-        EXPECT_EQ(floor_units(91.19, bad_rate), 0.0);
+        EXPECT_EQ(floor_units(91.19, bad_rate, 1e3), 0.0);
+        EXPECT_EQ(floor_units(91.19, 1.0, bad_rate), 0.0) << "as mojos per unit";
     }
     for (const double bad_floor : {0.0, -1.0, kNaN, kInf}) {
         SCOPED_TRACE(bad_floor);
-        EXPECT_EQ(floor_units(bad_floor, 1.0), 0.0);
+        EXPECT_EQ(floor_units(bad_floor, 1.0, 1e12), 0.0);
     }
 }

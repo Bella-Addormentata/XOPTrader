@@ -111,13 +111,15 @@ TEST(SizingWiring, ReviveMaintenanceUsesThePairsMinimum) {
 // values the portfolio only when the switch is on and only from validated,
 // fresh balances, applies the floor once every pair is quoted and before
 // anything reads the size, shares each coin's gap across the pairs, skips a
-// quote the strategy rejected, only ever raises the bid, and that the pace
-// balance refresh keeps the targeted balances fresh while the floor is on.
+// quote the strategy rejected, only ever raises the bid, converts it at the
+// pair's own mojos per unit, and that the pace balance refresh keeps the
+// targeted balances fresh while the floor is on, from a synced wallet only.
 
 namespace {
 
 const char* const kComputeQuotesSignature = "void Engine::step_compute_quotes(BlockHeight block_height)";
 const char* const kHeartbeatSignature = "asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)";
+const char* const kRefreshSignature = "asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)";
 const char* const kStep4Log = "spdlog::debug(\"[Engine] Step 4: {} bid={:.6f} ask={:.6f} spread={:.1f}bps \"";
 const char* const kValuationCall =
     "strategy::target_gap::value_targeted(gap_holdings, config_.strategy.pace_max_balance_age_blocks);";
@@ -167,7 +169,8 @@ TEST(SizingWiring, TargetGapFloorIsSharedAndOnlyRaisesAUsableBid) {
     const std::size_t claim_at = position_of(body, "gap_pairs.push_back(std::move(gap_coins));");
     const std::size_t shared_at = position_of(body, kSharedCall);
     const std::size_t units_at = position_of(body,
-        "strategy::target_gap::floor_units(gap_floors_xch[gap_i], gap_base_xch_per_unit);");
+        "strategy::target_gap::floor_units(gap_floors_xch[gap_i], gap_base_xch_per_unit, "
+        "static_cast<double>(gap_pc->base_mojos_per_unit));");
     const std::size_t raise_at = position_of(body, "if (gap_floor > 0.0 && gap_floor > gap_pcs.raw_quote.bid_size) {");
     const std::size_t assign_at = position_of(body, "gap_pcs.raw_quote.bid_size = gap_floor;");
     ASSERT_NE(strategy_at, std::string::npos);
@@ -185,6 +188,10 @@ TEST(SizingWiring, TargetGapFloorIsSharedAndOnlyRaisesAUsableBid) {
     EXPECT_LT(shared_at, units_at);
     EXPECT_LT(units_at, raise_at);
     EXPECT_LT(raise_at, assign_at);
+    // floor_units() caps the size where Step 6's llround stays in range
+    // (TargetGapUnits.CapsTheSizeWhereStep6CanConvertIt): that needs the
+    // pair's own mojos per unit, and nothing else converts the floor.
+    EXPECT_EQ(count_of(body, "floor_units("), 1u);
     // The base coin's XCH per unit at the mark the valuation used.
     EXPECT_NE(position_of(body, "state_->get_asset_xch_rate(AssetId{gap_pc->base_asset_id}) "
                                 "* static_cast<double>(gap_pc->base_mojos_per_unit) "
@@ -230,4 +237,42 @@ TEST(SizingWiring, TheBalanceRefreshKeepsItsBackoffWhilePaceIsOff) {
     EXPECT_EQ(count_of(body, "pace_refresh_failures_.clear();"), 1u);
     EXPECT_EQ(count_of(read_engine_cpp(), "pace_refresh_attempted_at_.clear()"), 1u);
     EXPECT_EQ(count_of(read_engine_cpp(), "pace_refresh_failures_.clear()"), 1u);
+}
+
+TEST(SizingWiring, TheBalanceRefreshReadsOnlyFromASyncedWallet) {
+    // A wallet that is not synced can report a partial balance, and the next
+    // heartbeat's Step 4 values the targeted coins from the refresh's cache
+    // before Step 8 reads anything.  So the refresh asks the wallet once,
+    // before its first due read, reads it the way Step 8's gate does, and
+    // records no attempt when it is not synced, so the balance stays due.
+    const std::string body = function_body(read_engine_cpp(), kRefreshSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t due_at = position_of(body, "if (!strategy::pace::pace_refresh_due(");
+    const std::size_t ask_at = position_of(body, "if (!pace_wallet_synced.has_value()) {");
+    const std::size_t sync_at = position_of(body, "co_await wallet_->get_sync_status();");
+    const std::size_t stop_at = position_of(body, "if (!*pace_wallet_synced) { co_return; }");
+    const std::size_t record_at = position_of(body, "pace_refresh_attempted_at_[*pace_id] = block_height;");
+    const std::size_t read_at = position_of(body, "co_await wallet_->get_wallet_balance(pace_wid)");
+    ASSERT_NE(due_at, std::string::npos);
+    ASSERT_NE(ask_at, std::string::npos);
+    ASSERT_NE(sync_at, std::string::npos);
+    ASSERT_NE(stop_at, std::string::npos);
+    ASSERT_NE(record_at, std::string::npos);
+    ASSERT_NE(read_at, std::string::npos);
+    EXPECT_LT(due_at, ask_at) << "asked only when a balance is due";
+    EXPECT_LT(ask_at, sync_at);
+    EXPECT_LT(sync_at, stop_at);
+    EXPECT_LT(stop_at, record_at) << "an unsynced wallet records no attempt";
+    EXPECT_LT(record_at, read_at);
+    EXPECT_EQ(count_of(body, "get_sync_status("), 1u) << "asked once per refresh";
+    // Starts unsynced, so a reply that throws reads nothing; synced only as
+    // Step 8's gate reads it.
+    EXPECT_NE(position_of(body, "pace_wallet_synced = false; try {"), std::string::npos);
+    EXPECT_NE(position_of(body, "const bool pace_synced = pace_sync.contains(\"synced\") "
+                                "&& pace_sync[\"synced\"].is_boolean() && pace_sync[\"synced\"].get<bool>();"),
+              std::string::npos);
+    EXPECT_NE(position_of(body, "const bool pace_syncing = !pace_sync.contains(\"syncing\") "
+                                "|| !pace_sync[\"syncing\"].is_boolean() || pace_sync[\"syncing\"].get<bool>();"),
+              std::string::npos);
+    EXPECT_NE(position_of(body, "pace_wallet_synced = pace_synced && !pace_syncing;"), std::string::npos);
 }

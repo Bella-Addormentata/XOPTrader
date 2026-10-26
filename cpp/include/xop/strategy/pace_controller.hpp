@@ -1081,7 +1081,9 @@ inline std::vector<std::string> select_resting_above_fair_value(const std::vecto
 /// wallet has not failed since the last success of Step 2 or Step 8
 /// (wallet_consecutive_failures == 0).  Step 8's own wallet-sync and
 /// fee-budget checks are not inputs: while either holds Step 8 back, the
-/// refresh still runs, bounded by P25c's per-asset backoff.
+/// refresh still runs, bounded by P25c's per-asset backoff.  [TARGET-GAP
+/// 2026-10-26] It reads nothing, though, from a wallet that does not report
+/// itself synced: the engine asks once, before its first due read.
 [[nodiscard]] constexpr bool pace_refresh_gates_open(const RefreshGates& g) noexcept
 {
     return g.pace_enabled && !g.dry_run && !g.wallet_circuit_open && !g.watchdog_fired

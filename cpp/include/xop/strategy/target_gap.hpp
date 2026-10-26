@@ -38,9 +38,12 @@
 // strategy.pace_max_balance_age_blocks, or a balance and no mark leaves the
 // valuation unusable and every floor 0: today's sizing, never a guess.  The
 // pace balance refresh keeps every targeted balance fresh while this is on,
-// a coin whose pairs are all disabled included.  Unit-tested in
-// tests/test_target_gap.cpp; the engine wiring is pinned by
-// tests/test_sizing_wiring.cpp.
+// a coin whose pairs are all disabled included, and like Step 8 it reads
+// only from a wallet that reports itself synced.  The floor converts to base
+// units at the base coin's mark, so a tiny mark makes a huge size: it is
+// capped at kMaxFloorBaseMojos, far above any ladder, so Step 6's conversion
+// to mojos stays in range.  Unit-tested in tests/test_target_gap.cpp; the
+// engine wiring is pinned by tests/test_sizing_wiring.cpp.
 //
 // Compliant with:
 //   ISO/IEC 5055 -- no UB: NaN/negative inputs fail closed to a floor of 0
@@ -211,15 +214,29 @@ struct PairCoins {
     return floors;
 }
 
-/// A floor in XCH as base display units, at `base_xch_per_unit` XCH per
-/// unit.  0 unless the floor is > 0 and the rate is finite and > 0.
-[[nodiscard]] inline double floor_units(double floor_xch, double base_xch_per_unit) noexcept
+/// The largest floor, in base mojos: 2^53, the last integer a double holds
+/// exactly.  The XCH floor is bounded by the portfolio, but its size in base
+/// units is not: a mark of 1e-12 XCH per unit turns a 10,000 XCH floor into
+/// 1e19 mojos of a 1,000-mojo CAT, past the Mojo maximum, and Step 6 rounds
+/// the size to mojos before any cap.  2^53 is far above any ladder (six
+/// 5-unit tiers of XCH are 3e13 mojos) and 1024 times under the Mojo
+/// maximum, so that rounding and every later scale-up of the pool (at most
+/// 3x from the ratio rebalancer and 1.5x from the market allocator) stay in
+/// range.
+inline constexpr double kMaxFloorBaseMojos = 9007199254740992.0;
+
+/// A floor in XCH as base display units, at `base_xch_per_unit` XCH per unit
+/// and `base_mojos_per_unit` mojos per unit, capped at kMaxFloorBaseMojos.
+/// 0 unless the floor is > 0 and both rates are finite and > 0.
+[[nodiscard]] inline double floor_units(double floor_xch, double base_xch_per_unit,
+                                        double base_mojos_per_unit) noexcept
 {
     if (!(floor_xch > 0.0) || !std::isfinite(floor_xch)
-        || !(std::isfinite(base_xch_per_unit) && base_xch_per_unit > 0.0)) {
+        || !(std::isfinite(base_xch_per_unit) && base_xch_per_unit > 0.0)
+        || !(std::isfinite(base_mojos_per_unit) && base_mojos_per_unit > 0.0)) {
         return 0.0;
     }
-    const double units = floor_xch / base_xch_per_unit;
+    const double units = std::min(floor_xch / base_xch_per_unit, kMaxFloorBaseMojos / base_mojos_per_unit);
     return std::isfinite(units) ? units : 0.0;
 }
 

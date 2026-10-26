@@ -7500,7 +7500,9 @@ void Engine::step_compute_quotes(BlockHeight block_height)
             : state_->get_asset_xch_rate(AssetId{gap_pc->base_asset_id})
                   * static_cast<double>(gap_pc->base_mojos_per_unit)
                   / static_cast<double>(kMojosPerXch);
-        const double gap_floor = strategy::target_gap::floor_units(gap_floors_xch[gap_i], gap_base_xch_per_unit);
+        // Capped where Step 6's llround of the size stays in range.
+        const double gap_floor = strategy::target_gap::floor_units(
+            gap_floors_xch[gap_i], gap_base_xch_per_unit, static_cast<double>(gap_pc->base_mojos_per_unit));
         if (gap_floor > 0.0 && gap_floor > gap_pcs.raw_quote.bid_size) {
             const std::string& gap_base_key = gap_pairs[gap_i].base_key;
             const std::string& gap_quote_key = gap_pairs[gap_i].quote_key;
@@ -8071,7 +8073,9 @@ asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)
     // active (the balances only feed a plan that could not post), nor while
     // wallet_consecutive_failures_ > 0.  Step 8's own wallet-sync and
     // fee-budget checks are not among these gates, so the refresh still runs
-    // while either holds Step 8 back.  Nor do the gates keep pace out of a
+    // while either holds Step 8 back -- though since [TARGET-GAP 2026-10-26]
+    // it reads no balance from a wallet that does not report itself synced
+    // (below).  Nor do the gates keep pace out of a
     // wallet brown-out: wallet_consecutive_failures_ rarely rises in one,
     // because detect_fills catches RPC errors and Step 8's sync check catches
     // and returns.  What bounds the load pace adds is the per-asset backoff
@@ -8109,6 +8113,15 @@ asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)
     // and the per-asset backoff retries a failed attempt at age 2h.
     const std::uint32_t pace_refresh_age =
         strategy::pace::pace_refresh_age_blocks(config_.strategy.pace_max_balance_age_blocks);
+    // [TARGET-GAP 2026-10-26] Read only from a synced wallet.  One that is not
+    // synced can report a partial balance, and the next heartbeat's Step 4
+    // values the targeted coins from this cache before Step 8 reads anything;
+    // every Step 8 writer of the cache sits below its sync gate.  Asked once,
+    // before the first due read, and read the way that gate reads it
+    // (synced=true and syncing=false; a reply without `syncing` reads as
+    // syncing).  An unsynced wallet records no attempt, so every due balance
+    // stays due and is read on the first synced heartbeat.
+    std::optional<bool> pace_wallet_synced{};
     for (const auto& pace_key : pace_keys) {
         const auto pace_id = pace_asset_id_for_key(pace_key);
         if (!pace_id) {
@@ -8130,6 +8143,25 @@ asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)
         const auto pace_wid = offer_mgr_->resolve_wallet_id(*pace_id);
         if (pace_wid <= 0) {
             continue;
+        }
+        if (!pace_wallet_synced.has_value()) {
+            pace_wallet_synced = false;
+            try {
+                const auto pace_sync = co_await wallet_->get_sync_status();
+                const bool pace_synced = pace_sync.contains("synced") && pace_sync["synced"].is_boolean()
+                                         && pace_sync["synced"].get<bool>();
+                const bool pace_syncing = !pace_sync.contains("syncing") || !pace_sync["syncing"].is_boolean()
+                                          || pace_sync["syncing"].get<bool>();
+                pace_wallet_synced = pace_synced && !pace_syncing;
+                if (!*pace_wallet_synced) {
+                    spdlog::debug("[Engine] Pace: balance refresh deferred -- the wallet is not synced");
+                }
+            } catch (const std::exception& e) {
+                spdlog::debug("[Engine] Pace: balance refresh deferred -- wallet sync check failed: {}", e.what());
+            }
+        }
+        if (!*pace_wallet_synced) {
+            co_return;
         }
         // Recorded BEFORE the RPC: a failed, timed-out or malformed attempt
         // backs off exactly like a good one, so this refresh sends at most one

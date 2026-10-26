@@ -45,7 +45,10 @@ no price. The log says so once per change
 then `target-gap bid floor on`). To keep those balances fresh when no enabled
 pair reads one (a coin whose pairs are all disabled), the pace balance refresh
 now also runs while the floor is on; a balance Step 8 keeps reading costs it
-no RPC.
+no RPC. Like Step 8, the refresh now reads only from a wallet that reports
+itself synced (for pace too), since a syncing wallet can report a partial
+balance. A floor's size in base units is capped far above any ladder, so a
+tiny price for the base coin cannot overflow its conversion to mojos.
 
 On the 2026-10-26 book (Step 4 sizes, before the per-tier cap of 5 XCH over
 six tiers), the three pairs buying XCH want 107.4 XCH of its 91.2 XCH
