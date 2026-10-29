@@ -32,6 +32,7 @@
 #include "xop/config.hpp"
 #include "xop/state.hpp"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -504,6 +505,76 @@ public:
             && current_block > newest_block
             && current_block - newest_block > max_age_blocks;
     }
+
+    /// [WIDEBOOK 2026-10-29] True when a price-history sample is a price the
+    /// crash and recovery checks may lean on: its book is no wider than
+    /// `max_spread_bps` (risk.flash_crash_max_spread_bps). 0 disables the
+    /// test. A spread of 0 (crossed or unmeasured book) always counts, as
+    /// does a NaN, so only a sample measured as wide is ever held back.
+    [[nodiscard]]
+    static constexpr bool crash_sample_counts(double spread_bps,
+                                              double max_spread_bps) noexcept
+    {
+        return !(max_spread_bps > 0.0 && spread_bps > max_spread_bps);
+    }
+
+    /// The prices one pair's crash and recovery checks run on.
+    struct CrashSeries {
+        std::vector<Mojo> prices;   ///< Every sample, oldest first.
+        std::vector<bool> counted;  ///< crash_sample_counts() for each one.
+        std::size_t       left_out{0}; ///< How many are from too wide a book.
+    };
+
+    /// [WIDEBOOK 2026-10-29] A pair's price history (oldest first; any entry
+    /// type with price and spread_bps) as mojo prices, marking each sample
+    /// whose book crash_sample_counts() rejects.
+    ///
+    /// On 2026-10-29 the XCH/BYC book's near ask kept vanishing for a few
+    /// minutes. The mid went 1.635 -> 2.150 (a 6,976 bps book) -> 1.587: a
+    /// 26% running-max drawdown off a high that was never a market, which
+    /// held the GLOBAL guard in Crash and stopped every pair's posting.
+    template <typename Entry>
+    [[nodiscard]]
+    static CrashSeries crash_series(const std::vector<Entry>& history,
+                                    double max_spread_bps)
+    {
+        CrashSeries s;
+        s.prices.reserve(history.size());
+        s.counted.reserve(history.size());
+        for (const auto& e : history) {
+            s.prices.push_back(static_cast<Mojo>(
+                std::llround(e.price * static_cast<double>(kMojosPerXch))));
+            const bool counts = crash_sample_counts(e.spread_bps, max_spread_bps);
+            s.counted.push_back(counts);
+            if (!counts) ++s.left_out;
+        }
+        return s;
+    }
+
+    /// [WIDEBOOK 2026-10-29] check_flash_crash() over the newest `window`
+    /// samples (0 = all), except that a sample from too wide a book cannot
+    /// raise the running maximum. It still counts as a LOW: in a real crash
+    /// on Dexie takers eat the stale bids while the asks stay put, so the
+    /// book widens exactly as the price falls, and that drop must still
+    /// trip. What it can no longer do is supply the high a fake drop is
+    /// measured from -- the 2026-10-29 trips. With every sample counted
+    /// this is check_flash_crash(prices, threshold, window) exactly.
+    [[nodiscard]]
+    static bool series_crashing(const CrashSeries& s, double threshold,
+                                std::size_t window) noexcept;
+
+    /// [WIDEBOOK 2026-10-29] is_stable_after_crash() over the newest
+    /// `required_blocks` samples, judging only the counted ones: each must
+    /// lie within `stability_band` of the newest counted one, so a thin
+    /// book's fake jumps between them cannot hold Recovery. A tail with NO
+    /// counted price is judged on all of its prices, exactly as before:
+    /// after a real crash that leaves the book too wide to price, the guard
+    /// still waits for that wide mid to settle. With every sample counted
+    /// this is is_stable_after_crash() exactly.
+    [[nodiscard]]
+    static bool series_stable(const CrashSeries& s,
+                              std::size_t required_blocks,
+                              double stability_band) noexcept;
 
     /// Compute the recommended rebalancing buffer multiplier during network
     /// congestion.  Normal operation returns 1.0; when `congested` is true

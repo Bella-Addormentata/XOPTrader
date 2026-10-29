@@ -2692,6 +2692,22 @@ RiskConfig parse_risk(const YAML::Node& root)
         cfg.flash_crash_stale_history_blocks = static_cast<uint32_t>(v);
     }
 
+    // [WIDEBOOK 2026-10-29] 0 = every sample counts. A spread is below
+    // 20,000 bps by construction ((ask - bid) / mid < 2), so a larger
+    // value is accepted and simply never excludes anything.
+    if (node["flash_crash_max_spread_bps"]
+            && node["flash_crash_max_spread_bps"].IsDefined()
+            && !node["flash_crash_max_spread_bps"].IsNull()) {
+        cfg.flash_crash_max_spread_bps =
+            node["flash_crash_max_spread_bps"].as<double>();
+        if (!(std::isfinite(cfg.flash_crash_max_spread_bps)
+              && cfg.flash_crash_max_spread_bps >= 0.0)) {
+            throw ConfigError(sec + ".flash_crash_max_spread_bps must be a "
+                              "finite number >= 0; got "
+                              + std::to_string(cfg.flash_crash_max_spread_bps));
+        }
+    }
+
     // recovery_stable_blocks_phase1: blocks that must be stable for Crash->Recovery.
     if (node["recovery_stable_blocks_phase1"] && node["recovery_stable_blocks_phase1"].IsDefined()
             && !node["recovery_stable_blocks_phase1"].IsNull()) {
@@ -3699,6 +3715,9 @@ void log_config_summary(const AppConfig& cfg)
         << "  flash_crash    = " << cfg.risk.flash_crash_threshold_pct * 100.0 << "%\n"
         << "  flash_window   = " << cfg.risk.flash_crash_window_blocks
         << " blocks (0 = whole history)\n"
+        << "  flash_spread   = " << cfg.risk.flash_crash_max_spread_bps
+        << " bps widest book that may set a crash high"
+        << (cfg.risk.flash_crash_max_spread_bps == 0.0 ? " (disabled)" : "") << "\n"
         << "  recovery_ph1   = " << cfg.risk.recovery_stable_blocks_phase1 << " blocks\n"
         << "  recovery_ph2   = " << cfg.risk.recovery_stable_blocks_phase2 << " blocks\n"
         << "  recovery_band  = " << cfg.risk.recovery_stability_band_pct * 100.0 << "%\n"

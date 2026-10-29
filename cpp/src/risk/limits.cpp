@@ -781,6 +781,70 @@ bool PreTradeCheck::is_stable_after_crash(
 }
 
 // ---------------------------------------------------------------------------
+// [WIDEBOOK 2026-10-29] series_crashing / series_stable -- the two checks
+// above on a CrashSeries, where a sample from too wide a book may mark a low
+// but never the high, and judges stability only when nothing else can.
+// ---------------------------------------------------------------------------
+
+bool PreTradeCheck::series_crashing(const CrashSeries& s, double threshold,
+                                    std::size_t window) noexcept
+{
+    const std::size_t n = s.prices.size();
+    const std::size_t start = (window > 0 && n > window) ? n - window : 0;
+
+    Mojo high = 0;  // running maximum of the counted samples only
+    for (std::size_t i = start; i < n; ++i) {
+        if (s.counted[i] && s.prices[i] > high) {
+            high = s.prices[i];
+        }
+        if (high <= 0) {
+            continue;  // no counted high yet to measure a drop from
+        }
+        const double drawdown = static_cast<double>(high - s.prices[i])
+                              / static_cast<double>(high);
+        if (drawdown >= threshold) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool PreTradeCheck::series_stable(const CrashSeries& s,
+                                  std::size_t required_blocks,
+                                  double stability_band) noexcept
+{
+    const std::size_t n = s.prices.size();
+    if (n == 0 || n < required_blocks) {
+        return false;  // not enough blocks to declare stability
+    }
+    const std::size_t start = n - required_blocks;
+
+    std::size_t newest = n;  // newest counted sample in the tail
+    for (std::size_t i = n; i > start; --i) {
+        if (s.counted[i - 1]) { newest = i - 1; break; }
+    }
+    // No counted price in the tail: judge every price in it, as before
+    // WIDEBOOK, so an illiquid book still has to settle before resuming.
+    const bool judge_all = (newest == n);
+    if (judge_all) {
+        newest = n - 1;
+    }
+    const Mojo latest = s.prices[newest];
+    if (latest <= 0) {
+        return false;  // degenerate
+    }
+    for (std::size_t i = start; i < n; ++i) {
+        if (!judge_all && !s.counted[i]) continue;
+        const double deviation = std::abs(static_cast<double>(s.prices[i] - latest))
+                               / static_cast<double>(latest);
+        if (deviation > stability_band) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // congestion_buffer_multiplier
 //
 // Section 8 Emergency Playbook: "Network congestion: Increase rebalancing

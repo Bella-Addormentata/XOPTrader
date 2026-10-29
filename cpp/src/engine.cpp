@@ -4728,12 +4728,22 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
                 continue;
             }
 
-            // Convert PriceHistoryEntry to Mojo vector for check_flash_crash.
-            std::vector<Mojo> price_vec;
-            price_vec.reserve(history.size());
-            for (const auto& entry : history) {
-                price_vec.push_back(static_cast<Mojo>(
-                    std::llround(entry.price * static_cast<double>(kMojosPerXch))));
+            // [WIDEBOOK 2026-10-29] A mid from a book wider than
+            // flash_crash_max_spread_bps may mark a low but never the high a
+            // drop is measured from, and judges stability only when a whole
+            // tail is that wide: a
+            // thin book losing its near ask for a few minutes moved XCH/BYC's
+            // mid 1.635 -> 2.150 -> 1.587 and held every pair in Crash.
+            const auto series = PreTradeCheck::crash_series(
+                history, config_.risk.flash_crash_max_spread_bps);
+            if (!series.counted.back()) {
+                spdlog::debug("[Engine] Flash crash check: {} newest mid "
+                              "{:.6f} comes from a {:.0f} bps book (max {:.0f})"
+                              " -- counted as a low only; {} of {} samples",
+                              pair.name, history.back().price,
+                              history.back().spread_bps,
+                              config_.risk.flash_crash_max_spread_bps,
+                              series.left_out, history.size());
             }
 
             // Check crash signal for this pair.
@@ -4748,17 +4758,17 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             // still requires exactly what phase 2 always demanded, the
             // last 100 blocks inside the stability band; the phases only
             // run sequentially when a pair re-crashes DURING recovery.
-            const bool pair_crashing = PreTradeCheck::check_flash_crash(
-                price_vec,
+            const bool pair_crashing = PreTradeCheck::series_crashing(
+                series,
                 config_.risk.flash_crash_threshold_pct,
                 config_.risk.flash_crash_window_blocks);
-            const bool pair_stable_phase1 = PreTradeCheck::is_stable_after_crash(
-                price_vec,
-                static_cast<int>(config_.risk.recovery_stable_blocks_phase1),
+            const bool pair_stable_phase1 = PreTradeCheck::series_stable(
+                series,
+                config_.risk.recovery_stable_blocks_phase1,
                 config_.risk.recovery_stability_band_pct);
-            const bool pair_stable_phase2 = PreTradeCheck::is_stable_after_crash(
-                price_vec,
-                static_cast<int>(config_.risk.recovery_stable_blocks_phase2),
+            const bool pair_stable_phase2 = PreTradeCheck::series_stable(
+                series,
+                config_.risk.recovery_stable_blocks_phase2,
                 config_.risk.recovery_stability_band_pct);
 
             // [REVIVE2 2026-10-22] A revive pair runs its own state machine

@@ -1873,6 +1873,18 @@ struct RiskConfig {
     /// pair paused (PreTradeCheck::price_history_is_stale). 0 keeps every
     /// pair in, the pre-2026-10-22 behaviour.
     uint32_t flash_crash_stale_history_blocks{10};
+    /// [WIDEBOOK 2026-10-29] A mid from a filtered book wider than this can
+    /// mark a low but never the high the crash check measures a drop from,
+    /// and judges recovery only when a whole tail is that wide
+    /// (PreTradeCheck::series_crashing / series_stable). One side of a thin book vanishing moves the mid by
+    /// half the gap it leaves, so a fake jump big enough to read as a 20%
+    /// crash on the way back needs a book roughly 4,000 bps wide. On
+    /// 2026-10-29 XCH/BYC's near ask kept vanishing (6,976 bps books, mid
+    /// 1.6 -> 2.15 -> 1.5) and held every pair paused. A real crash still
+    /// trips even when it widens the book, as Dexie's does when takers eat
+    /// the stale bids. Crossed and unmeasured books (spread 0) always count.
+    /// 0 counts every sample, the old behaviour.
+    double   flash_crash_max_spread_bps{2000.0};
 
     // -- Circuit-breaker rebalance (T7-09) -----------------------------------
     // Automatically enables StrategicLossManager for a pair when all of:

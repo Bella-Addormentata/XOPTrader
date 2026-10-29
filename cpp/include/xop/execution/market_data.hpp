@@ -131,6 +131,9 @@ struct ArbitrageSignal {
 struct PriceHistoryEntry {
     BlockHeight block_height;  // Block at which this price was observed
     double      price;         // Mid-price in quote-per-base (double for math)
+    /// [WIDEBOOK 2026-10-29] Width of the filtered book the mid came from
+    /// (PairState::spread_bps). 0 means crossed or not measured, never wide.
+    double      spread_bps{0.0};
 };
 
 // ---------------------------------------------------------------------------
@@ -590,6 +593,12 @@ struct PairState {
     // that form was unbounded and was corrected 2026-09-02; see
     // xop/execution/orderbook_mid.hpp before changing anything here.
     double      orderbook_mid{0.0}; // Stoikov micro-price from competing offers
+    // [WIDEBOOK 2026-10-29] Width (bps) of the filtered book orderbook_mid
+    // came from, written beside it. compute_mid() serves orderbook_mid for
+    // up to stale_threshold after the offers fetch fails, while spread_bps
+    // is 0 for that raw-ticker heartbeat (PR #159); the crash guard's price
+    // history must still judge that mid by the book it was measured on.
+    double      orderbook_spread_bps{0.0};
 
     // --- CEX reference ---
     double      cex_mid{0.0};       // CEX mid-price (0 if unavailable)
@@ -1321,8 +1330,13 @@ private:
     /// Returns 0.0 if no price data is available at all.
     /// [SYNTH] `synthetic_used`, when given, is set to whether a synthetic
     /// reference contributed to the returned mid.
+    /// [WIDEBOOK 2026-10-29] `dex_book_spread_bps`, when given, is set to the
+    /// width of the book the DEX leg came from: orderbook_spread_bps for the
+    /// cached orderbook_mid, the dex BBO's own width for a BBO midpoint
+    /// (filtered or raw), 0 for a last trade or no DEX leg.
     double compute_mid(const PairState& ps,
-                       bool* synthetic_used = nullptr) const;
+                       bool* synthetic_used = nullptr,
+                       double* dex_book_spread_bps = nullptr) const;
 
     /// Compute the spread in basis points from best_bid and best_ask.
     /// Returns 0.0 if either side is zero (no two-sided market).
@@ -1346,10 +1360,12 @@ private:
     void check_arbitrage(PairState& ps);
 
     /// Append a price observation to the per-pair circular buffer, evicting
-    /// the oldest entry if capacity is reached.
+    /// the oldest entry if capacity is reached.  `spread_bps` is the width
+    /// of the book the price came from (0 = crossed or not measured).
     void append_price_history(const std::string& pair_name,
                               BlockHeight         block,
-                              double              price);
+                              double              price,
+                              double              spread_bps);
 
     /// Compute CompetitorMetrics from the tracked competing offers for a pair.
     /// Computes best spreads, depth counts, and detects new competitors.
