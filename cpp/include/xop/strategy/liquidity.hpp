@@ -54,6 +54,13 @@ namespace xop {
 // underserved price levels, capturing spread that competitors miss.
 // ---------------------------------------------------------------------------
 
+/// [TIERMIN 2026-10-29] The base-mojo pool each side's tiers are sized from
+/// (LiquidityEngine::side_pools).
+struct SidePools {
+    std::int64_t bid{0};
+    std::int64_t ask{0};
+};
+
 struct OrderBookGap {
     Side   side;         // Bid or Ask
     double low_bps;      // Lower bound of the gap (bps from mid)
@@ -617,6 +624,14 @@ public:
         const std::vector<TierQuote>& ladder,
         double inventory_ratio,
         double phi);
+
+    /// [TIERMIN 2026-10-29] The pool each side's tiers are sized from, as
+    /// build_raw_ladder sizes them: the smaller of the two when both sides
+    /// have one, so paired tiers match, else the one side's own (negative
+    /// inputs read as 0).  The tiers can sum past it -- tier 0 is raised to
+    /// 1 XCH -- so Step 7 bounds its tier minimums by this, not by the sum.
+    static SidePools side_pools(std::int64_t available_capital,
+                                std::int64_t available_inventory) noexcept;
 
     // -- State tracking (call after successful offer placement) --------------
 

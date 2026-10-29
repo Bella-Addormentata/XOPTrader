@@ -2429,11 +2429,13 @@ private:
         // spread floor and size cap apply.
         bool          revive_thin{false};
         // [TIERMIN 2026-10-29] Step 7's minimum (base mojos) for each tier
-        // it sized at its tier minimum this cycle, and the pair's offer cap
-        // (0 = none), so Step 8 can replace a resting offer the size settings
-        // have since outgrown.  Empty when Step 7 set no tier minimum.
+        // it sized at its tier minimum this cycle, so Step 8 can retire a
+        // resting offer the plan has moved past.  Empty when Step 7 set no
+        // tier minimum; a side with no entry posts its plain ladder.
         std::map<std::pair<Side, std::uint8_t>, Mojo> tier_min_mojos;
-        Mojo          max_offer_mojos{0};
+        // [TIERMIN 2026-10-29] The risk-approved pool (base mojos) each side's
+        // tiers were sized from this cycle, which bounds its tier minimums.
+        SidePools     ladder_pools{};
         // [SYNTH 2026-10-22] The error bar (bps) of the synthetic quoting
         // price published for this pair in Step 1; 0 when none was.
         double        revive_synth_sigma_bps{0.0};

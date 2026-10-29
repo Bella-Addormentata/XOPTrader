@@ -8351,7 +8351,6 @@ void Engine::step_evaluate_pace(BlockHeight block_height)
         pair_in.base_mpu = pace_pc.base_mojos_per_unit;
         pair_in.quote_mpu = pace_pc.quote_mojos_per_unit;
         pair_in.min_offer_override = pace_pc.min_offer_size_units_override;
-        pair_in.max_offer_override = pace_pc.max_offer_size_units_override;
         pair_in.xch_base = (pace_pc.base_asset_id == "xch");
         const auto liq_it = liquidity_engines_.find(pace_pc.name);
         pair_in.side_tier_count = (liq_it != liquidity_engines_.end() && liq_it->second)
@@ -10859,6 +10858,8 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 mid_mojos, sigma, inv_ratio,
                 avail_capital, avail_inventory, ladder_cfg);
         }
+        // [TIERMIN 2026-10-29] The pools those tiers were sized from.
+        pcs.ladder_pools = LiquidityEngine::side_pools(avail_capital, avail_inventory);
 
         // -----------------------------------------------------------------
         // Order-book competitive cap: ensure every tier is priced at least
@@ -12182,15 +12183,12 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 *pair_cfg, config_.strategy.min_offer_size_units);
             const Mojo min_base_mojos = static_cast<Mojo>(std::llround(
                 eff_min_units * static_cast<double>(pair_cfg->base_mojos_per_unit)));
-            // [TIERMIN 2026-10-29] The pair's own cap when it sets one (any
-            // pair), else the global cap on an XCH-base pair; rounded down,
-            // and a positive cap is at least 1 mojo.  A cap past the mojo
-            // range caps nothing, which is what 0 means.
-            const double eff_max_units = effective_max_offer_units(
-                *pair_cfg, config_.strategy.max_offer_size_units);
-            const Mojo max_base_mojos = strategy::tiermin::cap_units_to_mojos(
-                eff_max_units, pair_cfg->base_mojos_per_unit).value_or(0);
-            pcs.max_offer_mojos = max_base_mojos;
+            const double eff_max_units = (xch_base_pair && config_.strategy.max_offer_size_units > 0.0) ? config_.strategy.max_offer_size_units : 0.0;
+            const Mojo max_base_mojos = xch_base_pair
+                ? static_cast<Mojo>(std::llround(
+                      eff_max_units
+                      * static_cast<double>(pair_cfg->base_mojos_per_unit)))
+                : 0;
 
             // [TIERMIN 2026-10-29] Each tier's own minimum: the pair's
             // tight-to-wide line (tier_min_offer_units), never below the pair
@@ -12232,7 +12230,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 }
             }
 
-            if (max_base_mojos > 0) {
+            if (xch_base_pair && max_base_mojos > 0) {
                 int capped_tiers = 0;
                 for (auto& tq : pcs.ladder) {
                     // No tier is capped below its own minimum.
@@ -12489,15 +12487,24 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                     // the widest tier cannot meet its minimum the side sets
                     // the minimums aside and posts the plain ladder.  A CAT
                     // whose pool caps are off has no known budget here; its
-                    // confirmed balance bounds the minimums instead.
+                    // confirmed balance bounds the minimums instead, when the
+                    // wallet's last reply carried it (an incomplete reply
+                    // reads 0 and would set them aside for nothing), else
+                    // the pool alone does and Step 8 checks each offer.
                     if (tier_minimums_on) {
                         std::optional<Mojo> min_budget = budget;
                         if (!min_budget.has_value()) {
                             const auto bal = cached_wallet_balances_.find(funding_asset);
-                            if (bal != cached_wallet_balances_.end()) {
+                            if (bal != cached_wallet_balances_.end()
+                                && bal->second.fields_validated) {
                                 min_budget = bal->second.confirmed;
                             }
                         }
+                        // The side's pool is the one its tiers were sized
+                        // from, or the sum of their pre-cap sizes when a
+                        // later pass (the low-balance throttle) shrank them:
+                        // the sum alone overstates it, as tier 0 is raised
+                        // to 1 XCH whatever its share.
                         std::vector<Mojo> min_sizes;
                         Mojo side_pool = 0;
                         for (const auto& tq : pcs.ladder) {
@@ -12507,6 +12514,8 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                                 side_pool, sz != tier_min_sizes.end() ? sz->second.first : tq.size);
                             min_sizes.push_back(tq.size);
                         }
+                        side_pool = std::min<Mojo>(side_pool,
+                            is_ask ? pcs.ladder_pools.ask : pcs.ladder_pools.bid);
                         const std::size_t fit = strategy::tiermin::widest_tiers_within_pool(
                             min_sizes, side_costs(), side_pool, min_budget);
                         if (fit == 0 && !min_sizes.empty()) {
@@ -13764,38 +13773,44 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
         }
 
-        // [TIERMIN 2026-10-29] A Fresh resting tier the pair's size settings
-        // have outgrown: below the tier minimum Step 7 sized it to this cycle,
-        // or above the pair's offer cap (and above what Step 7 plans for it).
-        // The size rule in classify_tier_staleness refreshes only an offer
-        // past 2x its planned size, so after the tight minimum went from 5 to
-        // 10 XCH, or the cap from 5 to 3, the old offer would rest until its
-        // TTL.  Neither test can fire on an offer Step 7 just sized, so a
-        // replaced tier stays put.  Not with batching, whose one offer per
-        // side carries the sum of its tiers.
-        if (!config_.strategy.batch_offers_enabled
-            && (!pcs.tier_min_mojos.empty() || pcs.max_offer_mojos > 0)) {
+        // [TIERMIN 2026-10-29] On a side posting tier minimums, a Fresh
+        // resting offer the plan has moved past: below the minimum Step 7
+        // sized its tier to this cycle, or on a tier Step 7 no longer plans
+        // (a tight tier skipped for want of funds).  classify_tier_staleness
+        // refreshes by size only past 2x the planned size and keeps an
+        // unplanned offer Fresh, so after the tight minimum went from 5 to
+        // 10 XCH the old offer would rest until its TTL, and a skipped tier's
+        // old offer would stay up beside the wider tiers that took its funds.
+        // Neither test can fire on an offer Step 7 just sized.  Not with
+        // batching, whose one offer per side carries the sum of its tiers.
+        if (!config_.strategy.batch_offers_enabled && !pcs.tier_min_mojos.empty()) {
+            auto side_has_minimums = [&](Side s) {
+                return std::any_of(pcs.tier_min_mojos.begin(), pcs.tier_min_mojos.end(),
+                    [&](const auto& entry) { return entry.first.first == s; });
+            };
             for (auto& size_tc : tier_classes) {
                 if (size_tc.staleness != execution::TierStaleness::Fresh) continue;
+                if (!side_has_minimums(size_tc.side)) continue;
                 const auto planned = std::find_if(pcs.ladder.begin(), pcs.ladder.end(),
                     [&](const TierQuote& tq) {
                         return tq.side == size_tc.side && tq.tier_index == size_tc.tier_index;
                     });
-                if (planned == pcs.ladder.end()) continue;
-                const auto min_it = pcs.tier_min_mojos.find({size_tc.side, size_tc.tier_index});
-                const Mojo tier_min = (min_it != pcs.tier_min_mojos.end()) ? min_it->second : Mojo{0};
                 const PendingOffer size_po = state_->get_offer(size_tc.offer_id);
-                const bool below_min = tier_min > 0 && size_po.size < tier_min;
-                const bool above_cap = pcs.max_offer_mojos > 0
-                    && size_po.size > std::max(pcs.max_offer_mojos, planned->size);
-                if (below_min || above_cap) {
+                const char* why = nullptr;
+                if (planned == pcs.ladder.end()) {
+                    why = "on a tier no longer planned";
+                } else {
+                    const auto min_it = pcs.tier_min_mojos.find({size_tc.side, size_tc.tier_index});
+                    if (min_it != pcs.tier_min_mojos.end() && size_po.size < min_it->second) {
+                        why = "below its tier minimum";
+                    }
+                }
+                if (why != nullptr) {
                     size_tc.staleness = execution::TierStaleness::Stale;
                     spdlog::info("[Engine] Step 8: {} {} tier {} resting {} mojos is {} -- "
-                                 "replacing it at {} mojos",
+                                 "retiring it",
                                  pair_name, (size_tc.side == Side::Bid) ? "BID" : "ASK",
-                                 size_tc.tier_index, size_po.size,
-                                 below_min ? "below its tier minimum" : "above the offer cap",
-                                 planned->size);
+                                 size_tc.tier_index, size_po.size, why);
                 }
             }
         }

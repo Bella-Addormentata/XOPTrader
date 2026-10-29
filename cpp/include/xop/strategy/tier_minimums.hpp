@@ -1,6 +1,6 @@
 // tier_minimums.hpp -- [TIERMIN 2026-10-29] Step 7's per-tier minimum offer
 // sizes (PairConfig::tight_tier_min_offer_units / wide_tier_min_offer_units)
-// and per-pair cap (max_offer_size_units_override), in base mojos.
+// in base mojos, and how a side short of funds fits them.
 //
 // On 2026-10-29 every XCH/wUSDC.b bid sat at the flat 5 XCH cap (tier 0 would
 // have been 16.9 XCH) and the operator asked for 10 XCH at the tight tier down
@@ -40,19 +40,6 @@ namespace xop::strategy::tiermin {
     const double nearest = std::round(x);
     return (std::fabs(x - nearest) <= 0.05) ? to_mojo_checked(nearest)
                                             : ceil_mojo_checked(x);
-}
-
-/// A cap in base mojos, rounded DOWN so an offer never exceeds it.  A
-/// positive cap is at least 1 mojo, because 0 means "no cap"; 0 or less is
-/// no cap.  nullopt when the product is not a representable mojo amount.
-[[nodiscard]] inline std::optional<Mojo> cap_units_to_mojos(double units,
-                                                           std::int64_t mpu) noexcept
-{
-    if (!std::isfinite(units) || mpu <= 0) return std::nullopt;
-    if (!(units > 0.0)) return Mojo{0};
-    const std::optional<Mojo> m = floor_mojo_checked(units * static_cast<double>(mpu));
-    if (!m.has_value()) return std::nullopt;
-    return std::max<Mojo>(1, *m);
 }
 
 /// How many of one side's tiers, widest first, keep their tier-minimum sizes:

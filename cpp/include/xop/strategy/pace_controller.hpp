@@ -157,7 +157,6 @@ struct PairInput {
     std::int64_t  base_mpu{0};
     std::int64_t  quote_mpu{0};
     std::optional<double> min_offer_override{};
-    std::optional<double> max_offer_override{};  ///< PairConfig::max_offer_size_units_override
     bool          xch_base{false};
     std::uint32_t side_tier_count{0};  ///< the pair's LiquidityEngine num_tiers
     bool          fv_ok{false};        ///< P2-usable for this pair, feed freshness included
@@ -641,21 +640,13 @@ static_assert(balance_is_fresh(true, 130u, 120u, 20u));
 /// P12: the offer-size band Step 7 enforces (engine.cpp's min-offer-size
 /// pass, which is NOT changed): min is the pair override, else 1.0 for an
 /// XCH-base pair and the global minimum otherwise; max is the global maximum
-/// for an XCH-base pair and 0 (no cap) otherwise.  [TIERMIN 2026-10-29] A
-/// pair's max_offer_size_units_override replaces the max (0 = no cap) and,
-/// as in Step 7, never caps below the pair's minimum.  Step 7's tier
-/// minimums stand aside on a pace-managed pair.
+/// for an XCH-base pair and 0 (no cap) otherwise.
 [[nodiscard]] inline OfferSizeBand effective_offer_size_band(bool xch_base, std::optional<double> min_override,
-                                                             double global_min, double global_max,
-                                                             std::optional<double> max_override = std::nullopt) noexcept
+                                                             double global_min, double global_max) noexcept
 {
     OfferSizeBand b{};
     b.min_units = min_override.value_or(xch_base ? 1.0 : global_min);
-    if (max_override.has_value()) {
-        b.max_units = (*max_override > 0.0) ? std::max(*max_override, b.min_units) : 0.0;
-    } else {
-        b.max_units = (xch_base && global_max > 0.0) ? global_max : 0.0;
-    }
+    b.max_units = (xch_base && global_max > 0.0) ? global_max : 0.0;
     return b;
 }
 
@@ -1288,8 +1279,7 @@ inline PaceDecision decide(const PaceInputs& in)
         for (const PairInput* p : eligible) {
             const OfferSizeBand band = effective_offer_size_band(p->xch_base, p->min_offer_override,
                                                                  prm.global_min_offer_units,
-                                                                 prm.global_max_offer_units,
-                                                                 p->max_offer_override);
+                                                                 prm.global_max_offer_units);
             const double cap = budget.resting_cap / static_cast<double>(n);
             const double rem = asset_remaining / static_cast<double>(n);
             const TierPlan tp = plan_tiers(cap, p->fv_price, p->base_mpu, prm.min_tier_units, prm.max_tier_units,

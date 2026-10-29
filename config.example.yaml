@@ -219,15 +219,11 @@ pairs:
     # tier limit; a side that cannot fit even its widest tier at its minimum
     # posts the plain ladder instead.  Not used on a pace-managed pair
     # or on a revive pair while its book is thin.  A resting offer smaller
-    # than its tier's minimum is replaced at the new size.
+    # than its tier's minimum, or on a tier skipped for want of funds, is
+    # cancelled and the plan reposted.  strategy.max_offer_size_units never
+    # caps a tier below its minimum; set it to 0 for no cap.
     # tight_tier_min_offer_units: 10      # [OPTIONAL, default: unset]
     # wide_tier_min_offer_units: 1        # [OPTIONAL, default: unset]
-    # This pair's largest offer in base units, in place of
-    # strategy.max_offer_size_units (which covers XCH-base pairs only); 0 = no
-    # cap.  No tier is capped below its own minimum.  A resting offer larger
-    # than the cap is replaced.  Refused while strategy.batch_offers_enabled
-    # is on (a batched side is one offer, so a per-pair cap cannot hold).
-    # max_offer_size_units_override: 20   # [OPTIONAL, default: unset -> strategy.max_offer_size_units]
   - base_asset_id: "xch"
     quote_asset_id: "ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac"  # BYC
     name: "XCH/BYC"
@@ -669,7 +665,7 @@ strategy:
   # asset_reserve_units:
   #   f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6: 3.0   # wmilliETH.b
   min_offer_size_units: 1.0            # [OPTIONAL, default: 1.0]  Min offer size in base-asset units; tiers below this are dropped
-  max_offer_size_units: 5.0            # [OPTIONAL, default: 5.0]  Max offer size per tier for XCH-base pairs; 0 = no cap; pairs[].max_offer_size_units_override replaces it
+  max_offer_size_units: 5.0            # [OPTIONAL, default: 5.0]  Max offer size per tier for XCH-base pairs; 0 = no cap; never below a pair's tier minimums
   # revive_market pairs (see pairs[].revive_market). "Thin" = the third-party
   # book is one-sided, empty, or may be our own offers.
   revive_min_half_spread_bps: 300      # [OPTIONAL, default: 300]  Min half-spread while thin; 0 = none

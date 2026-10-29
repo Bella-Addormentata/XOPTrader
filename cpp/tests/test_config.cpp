@@ -4550,75 +4550,21 @@ TEST(TierMinOfferUnits, WithoutBothSettingsItIsThePairMinimum) {
     }
 }
 
-TEST(EffectiveMaxOfferUnits, PairOverrideElseGlobalOnXchBaseElseNoCap) {
-    xop::PairConfig xch;
-    xch.base_asset_id = "xch";
-    EXPECT_DOUBLE_EQ(xop::effective_max_offer_units(xch, 5.0), 5.0);
-    EXPECT_DOUBLE_EQ(xop::effective_max_offer_units(xch, 0.0), 0.0);
-    xch.max_offer_size_units_override = 20.0;
-    EXPECT_DOUBLE_EQ(xop::effective_max_offer_units(xch, 5.0), 20.0);
-    xch.max_offer_size_units_override = 0.0;
-    EXPECT_DOUBLE_EQ(xop::effective_max_offer_units(xch, 5.0), 0.0)
-        << "0 on the pair lifts the global cap";
-
-    xop::PairConfig cat;
-    cat.base_asset_id = kWmilliEthId;
-    EXPECT_DOUBLE_EQ(xop::effective_max_offer_units(cat, 5.0), 0.0)
-        << "the global cap is for XCH-base pairs only";
-    cat.max_offer_size_units_override = 3.0;
-    EXPECT_DOUBLE_EQ(xop::effective_max_offer_units(cat, 5.0), 3.0)
-        << "a pair's own cap applies whatever its base";
-}
-
-TEST(EffectiveMaxOfferUnits, MatchesThePaceControllersBandMaximum) {
-    // The pace controller sizes its tiers to Step 7's band through its own
-    // copy of the rule; the two must never disagree.
-    const std::vector<std::string> bases{"xch", "XCH", kWmilliEthId};
-    const std::vector<std::optional<double>> overrides{
-        std::nullopt, 0.0, 2.0, 20.0};
-    for (const auto& base : bases) {
-        for (const auto& ovr : overrides) {
-            for (const double global : {0.0, 5.0}) {
-                xop::PairConfig pc;
-                pc.base_asset_id = base;
-                pc.max_offer_size_units_override = ovr;
-                const bool xch_base = base == "xch" || base == "XCH";
-                EXPECT_DOUBLE_EQ(
-                    xop::effective_max_offer_units(pc, global),
-                    xop::strategy::pace::effective_offer_size_band(
-                        xch_base, std::nullopt, 0.1, global, ovr).max_units)
-                    << base << " override=" << ovr.value_or(-1.0)
-                    << " global=" << global;
-            }
-        }
-    }
-}
-
 TEST(ConfigParserTest, TierMinimums_ParseTogether) {
     TempYaml tmp(with_pair_extra(
-        "tight_tier_min_offer_units: 10\n    wide_tier_min_offer_units: 1\n"
-        "    max_offer_size_units_override: 20"));
+        "tight_tier_min_offer_units: 10\n    wide_tier_min_offer_units: 1"));
     const auto cfg = xop::load_config(tmp.path());
     ASSERT_FALSE(cfg.pairs.empty());
     const auto& pc = cfg.pairs[0];
     ASSERT_TRUE(xop::has_tier_minimums(pc));
     EXPECT_DOUBLE_EQ(*pc.tight_tier_min_offer_units, 10.0);
     EXPECT_DOUBLE_EQ(*pc.wide_tier_min_offer_units, 1.0);
-    ASSERT_TRUE(pc.max_offer_size_units_override.has_value());
-    EXPECT_DOUBLE_EQ(*pc.max_offer_size_units_override, 20.0);
 
     TempYaml none(kMinimalValidYaml);
     const auto plain = xop::load_config(none.path());
     EXPECT_FALSE(xop::has_tier_minimums(plain.pairs[0]));
     EXPECT_FALSE(plain.pairs[0].tight_tier_min_offer_units.has_value());
     EXPECT_FALSE(plain.pairs[0].wide_tier_min_offer_units.has_value());
-    EXPECT_FALSE(plain.pairs[0].max_offer_size_units_override.has_value());
-
-    TempYaml no_cap(with_pair_extra("max_offer_size_units_override: 0"));
-    const auto uncapped = xop::load_config(no_cap.path());
-    ASSERT_TRUE(uncapped.pairs[0].max_offer_size_units_override.has_value());
-    EXPECT_DOUBLE_EQ(*uncapped.pairs[0].max_offer_size_units_override, 0.0)
-        << "0 is the documented no-cap";
 }
 
 TEST(ConfigParserTest, TierMinimums_OneWithoutTheOtherRejected) {
@@ -4646,35 +4592,6 @@ TEST(ConfigParserTest, TierMinimums_BadValuesRejected) {
                             + "\n    wide_tier_min_offer_units: " + bad),
             "wide_tier_min_offer_units", bad);
     }
-    for (const char* bad : {"-1", "1000001", ".inf", "-.inf", ".nan"}) {
-        expect_non_finite_rejected(
-            with_pair_extra(std::string("max_offer_size_units_override: ") + bad),
-            "max_offer_size_units_override", bad);
-    }
-}
-
-TEST(ConfigParserTest, PairOfferCap_RefusedWithBatching) {
-    // Batching posts a side's tiers as ONE offer, so a per-tier cap would
-    // not bound what is posted (as with the revive cap).
-    const auto batched_with = [](const std::string& pair_line) {
-        std::string y = with_strategy_keys("\n  batch_offers_enabled: true");
-        const std::string anchor = "    enabled: true";
-        y.insert(y.find(anchor) + anchor.size(), "\n    " + pair_line);
-        return y;
-    };
-    TempYaml capped(batched_with("max_offer_size_units_override: 20"));
-    try {
-        xop::load_config(capped.path());
-        ADD_FAILURE() << "a pair cap with batching was accepted";
-    } catch (const xop::ConfigError& e) {
-        EXPECT_NE(std::string(e.what()).find("batch_offers_enabled"), std::string::npos)
-            << e.what();
-    }
-    // 0 (no cap) is fine with batching, and so is a cap without it.
-    TempYaml zero(batched_with("max_offer_size_units_override: 0"));
-    EXPECT_NO_THROW(xop::load_config(zero.path()));
-    TempYaml unbatched(with_pair_extra("max_offer_size_units_override: 20"));
-    EXPECT_NO_THROW(xop::load_config(unbatched.path()));
 }
 
 TEST(TierMinimumMojos, RoundUpButNotPastAWholeMojo) {
@@ -4695,17 +4612,6 @@ TEST(TierMinimumMojos, RoundUpButNotPastAWholeMojo) {
     EXPECT_FALSE(tmin::min_units_to_mojos(1e7, 1'000'000'000'000).has_value())
         << "past the mojo range";
     EXPECT_FALSE(tmin::min_units_to_mojos(std::nan(""), 1'000).has_value());
-}
-
-TEST(TierMinimumMojos, CapRoundsDownAndAPositiveCapIsNeverNoCap) {
-    namespace tmin = xop::strategy::tiermin;
-    EXPECT_EQ(tmin::cap_units_to_mojos(20.0, 1'000'000'000'000), 20'000'000'000'000);
-    EXPECT_EQ(tmin::cap_units_to_mojos(5.0, 1'000'000'000'000), 5'000'000'000'000);
-    EXPECT_EQ(tmin::cap_units_to_mojos(2.5005, 1'000), 2'500) << "never past the cap";
-    EXPECT_EQ(tmin::cap_units_to_mojos(0.0001, 1'000), 1) << "0.1 mojo is still a cap";
-    EXPECT_EQ(tmin::cap_units_to_mojos(0.0, 1'000), 0) << "0 is no cap";
-    EXPECT_FALSE(tmin::cap_units_to_mojos(std::nan(""), 1'000).has_value());
-    EXPECT_FALSE(tmin::cap_units_to_mojos(1e300, 1'000).has_value());
 }
 
 TEST(TierMinimumMojos, ShortOfFundsTheTightestTiersGoFirst) {

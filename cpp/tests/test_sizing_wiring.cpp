@@ -342,24 +342,20 @@ TEST(SizingWiring, EveryBalanceCacheWriterReadsFromASyncedWallet) {
     EXPECT_NE(position_of(synced, "secondary_sync_ok_ = synced && !syncing;"), std::string::npos);
 }
 
-// -- [TIERMIN 2026-10-29] Step 7's per-tier minimums and per-pair cap --------
+// -- [TIERMIN 2026-10-29] Step 7's per-tier minimums --------------------------
 // Every XCH/wUSDC.b bid sat at the flat 5 XCH cap on 2026-10-29 and the
-// operator asked for 10 XCH at the tight tier down to 1 XCH at the wide one.
-// The arithmetic is unit-tested in test_config.cpp (tier_min_offer_units,
-// effective_max_offer_units); these scans pin that Step 7 caps through the
-// pair's own cap, never below a tier's own minimum, up-scales each tier to
-// its own minimum (not on a pace-managed pair), and that the funding filter
-// sets the minimums aside for a side whose tightest tier the wallet cannot
-// fund, so the side falls back to the plain ladder instead of vanishing.
+// operator asked for 10 XCH at the tight tier down to 1 XCH at the wide one,
+// and, short of funds, for the wider offers to stay up and the tight ones to
+// go.  The arithmetic is unit-tested in test_config.cpp (tier_min_offer_units,
+// tiermin::widest_tiers_within_pool); these scans pin that Step 7 never caps
+// a tier below its own minimum, up-scales each tier to its own minimum (not
+// on a pace-managed pair), bounds the minimums by the side's pool and budget
+// by skipping its tightest tiers, and that Step 8 retires resting offers the
+// plan has moved past and limits XCH widest-first on such a pair.
 
-TEST(SizingWiring, Step7CapsThroughThePairsOwnCapNeverBelowATiersMinimum) {
+TEST(SizingWiring, Step7NeverCapsATierBelowItsMinimum) {
     const std::string body = function_body(read_engine_cpp(), kLadderSignature);
     ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
-    EXPECT_NE(position_of(body, "const double eff_max_units = effective_max_offer_units("
-                                "*pair_cfg, config_.strategy.max_offer_size_units);"),
-              std::string::npos);
-    EXPECT_EQ(count_of(body, "config_.strategy.max_offer_size_units"), 1u)
-        << "the global cap reaches Step 7 only through the helper";
     EXPECT_NE(position_of(body, "const Mojo tier_cap = std::max(max_base_mojos, tier_min_mojos(tq));"),
               std::string::npos);
     EXPECT_NE(position_of(body, "if (tq.size > tier_cap) {"), std::string::npos);
@@ -416,7 +412,19 @@ TEST(SizingWiring, TierMinimumsStayWithinThePoolAndTheBudget) {
     EXPECT_NE(position_of(body, "side_pool = saturating_add_mojo(side_pool, "
                                 "sz != tier_min_sizes.end() ? sz->second.first : tq.size);"),
               std::string::npos);
-    EXPECT_NE(position_of(body, "min_budget = bal->second.confirmed;"), std::string::npos);
+    EXPECT_NE(position_of(body,
+        "side_pool = std::min<Mojo>(side_pool, is_ask ? pcs.ladder_pools.ask : pcs.ladder_pools.bid);"),
+        std::string::npos);
+    EXPECT_NE(position_of(body,
+        "if (bal != cached_wallet_balances_.end() && bal->second.fields_validated) "
+        "{ min_budget = bal->second.confirmed; }"), std::string::npos);
+    // The pools are the ones the ladder was sized from.
+    const std::size_t ladder_at = position_of(body, "avail_capital, avail_inventory, ladder_cfg); }");
+    const std::size_t pools_at = position_of(body,
+        "pcs.ladder_pools = LiquidityEngine::side_pools(avail_capital, avail_inventory);");
+    ASSERT_NE(ladder_at, std::string::npos);
+    ASSERT_NE(pools_at, std::string::npos);
+    EXPECT_LT(ladder_at, pools_at);
     // Nothing fits: the plain sizes; otherwise the TIGHTEST tiers in front
     // of the fit go, and the kept ones are recorded for Step 8.
     const std::size_t plain_at = position_of(body,
@@ -431,28 +439,33 @@ TEST(SizingWiring, TierMinimumsStayWithinThePoolAndTheBudget) {
     EXPECT_LT(fit_at, plain_at);
     EXPECT_LT(plain_at, record_at);
     EXPECT_LT(record_at, skip_at);
-    EXPECT_NE(position_of(body, "pcs.max_offer_mojos = max_base_mojos;"), std::string::npos);
 }
 
-TEST(SizingWiring, Step8ReplacesARestingOfferTheSizeSettingsOutgrew) {
+TEST(SizingWiring, Step8RetiresRestingOffersThePlanMovedPast) {
     const std::string body = function_body(
         read_engine_cpp(), "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)");
     ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
     const std::size_t classify_at = position_of(body, "auto tier_classes = offer_mgr_->classify_tier_staleness(");
     const std::size_t guard_at = position_of(body,
-        "if (!config_.strategy.batch_offers_enabled "
-        "&& (!pcs.tier_min_mojos.empty() || pcs.max_offer_mojos > 0)) {");
+        "if (!config_.strategy.batch_offers_enabled && !pcs.tier_min_mojos.empty()) {");
     const std::size_t count_at = position_of(body, "bool has_pending = !tier_classes.empty();");
     ASSERT_NE(classify_at, std::string::npos);
     ASSERT_NE(guard_at, std::string::npos);
     ASSERT_NE(count_at, std::string::npos);
     EXPECT_LT(classify_at, guard_at);
     EXPECT_LT(guard_at, count_at);
-    EXPECT_NE(position_of(body, "const bool below_min = tier_min > 0 && size_po.size < tier_min;"),
-              std::string::npos);
-    EXPECT_NE(position_of(body, "const bool above_cap = pcs.max_offer_mojos > 0 "
-                                "&& size_po.size > std::max(pcs.max_offer_mojos, planned->size);"),
-              std::string::npos);
+    // Only on a side posting minimums; an unplanned tier goes, as does one
+    // below its minimum.
+    EXPECT_NE(position_of(body, "if (!side_has_minimums(size_tc.side)) continue;"), std::string::npos);
+    EXPECT_NE(position_of(body,
+        "if (planned == pcs.ladder.end()) { why = \"on a tier no longer planned\"; }"),
+        std::string::npos);
+    EXPECT_NE(position_of(body,
+        "if (min_it != pcs.tier_min_mojos.end() && size_po.size < min_it->second) {"),
+        std::string::npos);
+    EXPECT_NE(position_of(body,
+        "if (why != nullptr) { size_tc.staleness = execution::TierStaleness::Stale;"),
+        std::string::npos);
 }
 
 TEST(SizingWiring, Step8XchLimiterSkipsTightTiersFirstUnderTierMinimums) {
@@ -477,11 +490,4 @@ TEST(SizingWiring, Step8XchLimiterSkipsTightTiersFirstUnderTierMinimums) {
     EXPECT_NE(position_of(body,
         "keep_ti = widest_first ? std::max(keep_ti, tq.tier_index) "
         ": std::min(keep_ti, tq.tier_index);"), std::string::npos);
-}
-
-TEST(SizingWiring, PaceBandSeesThePairsOwnCap) {
-    const std::string all = squeeze(read_engine_cpp());
-    ASSERT_FALSE(all.empty()) << XOP_TESTS_ENGINE_CPP;
-    EXPECT_NE(position_of(all, "pair_in.max_offer_override = pace_pc.max_offer_size_units_override;"),
-              std::string::npos);
 }

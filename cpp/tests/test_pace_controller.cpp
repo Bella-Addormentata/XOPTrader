@@ -801,24 +801,6 @@ TEST(PaceBand, OverrideWins) {
     EXPECT_NEAR(b.max_units, 5.0, 1e-9);
 }
 
-TEST(PaceBand, PairCapWins) {
-    // [TIERMIN 2026-10-29] A pair's max_offer_size_units_override, on any base.
-    EXPECT_NEAR(pace::effective_offer_size_band(true, std::nullopt, 0.1, 5.0, 20.0).max_units, 20.0, 1e-9);
-    EXPECT_NEAR(pace::effective_offer_size_band(true, std::nullopt, 0.1, 5.0, 0.0).max_units, 0.0, 1e-9);
-    EXPECT_NEAR(pace::effective_offer_size_band(false, std::nullopt, 0.1, 5.0, 3.0).max_units, 3.0, 1e-9);
-}
-
-TEST(PaceBand, PairCapNeverBelowTheMinimum) {
-    // Step 7 never caps a tier below its minimum, so a pair cap under the
-    // minimum is the minimum here too -- not a conflict that plans no tiers.
-    const pace::OfferSizeBand b = pace::effective_offer_size_band(true, std::nullopt, 0.1, 5.0, 0.5);
-    EXPECT_NEAR(b.min_units, 1.0, 1e-9);
-    EXPECT_NEAR(b.max_units, 1.0, 1e-9);
-    const pace::TierPlan tp = pace::plan_tiers(10.0, 1.0, 1'000'000'000'000, 0.1, 100.0, b, 6u, 6u);
-    EXPECT_FALSE(tp.conflict);
-    EXPECT_GT(tp.tiers, 0u);
-}
-
 pace::OfferSizeBand band_of(double min_units, double max_units)
 {
     pace::OfferSizeBand b{};

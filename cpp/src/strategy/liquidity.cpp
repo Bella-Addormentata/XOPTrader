@@ -139,22 +139,9 @@ LiquidityEngine::LiquidityEngine(const std::string& pair_name,
 // Raw ladder construction (no inventory skew)
 // ===========================================================================
 
-std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
-    std::int64_t          mid,
-    std::int64_t          available_capital,
-    std::int64_t          available_inventory,
-    const LiquidityConfig& cfg)
+SidePools LiquidityEngine::side_pools(std::int64_t available_capital,
+                                      std::int64_t available_inventory) noexcept
 {
-    // Pre-allocate: num_tiers bids + num_tiers asks.
-    std::vector<TierQuote> ladder;
-    ladder.reserve(static_cast<std::size_t>(cfg.num_tiers) * 2);
-
-    // Guard against non-positive mid-price.  In this case the ladder is
-    // empty because we cannot compute meaningful tier prices.
-    if (mid <= 0) {
-        return ladder;
-    }
-
     // Clamp capital/inventory to non-negative values.  Negative values
     // would indicate a data error upstream; defensive clamping prevents
     // nonsensical negative offer sizes.
@@ -171,9 +158,30 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
     const std::int64_t paired_pool = (has_bid_pool && has_ask_pool)
         ? std::min(cap, inv)
         : static_cast<std::int64_t>(0);
-    const std::int64_t bid_pool = has_ask_pool ? paired_pool : cap;
-    const std::int64_t ask_pool = has_bid_pool ? paired_pool : inv;
-    
+    return SidePools{has_ask_pool ? paired_pool : cap,
+                     has_bid_pool ? paired_pool : inv};
+}
+
+std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
+    std::int64_t          mid,
+    std::int64_t          available_capital,
+    std::int64_t          available_inventory,
+    const LiquidityConfig& cfg)
+{
+    // Pre-allocate: num_tiers bids + num_tiers asks.
+    std::vector<TierQuote> ladder;
+    ladder.reserve(static_cast<std::size_t>(cfg.num_tiers) * 2);
+
+    // Guard against non-positive mid-price.  In this case the ladder is
+    // empty because we cannot compute meaningful tier prices.
+    if (mid <= 0) {
+        return ladder;
+    }
+
+    const SidePools pools = side_pools(available_capital, available_inventory);
+    const std::int64_t bid_pool = pools.bid;
+    const std::int64_t ask_pool = pools.ask;
+
     // Minimum pool size: tier-0 must have at least 1 XCH funding (split between bid and ask)
     const std::int64_t min_pool_per_tier = 1000000000000LL;  // 1.0 XCH
 
