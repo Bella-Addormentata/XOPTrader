@@ -5,6 +5,26 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.37] — 2026-10-29 — a small guarded side no longer shrinks the other side's tiers
+
+### Each side keeps its own pool when the floor lifted a drift-tapered side (#202)
+
+After v0.10.36 turned on tier minimums, XCH/wUSDC.b posted one 1 XCH bid and
+one 1 XCH ask, though its bid side had a 31.8 XCH pool. The drift guard
+tapered the ask to about 0.1 XCH, the deploy-idle floor lifted it to the
+pair minimum (1 XCH), and the ladder then sized both sides from the smaller
+pool, so the bids were sized from 1 XCH and only the widest tier fit.
+
+On a pair with tier minimums, when exactly one side was both tapered by the
+drift guard and lifted by the floor, each side is now sized from its own
+pool. With today's balances XCH/wUSDC.b posts about five bids (8.2 down to
+3.7 XCH) and its 1 XCH ask. The engine logs "ladder sides sized from their
+own pools" when this applies.
+
+Unchanged: pairs without tier minimums, and a side the strategy itself sized
+small (no drift taper), such as the XCH/DBX bid, which still pairs the other
+side down.
+
 ## [0.10.36] — 2026-10-29 — per-tier minimum offer sizes, and short of funds the tight tiers go first
 
 ### Tier minimums that grow with the balances (#200)
