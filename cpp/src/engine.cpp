@@ -12218,9 +12218,10 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             // What each tier had before the cap and the minimums -- its share
             // of the side's risk-approved pool -- and what it would post
             // under the pair minimum alone.  The funding filter below keeps
-            // the minimums within that pool and the funding budget, and
-            // falls back to the plain sizes when even the tightest tier
-            // cannot meet its minimum (tiermin::tiers_within_pool).
+            // the minimums within that pool and the funding budget by
+            // skipping the tightest tiers first, and falls back to the plain
+            // sizes when even the widest tier cannot meet its minimum
+            // (tiermin::widest_tiers_within_pool).
             std::map<std::pair<Side, std::uint8_t>, std::pair<Mojo, Mojo>> tier_min_sizes;
             if (tier_minimums_on) {
                 for (const auto& tq : pcs.ladder) {
@@ -12478,15 +12479,17 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         return side_tier_costs;
                     };
                     // [TIERMIN 2026-10-29] The tier minimums stay within what
-                    // the side may spend: the longest tightest-first run of
-                    // tiers whose sizes fit the side's risk-approved pool
-                    // (Step 6's taper, the drift guard, ratio scaling) and
-                    // whose costs fit the funding budget keeps its minimums,
-                    // and the rest are dropped.  When even the tightest tier
-                    // cannot meet its minimum the side sets the minimums
-                    // aside and posts the plain ladder.  A CAT whose pool caps
-                    // are off has no known budget here; its confirmed balance
-                    // bounds the minimums instead.
+                    // the side may spend: the longest run of its WIDEST tiers
+                    // whose sizes fit the side's risk-approved pool (Step 6's
+                    // taper, the drift guard, ratio scaling) and whose costs
+                    // fit the funding budget keeps its minimums, and the
+                    // tighter tiers in front of it are skipped.  Short of
+                    // funds the operator wants the wider, smaller offers up
+                    // rather than one big tight one (2026-10-29).  When even
+                    // the widest tier cannot meet its minimum the side sets
+                    // the minimums aside and posts the plain ladder.  A CAT
+                    // whose pool caps are off has no known budget here; its
+                    // confirmed balance bounds the minimums instead.
                     if (tier_minimums_on) {
                         std::optional<Mojo> min_budget = budget;
                         if (!min_budget.has_value()) {
@@ -12504,7 +12507,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                                 side_pool, sz != tier_min_sizes.end() ? sz->second.first : tq.size);
                             min_sizes.push_back(tq.size);
                         }
-                        const std::size_t fit = strategy::tiermin::tiers_within_pool(
+                        const std::size_t fit = strategy::tiermin::widest_tiers_within_pool(
                             min_sizes, side_costs(), side_pool, min_budget);
                         if (fit == 0 && !min_sizes.empty()) {
                             for (auto& tq : pcs.ladder) {
@@ -12515,7 +12518,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                             spdlog::warn(
                                 "[Engine] Step 7: {} {} tier minimums set aside: "
                                 "the side's pool of {} base mojos or its {} "
-                                "budget of {} cannot fund the tightest tier at "
+                                "budget of {} cannot fund the widest tier at "
                                 "its minimum; posting the plain ladder",
                                 pair_name, is_ask ? "ASK" : "BID", side_pool,
                                 funding_asset,
@@ -12523,22 +12526,23 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                                                        : std::string("(unknown)"));
                         } else {
                             if (fit < min_sizes.size()) {
+                                const std::size_t skip = min_sizes.size() - fit;
                                 std::size_t seen = 0;
                                 pcs.ladder.erase(
                                     std::remove_if(
                                         pcs.ladder.begin(), pcs.ladder.end(),
                                         [&](const TierQuote& tq) {
                                             if (tq.side != side) return false;
-                                            return seen++ >= fit;
+                                            return seen++ < skip;
                                         }),
                                     pcs.ladder.end());
                                 spdlog::info(
-                                    "[Engine] Step 7: {} {} kept {} of {} tiers "
-                                    "at their tier minimums within the side's "
-                                    "pool of {} base mojos and its {} budget; "
-                                    "dropped the rest",
-                                    pair_name, is_ask ? "ASK" : "BID", fit,
-                                    min_sizes.size(), side_pool, funding_asset);
+                                    "[Engine] Step 7: {} {} skipped the {} "
+                                    "tightest of {} tiers: the side's pool of "
+                                    "{} base mojos and its {} budget fund only "
+                                    "the {} widest at their tier minimums",
+                                    pair_name, is_ask ? "ASK" : "BID", skip,
+                                    min_sizes.size(), side_pool, funding_asset, fit);
                             }
                             for (const auto& tq : pcs.ladder) {
                                 if (tq.side == side) {
@@ -15245,7 +15249,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         //
         // Tiers are dropped from the outside in (highest tier_index
         // first), preserving tight tiers that have the best fill
-        // probability.  Remaining tier sizes are NOT renormalised --
+        // probability.  [TIERMIN 2026-10-29] A pair posting tier minimums
+        // is the exception: its tight tiers are its largest, so it drops
+        // them first (the operator's call).  Remaining tier sizes are NOT renormalised --
         // the ladder was already built with full allocations and
         // renormalising would change the effective position size.
         //
@@ -15325,12 +15331,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 const auto resting_keys =
                     select_resting_keys(tier_classes, cancelled_ids);
 
-                // Accumulate cost from tier 0 upward.  Stop when adding
-                // the next tier would exceed the budget.
-                Mojo cumulative_cost = 0;
-                uint8_t max_affordable_tier = max_tier;  // inclusive
-
-                for (uint8_t ti = 0; ti <= max_tier; ++ti) {
+                // The XCH a tier's NEW offers lock: a fee UTXO each, plus
+                // the offer itself for an ask on an XCH-base pair.  Resting
+                // offers cost nothing new; 0 offers means nothing to post.
+                auto new_tier_cost = [&](uint8_t ti) {
                     Mojo tier_cost = 0;
                     int tier_offer_count = 0;
                     for (const auto& tq : fee_filtered_tiers) {
@@ -15347,51 +15351,103 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             tier_cost += tq.size;
                         }
                     }
-                    if (tier_offer_count == 0) continue;
+                    return std::make_pair(tier_cost, tier_offer_count);
+                };
 
-                    if (cumulative_cost + tier_cost > xch_budget) {
-                        max_affordable_tier = (ti > 0) ? ti - 1 : 0;
-                        // If even tier 0 doesn't fit, keep it anyway
-                        // (minimum 1 tier).
-                        break;
+                // [TIERMIN 2026-10-29] A pair posting tier minimums has its
+                // largest offers at the TIGHT end (10 XCH down to 1 XCH), so
+                // short of XCH it skips the tightest tiers and keeps the
+                // wider ones, as the operator asked; always at least the
+                // widest.  Every other pair keeps its tight tiers, below.
+                if (!pcs.tier_min_mojos.empty()) {
+                    std::vector<Mojo> tier_costs;
+                    tier_costs.reserve(static_cast<std::size_t>(max_tier) + 1);
+                    for (int ti = 0; ti <= static_cast<int>(max_tier); ++ti) {
+                        tier_costs.push_back(
+                            new_tier_cost(static_cast<uint8_t>(ti)).first);
                     }
-                    cumulative_cost += tier_cost;
-                    max_affordable_tier = ti;
-                }
-
-                // Remove tiers beyond max_affordable_tier.
-                if (max_affordable_tier < max_tier) {
-                    const auto orig_size = fee_filtered_tiers.size();
-                    std::vector<TierQuote> trimmed;
-                    trimmed.reserve(orig_size);
-                    for (const auto& tq : fee_filtered_tiers) {
-                        if (tq.tier_index <= max_affordable_tier) {
-                            trimmed.push_back(tq);
+                    const uint8_t lowest_kept =
+                        strategy::tiermin::lowest_affordable_tier_widest_first(
+                            tier_costs, 0, max_tier, xch_budget);
+                    if (lowest_kept > 0) {
+                        const auto orig_size = fee_filtered_tiers.size();
+                        std::vector<TierQuote> trimmed;
+                        trimmed.reserve(orig_size);
+                        for (const auto& tq : fee_filtered_tiers) {
+                            if (tq.tier_index >= lowest_kept) {
+                                trimmed.push_back(tq);
+                            }
                         }
+                        if (trimmed.size() < orig_size) {
+                            spdlog::info("[Engine] Dynamic tier limit: {} -> {} "
+                                         "tiers for {}, tightest skipped "
+                                         "first (tier minimums; xch_budget={:.3f} "
+                                         "xch_spendable={:.3f} reserve={:.3f})",
+                                         orig_size, trimmed.size(),
+                                         pair_name,
+                                         static_cast<double>(xch_budget) / kMojosPerXch,
+                                         static_cast<double>(xch_spendable_pre) / kMojosPerXch,
+                                         config_.strategy.fee_reserve_xch);
+                        }
+                        fee_filtered_tiers = std::move(trimmed);
+                    }
+                } else {
+                    // Accumulate cost from tier 0 upward.  Stop when adding
+                    // the next tier would exceed the budget.
+                    Mojo cumulative_cost = 0;
+                    uint8_t max_affordable_tier = max_tier;  // inclusive
+
+                    for (uint8_t ti = 0; ti <= max_tier; ++ti) {
+                        const auto [tier_cost, tier_offer_count] = new_tier_cost(ti);
+                        if (tier_offer_count == 0) continue;
+
+                        if (cumulative_cost + tier_cost > xch_budget) {
+                            max_affordable_tier = (ti > 0) ? ti - 1 : 0;
+                            // If even tier 0 doesn't fit, keep it anyway
+                            // (minimum 1 tier).
+                            break;
+                        }
+                        cumulative_cost += tier_cost;
+                        max_affordable_tier = ti;
                     }
 
-                    spdlog::info("[Engine] Dynamic tier limit: {} -> {} "
-                                 "tiers for {} (xch_budget={:.3f} "
-                                 "xch_spendable={:.3f} reserve={:.3f})",
-                                 orig_size, trimmed.size(),
-                                 pair_name,
-                                 static_cast<double>(xch_budget) / kMojosPerXch,
-                                 static_cast<double>(xch_spendable_pre) / kMojosPerXch,
-                                 config_.strategy.fee_reserve_xch);
-                    fee_filtered_tiers = std::move(trimmed);
+                    // Remove tiers beyond max_affordable_tier.
+                    if (max_affordable_tier < max_tier) {
+                        const auto orig_size = fee_filtered_tiers.size();
+                        std::vector<TierQuote> trimmed;
+                        trimmed.reserve(orig_size);
+                        for (const auto& tq : fee_filtered_tiers) {
+                            if (tq.tier_index <= max_affordable_tier) {
+                                trimmed.push_back(tq);
+                            }
+                        }
+
+                        spdlog::info("[Engine] Dynamic tier limit: {} -> {} "
+                                     "tiers for {} (xch_budget={:.3f} "
+                                     "xch_spendable={:.3f} reserve={:.3f})",
+                                     orig_size, trimmed.size(),
+                                     pair_name,
+                                     static_cast<double>(xch_budget) / kMojosPerXch,
+                                     static_cast<double>(xch_spendable_pre) / kMojosPerXch,
+                                     config_.strategy.fee_reserve_xch);
+                        fee_filtered_tiers = std::move(trimmed);
+                    }
                 }
             } else {
-                // Zero budget -- only keep tier 0 (minimum presence).
+                // Zero budget -- only keep tier 0 (minimum presence), or
+                // on a pair posting tier minimums its widest, smallest tier.
                 const auto orig_size = fee_filtered_tiers.size();
                 if (orig_size > 0) {
-                    // Find minimum tier_index present.
-                    uint8_t min_ti = 255;
+                    const bool widest_first = !pcs.tier_min_mojos.empty();
+                    // Find the tier_index to keep.
+                    uint8_t keep_ti = widest_first ? 0 : 255;
                     for (const auto& tq : fee_filtered_tiers)
-                        min_ti = std::min(min_ti, tq.tier_index);
+                        keep_ti = widest_first ? std::max(keep_ti, tq.tier_index)
+                                               : std::min(keep_ti, tq.tier_index);
 
                     std::vector<TierQuote> trimmed;
                     for (const auto& tq : fee_filtered_tiers) {
-                        if (tq.tier_index == min_ti)
+                        if (tq.tier_index == keep_ti)
                             trimmed.push_back(tq);
                     }
                     if (trimmed.size() < orig_size) {

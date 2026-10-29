@@ -208,7 +208,8 @@ struct PairConfig {
     // pair), else strategy.max_offer_size_units on an XCH-base pair
     // (effective_max_offer_units), and no tier is capped below its own
     // minimum.  Above its minimum a tier keeps its share of the pool, so it
-    // grows with the balances.
+    // grows with the balances.  Short of funds the side skips its tightest
+    // tiers first (strategy/tier_minimums.hpp).
     std::optional<double>   tight_tier_min_offer_units;
     std::optional<double>   wide_tier_min_offer_units;
     std::optional<double>   max_offer_size_units_override;

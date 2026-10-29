@@ -4708,20 +4708,37 @@ TEST(TierMinimumMojos, CapRoundsDownAndAPositiveCapIsNeverNoCap) {
     EXPECT_FALSE(tmin::cap_units_to_mojos(1e300, 1'000).has_value());
 }
 
-TEST(TierMinimumMojos, MinimumsStayWithinThePoolAndTheBudget) {
+TEST(TierMinimumMojos, ShortOfFundsTheTightestTiersGoFirst) {
     namespace tmin = xop::strategy::tiermin;
     // XCH units for readability: the floored ladder 10, 8.2, 6.4 ...
     const std::vector<xop::Mojo> sizes{100, 82, 64, 46, 28, 10};
     const std::vector<xop::Mojo> costs{130, 107, 83, 60, 36, 13};
-    EXPECT_EQ(tmin::tiers_within_pool(sizes, costs, 562, std::nullopt), 6u)
+    EXPECT_EQ(tmin::widest_tiers_within_pool(sizes, costs, 562, std::nullopt), 6u)
         << "a big pool keeps every minimum";
-    EXPECT_EQ(tmin::tiers_within_pool(sizes, costs, 250, std::nullopt), 3u)
-        << "a 25 XCH pool keeps 10 + 8.2 + 6.4";
-    EXPECT_EQ(tmin::tiers_within_pool(sizes, costs, 99, std::nullopt), 0u)
-        << "a pool under the tight minimum sets them aside";
-    EXPECT_EQ(tmin::tiers_within_pool(sizes, costs, 562, xop::Mojo{240}), 2u)
+    EXPECT_EQ(tmin::widest_tiers_within_pool(sizes, costs, 250, std::nullopt), 5u)
+        << "a 25 XCH pool skips the 10 XCH tight tier and keeps 8.2 down to 1";
+    EXPECT_EQ(tmin::widest_tiers_within_pool(sizes, costs, 99, std::nullopt), 3u)
+        << "a 9.9 XCH pool keeps the three widest: 4.6 + 2.8 + 1";
+    EXPECT_EQ(tmin::widest_tiers_within_pool(sizes, costs, 9, std::nullopt), 0u)
+        << "a pool under the widest minimum sets them aside";
+    EXPECT_EQ(tmin::widest_tiers_within_pool(sizes, costs, 562, xop::Mojo{240}), 4u)
         << "the funding budget binds too";
-    EXPECT_EQ(tmin::tiers_within_pool(sizes, costs, 562, xop::Mojo{129}), 0u);
-    EXPECT_EQ(tmin::tiers_within_pool({}, {}, 0, std::nullopt), 0u);
+    EXPECT_EQ(tmin::widest_tiers_within_pool(sizes, costs, 562, xop::Mojo{12}), 0u);
+    EXPECT_EQ(tmin::widest_tiers_within_pool({}, {}, 0, std::nullopt), 0u);
+}
+
+TEST(TierMinimumMojos, XchLimiterKeepsTheWidestTiersFirst) {
+    namespace tmin = xop::strategy::tiermin;
+    // New XCH each tier locks, tier 0 first.
+    const std::vector<xop::Mojo> costs{130, 107, 83, 60, 36, 13};
+    EXPECT_EQ(tmin::lowest_affordable_tier_widest_first(costs, 0, 5, 1000), 0)
+        << "everything fits";
+    EXPECT_EQ(tmin::lowest_affordable_tier_widest_first(costs, 0, 5, 200), 2)
+        << "13 + 36 + 60 + 83 = 192 fits, tier 1 would not";
+    EXPECT_EQ(tmin::lowest_affordable_tier_widest_first(costs, 0, 5, 0), 5)
+        << "the widest tier always stays";
+    // A resting tier costs nothing new and does not stop the run.
+    const std::vector<xop::Mojo> resting{130, 0, 83, 60, 36, 13};
+    EXPECT_EQ(tmin::lowest_affordable_tier_widest_first(resting, 0, 5, 200), 1);
 }
 

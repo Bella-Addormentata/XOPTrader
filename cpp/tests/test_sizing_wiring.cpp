@@ -400,7 +400,7 @@ TEST(SizingWiring, TierMinimumsStayWithinThePoolAndTheBudget) {
     const std::size_t cap_at = position_of(body, "const Mojo tier_cap = std::max(max_base_mojos, tier_min_mojos(tq));");
     const std::size_t funding_at = position_of(body, "[S3 rounds 5+7] Re-enforce EVERY side's funding budget");
     const std::size_t fit_at = position_of(body,
-        "const std::size_t fit = strategy::tiermin::tiers_within_pool("
+        "const std::size_t fit = strategy::tiermin::widest_tiers_within_pool("
         "min_sizes, side_costs(), side_pool, min_budget);");
     const std::size_t skip_at = position_of(body, "if (!budget.has_value()) continue;");
     ASSERT_NE(snapshot_at, std::string::npos);
@@ -417,10 +417,13 @@ TEST(SizingWiring, TierMinimumsStayWithinThePoolAndTheBudget) {
                                 "sz != tier_min_sizes.end() ? sz->second.first : tq.size);"),
               std::string::npos);
     EXPECT_NE(position_of(body, "min_budget = bal->second.confirmed;"), std::string::npos);
-    // Nothing fits: the plain sizes; otherwise the tiers past the fit go,
-    // and the kept ones are recorded for Step 8.
+    // Nothing fits: the plain sizes; otherwise the TIGHTEST tiers in front
+    // of the fit go, and the kept ones are recorded for Step 8.
     const std::size_t plain_at = position_of(body,
         "if (sz != tier_min_sizes.end()) tq.size = sz->second.second;");
+    EXPECT_NE(position_of(body, "const std::size_t skip = min_sizes.size() - fit;"),
+              std::string::npos);
+    EXPECT_NE(position_of(body, "return seen++ < skip;"), std::string::npos);
     const std::size_t record_at = position_of(body,
         "pcs.tier_min_mojos[{side, tq.tier_index}] = tier_min_mojos(tq);");
     ASSERT_NE(plain_at, std::string::npos);
@@ -450,6 +453,30 @@ TEST(SizingWiring, Step8ReplacesARestingOfferTheSizeSettingsOutgrew) {
     EXPECT_NE(position_of(body, "const bool above_cap = pcs.max_offer_mojos > 0 "
                                 "&& size_po.size > std::max(pcs.max_offer_mojos, planned->size);"),
               std::string::npos);
+}
+
+TEST(SizingWiring, Step8XchLimiterSkipsTightTiersFirstUnderTierMinimums) {
+    const std::string body = function_body(
+        read_engine_cpp(), "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)");
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t branch_at = position_of(body,
+        "if (!pcs.tier_min_mojos.empty()) { std::vector<Mojo> tier_costs;");
+    const std::size_t lowest_at = position_of(body,
+        "strategy::tiermin::lowest_affordable_tier_widest_first( tier_costs, 0, max_tier, xch_budget);");
+    const std::size_t keep_at = position_of(body, "if (tq.tier_index >= lowest_kept) {");
+    const std::size_t tight_first_at = position_of(body,
+        "if (tq.tier_index <= max_affordable_tier) {");
+    ASSERT_NE(branch_at, std::string::npos);
+    ASSERT_NE(lowest_at, std::string::npos);
+    ASSERT_NE(keep_at, std::string::npos);
+    ASSERT_NE(tight_first_at, std::string::npos);
+    EXPECT_LT(branch_at, lowest_at);
+    EXPECT_LT(lowest_at, keep_at);
+    EXPECT_LT(keep_at, tight_first_at);
+    // With no XCH budget at all, such a pair keeps its widest tier.
+    EXPECT_NE(position_of(body,
+        "keep_ti = widest_first ? std::max(keep_ti, tq.tier_index) "
+        ": std::min(keep_ti, tq.tier_index);"), std::string::npos);
 }
 
 TEST(SizingWiring, PaceBandSeesThePairsOwnCap) {

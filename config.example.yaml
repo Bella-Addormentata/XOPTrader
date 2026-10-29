@@ -214,9 +214,10 @@ pairs:
     # of the pool, so it grows with the balances.  Set both or neither; each
     # must be > 0 and at most 1e6.  Never below the pair's min offer size.
     # The minimums never take a side past its risk-approved pool or what the
-    # wallet can fund: the tiers that do not fit at their minimums are
-    # dropped, widest first, and a side that cannot fit even its tightest
-    # tier posts the plain ladder instead.  Not used on a pace-managed pair
+    # wallet can fund.  Short of funds, the side skips its tightest (largest)
+    # tiers first and keeps the wider ones, here and in the spendable-XCH
+    # tier limit; a side that cannot fit even its widest tier at its minimum
+    # posts the plain ladder instead.  Not used on a pace-managed pair
     # or on a revive pair while its book is thin.  A resting offer smaller
     # than its tier's minimum is replaced at the new size.
     # tight_tier_min_offer_units: 10      # [OPTIONAL, default: unset]
