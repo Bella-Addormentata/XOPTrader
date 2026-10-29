@@ -593,6 +593,12 @@ struct PairState {
     // that form was unbounded and was corrected 2026-09-02; see
     // xop/execution/orderbook_mid.hpp before changing anything here.
     double      orderbook_mid{0.0}; // Stoikov micro-price from competing offers
+    // [WIDEBOOK 2026-10-29] Width (bps) of the filtered book orderbook_mid
+    // came from, written beside it. compute_mid() serves orderbook_mid for
+    // up to stale_threshold after the offers fetch fails, while spread_bps
+    // is 0 for that raw-ticker heartbeat (PR #159); the crash guard's price
+    // history must still judge that mid by the book it was measured on.
+    double      orderbook_spread_bps{0.0};
 
     // --- CEX reference ---
     double      cex_mid{0.0};       // CEX mid-price (0 if unavailable)
@@ -1324,8 +1330,11 @@ private:
     /// Returns 0.0 if no price data is available at all.
     /// [SYNTH] `synthetic_used`, when given, is set to whether a synthetic
     /// reference contributed to the returned mid.
+    /// [WIDEBOOK 2026-10-29] `orderbook_used`, when given, is set to whether
+    /// the DEX leg was PairState::orderbook_mid.
     double compute_mid(const PairState& ps,
-                       bool* synthetic_used = nullptr) const;
+                       bool* synthetic_used = nullptr,
+                       bool* orderbook_used = nullptr) const;
 
     /// Compute the spread in basis points from best_bid and best_ask.
     /// Returns 0.0 if either side is zero (no two-sided market).

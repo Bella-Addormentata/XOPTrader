@@ -413,7 +413,8 @@ void MarketDataFeed::refresh(const std::vector<std::string>& enabled_pairs) {
 
         // Step 4: Compute aggregated mid-price.
         bool synthetic_used = false;
-        ps.mid_price     = compute_mid(ps, &synthetic_used);
+        bool orderbook_used = false;
+        ps.mid_price     = compute_mid(ps, &synthetic_used, &orderbook_used);
         ps.mid_synthetic = synthetic_used;
 
         // Step 4b: [S20 2026-08-24] Plausibility gate.  Runs BEFORE the
@@ -476,8 +477,15 @@ void MarketDataFeed::refresh(const std::vector<std::string>& enabled_pairs) {
             // Release pairs lock scope not needed here; append_price_history
             // acquires mtx_history_ but we hold mtx_pairs_.  Lock ordering:
             // pairs -> history (never reversed).  Documented and safe.
+            //
+            // [WIDEBOOK 2026-10-29] Recorded with the width of the book the
+            // mid came from.  After a failed offers fetch spread_bps is 0
+            // (raw ticker, Step 5) while compute_mid may still serve the
+            // cached orderbook_mid; that mid keeps its own book's width, or
+            // a cached fake high from a wide book would count as a price.
             append_price_history(pair_name, current_block, ps.mid_price,
-                                 ps.spread_bps);
+                                 orderbook_used ? ps.orderbook_spread_bps
+                                                : ps.spread_bps);
         }
 
         // Step 9: Publish snapshot to shared State.
@@ -1452,8 +1460,10 @@ void MarketDataFeed::set_whale_max_spread_multiplier(double multiplier) {
 // -------------------------------------------------------------------------
 
 double MarketDataFeed::compute_mid(const PairState& ps,
-                                   bool* synthetic_used) const {
+                                   bool* synthetic_used,
+                                   bool* orderbook_used) const {
     if (synthetic_used != nullptr) *synthetic_used = false;
+    if (orderbook_used != nullptr) *orderbook_used = false;
     // [MEDIUM-1] Snapshot config under shared_lock (ISO/IEC 5055 -- CWE-362).
     const auto cfg = [&] { std::shared_lock lk(mtx_config_); return config_; }();
 
@@ -1480,6 +1490,7 @@ double MarketDataFeed::compute_mid(const PairState& ps,
             <= cfg.stale_threshold);
     if (cfg.orderbook_mid_enabled && ps.orderbook_mid > 0.0 && ob_fresh) {
         dex_mid = ps.orderbook_mid;
+        if (orderbook_used != nullptr) *orderbook_used = true;
         spdlog::debug("[MarketData] {} using orderbook_mid={:.6f}",
                       ps.pair_name, dex_mid);
     }
@@ -2680,6 +2691,8 @@ void MarketDataFeed::ingest_competing_offers(
             // dex_print_age was added to detect.
             if (cfg.orderbook_mid_enabled) {
                 ps.orderbook_mid = ob_mid;
+                ps.orderbook_spread_bps =
+                    compute_spread_bps(ps.dex_best_bid, ps.dex_best_ask);
             }
             // [S20] Stamp the orderbook mid's OWN age.  This method is the
             // field's only writer, so compute_mid can now distinguish "the

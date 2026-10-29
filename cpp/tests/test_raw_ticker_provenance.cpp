@@ -356,3 +356,60 @@ TEST(RawTickerProvenance, WithCompetitorTrackingOffNoTouchesAreThirdParty)
 
     EXPECT_FALSE(state.get_market(kPair).touches_third_party);
 }
+
+// ===========================================================================
+// [WIDEBOOK 2026-10-29] The price history the flash-crash guard reads.
+//
+// A mid from a book wider than risk.flash_crash_max_spread_bps cannot set the
+// high a crash is measured from.  On a heartbeat whose offers fetch failed the
+// published spread is 0 (raw ticker, above) while compute_mid still serves the
+// cached orderbook_mid for up to stale_threshold.  Recorded at 0 bps, a fake
+// high cached from a wide book would count again and the return to a normal
+// price would trip the global guard.
+// ===========================================================================
+
+TEST(RawTickerProvenance, AFailedFetchKeepsTheCachedMidsBookWidthInHistory)
+{
+    State state;
+    MarketDataFeed feed(provenance_cfg(), state);
+
+    // XCH/BYC's book of 2026-10-29 with its near ask gone, in miniature:
+    // 83.40467 / 108.0 is ~2,571 bps wide.
+    feed.ingest_block_height(100);
+    feed.ingest_competing_offers(
+        kPair,
+        {third_party("tp-bid", Side::Bid, kBid),
+         third_party("tp-ask", Side::Ask, 108.0)},
+        {}, xop::kMojosPerXch, 1'000);
+    feed.refresh({kPair});
+
+    // The next heartbeat's offers fetch fails: only the ticker arrives. With
+    // none of our own offers resting (they expire unreplaced while the guard
+    // holds) it is the same wide book, so nothing clamps the cached mid.
+    feed.ingest_block_height(101);
+    feed.ingest_dexie(kPair, kBid, 108.0, /*last=*/83.40, /*vol_24h=*/0.21);
+    feed.refresh({kPair});
+
+    const auto h = feed.get_price_history(kPair);
+    ASSERT_EQ(h.size(), 2u);
+    ASSERT_GT(h[0].spread_bps, 2000.0);
+    ASSERT_DOUBLE_EQ(h[1].price, h[0].price)
+        << "precondition: block 101 served the cached orderbook mid";
+    EXPECT_DOUBLE_EQ(state.get_market(kPair).spread_bps, 0.0)
+        << "the published spread stays 0 for the raw ticker (PR #159)";
+    EXPECT_DOUBLE_EQ(h[1].spread_bps, h[0].spread_bps)
+        << "the cached mid keeps the width of the book it came from";
+}
+
+TEST(RawTickerProvenance, AFilteredBookRecordsItsSpreadInHistory)
+{
+    State state;
+    MarketDataFeed feed(provenance_cfg(), state);
+    feed.ingest_block_height(100);
+    ingest_filtered(feed);
+    feed.refresh({kPair});
+
+    const auto h = feed.get_price_history(kPair);
+    ASSERT_EQ(h.size(), 1u);
+    EXPECT_NEAR(h[0].spread_bps, kSpreadBps, 1e-6);
+}
