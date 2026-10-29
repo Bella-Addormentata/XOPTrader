@@ -1574,4 +1574,34 @@ TEST(BookSideQualityLadder, HealthyTwoSidedBookIsUnaffectedByTheNewFlags) {
     }
 }
 
+// [TIERMIN 2026-10-29] The pools each side's tiers are sized from -- what
+// Step 7 bounds its tier minimums by -- are the ones build_raw_ladder uses.
+TEST(SidePoolsTest, PairedWhenBothSidesHaveAPoolElseEachItsOwn) {
+    const auto both = LiquidityEngine::side_pools(5'000, 3'000);
+    EXPECT_EQ(both.bid, 3'000);
+    EXPECT_EQ(both.ask, 3'000);
+    const auto bid_only = LiquidityEngine::side_pools(5'000, 0);
+    EXPECT_EQ(bid_only.bid, 5'000);
+    EXPECT_EQ(bid_only.ask, 0);
+    const auto ask_only = LiquidityEngine::side_pools(-1, 3'000);
+    EXPECT_EQ(ask_only.bid, 0);
+    EXPECT_EQ(ask_only.ask, 3'000);
+}
+
+TEST(SidePoolsTest, TiersPastTierZeroStayWithinThePool) {
+    LiquidityConfig cfg;
+    cfg.num_tiers = 3;
+    cfg.tier_spacing_bps = {50.0, 100.0, 150.0};
+    cfg.tier_size_pct = {0.5, 0.3, 0.2};
+    LiquidityEngine engine("XCH/TEST", cfg);
+    // 10 XCH a side: 5 / 3 / 2 XCH, summing to the pool.
+    const std::int64_t pool = 10'000'000'000'000LL;
+    const auto ladder = engine.compute_ladder(1'000'000, 0.0, 0.5, pool, pool);
+    std::int64_t bid_sum = 0;
+    for (const auto& tq : ladder) {
+        if (tq.side == Side::Bid) bid_sum += tq.size;
+    }
+    EXPECT_LE(bid_sum, LiquidityEngine::side_pools(pool, pool).bid);
+}
+
 }  // namespace

@@ -2428,6 +2428,14 @@ private:
         // third-party book cannot price the pair by itself, so the revive
         // spread floor and size cap apply.
         bool          revive_thin{false};
+        // [TIERMIN 2026-10-29] Step 7's minimum (base mojos) for each tier
+        // it sized at its tier minimum this cycle, so Step 8 can retire a
+        // resting offer the plan has moved past.  Empty when Step 7 set no
+        // tier minimum; a side with no entry posts its plain ladder.
+        std::map<std::pair<Side, std::uint8_t>, Mojo> tier_min_mojos;
+        // [TIERMIN 2026-10-29] The risk-approved pool (base mojos) each side's
+        // tiers were sized from this cycle, which bounds its tier minimums.
+        SidePools     ladder_pools{};
         // [SYNTH 2026-10-22] The error bar (bps) of the synthetic quoting
         // price published for this pair in Step 1; 0 when none was.
         double        revive_synth_sigma_bps{0.0};
@@ -3061,6 +3069,11 @@ private:
     // posts nothing on the asset's pairs: an offer the drain could not cancel
     // may still rest.
     std::unordered_map<std::string, BlockHeight> state_verified_undrained_;
+    // [TIERMIN 2026-10-29] Offer id -> the block Step 8 first found it
+    // resting on a tier a tier-minimum side no longer plans.  Its side posts
+    // nothing new while it is live, or while its cancel is unconfirmed for up
+    // to kTierMinRetireHoldBlocks after that; dropped once the offer is gone.
+    std::unordered_map<std::string, BlockHeight> tier_min_retired_at_;
     // [SEED-FAIL-CLOSED review round 9, #172's review] Assets a booked fill
     // moved.  Step 2 books a fill into State with record_buy/record_sell, and
     // Step 8 sets State to the wallet's balance; a take the wallet already

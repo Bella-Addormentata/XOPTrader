@@ -80,6 +80,7 @@
 #include "xop/util/shutdown_flag.hpp"
 #include "xop/execution/kept_book.hpp"
 #include "xop/execution/offer_expiry.hpp"
+#include "xop/strategy/tier_minimums.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -90,6 +91,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -10856,6 +10858,8 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 mid_mojos, sigma, inv_ratio,
                 avail_capital, avail_inventory, ladder_cfg);
         }
+        // [TIERMIN 2026-10-29] The pools those tiers were sized from.
+        pcs.ladder_pools = LiquidityEngine::side_pools(avail_capital, avail_inventory);
 
         // -----------------------------------------------------------------
         // Order-book competitive cap: ensure every tier is priced at least
@@ -12186,19 +12190,62 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                       * static_cast<double>(pair_cfg->base_mojos_per_unit)))
                 : 0;
 
+            // [TIERMIN 2026-10-29] Each tier's own minimum: the pair's
+            // tight-to-wide line (tier_min_offer_units), never below the pair
+            // minimum, rounded up.  A pace-managed pair keeps the pace plan's
+            // sizes and a revive pair on a thin book its revive cap.  On
+            // 2026-10-29 every XCH/wUSDC.b bid sat at the flat 5 XCH cap
+            // (tier 0 would have been 16.9 XCH) and the operator asked for
+            // 10 XCH at the tight tier down to 1 XCH at the wide one.
+            const bool tier_minimums_on = has_tier_minimums(*pair_cfg)
+                && !(config_.strategy.pace_enabled && pcs.pace.managed)
+                && !(pair_cfg->revive_market && pcs.revive_thin);
+            auto tier_min_units = [&](const TierQuote& tq) {
+                return tier_minimums_on
+                    ? tier_min_offer_units(*pair_cfg, eff_min_units,
+                                           tq.tier_index, ladder_cfg.num_tiers)
+                    : eff_min_units;
+            };
+            auto tier_min_mojos = [&](const TierQuote& tq) {
+                if (!tier_minimums_on) return min_base_mojos;
+                return std::max(min_base_mojos,
+                    strategy::tiermin::min_units_to_mojos(
+                        tier_min_units(tq), pair_cfg->base_mojos_per_unit)
+                        .value_or(min_base_mojos));
+            };
+            // What each tier had before the cap and the minimums -- its share
+            // of the side's risk-approved pool -- and what it would post
+            // under the pair minimum alone.  The funding filter below keeps
+            // the minimums within that pool and the funding budget by
+            // skipping the tightest tiers first, and falls back to the plain
+            // sizes when even the widest tier cannot meet its minimum
+            // (tiermin::widest_tiers_within_pool).
+            std::map<std::pair<Side, std::uint8_t>, std::pair<Mojo, Mojo>> tier_min_sizes;
+            if (tier_minimums_on) {
+                for (const auto& tq : pcs.ladder) {
+                    const Mojo capped = (max_base_mojos > 0)
+                        ? std::min(tq.size, max_base_mojos) : tq.size;
+                    tier_min_sizes[{tq.side, tq.tier_index}] =
+                        {tq.size, std::max(capped, min_base_mojos)};
+                }
+            }
+
             if (xch_base_pair && max_base_mojos > 0) {
                 int capped_tiers = 0;
                 for (auto& tq : pcs.ladder) {
-                    if (tq.size > max_base_mojos) {
+                    // No tier is capped below its own minimum.
+                    const Mojo tier_cap = std::max(max_base_mojos, tier_min_mojos(tq));
+                    if (tq.size > tier_cap) {
                         spdlog::info("[Engine] Step 7: {} {} tier {} capped: "
-                                     "size {} -> {} mojos ({:.1f} XCH max)",
+                                     "size {} -> {} mojos ({:.1f} units max)",
                                      pair_name,
                                      (tq.side == Side::Bid) ? "BID" : "ASK",
                                      tq.tier_index,
                                      tq.size,
-                                     max_base_mojos,
-                                     eff_max_units);
-                        tq.size = max_base_mojos;
+                                     tier_cap,
+                                     static_cast<double>(tier_cap)
+                                         / static_cast<double>(pair_cfg->base_mojos_per_unit));
+                        tq.size = tier_cap;
                         ++capped_tiers;
                     }
                 }
@@ -12209,24 +12256,33 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 }
             }
 
-            // Up-scale smaller tiers to min_base_mojos to support minimum offer size
+            // Up-scale smaller tiers to their minimum to support minimum offer size
             // without reducing the number of active offers (never dropping them).
             int bumped_tiers = 0;
             for (auto& tq : pcs.ladder) {
-                if (tq.size < min_base_mojos) {
+                const Mojo tier_min = tier_min_mojos(tq);
+                if (tq.size < tier_min) {
                     const Mojo old_size = tq.size;
-                    tq.size = min_base_mojos;
+                    tq.size = tier_min;
                     spdlog::info("[Engine] Step 7: {} {} tier {} up-scaled to minimum size: "
                                  "{} -> {} mojos ({:.2f} units)",
                                  pair_name, (tq.side == Side::Bid) ? "BID" : "ASK",
-                                 tq.tier_index, old_size, min_base_mojos, eff_min_units);
+                                 tq.tier_index, old_size, tier_min, tier_min_units(tq));
                     ++bumped_tiers;
                 }
             }
             if (bumped_tiers > 0) {
-                spdlog::info("[Engine] Step 7: {} up-scaled {} tiers to "
-                             "the min offer size ({:.2f} units)",
-                             pair_name, bumped_tiers, eff_min_units);
+                if (tier_minimums_on) {
+                    spdlog::info("[Engine] Step 7: {} up-scaled {} tiers to "
+                                 "their tier minimums ({:.2f} tight to {:.2f} wide units)",
+                                 pair_name, bumped_tiers,
+                                 *pair_cfg->tight_tier_min_offer_units,
+                                 *pair_cfg->wide_tier_min_offer_units);
+                } else {
+                    spdlog::info("[Engine] Step 7: {} up-scaled {} tiers to "
+                                 "the min offer size ({:.2f} units)",
+                                 pair_name, bumped_tiers, eff_min_units);
+                }
             }
 
             // [REVIVE2 2026-10-22] A revive pair on a thin book posts no tier
@@ -12348,14 +12404,10 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         is_ask ? pair_cfg->base_asset_id
                                : pair_cfg->quote_asset_id;
                     const auto budget = known_budget(funding_asset);
-                    if (!budget.has_value()) continue;
 
-                    std::vector<Mojo> costs;
-                    costs.reserve(pcs.ladder.size());
-                    for (const auto& tq : pcs.ladder) {
-                        if (tq.side != side) continue;
+                    auto tier_cost = [&](const TierQuote& tq) -> Mojo {
                         if (is_ask) {
-                            costs.push_back(tq.size);
+                            return tq.size;
                         } else {
                             // [2026-09-01] The FIFTH copy of this conversion,
                             // and the one that made Step 8 compute the same
@@ -12410,14 +12462,108 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                             // sides' tier size from base-denominated pools.
                             // See the note on TierQuote::size in types.hpp,
                             // whose comment used to claim the opposite.
-                            costs.push_back(execution::quote_cost_for_ask(
+                            return execution::quote_cost_for_ask(
                                 BaseMojos{tq.size}, tq.price,
                                 BaseMpu{pair_cfg->base_mojos_per_unit},
-                                QuoteMpu{pair_cfg->quote_mojos_per_unit}).v);
+                                QuoteMpu{pair_cfg->quote_mojos_per_unit}).v;
+                        }
+                    };
+                    auto side_costs = [&]() {
+                        std::vector<Mojo> side_tier_costs;
+                        side_tier_costs.reserve(pcs.ladder.size());
+                        for (const auto& tq : pcs.ladder) {
+                            if (tq.side == side) side_tier_costs.push_back(tier_cost(tq));
+                        }
+                        return side_tier_costs;
+                    };
+                    // [TIERMIN 2026-10-29] The tier minimums stay within what
+                    // the side may spend: the longest run of its WIDEST tiers
+                    // whose sizes fit the side's risk-approved pool (Step 6's
+                    // taper, the drift guard, ratio scaling) and whose costs
+                    // fit the funding budget keeps its minimums, and the
+                    // tighter tiers in front of it are skipped.  Short of
+                    // funds the operator wants the wider, smaller offers up
+                    // rather than one big tight one (2026-10-29).  When even
+                    // the widest tier cannot meet its minimum the side sets
+                    // the minimums aside and posts the plain ladder.  A CAT
+                    // whose pool caps are off has no known budget here; its
+                    // confirmed balance bounds the minimums instead, when the
+                    // wallet's last reply carried it (an incomplete reply
+                    // reads 0 and would set them aside for nothing), else
+                    // the pool alone does and Step 8 checks each offer.
+                    if (tier_minimums_on) {
+                        std::optional<Mojo> min_budget = budget;
+                        if (!min_budget.has_value()) {
+                            const auto bal = cached_wallet_balances_.find(funding_asset);
+                            if (bal != cached_wallet_balances_.end()
+                                && bal->second.fields_validated) {
+                                min_budget = bal->second.confirmed;
+                            }
+                        }
+                        // The side's pool is the one its tiers were sized
+                        // from, or the sum of their pre-cap sizes when a
+                        // later pass (the low-balance throttle) shrank them:
+                        // the sum alone overstates it, as tier 0 is raised
+                        // to 1 XCH whatever its share.
+                        std::vector<Mojo> min_sizes;
+                        Mojo side_pool = 0;
+                        for (const auto& tq : pcs.ladder) {
+                            if (tq.side != side) continue;
+                            const auto sz = tier_min_sizes.find({tq.side, tq.tier_index});
+                            side_pool = saturating_add_mojo(
+                                side_pool, sz != tier_min_sizes.end() ? sz->second.first : tq.size);
+                            min_sizes.push_back(tq.size);
+                        }
+                        side_pool = std::min<Mojo>(side_pool,
+                            is_ask ? pcs.ladder_pools.ask : pcs.ladder_pools.bid);
+                        const std::size_t fit = strategy::tiermin::widest_tiers_within_pool(
+                            min_sizes, side_costs(), side_pool, min_budget);
+                        if (fit == 0 && !min_sizes.empty()) {
+                            for (auto& tq : pcs.ladder) {
+                                if (tq.side != side) continue;
+                                const auto sz = tier_min_sizes.find({tq.side, tq.tier_index});
+                                if (sz != tier_min_sizes.end()) tq.size = sz->second.second;
+                            }
+                            spdlog::warn(
+                                "[Engine] Step 7: {} {} tier minimums set aside: "
+                                "the side's pool of {} base mojos or its {} "
+                                "budget of {} cannot fund the widest tier at "
+                                "its minimum; posting the plain ladder",
+                                pair_name, is_ask ? "ASK" : "BID", side_pool,
+                                funding_asset,
+                                min_budget.has_value() ? std::to_string(*min_budget)
+                                                       : std::string("(unknown)"));
+                        } else {
+                            if (fit < min_sizes.size()) {
+                                const std::size_t skip = min_sizes.size() - fit;
+                                std::size_t seen = 0;
+                                pcs.ladder.erase(
+                                    std::remove_if(
+                                        pcs.ladder.begin(), pcs.ladder.end(),
+                                        [&](const TierQuote& tq) {
+                                            if (tq.side != side) return false;
+                                            return seen++ < skip;
+                                        }),
+                                    pcs.ladder.end());
+                                spdlog::info(
+                                    "[Engine] Step 7: {} {} skipped the {} "
+                                    "tightest of {} tiers: the side's pool of "
+                                    "{} base mojos and its {} budget fund only "
+                                    "the {} widest at their tier minimums",
+                                    pair_name, is_ask ? "ASK" : "BID", skip,
+                                    min_sizes.size(), side_pool, funding_asset, fit);
+                            }
+                            for (const auto& tq : pcs.ladder) {
+                                if (tq.side == side) {
+                                    pcs.tier_min_mojos[{side, tq.tier_index}] = tier_min_mojos(tq);
+                                }
+                            }
                         }
                     }
-                    const std::size_t keep = tiers_within_budget(
-                        costs, *budget);
+                    if (!budget.has_value()) continue;
+
+                    const std::vector<Mojo> costs = side_costs();
+                    const std::size_t keep = tiers_within_budget(costs, *budget);
                     if (keep >= costs.size()) continue;
 
                     std::size_t seen = 0;
@@ -13627,6 +13773,57 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
         }
 
+        // [TIERMIN 2026-10-29] On a side posting tier minimums, a Fresh
+        // resting offer the plan has moved past: below the minimum Step 7
+        // sized its tier to this cycle, or on a tier Step 7 no longer plans
+        // (a tight tier skipped for want of funds).  classify_tier_staleness
+        // refreshes by size only past 2x the planned size and keeps an
+        // unplanned offer Fresh, so after the tight minimum went from 5 to
+        // 10 XCH the old offer would rest until its TTL, and a skipped tier's
+        // old offer would stay up beside the wider tiers that took its funds.
+        // Neither test can fire on an offer Step 7 just sized.  Config
+        // refuses tier minimums with batching, whose one offer per side
+        // carries the sum of its tiers.
+        const auto side_has_minimums = [&](Side s) {
+            return std::any_of(pcs.tier_min_mojos.begin(), pcs.tier_min_mojos.end(),
+                [&](const auto& entry) { return entry.first.first == s; });
+        };
+        const auto tier_planned = [&](Side s, std::uint8_t tier_index) {
+            return std::any_of(pcs.ladder.begin(), pcs.ladder.end(),
+                [&](const TierQuote& tq) {
+                    return tq.side == s && tq.tier_index == tier_index;
+                });
+        };
+        // Why a resting offer on a side posting tier minimums must go, as
+        // the cancel reason recorded for it; nullptr when it may stay.
+        const auto tier_min_retire_reason = [&](Side s, std::uint8_t tier_index,
+                                                Mojo size) -> const char* {
+            if (!side_has_minimums(s)) return nullptr;
+            if (!tier_planned(s, tier_index)) return "tier_min_unplanned";
+            const auto min_it = pcs.tier_min_mojos.find({s, tier_index});
+            if (min_it != pcs.tier_min_mojos.end() && size < min_it->second) {
+                return "tier_min_undersized";
+            }
+            return nullptr;
+        };
+        std::unordered_map<std::string, std::string> tier_min_retire_reasons;
+        if (!config_.strategy.batch_offers_enabled && !pcs.tier_min_mojos.empty()) {
+            for (auto& size_tc : tier_classes) {
+                if (size_tc.staleness != execution::TierStaleness::Fresh) continue;
+                const PendingOffer size_po = state_->get_offer(size_tc.offer_id);
+                const char* why = tier_min_retire_reason(
+                    size_tc.side, size_tc.tier_index, size_po.size);
+                if (why != nullptr) {
+                    size_tc.staleness = execution::TierStaleness::Stale;
+                    tier_min_retire_reasons[size_tc.offer_id] = why;
+                    spdlog::info("[Engine] Step 8: {} {} tier {} resting {} mojos -- "
+                                 "retiring it ({})",
+                                 pair_name, (size_tc.side == Side::Bid) ? "BID" : "ASK",
+                                 size_tc.tier_index, size_po.size, why);
+                }
+            }
+        }
+
         bool has_pending = !tier_classes.empty();
         int fresh_count = 0, stale_count = 0, expired_count = 0;
         for (const auto& tc : tier_classes) {
@@ -13707,6 +13904,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         }
         for (const auto& pace_id : pace_reprice_ids) {
             cancel_reasons[pace_id] = "pace_reprice";
+        }
+        for (const auto& [retired_id, why] : tier_min_retire_reasons) {
+            cancel_reasons[retired_id] = why;
         }
 
         if (!cancelled_ids.empty()) {
@@ -15076,7 +15276,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         //
         // Tiers are dropped from the outside in (highest tier_index
         // first), preserving tight tiers that have the best fill
-        // probability.  Remaining tier sizes are NOT renormalised --
+        // probability.  [TIERMIN 2026-10-29] A pair posting tier minimums
+        // is the exception: its tight tiers are its largest, so it drops
+        // them first (the operator's call).  Remaining tier sizes are NOT renormalised --
         // the ladder was already built with full allocations and
         // renormalising would change the effective position size.
         //
@@ -15103,6 +15305,16 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // Estimated UTXO overhead per offer (~0.25 XCH).
             constexpr Mojo kUtxoOverheadMojos =
                 static_cast<Mojo>(250000000000LL);  // 0.25 * 1e12
+
+            // [TIERMIN 2026-10-29] A pair posting tier minimums keeps its
+            // wider tiers when short (below), and charges only the sides it
+            // may post: the side filter below would drop the rest anyway,
+            // and charging them would trim tiers the budget can fund.
+            const bool widest_first = !pcs.tier_min_mojos.empty();
+            auto side_may_post = [&](Side side) {
+                return !widest_first
+                    || (side == Side::Bid ? can_bid : can_ask);
+            };
 
             // Safety margin: 20% headroom above fee reserve.
             constexpr double kSafetyMarginPct = 0.20;
@@ -15156,16 +15368,15 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 const auto resting_keys =
                     select_resting_keys(tier_classes, cancelled_ids);
 
-                // Accumulate cost from tier 0 upward.  Stop when adding
-                // the next tier would exceed the budget.
-                Mojo cumulative_cost = 0;
-                uint8_t max_affordable_tier = max_tier;  // inclusive
-
-                for (uint8_t ti = 0; ti <= max_tier; ++ti) {
+                // The XCH a tier's NEW offers lock: a fee UTXO each, plus
+                // the offer itself for an ask on an XCH-base pair.  Resting
+                // offers cost nothing new; 0 offers means nothing to post.
+                auto new_tier_cost = [&](uint8_t ti) {
                     Mojo tier_cost = 0;
                     int tier_offer_count = 0;
                     for (const auto& tq : fee_filtered_tiers) {
                         if (tq.tier_index != ti) continue;
+                        if (!side_may_post(tq.side)) continue;
                         const std::string resting_key =
                             std::to_string(static_cast<int>(tq.side))
                             + "_" + std::to_string(tq.tier_index);
@@ -15178,51 +15389,104 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             tier_cost += tq.size;
                         }
                     }
-                    if (tier_offer_count == 0) continue;
+                    return std::make_pair(tier_cost, tier_offer_count);
+                };
 
-                    if (cumulative_cost + tier_cost > xch_budget) {
-                        max_affordable_tier = (ti > 0) ? ti - 1 : 0;
-                        // If even tier 0 doesn't fit, keep it anyway
-                        // (minimum 1 tier).
-                        break;
+                // [TIERMIN 2026-10-29] A pair posting tier minimums has its
+                // largest offers at the TIGHT end (10 XCH down to 1 XCH), so
+                // short of XCH it skips the tightest tiers and keeps the
+                // wider ones, as the operator asked; always at least the
+                // widest.  Every other pair keeps its tight tiers, below.
+                if (widest_first) {
+                    std::vector<Mojo> tier_costs;
+                    tier_costs.reserve(static_cast<std::size_t>(max_tier) + 1);
+                    for (int ti = 0; ti <= static_cast<int>(max_tier); ++ti) {
+                        tier_costs.push_back(
+                            new_tier_cost(static_cast<uint8_t>(ti)).first);
                     }
-                    cumulative_cost += tier_cost;
-                    max_affordable_tier = ti;
-                }
-
-                // Remove tiers beyond max_affordable_tier.
-                if (max_affordable_tier < max_tier) {
-                    const auto orig_size = fee_filtered_tiers.size();
-                    std::vector<TierQuote> trimmed;
-                    trimmed.reserve(orig_size);
-                    for (const auto& tq : fee_filtered_tiers) {
-                        if (tq.tier_index <= max_affordable_tier) {
-                            trimmed.push_back(tq);
+                    const uint8_t lowest_kept =
+                        strategy::tiermin::lowest_affordable_tier_widest_first(
+                            tier_costs, 0, max_tier, xch_budget);
+                    if (lowest_kept > 0) {
+                        const auto orig_size = fee_filtered_tiers.size();
+                        std::vector<TierQuote> trimmed;
+                        trimmed.reserve(orig_size);
+                        for (const auto& tq : fee_filtered_tiers) {
+                            if (tq.tier_index >= lowest_kept) {
+                                trimmed.push_back(tq);
+                            }
                         }
+                        if (trimmed.size() < orig_size) {
+                            spdlog::info("[Engine] Dynamic tier limit: {} -> {} "
+                                         "tiers for {}, tightest skipped "
+                                         "first (tier minimums; xch_budget={:.3f} "
+                                         "xch_spendable={:.3f} reserve={:.3f})",
+                                         orig_size, trimmed.size(),
+                                         pair_name,
+                                         static_cast<double>(xch_budget) / kMojosPerXch,
+                                         static_cast<double>(xch_spendable_pre) / kMojosPerXch,
+                                         config_.strategy.fee_reserve_xch);
+                        }
+                        fee_filtered_tiers = std::move(trimmed);
+                    }
+                } else {
+                    // Accumulate cost from tier 0 upward.  Stop when adding
+                    // the next tier would exceed the budget.
+                    Mojo cumulative_cost = 0;
+                    uint8_t max_affordable_tier = max_tier;  // inclusive
+
+                    for (uint8_t ti = 0; ti <= max_tier; ++ti) {
+                        const auto [tier_cost, tier_offer_count] = new_tier_cost(ti);
+                        if (tier_offer_count == 0) continue;
+
+                        if (cumulative_cost + tier_cost > xch_budget) {
+                            max_affordable_tier = (ti > 0) ? ti - 1 : 0;
+                            // If even tier 0 doesn't fit, keep it anyway
+                            // (minimum 1 tier).
+                            break;
+                        }
+                        cumulative_cost += tier_cost;
+                        max_affordable_tier = ti;
                     }
 
-                    spdlog::info("[Engine] Dynamic tier limit: {} -> {} "
-                                 "tiers for {} (xch_budget={:.3f} "
-                                 "xch_spendable={:.3f} reserve={:.3f})",
-                                 orig_size, trimmed.size(),
-                                 pair_name,
-                                 static_cast<double>(xch_budget) / kMojosPerXch,
-                                 static_cast<double>(xch_spendable_pre) / kMojosPerXch,
-                                 config_.strategy.fee_reserve_xch);
-                    fee_filtered_tiers = std::move(trimmed);
+                    // Remove tiers beyond max_affordable_tier.
+                    if (max_affordable_tier < max_tier) {
+                        const auto orig_size = fee_filtered_tiers.size();
+                        std::vector<TierQuote> trimmed;
+                        trimmed.reserve(orig_size);
+                        for (const auto& tq : fee_filtered_tiers) {
+                            if (tq.tier_index <= max_affordable_tier) {
+                                trimmed.push_back(tq);
+                            }
+                        }
+
+                        spdlog::info("[Engine] Dynamic tier limit: {} -> {} "
+                                     "tiers for {} (xch_budget={:.3f} "
+                                     "xch_spendable={:.3f} reserve={:.3f})",
+                                     orig_size, trimmed.size(),
+                                     pair_name,
+                                     static_cast<double>(xch_budget) / kMojosPerXch,
+                                     static_cast<double>(xch_spendable_pre) / kMojosPerXch,
+                                     config_.strategy.fee_reserve_xch);
+                        fee_filtered_tiers = std::move(trimmed);
+                    }
                 }
             } else {
-                // Zero budget -- only keep tier 0 (minimum presence).
+                // Zero budget -- only keep tier 0 (minimum presence), or
+                // on a pair posting tier minimums its widest, smallest tier.
                 const auto orig_size = fee_filtered_tiers.size();
                 if (orig_size > 0) {
-                    // Find minimum tier_index present.
-                    uint8_t min_ti = 255;
-                    for (const auto& tq : fee_filtered_tiers)
-                        min_ti = std::min(min_ti, tq.tier_index);
+                    // Find the tier_index to keep.
+                    uint8_t keep_ti = widest_first ? 0 : 255;
+                    for (const auto& tq : fee_filtered_tiers) {
+                        if (!side_may_post(tq.side)) continue;
+                        keep_ti = widest_first ? std::max(keep_ti, tq.tier_index)
+                                               : std::min(keep_ti, tq.tier_index);
+                    }
 
                     std::vector<TierQuote> trimmed;
                     for (const auto& tq : fee_filtered_tiers) {
-                        if (tq.tier_index == min_ti)
+                        if (tq.tier_index == keep_ti)
                             trimmed.push_back(tq);
                     }
                     if (trimmed.size() < orig_size) {
@@ -15929,6 +16193,107 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     QuoteMpu{pair_cfg->quote_mojos_per_unit}).v;
             };
 
+            // [S71 2026-09-20] The SAME verdict the resting-offer check above
+            // asked for, with the new tiers as `planned`: decide_exposure.
+            // Legacy inputs are the old ones (spendable, this pair's pending)
+            // and any non-Ok verdict suppresses, which is exactly the old
+            // exposure_breaches_reserve(spendable, pending+new, 0, reserve).
+            // Unified projects from `owned` against every resting offer that
+            // spends the asset -- re-read from State here, so an offer the
+            // first site just cancelled (cancel_pending) is already out of
+            // the sum -- and also refuses tiers the FREE coins cannot fund.
+            const std::vector<execution::RestingSpend> prepost_claims =
+                exposure_unified ? exposure_resting_claims()
+                                 : std::vector<execution::RestingSpend>{};
+            const auto inputs_for = [&](bool is_ask, Mojo planned) {
+                execution::ExposureInputs in;
+                in.owned_mojos     = is_ask ? pair_base_owned : pair_quote_owned;
+                in.spendable_mojos = is_ask ? pair_base_spendable
+                                            : pair_quote_spendable;
+                in.resting_spend_mojos = exposure_unified
+                    ? execution::resting_spend_on_asset(
+                          prepost_claims,
+                          is_ask ? pair_cfg->base_asset_id
+                                 : pair_cfg->quote_asset_id)
+                    : (is_ask ? pair_base_pending_spend : pair_quote_pending_spend);
+                in.planned_spend_mojos = planned;
+                in.reserve_mojos = is_ask ? pair_base_reserve_mojos
+                                          : pair_quote_reserve_mojos;
+                // [review #164] Legacy's prepost_claims is empty, so this is
+                // false for it; unified refuses to ADD exposure while any
+                // live resting offer's spend cannot be read.
+                in.resting_incomplete =
+                    execution::has_unmapped_live_claim(prepost_claims);
+                return in;
+            };
+            const auto decide_for = [&](bool is_ask, Mojo planned) {
+                const execution::ExposureInputs in = inputs_for(is_ask, planned);
+                return std::make_pair(
+                    in, execution::decide_exposure(
+                            exposure_unified, in,
+                            config_.strategy.exposure_cancel_hysteresis_pct));
+            };
+            const auto tier_spend = [&](const TierQuote& tq) -> Mojo {
+                return (tq.side == Side::Ask)
+                    ? tq.size
+                    : quote_cost_for_base_size(BaseMojos{tq.size}, tq.price);
+            };
+
+            // [TIERMIN 2026-10-29] A side posting tier minimums that cannot
+            // fund all its new tiers keeps the widest ones that fit instead
+            // of losing the whole side below, as the operator asked: its
+            // tight tiers are its largest.  Only where the check below runs,
+            // and never past the verdict it would give.
+            if (!pcs.tier_min_mojos.empty()) {
+                for (const Side side : {Side::Ask, Side::Bid}) {
+                    if (!side_has_minimums(side)) continue;
+                    const bool is_ask = (side == Side::Ask);
+                    const bool checked = is_ask
+                        ? (can_ask && pair_base_balance_known && pair_base_reserve_mojos > 0
+                           && (!exposure_unified || pair_base_owned_known))
+                        : (can_bid && pair_quote_balance_known && pair_quote_reserve_mojos > 0
+                           && (!exposure_unified || pair_quote_owned_known));
+                    if (!checked) continue;
+                    std::vector<const TierQuote*> side_tiers;
+                    for (const auto& tq : fee_filtered_tiers) {
+                        if (tq.side == side) side_tiers.push_back(&tq);
+                    }
+                    std::sort(side_tiers.begin(), side_tiers.end(),
+                        [](const TierQuote* a, const TierQuote* b) {
+                            return a->tier_index > b->tier_index;
+                        });
+                    Mojo planned = 0;
+                    std::uint8_t lowest_kept = 255;
+                    for (const TierQuote* tq : side_tiers) {
+                        const Mojo next = saturating_add_mojo(planned, tier_spend(*tq));
+                        if (decide_for(is_ask, next).second.verdict
+                            != execution::ExposureVerdict::Ok) {
+                            break;
+                        }
+                        planned = next;
+                        lowest_kept = tq->tier_index;
+                    }
+                    // Nothing fits: leave the side whole, so the check below
+                    // gives the verdict (and any cancel) it always has.
+                    if (lowest_kept == 255 || side_tiers.empty()
+                        || lowest_kept == side_tiers.back()->tier_index) {
+                        continue;
+                    }
+                    const auto before = fee_filtered_tiers.size();
+                    fee_filtered_tiers.erase(
+                        std::remove_if(fee_filtered_tiers.begin(), fee_filtered_tiers.end(),
+                            [&](const TierQuote& tq) {
+                                return tq.side == side && tq.tier_index < lowest_kept;
+                            }),
+                        fee_filtered_tiers.end());
+                    spdlog::info("[Engine] Step 8: {} {} kept the {} widest new "
+                                 "tier(s) its exposure allows, skipping {} tighter",
+                                 pair_name, is_ask ? "ASK" : "BID",
+                                 side_tiers.size() - (before - fee_filtered_tiers.size()),
+                                 before - fee_filtered_tiers.size());
+                }
+            }
+
             Mojo pending_plus_new_ask = pair_base_pending_spend;
             Mojo pending_plus_new_bid = pair_quote_pending_spend;
             for (const auto& tq : fee_filtered_tiers) {
@@ -15945,15 +16310,6 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 }
             }
 
-            // [S71 2026-09-20] The SAME verdict the resting-offer check above
-            // asked for, with the new tiers as `planned`: decide_exposure.
-            // Legacy inputs are the old ones (spendable, this pair's pending)
-            // and any non-Ok verdict suppresses, which is exactly the old
-            // exposure_breaches_reserve(spendable, pending+new, 0, reserve).
-            // Unified projects from `owned` against every resting offer that
-            // spends the asset -- re-read from State here, so an offer the
-            // first site just cancelled (cancel_pending) is already out of
-            // the sum -- and also refuses tiers the FREE coins cannot fund.
             Mojo planned_ask = 0;
             Mojo planned_bid = 0;
             for (const auto& tq : fee_filtered_tiers) {
@@ -15965,32 +16321,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         quote_cost_for_base_size(BaseMojos{tq.size}, tq.price));
                 }
             }
-            const std::vector<execution::RestingSpend> prepost_claims =
-                exposure_unified ? exposure_resting_claims()
-                                 : std::vector<execution::RestingSpend>{};
             const auto projection_for = [&](bool is_ask) {
-                execution::ExposureInputs in;
-                in.owned_mojos     = is_ask ? pair_base_owned : pair_quote_owned;
-                in.spendable_mojos = is_ask ? pair_base_spendable
-                                            : pair_quote_spendable;
-                in.resting_spend_mojos = exposure_unified
-                    ? execution::resting_spend_on_asset(
-                          prepost_claims,
-                          is_ask ? pair_cfg->base_asset_id
-                                 : pair_cfg->quote_asset_id)
-                    : (is_ask ? pair_base_pending_spend : pair_quote_pending_spend);
-                in.planned_spend_mojos = is_ask ? planned_ask : planned_bid;
-                in.reserve_mojos = is_ask ? pair_base_reserve_mojos
-                                          : pair_quote_reserve_mojos;
-                // [review #164] Legacy's prepost_claims is empty, so this is
-                // false for it; unified refuses to ADD exposure while any
-                // live resting offer's spend cannot be read.
-                in.resting_incomplete =
-                    execution::has_unmapped_live_claim(prepost_claims);
-                return std::make_pair(
-                    in, execution::decide_exposure(
-                            exposure_unified, in,
-                            config_.strategy.exposure_cancel_hysteresis_pct));
+                return decide_for(is_ask, is_ask ? planned_ask : planned_bid);
             };
 
             bool suppress_ask_projection = false;
@@ -16165,6 +16497,67 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // in State -- so a keep stop delivered by a signal waits for the ONE
         // call actually outstanding instead of orphaning it (shutdown(), and
         // the PostingMark in offer_manager.cpp).
+        // [TIERMIN 2026-10-29] A side posting tier minimums whose retired
+        // offer -- on a tier Step 7 no longer plans, or below its tier's
+        // minimum -- is still in State posts nothing new until it is gone:
+        // its cancel failed, or was sent and is unconfirmed, so it is still
+        // takeable, and it plus the new plan (its own replacement included)
+        // could exceed the side's pool.  The retire pass above re-sends a
+        // failed cancel next cycle.  An unconfirmed cancel holds the side
+        // for at most kTierMinRetireHoldBlocks: one the wallet never finishes
+        // (the escalation ladder owns it) must not silence the side for good.
+        if (!config_.strategy.batch_offers_enabled && !pcs.tier_min_mojos.empty()) {
+            constexpr BlockHeight kTierMinRetireHoldBlocks = 32;
+            bool hold_bid = false;
+            bool hold_ask = false;
+            const std::vector<PendingOffer> all_offers = state_->get_all_offers();
+            for (const auto& po : all_offers) {
+                if (po.pair_name != pair_name) continue;
+                if (tier_min_retire_reason(po.side, po.tier, po.size) == nullptr) continue;
+                const BlockHeight retired_at =
+                    tier_min_retired_at_.try_emplace(po.offer_id, block_height).first->second;
+                if (po.cancel_pending
+                    && block_height >= retired_at + kTierMinRetireHoldBlocks) {
+                    continue;
+                }
+                (po.side == Side::Bid ? hold_bid : hold_ask) = true;
+            }
+            std::unordered_set<std::string> live_ids;
+            for (const auto& po : all_offers) live_ids.insert(po.offer_id);
+            std::erase_if(tier_min_retired_at_, [&](const auto& entry) {
+                return live_ids.count(entry.first) == 0;
+            });
+            if (hold_bid || hold_ask) {
+                const auto before = fee_filtered_tiers.size();
+                fee_filtered_tiers.erase(
+                    std::remove_if(fee_filtered_tiers.begin(), fee_filtered_tiers.end(),
+                        [&](const TierQuote& tq) {
+                            return (tq.side == Side::Bid) ? hold_bid : hold_ask;
+                        }),
+                    fee_filtered_tiers.end());
+                if (fee_filtered_tiers.size() < before) {
+                    spdlog::info("[Engine] Step 8: {} holds {} new tier(s){}{} until "
+                                 "its retired offers are gone",
+                                 pair_name, before - fee_filtered_tiers.size(),
+                                 hold_bid ? " BID" : "", hold_ask ? " ASK" : "");
+                }
+            }
+        }
+
+        // [TIERMIN 2026-10-29] A pair posting tier minimums posts each side
+        // widest first: post_quotes stops a side at its first insufficient-
+        // funds reply, and the tight tiers are the largest, so a short
+        // wallet then still gets its wider offers up.
+        if (!pcs.tier_min_mojos.empty() && !config_.strategy.batch_offers_enabled) {
+            std::stable_sort(fee_filtered_tiers.begin(), fee_filtered_tiers.end(),
+                [&](const TierQuote& a, const TierQuote& b) {
+                    if (a.side != b.side) {
+                        return static_cast<int>(a.side) < static_cast<int>(b.side);
+                    }
+                    return side_has_minimums(a.side) ? a.tier_index > b.tier_index
+                                                     : a.tier_index < b.tier_index;
+                });
+        }
         int posted = co_await offer_mgr_->post_quotes(
             *pair_cfg, fee_filtered_tiers, block_height, fee_override);
 

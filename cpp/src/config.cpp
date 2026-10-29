@@ -1130,6 +1130,28 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             }
             p.min_offer_size_units_override = v;
         }
+        // [TIERMIN 2026-10-29] Per-tier minimums: both or neither, each
+        // finite in (0, 1e6].  1e6 units keeps every mojo product in range.
+        // See PairConfig::tight_tier_min_offer_units.
+        for (const auto& [key, field] : {
+                 std::pair<const char*, std::optional<double>*>{
+                     "tight_tier_min_offer_units", &p.tight_tier_min_offer_units},
+                 {"wide_tier_min_offer_units", &p.wide_tier_min_offer_units}}) {
+            if (item[key] && item[key].IsDefined() && !item[key].IsNull()) {
+                const double v = item[key].as<double>();
+                if (!std::isfinite(v) || !(v > 0.0) || v > 1e6) {
+                    throw ConfigError(idx + "." + key
+                                      + " must be a finite value in (0, 1e6]; got "
+                                      + std::to_string(v));
+                }
+                *field = v;
+            }
+        }
+        if (p.tight_tier_min_offer_units.has_value()
+            != p.wide_tier_min_offer_units.has_value()) {
+            throw ConfigError(idx + ": set both tight_tier_min_offer_units and "
+                                    "wide_tier_min_offer_units, or neither");
+        }
         if (item["peg_anchor_threshold_pct"]
             && item["peg_anchor_threshold_pct"].IsDefined()
             && !item["peg_anchor_threshold_pct"].IsNull()) {
@@ -3663,6 +3685,11 @@ void log_config_summary(const AppConfig& cfg)
                 << cfg.pairs[i].hard_limit_pct_override.value_or(cfg.risk.hard_limit_pct)
                 << "]";
         }
+        // [TIERMIN 2026-10-29] Per-tier minimums.
+        if (has_tier_minimums(cfg.pairs[i])) {
+            out << " [tier min tight=" << *cfg.pairs[i].tight_tier_min_offer_units
+                << " wide=" << *cfg.pairs[i].wide_tier_min_offer_units << "]";
+        }
         out << "\n";
     }
 
@@ -4909,6 +4936,20 @@ void validate_config_relations(const AppConfig& cfg)
                 "out), or give a pair its own offer_expiry_secs_override, or "
                 "set ttl_cancel_mode back to 'cancel'. With no expiry attached, "
                 "every offer keeps the hard TTL and the mode changes nothing.");
+        }
+    }
+
+    // [TIERMIN 2026-10-29] Batching merges a side's tiers into one wallet
+    // offer (post_merged_side), so Step 8 could neither retire a tier the
+    // minimums skip nor resize one below its minimum inside it.
+    for (std::size_t i = 0; i < cfg.pairs.size(); ++i) {
+        if (cfg.strategy.batch_offers_enabled && has_tier_minimums(cfg.pairs[i])) {
+            throw ConfigError(
+                "pairs[" + std::to_string(i) + "] (" + cfg.pairs[i].name
+                + "): tight_tier_min_offer_units / wide_tier_min_offer_units "
+                "cannot be combined with strategy.batch_offers_enabled: "
+                "batching merges a side's tiers into one offer. Disable "
+                "batching, or remove the tier minimums.");
         }
     }
 

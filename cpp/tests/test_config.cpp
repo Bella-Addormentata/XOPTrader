@@ -19,6 +19,7 @@
 #include <xop/execution/cancel_escalation_config.hpp>
 #include <xop/strategy/fee_controller.hpp>
 #include <xop/strategy/pace_controller.hpp>
+#include <xop/strategy/tier_minimums.hpp>
 
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
@@ -4496,3 +4497,180 @@ TEST(ConfigParserTest, TargetGapSizing_DefaultsOnAndParsesFalse) {
         EXPECT_TRUE(cfg.strategy.target_gap_sizing_enabled) << "null keeps the default";
     }
 }
+
+// -- [TIERMIN 2026-10-29] Per-tier minimum offer sizes ----------------------
+// On 2026-10-29 every XCH/wUSDC.b bid sat at the flat 5 XCH cap and the
+// operator asked for 10 XCH at the tight tier down to 1 XCH at the wide one,
+// still growing with the balances above that.
+
+namespace {
+
+xop::PairConfig tier_min_pair(std::optional<double> tight,
+                              std::optional<double> wide) {
+    xop::PairConfig pc;
+    pc.base_asset_id = "xch";
+    pc.tight_tier_min_offer_units = tight;
+    pc.wide_tier_min_offer_units = wide;
+    return pc;
+}
+
+}  // namespace
+
+TEST(TierMinOfferUnits, RunsInAStraightLineFromTightToWide) {
+    const auto pc = tier_min_pair(10.0, 1.0);
+    ASSERT_TRUE(xop::has_tier_minimums(pc));
+    const double expected[] = {10.0, 8.2, 6.4, 4.6, 2.8, 1.0};
+    for (std::uint32_t i = 0; i < 6; ++i) {
+        EXPECT_NEAR(xop::tier_min_offer_units(pc, 1.0, i, 6), expected[i], 1e-9)
+            << "tier " << i;
+    }
+    // A tier past the last reads as the widest; a one-tier ladder is all tight.
+    EXPECT_NEAR(xop::tier_min_offer_units(pc, 0.5, 9, 6), 1.0, 1e-9);
+    EXPECT_NEAR(xop::tier_min_offer_units(pc, 0.5, 0, 1), 10.0, 1e-9);
+    EXPECT_NEAR(xop::tier_min_offer_units(pc, 0.5, 3, 1), 10.0, 1e-9);
+    EXPECT_NEAR(xop::tier_min_offer_units(pc, 0.5, 0, 0), 10.0, 1e-9);
+}
+
+TEST(TierMinOfferUnits, NeverBelowThePairMinimum) {
+    const auto pc = tier_min_pair(10.0, 1.0);
+    EXPECT_NEAR(xop::tier_min_offer_units(pc, 3.0, 0, 6), 10.0, 1e-9);
+    EXPECT_NEAR(xop::tier_min_offer_units(pc, 3.0, 3, 6), 4.6, 1e-9);
+    EXPECT_NEAR(xop::tier_min_offer_units(pc, 3.0, 4, 6), 3.0, 1e-9);
+    EXPECT_NEAR(xop::tier_min_offer_units(pc, 3.0, 5, 6), 3.0, 1e-9);
+}
+
+TEST(TierMinOfferUnits, WithoutBothSettingsItIsThePairMinimum) {
+    for (const auto& pc : {tier_min_pair(std::nullopt, std::nullopt),
+                           tier_min_pair(10.0, std::nullopt),
+                           tier_min_pair(std::nullopt, 1.0)}) {
+        EXPECT_FALSE(xop::has_tier_minimums(pc));
+        for (std::uint32_t i = 0; i < 6; ++i) {
+            EXPECT_DOUBLE_EQ(xop::tier_min_offer_units(pc, 1.0, i, 6), 1.0);
+        }
+    }
+}
+
+TEST(ConfigParserTest, TierMinimums_ParseTogether) {
+    TempYaml tmp(with_pair_extra(
+        "tight_tier_min_offer_units: 10\n    wide_tier_min_offer_units: 1"));
+    const auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    const auto& pc = cfg.pairs[0];
+    ASSERT_TRUE(xop::has_tier_minimums(pc));
+    EXPECT_DOUBLE_EQ(*pc.tight_tier_min_offer_units, 10.0);
+    EXPECT_DOUBLE_EQ(*pc.wide_tier_min_offer_units, 1.0);
+
+    TempYaml none(kMinimalValidYaml);
+    const auto plain = xop::load_config(none.path());
+    EXPECT_FALSE(xop::has_tier_minimums(plain.pairs[0]));
+    EXPECT_FALSE(plain.pairs[0].tight_tier_min_offer_units.has_value());
+    EXPECT_FALSE(plain.pairs[0].wide_tier_min_offer_units.has_value());
+}
+
+TEST(ConfigParserTest, TierMinimums_OneWithoutTheOtherRejected) {
+    for (const char* line : {"tight_tier_min_offer_units: 10",
+                             "wide_tier_min_offer_units: 1"}) {
+        TempYaml tmp(with_pair_extra(line));
+        try {
+            xop::load_config(tmp.path());
+            ADD_FAILURE() << line << " accepted on its own";
+        } catch (const xop::ConfigError& e) {
+            EXPECT_NE(std::string(e.what()).find("set both"), std::string::npos)
+                << e.what();
+        }
+    }
+}
+
+TEST(ConfigParserTest, TierMinimums_RefusedWithBatching) {
+    // Batching posts a side's tiers as one offer, so Step 8 could neither
+    // retire a tier the minimums skip nor one sized below its minimum.
+    std::string yaml = with_strategy_keys("\n  batch_offers_enabled: true");
+    const std::string anchor = "    enabled: true";
+    const auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(),
+                "\n    tight_tier_min_offer_units: 10\n    wide_tier_min_offer_units: 1");
+    TempYaml tmp(yaml);
+    try {
+        xop::load_config(tmp.path());
+        ADD_FAILURE() << "tier minimums accepted with batching";
+    } catch (const xop::ConfigError& e) {
+        EXPECT_NE(std::string(e.what()).find("batch_offers_enabled"), std::string::npos)
+            << e.what();
+    }
+
+    // Batching alone, and the minimums alone, still load.
+    TempYaml batched(with_strategy_keys("\n  batch_offers_enabled: true"));
+    EXPECT_NO_THROW(xop::load_config(batched.path()));
+    TempYaml minimums(with_pair_extra(
+        "tight_tier_min_offer_units: 10\n    wide_tier_min_offer_units: 1"));
+    EXPECT_NO_THROW(xop::load_config(minimums.path()));
+}
+
+TEST(ConfigParserTest, TierMinimums_BadValuesRejected) {
+    for (const char* bad : {"0", "-1", "1000001", ".inf", "-.inf", ".nan"}) {
+        expect_non_finite_rejected(
+            with_pair_extra(std::string("tight_tier_min_offer_units: ") + bad
+                            + "\n    wide_tier_min_offer_units: 1"),
+            "tight_tier_min_offer_units", bad);
+        expect_non_finite_rejected(
+            with_pair_extra(std::string("tight_tier_min_offer_units: 10")
+                            + "\n    wide_tier_min_offer_units: " + bad),
+            "wide_tier_min_offer_units", bad);
+    }
+}
+
+TEST(TierMinimumMojos, RoundUpButNotPastAWholeMojo) {
+    namespace tmin = xop::strategy::tiermin;
+    // The 10 -> 1 XCH line over six tiers lands on whole mojos.
+    const auto pc = tier_min_pair(10.0, 1.0);
+    const xop::Mojo expected[] = {10'000'000'000'000, 8'200'000'000'000, 6'400'000'000'000,
+                                  4'600'000'000'000, 2'800'000'000'000, 1'000'000'000'000};
+    for (std::uint32_t i = 0; i < 6; ++i) {
+        EXPECT_EQ(tmin::min_units_to_mojos(xop::tier_min_offer_units(pc, 1.0, i, 6),
+                                         1'000'000'000'000),
+                  expected[i]) << "tier " << i;
+    }
+    EXPECT_EQ(tmin::min_units_to_mojos(4.6, 1'000), 4'600);
+    EXPECT_EQ(tmin::min_units_to_mojos(1.0001, 1'000), 1'001) << "never short of the figure";
+    EXPECT_EQ(tmin::min_units_to_mojos(0.0, 1'000), 0);
+    EXPECT_FALSE(tmin::min_units_to_mojos(-1.0, 1'000).has_value());
+    EXPECT_FALSE(tmin::min_units_to_mojos(1e7, 1'000'000'000'000).has_value())
+        << "past the mojo range";
+    EXPECT_FALSE(tmin::min_units_to_mojos(std::nan(""), 1'000).has_value());
+}
+
+TEST(TierMinimumMojos, ShortOfFundsTheTightestTiersGoFirst) {
+    namespace tmin = xop::strategy::tiermin;
+    // XCH units for readability: the floored ladder 10, 8.2, 6.4 ...
+    const std::vector<xop::Mojo> sizes{100, 82, 64, 46, 28, 10};
+    const std::vector<xop::Mojo> costs{130, 107, 83, 60, 36, 13};
+    EXPECT_EQ(tmin::widest_tiers_within_pool(sizes, costs, 562, std::nullopt), 6u)
+        << "a big pool keeps every minimum";
+    EXPECT_EQ(tmin::widest_tiers_within_pool(sizes, costs, 250, std::nullopt), 5u)
+        << "a 25 XCH pool skips the 10 XCH tight tier and keeps 8.2 down to 1";
+    EXPECT_EQ(tmin::widest_tiers_within_pool(sizes, costs, 99, std::nullopt), 3u)
+        << "a 9.9 XCH pool keeps the three widest: 4.6 + 2.8 + 1";
+    EXPECT_EQ(tmin::widest_tiers_within_pool(sizes, costs, 9, std::nullopt), 0u)
+        << "a pool under the widest minimum sets them aside";
+    EXPECT_EQ(tmin::widest_tiers_within_pool(sizes, costs, 562, xop::Mojo{240}), 4u)
+        << "the funding budget binds too";
+    EXPECT_EQ(tmin::widest_tiers_within_pool(sizes, costs, 562, xop::Mojo{12}), 0u);
+    EXPECT_EQ(tmin::widest_tiers_within_pool({}, {}, 0, std::nullopt), 0u);
+}
+
+TEST(TierMinimumMojos, XchLimiterKeepsTheWidestTiersFirst) {
+    namespace tmin = xop::strategy::tiermin;
+    // New XCH each tier locks, tier 0 first.
+    const std::vector<xop::Mojo> costs{130, 107, 83, 60, 36, 13};
+    EXPECT_EQ(tmin::lowest_affordable_tier_widest_first(costs, 0, 5, 1000), 0)
+        << "everything fits";
+    EXPECT_EQ(tmin::lowest_affordable_tier_widest_first(costs, 0, 5, 200), 2)
+        << "13 + 36 + 60 + 83 = 192 fits, tier 1 would not";
+    EXPECT_EQ(tmin::lowest_affordable_tier_widest_first(costs, 0, 5, 0), 5)
+        << "the widest tier always stays";
+    // A resting tier costs nothing new and does not stop the run.
+    const std::vector<xop::Mojo> resting{130, 0, 83, 60, 36, 13};
+    EXPECT_EQ(tmin::lowest_affordable_tier_widest_first(resting, 0, 5, 200), 1);
+}
+

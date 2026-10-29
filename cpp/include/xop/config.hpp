@@ -15,6 +15,7 @@
 #ifndef XOP_CONFIG_HPP
 #define XOP_CONFIG_HPP
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -198,6 +199,17 @@ struct PairConfig {
     std::optional<std::vector<double>> tier_size_pct_override;
     std::optional<double>   max_half_spread_bps_override;
     std::optional<double>   min_offer_size_units_override;
+    // [TIERMIN 2026-10-29] Per-tier minimum offer sizes, in base units: the
+    // tightest tier is raised to at least `tight_tier_min_offer_units`, the
+    // widest to at least `wide_tier_min_offer_units`, and the tiers between
+    // to a straight line through the two (tier_min_offer_units).  Set both or
+    // neither; each finite and in (0, 1e6].  strategy.max_offer_size_units
+    // never caps a tier below its own minimum.  Above its minimum a tier
+    // keeps its share of the pool, so it grows with the balances.  Short of
+    // funds the side skips its tightest tiers first
+    // (strategy/tier_minimums.hpp).
+    std::optional<double>   tight_tier_min_offer_units;
+    std::optional<double>   wide_tier_min_offer_units;
     std::optional<bool>     competitive_anchor_enabled_override;
     std::optional<double>   competitive_anchor_max_distance_bps_override;
     std::optional<double>   competitive_anchor_stride_bps_override;
@@ -344,6 +356,33 @@ inline double effective_min_offer_units(const PairConfig& pc,
     const bool xch_base =
         pc.base_asset_id == "xch" || pc.base_asset_id == "XCH";
     return xch_base ? 1.0 : global_min_units;
+}
+
+/// [TIERMIN 2026-10-29] True when this pair sets its own per-tier minimums.
+inline bool has_tier_minimums(const PairConfig& pc) {
+    return pc.tight_tier_min_offer_units.has_value()
+        && pc.wide_tier_min_offer_units.has_value();
+}
+
+/// [TIERMIN 2026-10-29] The smallest offer, in base units, Step 7 posts at
+/// tier `tier_index` (0 = tightest) of this pair's `num_tiers`-tier ladder:
+/// on the straight line from tight_tier_min_offer_units at tier 0 to
+/// wide_tier_min_offer_units at the last tier, and never below
+/// `pair_min_units` (effective_min_offer_units).  Without the two settings
+/// it is `pair_min_units`.  A tier past the last reads as the widest.
+inline double tier_min_offer_units(const PairConfig& pc, double pair_min_units,
+                                   std::uint32_t tier_index,
+                                   std::uint32_t num_tiers) {
+    if (!has_tier_minimums(pc)) {
+        return pair_min_units;
+    }
+    const double tight = *pc.tight_tier_min_offer_units;
+    const double wide  = *pc.wide_tier_min_offer_units;
+    const double t = (num_tiers > 1u)
+        ? std::min(1.0, static_cast<double>(tier_index)
+                            / static_cast<double>(num_tiers - 1u))
+        : 0.0;
+    return std::max(pair_min_units, tight + (wide - tight) * t);
 }
 
 /// Step 7's empty-book decision, factored out so it is unit-testable.
@@ -1216,6 +1255,8 @@ struct StrategyConfig {
 
     /// Maximum offer size per tier in base-asset units for XCH-base pairs.
     /// Tiers larger than this are capped down.  0 = no cap.  Default 5.0.
+    /// No tier is capped below its own tier minimum
+    /// (PairConfig::tight_tier_min_offer_units).
     double   max_offer_size_units{5.0};
 
     // -- [REVIVE2 2026-10-22] revive_market pairs in thin markets ----------

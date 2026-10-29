@@ -206,6 +206,25 @@ pairs:
     quote_asset_id: "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"  # wUSDC.b
     name: "XCH/wUSDC.b"
     enabled: true
+    # -- Per-tier minimum offer sizes (base units) --
+    # Raise the tightest tier to at least tight_tier_min_offer_units, the
+    # widest to at least wide_tier_min_offer_units, and the tiers between to
+    # a straight line through the two (10 and 1 over 6 tiers: 10, 8.2, 6.4,
+    # 4.6, 2.8, 1).  Above its minimum a tier keeps its tier_size_pct share
+    # of the pool, so it grows with the balances.  Set both or neither; each
+    # must be > 0 and at most 1e6.  Never below the pair's min offer size.
+    # The minimums never take a side past its risk-approved pool or what the
+    # wallet can fund.  Short of funds, the side skips its tightest (largest)
+    # tiers first and keeps the wider ones, here and in the spendable-XCH
+    # tier limit; a side that cannot fit even its widest tier at its minimum
+    # posts the plain ladder instead.  Not used on a pace-managed pair
+    # or on a revive pair while its book is thin.  A resting offer smaller
+    # than its tier's minimum, or on a tier skipped for want of funds, is
+    # cancelled and the plan reposted.  strategy.max_offer_size_units never
+    # caps a tier below its minimum; set it to 0 for no cap.  Refused with
+    # strategy.batch_offers_enabled (one offer per side has no tiers).
+    # tight_tier_min_offer_units: 10      # [OPTIONAL, default: unset]
+    # wide_tier_min_offer_units: 1        # [OPTIONAL, default: unset]
   - base_asset_id: "xch"
     quote_asset_id: "ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac"  # BYC
     name: "XCH/BYC"
@@ -647,7 +666,7 @@ strategy:
   # asset_reserve_units:
   #   f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6: 3.0   # wmilliETH.b
   min_offer_size_units: 1.0            # [OPTIONAL, default: 1.0]  Min offer size in base-asset units; tiers below this are dropped
-  max_offer_size_units: 5.0            # [OPTIONAL, default: 5.0]  Max offer size per tier for XCH-base pairs; 0 = no cap
+  max_offer_size_units: 5.0            # [OPTIONAL, default: 5.0]  Max offer size per tier for XCH-base pairs; 0 = no cap; never below a pair's tier minimums
   # revive_market pairs (see pairs[].revive_market). "Thin" = the third-party
   # book is one-sided, empty, or may be our own offers.
   revive_min_half_spread_bps: 300      # [OPTIONAL, default: 300]  Min half-spread while thin; 0 = none

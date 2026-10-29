@@ -341,3 +341,235 @@ TEST(SizingWiring, EveryBalanceCacheWriterReadsFromASyncedWallet) {
     EXPECT_NE(position_of(synced, "if (step8_sync_gate_passed_) co_return true;"), std::string::npos);
     EXPECT_NE(position_of(synced, "secondary_sync_ok_ = synced && !syncing;"), std::string::npos);
 }
+
+// -- [TIERMIN 2026-10-29] Step 7's per-tier minimums --------------------------
+// Every XCH/wUSDC.b bid sat at the flat 5 XCH cap on 2026-10-29 and the
+// operator asked for 10 XCH at the tight tier down to 1 XCH at the wide one,
+// and, short of funds, for the wider offers to stay up and the tight ones to
+// go.  The arithmetic is unit-tested in test_config.cpp (tier_min_offer_units,
+// tiermin::widest_tiers_within_pool); these scans pin that Step 7 never caps
+// a tier below its own minimum, up-scales each tier to its own minimum (not
+// on a pace-managed pair), bounds the minimums by the side's pool and budget
+// by skipping its tightest tiers, and that Step 8 retires resting offers the
+// plan has moved past and limits XCH widest-first on such a pair.
+
+TEST(SizingWiring, Step7NeverCapsATierBelowItsMinimum) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    EXPECT_NE(position_of(body, "const Mojo tier_cap = std::max(max_base_mojos, tier_min_mojos(tq));"),
+              std::string::npos);
+    EXPECT_NE(position_of(body, "if (tq.size > tier_cap) {"), std::string::npos);
+    EXPECT_EQ(position_of(body, "if (tq.size > max_base_mojos) {"), std::string::npos);
+}
+
+TEST(SizingWiring, Step7UpScalesEachTierToItsOwnMinimum) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t on_at = position_of(body, "const bool tier_minimums_on = has_tier_minimums(*pair_cfg)");
+    const std::size_t line_at = position_of(body,
+        "tier_min_offer_units(*pair_cfg, eff_min_units, tq.tier_index, ladder_cfg.num_tiers)");
+    const std::size_t upscale_at = position_of(body, "const Mojo tier_min = tier_min_mojos(tq);");
+    ASSERT_NE(on_at, std::string::npos);
+    ASSERT_NE(line_at, std::string::npos);
+    ASSERT_NE(upscale_at, std::string::npos);
+    EXPECT_LT(on_at, line_at);
+    EXPECT_LT(line_at, upscale_at);
+    EXPECT_NE(position_of(body, "if (tq.size < tier_min) {"), std::string::npos);
+    EXPECT_EQ(position_of(body, "if (tq.size < min_base_mojos) { const Mojo old_size"),
+              std::string::npos);
+}
+
+TEST(SizingWiring, TierMinimumsStayWithinThePoolAndTheBudget) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    // Off on a pace-managed pair and on a revive pair while thin.
+    EXPECT_NE(position_of(body,
+        "const bool tier_minimums_on = has_tier_minimums(*pair_cfg) "
+        "&& !(config_.strategy.pace_enabled && pcs.pace.managed) "
+        "&& !(pair_cfg->revive_market && pcs.revive_thin);"), std::string::npos);
+    // Each tier's pre-cap size (its share of the pool) and plain size are
+    // taken before the cap, inside the funding filter the minimums are
+    // bounded by the side's pool and budget, and only then does a side with
+    // no known budget skip the filter.
+    const std::size_t snapshot_at = position_of(body,
+        "tier_min_sizes[{tq.side, tq.tier_index}] = {tq.size, std::max(capped, min_base_mojos)};");
+    const std::size_t cap_at = position_of(body, "const Mojo tier_cap = std::max(max_base_mojos, tier_min_mojos(tq));");
+    const std::size_t funding_at = position_of(body, "[S3 rounds 5+7] Re-enforce EVERY side's funding budget");
+    const std::size_t fit_at = position_of(body,
+        "const std::size_t fit = strategy::tiermin::widest_tiers_within_pool("
+        "min_sizes, side_costs(), side_pool, min_budget);");
+    const std::size_t skip_at = position_of(body, "if (!budget.has_value()) continue;");
+    ASSERT_NE(snapshot_at, std::string::npos);
+    ASSERT_NE(cap_at, std::string::npos);
+    ASSERT_NE(funding_at, std::string::npos);
+    ASSERT_NE(fit_at, std::string::npos);
+    ASSERT_NE(skip_at, std::string::npos);
+    EXPECT_LT(snapshot_at, cap_at);
+    EXPECT_LT(funding_at, fit_at);
+    EXPECT_LT(fit_at, skip_at);
+    // The pool is the sum of the pre-cap sizes; a CAT without a known budget
+    // is bounded by its confirmed balance.
+    EXPECT_NE(position_of(body, "side_pool = saturating_add_mojo(side_pool, "
+                                "sz != tier_min_sizes.end() ? sz->second.first : tq.size);"),
+              std::string::npos);
+    EXPECT_NE(position_of(body,
+        "side_pool = std::min<Mojo>(side_pool, is_ask ? pcs.ladder_pools.ask : pcs.ladder_pools.bid);"),
+        std::string::npos);
+    EXPECT_NE(position_of(body,
+        "if (bal != cached_wallet_balances_.end() && bal->second.fields_validated) "
+        "{ min_budget = bal->second.confirmed; }"), std::string::npos);
+    // The pools are the ones the ladder was sized from.
+    const std::size_t ladder_at = position_of(body, "avail_capital, avail_inventory, ladder_cfg); }");
+    const std::size_t pools_at = position_of(body,
+        "pcs.ladder_pools = LiquidityEngine::side_pools(avail_capital, avail_inventory);");
+    ASSERT_NE(ladder_at, std::string::npos);
+    ASSERT_NE(pools_at, std::string::npos);
+    EXPECT_LT(ladder_at, pools_at);
+    // Nothing fits: the plain sizes; otherwise the TIGHTEST tiers in front
+    // of the fit go, and the kept ones are recorded for Step 8.
+    const std::size_t plain_at = position_of(body,
+        "if (sz != tier_min_sizes.end()) tq.size = sz->second.second;");
+    EXPECT_NE(position_of(body, "const std::size_t skip = min_sizes.size() - fit;"),
+              std::string::npos);
+    EXPECT_NE(position_of(body, "return seen++ < skip;"), std::string::npos);
+    const std::size_t record_at = position_of(body,
+        "pcs.tier_min_mojos[{side, tq.tier_index}] = tier_min_mojos(tq);");
+    ASSERT_NE(plain_at, std::string::npos);
+    ASSERT_NE(record_at, std::string::npos);
+    EXPECT_LT(fit_at, plain_at);
+    EXPECT_LT(plain_at, record_at);
+    EXPECT_LT(record_at, skip_at);
+}
+
+TEST(SizingWiring, Step8RetiresRestingOffersThePlanMovedPast) {
+    const std::string body = function_body(
+        read_engine_cpp(), "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)");
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t classify_at = position_of(body, "auto tier_classes = offer_mgr_->classify_tier_staleness(");
+    const std::size_t guard_at = position_of(body,
+        "if (!config_.strategy.batch_offers_enabled && !pcs.tier_min_mojos.empty()) {");
+    const std::size_t count_at = position_of(body, "bool has_pending = !tier_classes.empty();");
+    ASSERT_NE(classify_at, std::string::npos);
+    ASSERT_NE(guard_at, std::string::npos);
+    ASSERT_NE(count_at, std::string::npos);
+    EXPECT_LT(classify_at, guard_at);
+    EXPECT_LT(guard_at, count_at);
+    // Only on a side posting minimums; an unplanned tier goes, as does one
+    // below its minimum, each with its own cancel reason.
+    const std::size_t reason_at = position_of(body,
+        "const auto tier_min_retire_reason = [&](Side s, std::uint8_t tier_index, Mojo size) -> const char* {");
+    ASSERT_NE(reason_at, std::string::npos);
+    EXPECT_LT(reason_at, guard_at);
+    EXPECT_NE(position_of(body, "if (!side_has_minimums(s)) return nullptr;"), std::string::npos);
+    EXPECT_NE(position_of(body,
+        "if (!tier_planned(s, tier_index)) return \"tier_min_unplanned\";"), std::string::npos);
+    EXPECT_NE(position_of(body,
+        "if (min_it != pcs.tier_min_mojos.end() && size < min_it->second) { return \"tier_min_undersized\"; }"),
+        std::string::npos);
+    EXPECT_NE(position_of(body,
+        "const char* why = tier_min_retire_reason( size_tc.side, size_tc.tier_index, size_po.size);"),
+        std::string::npos);
+    const std::size_t pace_reason_at = position_of(body, "cancel_reasons[pace_id] = \"pace_reprice\";");
+    const std::size_t retire_reason_at = position_of(body, "cancel_reasons[retired_id] = why;");
+    ASSERT_NE(pace_reason_at, std::string::npos);
+    ASSERT_NE(retire_reason_at, std::string::npos);
+    EXPECT_LT(pace_reason_at, retire_reason_at)
+        << "a tier-minimum retirement is recorded under its own reason";
+    // While a retired offer -- unplanned or undersized -- is still in State
+    // (cancel failed or unconfirmed), its side posts nothing new, not even
+    // the offer's own replacement.
+    const std::size_t hold_at = position_of(body,
+        "if (po.cancel_pending && block_height >= retired_at + kTierMinRetireHoldBlocks) { continue; } "
+        "(po.side == Side::Bid ? hold_bid : hold_ask) = true;");
+    EXPECT_NE(position_of(body,
+        "if (tier_min_retire_reason(po.side, po.tier, po.size) == nullptr) continue;"), std::string::npos);
+    EXPECT_NE(position_of(body, "return live_ids.count(entry.first) == 0;"), std::string::npos)
+        << "the retired-at map forgets offers that are gone";
+    const std::size_t drop_at = position_of(body,
+        "return (tq.side == Side::Bid) ? hold_bid : hold_ask;");
+    const std::size_t post_at = position_of(body, "int posted = co_await offer_mgr_->post_quotes(");
+    ASSERT_NE(hold_at, std::string::npos);
+    ASSERT_NE(drop_at, std::string::npos);
+    ASSERT_NE(post_at, std::string::npos);
+    EXPECT_LT(hold_at, drop_at);
+    EXPECT_LT(drop_at, post_at);
+    EXPECT_NE(position_of(body,
+        "if (why != nullptr) { size_tc.staleness = execution::TierStaleness::Stale; "
+        "tier_min_retire_reasons[size_tc.offer_id] = why;"),
+        std::string::npos);
+}
+
+TEST(SizingWiring, Step8XchLimiterSkipsTightTiersFirstUnderTierMinimums) {
+    const std::string body = function_body(
+        read_engine_cpp(), "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)");
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t branch_at = position_of(body,
+        "if (widest_first) { std::vector<Mojo> tier_costs;");
+    const std::size_t lowest_at = position_of(body,
+        "strategy::tiermin::lowest_affordable_tier_widest_first( tier_costs, 0, max_tier, xch_budget);");
+    const std::size_t keep_at = position_of(body, "if (tq.tier_index >= lowest_kept) {");
+    const std::size_t tight_first_at = position_of(body,
+        "if (tq.tier_index <= max_affordable_tier) {");
+    ASSERT_NE(branch_at, std::string::npos);
+    ASSERT_NE(lowest_at, std::string::npos);
+    ASSERT_NE(keep_at, std::string::npos);
+    ASSERT_NE(tight_first_at, std::string::npos);
+    EXPECT_LT(branch_at, lowest_at);
+    EXPECT_LT(lowest_at, keep_at);
+    EXPECT_LT(keep_at, tight_first_at);
+    // With no XCH budget at all, such a pair keeps its widest tier.
+    EXPECT_NE(position_of(body,
+        "keep_ti = widest_first ? std::max(keep_ti, tq.tier_index) "
+        ": std::min(keep_ti, tq.tier_index);"), std::string::npos);
+}
+
+TEST(SizingWiring, Step8KeepsTheWidestTiersTheExposureAllowsAndPostsThemFirst) {
+    const std::string body = function_body(
+        read_engine_cpp(), "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)");
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    // The XCH limit charges only the sides the pair may post.
+    EXPECT_NE(position_of(body,
+        "auto side_may_post = [&](Side side) { return !widest_first "
+        "|| (side == Side::Bid ? can_bid : can_ask); };"), std::string::npos);
+    EXPECT_NE(position_of(body, "if (!side_may_post(tq.side)) continue; const std::string resting_key ="),
+              std::string::npos);
+    // The exposure check keeps a tier-minimum side's widest affordable new
+    // tiers before it decides the side, with the same inputs it decides on.
+    // A side without minimums keeps its plain all-or-nothing verdict.
+    const std::size_t gate_at = position_of(body,
+        "for (const Side side : {Side::Ask, Side::Bid}) { if (!side_has_minimums(side)) continue;");
+    const std::size_t trim_at = position_of(body,
+        "return a->tier_index > b->tier_index; });");
+    ASSERT_NE(gate_at, std::string::npos);
+    ASSERT_NE(trim_at, std::string::npos);
+    EXPECT_LT(gate_at, trim_at);
+    const std::size_t verdict_at = position_of(body,
+        "if (decide_for(is_ask, next).second.verdict != execution::ExposureVerdict::Ok) { break; }");
+    const std::size_t erase_at = position_of(body,
+        "return tq.side == side && tq.tier_index < lowest_kept;");
+    const std::size_t planned_at = position_of(body, "Mojo planned_ask = 0;");
+    const std::size_t decide_at = position_of(body,
+        "return decide_for(is_ask, is_ask ? planned_ask : planned_bid);");
+    ASSERT_NE(trim_at, std::string::npos);
+    ASSERT_NE(verdict_at, std::string::npos);
+    ASSERT_NE(erase_at, std::string::npos);
+    ASSERT_NE(planned_at, std::string::npos);
+    ASSERT_NE(decide_at, std::string::npos);
+    EXPECT_LT(trim_at, verdict_at);
+    EXPECT_LT(verdict_at, erase_at);
+    EXPECT_LT(erase_at, planned_at);
+    EXPECT_LT(planned_at, decide_at);
+    // Posted widest first within each side.
+    const std::size_t sort_at = position_of(body,
+        "if (!pcs.tier_min_mojos.empty() && !config_.strategy.batch_offers_enabled) "
+        "{ std::stable_sort(fee_filtered_tiers.begin(), fee_filtered_tiers.end(),");
+    const std::size_t post_at = position_of(body,
+        "int posted = co_await offer_mgr_->post_quotes(");
+    ASSERT_NE(sort_at, std::string::npos);
+    ASSERT_NE(post_at, std::string::npos);
+    EXPECT_LT(sort_at, post_at);
+    // Only a side posting minimums goes widest first; the other keeps tier order.
+    EXPECT_NE(position_of(body,
+        "return side_has_minimums(a.side) ? a.tier_index > b.tier_index : a.tier_index < b.tier_index;"),
+        std::string::npos);
+}
