@@ -341,3 +341,77 @@ TEST(SizingWiring, EveryBalanceCacheWriterReadsFromASyncedWallet) {
     EXPECT_NE(position_of(synced, "if (step8_sync_gate_passed_) co_return true;"), std::string::npos);
     EXPECT_NE(position_of(synced, "secondary_sync_ok_ = synced && !syncing;"), std::string::npos);
 }
+
+// -- [TIERMIN 2026-10-29] Step 7's per-tier minimums and per-pair cap --------
+// Every XCH/wUSDC.b bid sat at the flat 5 XCH cap on 2026-10-29 and the
+// operator asked for 10 XCH at the tight tier down to 1 XCH at the wide one.
+// The arithmetic is unit-tested in test_config.cpp (tier_min_offer_units,
+// effective_max_offer_units); these scans pin that Step 7 caps through the
+// pair's own cap, never below a tier's own minimum, up-scales each tier to
+// its own minimum (not on a pace-managed pair), and that the funding filter
+// sets the minimums aside for a side whose tightest tier the wallet cannot
+// fund, so the side falls back to the plain ladder instead of vanishing.
+
+TEST(SizingWiring, Step7CapsThroughThePairsOwnCapNeverBelowATiersMinimum) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    EXPECT_NE(position_of(body, "const double eff_max_units = effective_max_offer_units("
+                                "*pair_cfg, config_.strategy.max_offer_size_units);"),
+              std::string::npos);
+    EXPECT_EQ(count_of(body, "config_.strategy.max_offer_size_units"), 1u)
+        << "the global cap reaches Step 7 only through the helper";
+    EXPECT_NE(position_of(body, "const Mojo tier_cap = std::max(max_base_mojos, tier_min_mojos(tq));"),
+              std::string::npos);
+    EXPECT_NE(position_of(body, "if (tq.size > tier_cap) {"), std::string::npos);
+    EXPECT_EQ(position_of(body, "if (tq.size > max_base_mojos) {"), std::string::npos);
+}
+
+TEST(SizingWiring, Step7UpScalesEachTierToItsOwnMinimum) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t on_at = position_of(body,
+        "const bool tier_minimums_on = has_tier_minimums(*pair_cfg) "
+        "&& !(config_.strategy.pace_enabled && pcs.pace.managed);");
+    const std::size_t line_at = position_of(body,
+        "tier_min_offer_units(*pair_cfg, eff_min_units, tq.tier_index, ladder_cfg.num_tiers)");
+    const std::size_t upscale_at = position_of(body, "const Mojo tier_min = tier_min_mojos(tq);");
+    ASSERT_NE(on_at, std::string::npos);
+    ASSERT_NE(line_at, std::string::npos);
+    ASSERT_NE(upscale_at, std::string::npos);
+    EXPECT_LT(on_at, line_at);
+    EXPECT_LT(line_at, upscale_at);
+    EXPECT_NE(position_of(body, "if (tq.size < tier_min) {"), std::string::npos);
+    EXPECT_EQ(position_of(body, "if (tq.size < min_base_mojos) { const Mojo old_size"),
+              std::string::npos);
+}
+
+TEST(SizingWiring, FundingFilterFallsBackToThePlainLadder) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t plain_at = position_of(body,
+        "plain_tier_sizes[{tq.side, tq.tier_index}] = std::max(capped, min_base_mojos);");
+    const std::size_t funding_at = position_of(body, "[S3 rounds 5+7] Re-enforce EVERY side's funding budget");
+    const std::size_t fallback_at = position_of(body, "if (keep == 0 && !costs.empty()) {");
+    ASSERT_NE(plain_at, std::string::npos);
+    ASSERT_NE(funding_at, std::string::npos);
+    ASSERT_NE(fallback_at, std::string::npos);
+    EXPECT_LT(plain_at, funding_at);
+    EXPECT_LT(funding_at, fallback_at);
+    // Restores only downwards (a revive cap may already have gone lower),
+    // then re-measures the side before the drop.
+    EXPECT_NE(position_of(body, "if (plain != plain_tier_sizes.end() && plain->second < tq.size) {"),
+              std::string::npos);
+    const std::size_t remeasure_at = body.find(
+        squeeze("costs = side_costs(); keep = tiers_within_budget(costs, *budget);"), fallback_at);
+    const std::size_t drop_at = body.find(squeeze("if (keep >= costs.size()) continue;"), fallback_at);
+    ASSERT_NE(remeasure_at, std::string::npos);
+    ASSERT_NE(drop_at, std::string::npos);
+    EXPECT_LT(remeasure_at, drop_at);
+}
+
+TEST(SizingWiring, PaceBandSeesThePairsOwnCap) {
+    const std::string all = squeeze(read_engine_cpp());
+    ASSERT_FALSE(all.empty()) << XOP_TESTS_ENGINE_CPP;
+    EXPECT_NE(position_of(all, "pair_in.max_offer_override = pace_pc.max_offer_size_units_override;"),
+              std::string::npos);
+}

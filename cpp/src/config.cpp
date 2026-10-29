@@ -1130,6 +1130,39 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             }
             p.min_offer_size_units_override = v;
         }
+        // [TIERMIN 2026-10-29] Per-tier minimums (both or neither, each
+        // finite > 0) and this pair's own largest offer (finite >= 0, 0 = no
+        // cap).  See PairConfig::tight_tier_min_offer_units.
+        for (const auto& [key, field] : {
+                 std::pair<const char*, std::optional<double>*>{
+                     "tight_tier_min_offer_units", &p.tight_tier_min_offer_units},
+                 {"wide_tier_min_offer_units", &p.wide_tier_min_offer_units}}) {
+            if (item[key] && item[key].IsDefined() && !item[key].IsNull()) {
+                const double v = item[key].as<double>();
+                if (!std::isfinite(v) || !(v > 0.0)) {
+                    throw ConfigError(idx + "." + key
+                                      + " must be a finite value > 0; got "
+                                      + std::to_string(v));
+                }
+                *field = v;
+            }
+        }
+        if (p.tight_tier_min_offer_units.has_value()
+            != p.wide_tier_min_offer_units.has_value()) {
+            throw ConfigError(idx + ": set both tight_tier_min_offer_units and "
+                                    "wide_tier_min_offer_units, or neither");
+        }
+        if (item["max_offer_size_units_override"]
+            && item["max_offer_size_units_override"].IsDefined()
+            && !item["max_offer_size_units_override"].IsNull()) {
+            const double v = item["max_offer_size_units_override"].as<double>();
+            if (!std::isfinite(v) || !(v >= 0.0)) {
+                throw ConfigError(idx + ".max_offer_size_units_override must "
+                                  "be a finite value >= 0; got "
+                                  + std::to_string(v));
+            }
+            p.max_offer_size_units_override = v;
+        }
         if (item["peg_anchor_threshold_pct"]
             && item["peg_anchor_threshold_pct"].IsDefined()
             && !item["peg_anchor_threshold_pct"].IsNull()) {
@@ -3662,6 +3695,14 @@ void log_config_summary(const AppConfig& cfg)
                 << " hard="
                 << cfg.pairs[i].hard_limit_pct_override.value_or(cfg.risk.hard_limit_pct)
                 << "]";
+        }
+        // [TIERMIN 2026-10-29] Per-tier minimums and the pair's own cap.
+        if (has_tier_minimums(cfg.pairs[i])) {
+            out << " [tier min tight=" << *cfg.pairs[i].tight_tier_min_offer_units
+                << " wide=" << *cfg.pairs[i].wide_tier_min_offer_units << "]";
+        }
+        if (cfg.pairs[i].max_offer_size_units_override) {
+            out << " [max offer=" << *cfg.pairs[i].max_offer_size_units_override << "]";
         }
         out << "\n";
     }

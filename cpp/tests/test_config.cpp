@@ -4496,3 +4496,158 @@ TEST(ConfigParserTest, TargetGapSizing_DefaultsOnAndParsesFalse) {
         EXPECT_TRUE(cfg.strategy.target_gap_sizing_enabled) << "null keeps the default";
     }
 }
+
+// -- [TIERMIN 2026-10-29] Per-tier minimum offer sizes ----------------------
+// On 2026-10-29 every XCH/wUSDC.b bid sat at the flat 5 XCH cap and the
+// operator asked for 10 XCH at the tight tier down to 1 XCH at the wide one,
+// still growing with the balances above that.
+
+namespace {
+
+xop::PairConfig tier_min_pair(std::optional<double> tight,
+                              std::optional<double> wide) {
+    xop::PairConfig pc;
+    pc.base_asset_id = "xch";
+    pc.tight_tier_min_offer_units = tight;
+    pc.wide_tier_min_offer_units = wide;
+    return pc;
+}
+
+}  // namespace
+
+TEST(TierMinOfferUnits, RunsInAStraightLineFromTightToWide) {
+    const auto pc = tier_min_pair(10.0, 1.0);
+    ASSERT_TRUE(xop::has_tier_minimums(pc));
+    const double expected[] = {10.0, 8.2, 6.4, 4.6, 2.8, 1.0};
+    for (std::uint32_t i = 0; i < 6; ++i) {
+        EXPECT_NEAR(xop::tier_min_offer_units(pc, 1.0, i, 6), expected[i], 1e-9)
+            << "tier " << i;
+    }
+    // A tier past the last reads as the widest; a one-tier ladder is all tight.
+    EXPECT_NEAR(xop::tier_min_offer_units(pc, 0.5, 9, 6), 1.0, 1e-9);
+    EXPECT_NEAR(xop::tier_min_offer_units(pc, 0.5, 0, 1), 10.0, 1e-9);
+    EXPECT_NEAR(xop::tier_min_offer_units(pc, 0.5, 3, 1), 10.0, 1e-9);
+    EXPECT_NEAR(xop::tier_min_offer_units(pc, 0.5, 0, 0), 10.0, 1e-9);
+}
+
+TEST(TierMinOfferUnits, NeverBelowThePairMinimum) {
+    const auto pc = tier_min_pair(10.0, 1.0);
+    EXPECT_NEAR(xop::tier_min_offer_units(pc, 3.0, 0, 6), 10.0, 1e-9);
+    EXPECT_NEAR(xop::tier_min_offer_units(pc, 3.0, 3, 6), 4.6, 1e-9);
+    EXPECT_NEAR(xop::tier_min_offer_units(pc, 3.0, 4, 6), 3.0, 1e-9);
+    EXPECT_NEAR(xop::tier_min_offer_units(pc, 3.0, 5, 6), 3.0, 1e-9);
+}
+
+TEST(TierMinOfferUnits, WithoutBothSettingsItIsThePairMinimum) {
+    for (const auto& pc : {tier_min_pair(std::nullopt, std::nullopt),
+                           tier_min_pair(10.0, std::nullopt),
+                           tier_min_pair(std::nullopt, 1.0)}) {
+        EXPECT_FALSE(xop::has_tier_minimums(pc));
+        for (std::uint32_t i = 0; i < 6; ++i) {
+            EXPECT_DOUBLE_EQ(xop::tier_min_offer_units(pc, 1.0, i, 6), 1.0);
+        }
+    }
+}
+
+TEST(EffectiveMaxOfferUnits, PairOverrideElseGlobalOnXchBaseElseNoCap) {
+    xop::PairConfig xch;
+    xch.base_asset_id = "xch";
+    EXPECT_DOUBLE_EQ(xop::effective_max_offer_units(xch, 5.0), 5.0);
+    EXPECT_DOUBLE_EQ(xop::effective_max_offer_units(xch, 0.0), 0.0);
+    xch.max_offer_size_units_override = 20.0;
+    EXPECT_DOUBLE_EQ(xop::effective_max_offer_units(xch, 5.0), 20.0);
+    xch.max_offer_size_units_override = 0.0;
+    EXPECT_DOUBLE_EQ(xop::effective_max_offer_units(xch, 5.0), 0.0)
+        << "0 on the pair lifts the global cap";
+
+    xop::PairConfig cat;
+    cat.base_asset_id = kWmilliEthId;
+    EXPECT_DOUBLE_EQ(xop::effective_max_offer_units(cat, 5.0), 0.0)
+        << "the global cap is for XCH-base pairs only";
+    cat.max_offer_size_units_override = 3.0;
+    EXPECT_DOUBLE_EQ(xop::effective_max_offer_units(cat, 5.0), 3.0)
+        << "a pair's own cap applies whatever its base";
+}
+
+TEST(EffectiveMaxOfferUnits, MatchesThePaceControllersBandMaximum) {
+    // The pace controller sizes its tiers to Step 7's band through its own
+    // copy of the rule; the two must never disagree.
+    const std::vector<std::string> bases{"xch", "XCH", kWmilliEthId};
+    const std::vector<std::optional<double>> overrides{
+        std::nullopt, 0.0, 2.0, 20.0};
+    for (const auto& base : bases) {
+        for (const auto& ovr : overrides) {
+            for (const double global : {0.0, 5.0}) {
+                xop::PairConfig pc;
+                pc.base_asset_id = base;
+                pc.max_offer_size_units_override = ovr;
+                const bool xch_base = base == "xch" || base == "XCH";
+                EXPECT_DOUBLE_EQ(
+                    xop::effective_max_offer_units(pc, global),
+                    xop::strategy::pace::effective_offer_size_band(
+                        xch_base, std::nullopt, 0.1, global, ovr).max_units)
+                    << base << " override=" << ovr.value_or(-1.0)
+                    << " global=" << global;
+            }
+        }
+    }
+}
+
+TEST(ConfigParserTest, TierMinimums_ParseTogether) {
+    TempYaml tmp(with_pair_extra(
+        "tight_tier_min_offer_units: 10\n    wide_tier_min_offer_units: 1\n"
+        "    max_offer_size_units_override: 20"));
+    const auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    const auto& pc = cfg.pairs[0];
+    ASSERT_TRUE(xop::has_tier_minimums(pc));
+    EXPECT_DOUBLE_EQ(*pc.tight_tier_min_offer_units, 10.0);
+    EXPECT_DOUBLE_EQ(*pc.wide_tier_min_offer_units, 1.0);
+    ASSERT_TRUE(pc.max_offer_size_units_override.has_value());
+    EXPECT_DOUBLE_EQ(*pc.max_offer_size_units_override, 20.0);
+
+    TempYaml none(kMinimalValidYaml);
+    const auto plain = xop::load_config(none.path());
+    EXPECT_FALSE(xop::has_tier_minimums(plain.pairs[0]));
+    EXPECT_FALSE(plain.pairs[0].tight_tier_min_offer_units.has_value());
+    EXPECT_FALSE(plain.pairs[0].wide_tier_min_offer_units.has_value());
+    EXPECT_FALSE(plain.pairs[0].max_offer_size_units_override.has_value());
+
+    TempYaml no_cap(with_pair_extra("max_offer_size_units_override: 0"));
+    const auto uncapped = xop::load_config(no_cap.path());
+    ASSERT_TRUE(uncapped.pairs[0].max_offer_size_units_override.has_value());
+    EXPECT_DOUBLE_EQ(*uncapped.pairs[0].max_offer_size_units_override, 0.0)
+        << "0 is the documented no-cap";
+}
+
+TEST(ConfigParserTest, TierMinimums_OneWithoutTheOtherRejected) {
+    for (const char* line : {"tight_tier_min_offer_units: 10",
+                             "wide_tier_min_offer_units: 1"}) {
+        TempYaml tmp(with_pair_extra(line));
+        try {
+            xop::load_config(tmp.path());
+            ADD_FAILURE() << line << " accepted on its own";
+        } catch (const xop::ConfigError& e) {
+            EXPECT_NE(std::string(e.what()).find("set both"), std::string::npos)
+                << e.what();
+        }
+    }
+}
+
+TEST(ConfigParserTest, TierMinimums_BadValuesRejected) {
+    for (const char* bad : {"0", "-1", ".inf", "-.inf", ".nan"}) {
+        expect_non_finite_rejected(
+            with_pair_extra(std::string("tight_tier_min_offer_units: ") + bad
+                            + "\n    wide_tier_min_offer_units: 1"),
+            "tight_tier_min_offer_units", bad);
+        expect_non_finite_rejected(
+            with_pair_extra(std::string("tight_tier_min_offer_units: 10")
+                            + "\n    wide_tier_min_offer_units: " + bad),
+            "wide_tier_min_offer_units", bad);
+    }
+    for (const char* bad : {"-1", ".inf", "-.inf", ".nan"}) {
+        expect_non_finite_rejected(
+            with_pair_extra(std::string("max_offer_size_units_override: ") + bad),
+            "max_offer_size_units_override", bad);
+    }
+}

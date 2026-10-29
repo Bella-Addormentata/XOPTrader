@@ -90,6 +90,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -8349,6 +8350,7 @@ void Engine::step_evaluate_pace(BlockHeight block_height)
         pair_in.base_mpu = pace_pc.base_mojos_per_unit;
         pair_in.quote_mpu = pace_pc.quote_mojos_per_unit;
         pair_in.min_offer_override = pace_pc.min_offer_size_units_override;
+        pair_in.max_offer_override = pace_pc.max_offer_size_units_override;
         pair_in.xch_base = (pace_pc.base_asset_id == "xch");
         const auto liq_it = liquidity_engines_.find(pace_pc.name);
         pair_in.side_tier_count = (liq_it != liquidity_engines_.end() && liq_it->second)
@@ -12179,26 +12181,66 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 *pair_cfg, config_.strategy.min_offer_size_units);
             const Mojo min_base_mojos = static_cast<Mojo>(std::llround(
                 eff_min_units * static_cast<double>(pair_cfg->base_mojos_per_unit)));
-            const double eff_max_units = (xch_base_pair && config_.strategy.max_offer_size_units > 0.0) ? config_.strategy.max_offer_size_units : 0.0;
-            const Mojo max_base_mojos = xch_base_pair
+            // [TIERMIN 2026-10-29] The pair's own cap when it sets one (any
+            // pair), else the global cap on an XCH-base pair.
+            const double eff_max_units = effective_max_offer_units(
+                *pair_cfg, config_.strategy.max_offer_size_units);
+            const Mojo max_base_mojos = (eff_max_units > 0.0)
                 ? static_cast<Mojo>(std::llround(
                       eff_max_units
                       * static_cast<double>(pair_cfg->base_mojos_per_unit)))
                 : 0;
 
-            if (xch_base_pair && max_base_mojos > 0) {
+            // [TIERMIN 2026-10-29] Each tier's own minimum: the pair's
+            // tight-to-wide line (tier_min_offer_units), never below the pair
+            // minimum.  A pace-managed pair keeps the pace plan's sizes.  On
+            // 2026-10-29 every XCH/wUSDC.b bid sat at the flat 5 XCH cap
+            // (tier 0 would have been 16.9 XCH) and the operator asked for
+            // 10 XCH at the tight tier down to 1 XCH at the wide one.
+            const bool tier_minimums_on = has_tier_minimums(*pair_cfg)
+                && !(config_.strategy.pace_enabled && pcs.pace.managed);
+            auto tier_min_units = [&](const TierQuote& tq) {
+                return tier_minimums_on
+                    ? tier_min_offer_units(*pair_cfg, eff_min_units,
+                                           tq.tier_index, ladder_cfg.num_tiers)
+                    : eff_min_units;
+            };
+            auto tier_min_mojos = [&](const TierQuote& tq) {
+                return std::max(min_base_mojos, static_cast<Mojo>(std::llround(
+                    tier_min_units(tq)
+                    * static_cast<double>(pair_cfg->base_mojos_per_unit))));
+            };
+            // The size each tier would have had under the pair minimum alone,
+            // for every tier its own minimum changes.  The funding filter
+            // below falls back to these when the wallet cannot fund a side's
+            // tightest tier at its minimum, so a side shrinks to the plain
+            // ladder instead of vanishing.
+            std::map<std::pair<Side, std::uint8_t>, Mojo> plain_tier_sizes;
+            if (tier_minimums_on) {
+                for (const auto& tq : pcs.ladder) {
+                    const Mojo capped = (max_base_mojos > 0)
+                        ? std::min(tq.size, max_base_mojos) : tq.size;
+                    plain_tier_sizes[{tq.side, tq.tier_index}] =
+                        std::max(capped, min_base_mojos);
+                }
+            }
+
+            if (max_base_mojos > 0) {
                 int capped_tiers = 0;
                 for (auto& tq : pcs.ladder) {
-                    if (tq.size > max_base_mojos) {
+                    // No tier is capped below its own minimum.
+                    const Mojo tier_cap = std::max(max_base_mojos, tier_min_mojos(tq));
+                    if (tq.size > tier_cap) {
                         spdlog::info("[Engine] Step 7: {} {} tier {} capped: "
-                                     "size {} -> {} mojos ({:.1f} XCH max)",
+                                     "size {} -> {} mojos ({:.1f} units max)",
                                      pair_name,
                                      (tq.side == Side::Bid) ? "BID" : "ASK",
                                      tq.tier_index,
                                      tq.size,
-                                     max_base_mojos,
-                                     eff_max_units);
-                        tq.size = max_base_mojos;
+                                     tier_cap,
+                                     static_cast<double>(tier_cap)
+                                         / static_cast<double>(pair_cfg->base_mojos_per_unit));
+                        tq.size = tier_cap;
                         ++capped_tiers;
                     }
                 }
@@ -12209,24 +12251,46 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 }
             }
 
-            // Up-scale smaller tiers to min_base_mojos to support minimum offer size
+            // Up-scale smaller tiers to their minimum to support minimum offer size
             // without reducing the number of active offers (never dropping them).
             int bumped_tiers = 0;
             for (auto& tq : pcs.ladder) {
-                if (tq.size < min_base_mojos) {
+                const Mojo tier_min = tier_min_mojos(tq);
+                if (tq.size < tier_min) {
                     const Mojo old_size = tq.size;
-                    tq.size = min_base_mojos;
+                    tq.size = tier_min;
                     spdlog::info("[Engine] Step 7: {} {} tier {} up-scaled to minimum size: "
                                  "{} -> {} mojos ({:.2f} units)",
                                  pair_name, (tq.side == Side::Bid) ? "BID" : "ASK",
-                                 tq.tier_index, old_size, min_base_mojos, eff_min_units);
+                                 tq.tier_index, old_size, tier_min, tier_min_units(tq));
                     ++bumped_tiers;
                 }
             }
             if (bumped_tiers > 0) {
-                spdlog::info("[Engine] Step 7: {} up-scaled {} tiers to "
-                             "the min offer size ({:.2f} units)",
-                             pair_name, bumped_tiers, eff_min_units);
+                if (tier_minimums_on) {
+                    spdlog::info("[Engine] Step 7: {} up-scaled {} tiers to "
+                                 "their tier minimums ({:.2f} tight to {:.2f} wide units)",
+                                 pair_name, bumped_tiers,
+                                 *pair_cfg->tight_tier_min_offer_units,
+                                 *pair_cfg->wide_tier_min_offer_units);
+                } else {
+                    spdlog::info("[Engine] Step 7: {} up-scaled {} tiers to "
+                                 "the min offer size ({:.2f} units)",
+                                 pair_name, bumped_tiers, eff_min_units);
+                }
+            }
+            // Keep only the tiers whose own minimum changed their size.
+            for (auto it_plain = plain_tier_sizes.begin(); it_plain != plain_tier_sizes.end();) {
+                const auto tq_it = std::find_if(pcs.ladder.begin(), pcs.ladder.end(),
+                    [&](const TierQuote& tq) {
+                        return tq.side == it_plain->first.first
+                            && tq.tier_index == it_plain->first.second;
+                    });
+                if (tq_it == pcs.ladder.end() || tq_it->size == it_plain->second) {
+                    it_plain = plain_tier_sizes.erase(it_plain);
+                } else {
+                    ++it_plain;
+                }
             }
 
             // [REVIVE2 2026-10-22] A revive pair on a thin book posts no tier
@@ -12350,12 +12414,9 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                     const auto budget = known_budget(funding_asset);
                     if (!budget.has_value()) continue;
 
-                    std::vector<Mojo> costs;
-                    costs.reserve(pcs.ladder.size());
-                    for (const auto& tq : pcs.ladder) {
-                        if (tq.side != side) continue;
+                    auto tier_cost = [&](const TierQuote& tq) -> Mojo {
                         if (is_ask) {
-                            costs.push_back(tq.size);
+                            return tq.size;
                         } else {
                             // [2026-09-01] The FIFTH copy of this conversion,
                             // and the one that made Step 8 compute the same
@@ -12410,14 +12471,49 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                             // sides' tier size from base-denominated pools.
                             // See the note on TierQuote::size in types.hpp,
                             // whose comment used to claim the opposite.
-                            costs.push_back(execution::quote_cost_for_ask(
+                            return execution::quote_cost_for_ask(
                                 BaseMojos{tq.size}, tq.price,
                                 BaseMpu{pair_cfg->base_mojos_per_unit},
-                                QuoteMpu{pair_cfg->quote_mojos_per_unit}).v);
+                                QuoteMpu{pair_cfg->quote_mojos_per_unit}).v;
+                        }
+                    };
+                    auto side_costs = [&]() {
+                        std::vector<Mojo> side_tier_costs;
+                        side_tier_costs.reserve(pcs.ladder.size());
+                        for (const auto& tq : pcs.ladder) {
+                            if (tq.side == side) side_tier_costs.push_back(tier_cost(tq));
+                        }
+                        return side_tier_costs;
+                    };
+                    std::vector<Mojo> costs = side_costs();
+                    std::size_t keep = tiers_within_budget(costs, *budget);
+                    // [TIERMIN 2026-10-29] The wallet cannot fund even this
+                    // side's tightest tier at its own minimum: set the tier
+                    // minimums aside for this side and size it as if they
+                    // were unset, so a short wallet still posts the plain
+                    // ladder rather than nothing.
+                    if (keep == 0 && !costs.empty()) {
+                        int restored = 0;
+                        for (auto& tq : pcs.ladder) {
+                            if (tq.side != side) continue;
+                            const auto plain = plain_tier_sizes.find({tq.side, tq.tier_index});
+                            if (plain != plain_tier_sizes.end() && plain->second < tq.size) {
+                                tq.size = plain->second;
+                                ++restored;
+                            }
+                        }
+                        if (restored > 0) {
+                            costs = side_costs();
+                            keep = tiers_within_budget(costs, *budget);
+                            spdlog::warn(
+                                "[Engine] Step 7: {} {} tier minimums set aside: "
+                                "the known {} budget of {} mojos cannot fund "
+                                "the tightest tier at its minimum; {} tier(s) "
+                                "back to their plain size",
+                                pair_name, is_ask ? "ASK" : "BID",
+                                funding_asset, *budget, restored);
                         }
                     }
-                    const std::size_t keep = tiers_within_budget(
-                        costs, *budget);
                     if (keep >= costs.size()) continue;
 
                     std::size_t seen = 0;

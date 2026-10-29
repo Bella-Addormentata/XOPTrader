@@ -801,6 +801,13 @@ TEST(PaceBand, OverrideWins) {
     EXPECT_NEAR(b.max_units, 5.0, 1e-9);
 }
 
+TEST(PaceBand, PairCapWins) {
+    // [TIERMIN 2026-10-29] A pair's max_offer_size_units_override, on any base.
+    EXPECT_NEAR(pace::effective_offer_size_band(true, std::nullopt, 0.1, 5.0, 20.0).max_units, 20.0, 1e-9);
+    EXPECT_NEAR(pace::effective_offer_size_band(true, std::nullopt, 0.1, 5.0, 0.0).max_units, 0.0, 1e-9);
+    EXPECT_NEAR(pace::effective_offer_size_band(false, std::nullopt, 0.1, 5.0, 3.0).max_units, 3.0, 1e-9);
+}
+
 pace::OfferSizeBand band_of(double min_units, double max_units)
 {
     pace::OfferSizeBand b{};
