@@ -5,6 +5,41 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.35] — 2026-10-29 — a thin book's fake price jump can no longer pause every pair
+
+### The flash-crash guard ignores highs from books too wide to price (#198)
+
+On 2026-10-29 at 06:11Z the global flash-crash guard paused offer posting on
+every pair, although nothing had crashed. The XCH/BYC Dexie book is thin: its
+near ask (~1.66 BYC) kept vanishing for a few minutes, leaving 2.90 as the
+best ask, so the mid jumped from 1.635 to 2.15-2.26 in a 5,700-7,000 bps
+book and fell back to ~1.57 when the ask returned. That fall reads as a 26%
+drawdown, and every new spike re-armed the 100-block window. While the guard
+held, stale offers expired unreplaced, which emptied the XCH/wUSDC.b bids.
+XCH's exchange price never left 1.25-1.27.
+
+Each price-history sample now carries the width of the book its mid came
+from, and the new `risk.flash_crash_max_spread_bps` (default 2000) decides
+what a sample from a wider book may do:
+
+- It can no longer set the high a drop is measured from, so a fake jump up
+  cannot become a crash on the way back down.
+- It still counts as a low. In a real crash on Dexie, takers eat the stale
+  bids while the asks stay put, so the book widens exactly as the price
+  falls; that drop still trips the guard as before.
+- Recovery judges only the usable prices in its tail, so the fake jumps
+  between them cannot hold every pair paused. A tail with no usable price at
+  all is judged on all of its prices, as before.
+- After a failed offers fetch the history still records the real width of
+  the book the mid came from (the published spread stays 0 for the raw
+  ticker, as in #159).
+
+`0` restores the old behaviour. With nothing wide the checks are exactly the
+old ones. The setting applies live and is on by default, so existing
+installs get it without a config change. Still not filtered: a vanishing
+near bid in a thin book makes a fake low, which can trip the guard as
+before, because a real drop looks the same from the book alone.
+
 ## [0.10.34] — 2026-10-26 — bids are sized toward the target allocations, so a coin held past q_max is still bought while it sits below its target
 
 ### XCH/wUSDC.b bids again after a large wUSDC.b bridge (#196)
