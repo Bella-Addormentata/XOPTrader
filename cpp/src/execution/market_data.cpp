@@ -476,7 +476,8 @@ void MarketDataFeed::refresh(const std::vector<std::string>& enabled_pairs) {
             // Release pairs lock scope not needed here; append_price_history
             // acquires mtx_history_ but we hold mtx_pairs_.  Lock ordering:
             // pairs -> history (never reversed).  Documented and safe.
-            append_price_history(pair_name, current_block, ps.mid_price);
+            append_price_history(pair_name, current_block, ps.mid_price,
+                                 ps.spread_bps);
         }
 
         // Step 9: Publish snapshot to shared State.
@@ -2167,7 +2168,8 @@ void MarketDataFeed::check_arbitrage(PairState& ps) {
 
 void MarketDataFeed::append_price_history(const std::string& pair_name,
                                            BlockHeight         block,
-                                           double              price) {
+                                           double              price,
+                                           double              spread_bps) {
     // [MEDIUM-1] Snapshot config under shared_lock (ISO/IEC 5055 -- CWE-362).
     const auto cfg = [&] { std::shared_lock lk(mtx_config_); return config_; }();
 
@@ -2181,11 +2183,12 @@ void MarketDataFeed::append_price_history(const std::string& pair_name,
         // Update the price in place (data may have been refined within the
         // same block if multiple ingest calls occurred).
         deq.back().price = price;
+        deq.back().spread_bps = spread_bps;
         return;
     }
 
     // Append new observation.
-    deq.push_back(PriceHistoryEntry{block, price});
+    deq.push_back(PriceHistoryEntry{block, price, spread_bps});
 
     // Evict oldest if over capacity.
     while (deq.size() > cfg.price_history_capacity) {

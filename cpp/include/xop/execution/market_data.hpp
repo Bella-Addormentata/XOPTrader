@@ -131,6 +131,9 @@ struct ArbitrageSignal {
 struct PriceHistoryEntry {
     BlockHeight block_height;  // Block at which this price was observed
     double      price;         // Mid-price in quote-per-base (double for math)
+    /// [WIDEBOOK 2026-10-29] Width of the filtered book the mid came from
+    /// (PairState::spread_bps). 0 means crossed or not measured, never wide.
+    double      spread_bps{0.0};
 };
 
 // ---------------------------------------------------------------------------
@@ -1346,10 +1349,12 @@ private:
     void check_arbitrage(PairState& ps);
 
     /// Append a price observation to the per-pair circular buffer, evicting
-    /// the oldest entry if capacity is reached.
+    /// the oldest entry if capacity is reached.  `spread_bps` is the width
+    /// of the book the price came from (0 = crossed or not measured).
     void append_price_history(const std::string& pair_name,
                               BlockHeight         block,
-                              double              price);
+                              double              price,
+                              double              spread_bps);
 
     /// Compute CompetitorMetrics from the tracked competing offers for a pair.
     /// Computes best spreads, depth counts, and detects new competitors.

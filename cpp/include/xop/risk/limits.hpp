@@ -32,6 +32,7 @@
 #include "xop/config.hpp"
 #include "xop/state.hpp"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -503,6 +504,58 @@ public:
         return max_age_blocks > 0
             && current_block > newest_block
             && current_block - newest_block > max_age_blocks;
+    }
+
+    /// [WIDEBOOK 2026-10-29] True when a price-history sample may feed the
+    /// crash and recovery checks: its book is no wider than `max_spread_bps`
+    /// (risk.flash_crash_max_spread_bps). 0 disables the test. A spread of 0
+    /// (crossed or unmeasured book) always counts, as does a NaN, so the
+    /// filter can only ever drop a sample it measured as wide.
+    [[nodiscard]]
+    static constexpr bool crash_sample_counts(double spread_bps,
+                                              double max_spread_bps) noexcept
+    {
+        return !(max_spread_bps > 0.0 && spread_bps > max_spread_bps);
+    }
+
+    /// The prices one pair's crash and recovery checks run on.
+    struct CrashSeries {
+        std::vector<Mojo> prices;      ///< Counted samples, oldest first.
+        BlockHeight       newest_block{0}; ///< Block of the newest counted one.
+        std::size_t       left_out{0}; ///< Samples dropped as too wide.
+    };
+
+    /// [WIDEBOOK 2026-10-29] Build a pair's crash-check series from its
+    /// price history (oldest first; any entry type with block_height, price
+    /// and spread_bps), leaving out every sample crash_sample_counts()
+    /// rejects. A sample left out is not a price at all, so the existing
+    /// rules then apply to what remains unchanged: the window is the newest
+    /// flash_crash_window_blocks COUNTED samples, and newest_block is what
+    /// price_history_is_stale() judges -- a pair whose book has stayed too
+    /// wide to price is left out exactly like a pair with no mid, and cannot
+    /// hold every other pair paused with a frozen history.
+    ///
+    /// On 2026-10-29 the XCH/BYC book's near ask kept vanishing for a few
+    /// minutes. The mid went 1.635 -> 2.150 (a 6,976 bps book) -> 1.587: a
+    /// 26% running-max drawdown off a price that was never a market, which
+    /// held the GLOBAL guard in Crash and stopped every pair's posting.
+    template <typename Entry>
+    [[nodiscard]]
+    static CrashSeries crash_series(const std::vector<Entry>& history,
+                                    double max_spread_bps)
+    {
+        CrashSeries s;
+        s.prices.reserve(history.size());
+        for (const auto& e : history) {
+            if (!crash_sample_counts(e.spread_bps, max_spread_bps)) {
+                ++s.left_out;
+                continue;
+            }
+            s.prices.push_back(static_cast<Mojo>(
+                std::llround(e.price * static_cast<double>(kMojosPerXch))));
+            s.newest_block = e.block_height;
+        }
+        return s;
     }
 
     /// Compute the recommended rebalancing buffer multiplier during network

@@ -1231,6 +1231,48 @@ TEST(ConfigParserTest, FlashCrashStaleHistory_ParsesDefaultsAndRejects) {
     }
 }
 
+TEST(ConfigParserTest, FlashCrashMaxSpread_ParsesDefaultsAndRejects) {
+    // [WIDEBOOK 2026-10-29] Injected into the existing risk: section, as
+    // FlashCrashWindow below explains.
+    const auto with_spread = [](const std::string& value) {
+        std::string yaml(kMinimalValidYaml);
+        const std::string anchor = "risk:\n";
+        const auto at = yaml.find(anchor);
+        EXPECT_NE(at, std::string::npos);
+        yaml.insert(at + anchor.size(),
+                    "  flash_crash_max_spread_bps: " + value + "\n");
+        return yaml;
+    };
+    {
+        TempYaml tmp(kMinimalValidYaml);
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.risk.flash_crash_max_spread_bps, 2000.0)
+            << "on by default, so existing configs get it on upgrade";
+    }
+    {
+        TempYaml tmp(with_spread("3500"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.risk.flash_crash_max_spread_bps, 3500.0);
+    }
+    {
+        TempYaml tmp(with_spread("0"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.risk.flash_crash_max_spread_bps, 0.0);
+    }
+    {
+        TempYaml tmp(with_spread("-1"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        TempYaml tmp(with_spread(".nan"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        TempYaml tmp(with_spread(".inf"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+}
+
 TEST(ConfigParserTest, ReviveThinMarketKeys_ParseDefaultsAndReject) {
     // [REVIVE2 2026-10-22] Injected into the existing strategy: section, as
     // FlashCrashWindow below explains for risk:.
