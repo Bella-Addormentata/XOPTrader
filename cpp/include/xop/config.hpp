@@ -1875,8 +1875,8 @@ struct RiskConfig {
     uint32_t flash_crash_stale_history_blocks{10};
     /// [WIDEBOOK 2026-10-29] A mid from a filtered book wider than this can
     /// mark a low but never the high the crash check measures a drop from,
-    /// and is not used to judge recovery (PreTradeCheck::series_crashing /
-    /// series_stable). One side of a thin book vanishing moves the mid by
+    /// and judges recovery only when a whole tail is that wide
+    /// (PreTradeCheck::series_crashing / series_stable). One side of a thin book vanishing moves the mid by
     /// half the gap it leaves, so a fake jump big enough to read as a 20%
     /// crash on the way back needs a book roughly 4,000 bps wide. On
     /// 2026-10-29 XCH/BYC's near ask kept vanishing (6,976 bps books, mid

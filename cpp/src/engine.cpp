@@ -4730,7 +4730,8 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
 
             // [WIDEBOOK 2026-10-29] A mid from a book wider than
             // flash_crash_max_spread_bps may mark a low but never the high a
-            // drop is measured from, and is not used to judge stability: a
+            // drop is measured from, and judges stability only when a whole
+            // tail is that wide: a
             // thin book losing its near ask for a few minutes moved XCH/BYC's
             // mid 1.635 -> 2.150 -> 1.587 and held every pair in Crash.
             const auto series = PreTradeCheck::crash_series(

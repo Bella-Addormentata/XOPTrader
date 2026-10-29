@@ -783,7 +783,7 @@ bool PreTradeCheck::is_stable_after_crash(
 // ---------------------------------------------------------------------------
 // [WIDEBOOK 2026-10-29] series_crashing / series_stable -- the two checks
 // above on a CrashSeries, where a sample from too wide a book may mark a low
-// but never the high, and is never used to judge stability.
+// but never the high, and judges stability only when nothing else can.
 // ---------------------------------------------------------------------------
 
 bool PreTradeCheck::series_crashing(const CrashSeries& s, double threshold,
@@ -814,7 +814,7 @@ bool PreTradeCheck::series_stable(const CrashSeries& s,
                                   double stability_band) noexcept
 {
     const std::size_t n = s.prices.size();
-    if (n < required_blocks) {
+    if (n == 0 || n < required_blocks) {
         return false;  // not enough blocks to declare stability
     }
     const std::size_t start = n - required_blocks;
@@ -823,15 +823,18 @@ bool PreTradeCheck::series_stable(const CrashSeries& s,
     for (std::size_t i = n; i > start; --i) {
         if (s.counted[i - 1]) { newest = i - 1; break; }
     }
-    if (newest == n) {
-        return true;  // nothing in the tail it could judge: abstain
+    // No counted price in the tail: judge every price in it, as before
+    // WIDEBOOK, so an illiquid book still has to settle before resuming.
+    const bool judge_all = (newest == n);
+    if (judge_all) {
+        newest = n - 1;
     }
     const Mojo latest = s.prices[newest];
     if (latest <= 0) {
         return false;  // degenerate
     }
     for (std::size_t i = start; i < n; ++i) {
-        if (!s.counted[i]) continue;
+        if (!judge_all && !s.counted[i]) continue;
         const double deviation = std::abs(static_cast<double>(s.prices[i] - latest))
                                / static_cast<double>(latest);
         if (deviation > stability_band) {

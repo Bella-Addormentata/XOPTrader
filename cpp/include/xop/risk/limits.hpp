@@ -565,11 +565,12 @@ public:
 
     /// [WIDEBOOK 2026-10-29] is_stable_after_crash() over the newest
     /// `required_blocks` samples, judging only the counted ones: each must
-    /// lie within `stability_band` of the newest counted one. A tail with no
-    /// counted price abstains (true): a book too wide to price cannot show
-    /// stability, but nor may it hold every other pair in Recovery forever,
-    /// and it cannot trip the crash check without a counted high either.
-    /// With every sample counted this is is_stable_after_crash() exactly.
+    /// lie within `stability_band` of the newest counted one, so a thin
+    /// book's fake jumps between them cannot hold Recovery. A tail with NO
+    /// counted price is judged on all of its prices, exactly as before:
+    /// after a real crash that leaves the book too wide to price, the guard
+    /// still waits for that wide mid to settle. With every sample counted
+    /// this is is_stable_after_crash() exactly.
     [[nodiscard]]
     static bool series_stable(const CrashSeries& s,
                               std::size_t required_blocks,

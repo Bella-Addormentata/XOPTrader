@@ -5,8 +5,8 @@
 //   - check_flash_crash: rolling max-drawdown detection, edge cases
 //   - is_stable_after_crash: recovery gate, insufficient history
 //   - crash_sample_counts / series_crashing / series_stable: a wide-book
-//     sample may mark a crash low but never the high, and is not used to
-//     judge recovery [WIDEBOOK 2026-10-29]
+//     sample may mark a crash low but never the high, and judges recovery
+//     only when a whole tail is that wide [WIDEBOOK 2026-10-29]
 //   - congestion_buffer_multiplier: normal vs congested
 //   - apply_limits / evaluate_limits: exact sizes and per-side attribution
 //     (which rule, if any, lowered or zeroed each side) [STEP6-CAUSE]
@@ -490,7 +490,7 @@ TEST(WideBookTest, RecoveryJudgesOnlyCountedPricesInTheFullTail) {
         << "60 blocks cannot show 61 stable blocks";
     EXPECT_TRUE(PreTradeCheck::series_stable(s, 60, 0.05));
     EXPECT_TRUE(PreTradeCheck::series_stable(s, 20, 0.05))
-        << "a tail with no counted price abstains";
+        << "a tail with no counted price is judged on all of them: flat 1.20";
 
     add_blocks(h, 1, 0.70, 300.0);    // the 0.80s are now 14% off the newest
     s = PreTradeCheck::crash_series(h, 2000.0);
@@ -498,17 +498,25 @@ TEST(WideBookTest, RecoveryJudgesOnlyCountedPricesInTheFullTail) {
     EXPECT_TRUE(PreTradeCheck::series_stable(s, 21, 0.05));
 }
 
-TEST(WideBookTest, ABookThatNeverNarrowsCanNeitherTripNorHold) {
+TEST(WideBookTest, ABookThatStaysWideCannotTripButMustSettleToRecover) {
     using xop::PreTradeCheck;
+    // A real crash that leaves the book too wide to price: no counted high
+    // remains to trip on, but recovery still waits for the mid to settle.
     std::vector<Sample> h;
     for (int i = 0; i < 60; ++i) {
         add_blocks(h, 1, i % 2 == 0 ? 2.15 : 1.50, 6976.4);
     }
-    const auto s = PreTradeCheck::crash_series(h, 2000.0);
+    auto s = PreTradeCheck::crash_series(h, 2000.0);
     EXPECT_EQ(s.left_out, h.size());
     EXPECT_FALSE(PreTradeCheck::series_crashing(s, 0.20, 100));
-    EXPECT_TRUE(PreTradeCheck::series_stable(s, 50, 0.05));
-    EXPECT_FALSE(PreTradeCheck::series_stable(s, 100, 0.05))
+    EXPECT_FALSE(PreTradeCheck::series_stable(s, 50, 0.05))
+        << "judged on all its prices, it is still jumping";
+
+    add_blocks(h, 50, 1.50, 6976.4);
+    s = PreTradeCheck::crash_series(h, 2000.0);
+    EXPECT_TRUE(PreTradeCheck::series_stable(s, 50, 0.05))
+        << "settled, even though still wide";
+    EXPECT_FALSE(PreTradeCheck::series_stable(s, 111, 0.05))
         << "still needs the blocks";
 }
 
