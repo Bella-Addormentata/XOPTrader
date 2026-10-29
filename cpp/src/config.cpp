@@ -3716,7 +3716,7 @@ void log_config_summary(const AppConfig& cfg)
         << "  flash_window   = " << cfg.risk.flash_crash_window_blocks
         << " blocks (0 = whole history)\n"
         << "  flash_spread   = " << cfg.risk.flash_crash_max_spread_bps
-        << " bps max book width counted"
+        << " bps widest book that may set a crash high"
         << (cfg.risk.flash_crash_max_spread_bps == 0.0 ? " (disabled)" : "") << "\n"
         << "  recovery_ph1   = " << cfg.risk.recovery_stable_blocks_phase1 << " blocks\n"
         << "  recovery_ph2   = " << cfg.risk.recovery_stable_blocks_phase2 << " blocks\n"

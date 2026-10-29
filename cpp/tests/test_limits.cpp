@@ -4,8 +4,9 @@
 //   - enforce_no_loss: ask price flooring, disabled constraint, zero cost basis
 //   - check_flash_crash: rolling max-drawdown detection, edge cases
 //   - is_stable_after_crash: recovery gate, insufficient history
-//   - crash_sample_counts / crash_series: wide-book samples left out of the
-//     crash and recovery checks [WIDEBOOK 2026-10-29]
+//   - crash_sample_counts / series_crashing / series_stable: a wide-book
+//     sample may mark a crash low but never the high, and is not used to
+//     judge recovery [WIDEBOOK 2026-10-29]
 //   - congestion_buffer_multiplier: normal vs congested
 //   - apply_limits / evaluate_limits: exact sizes and per-side attribution
 //     (which rule, if any, lowered or zeroed each side) [STEP6-CAUSE]
@@ -373,11 +374,10 @@ TEST(WideBookTest, TheFakeXchBycJumpsNoLongerReadAsACrash) {
 
     const auto s = PreTradeCheck::crash_series(h, 2000.0);
     EXPECT_EQ(s.left_out, 26u);
-    ASSERT_EQ(s.prices.size(), h.size() - 26u);
-    EXPECT_EQ(s.entries, h.size());
-    EXPECT_EQ(s.newest_block, h.back().block_height);
+    ASSERT_EQ(s.prices.size(), h.size());
     EXPECT_FALSE(PreTradeCheck::series_crashing(s, 0.20, 100))
-        << "1.635 -> 1.587 -> 1.565 is a 4% move, not a crash";
+        << "the 2.26 / 2.15 highs came from 5,713-6,976 bps books; measured "
+           "from 1.635, the fall to 1.565 is 4%";
     EXPECT_TRUE(PreTradeCheck::series_stable(s, 50, 0.05));
 }
 
@@ -387,17 +387,57 @@ TEST(WideBookTest, WithNothingLeftOutTheChecksMatchTheOldOnes) {
     add_blocks(h, 40, 1.00, 300.0);
     add_blocks(h, 30, 0.79, 300.0);   // a 21% drop
     add_blocks(h, 60, 0.80, 300.0);
-    const auto s = PreTradeCheck::crash_series(h, 0.0);
-    for (std::size_t window : {0u, 2u, 50u, 61u, 100u, 130u, 500u}) {
-        EXPECT_EQ(PreTradeCheck::series_crashing(s, 0.20, window),
-                  PreTradeCheck::check_flash_crash(s.prices, 0.20, window))
-            << "window " << window;
+    for (double max_spread : {0.0, 2000.0}) {
+        const auto s = PreTradeCheck::crash_series(h, max_spread);
+        ASSERT_EQ(s.left_out, 0u);
+        for (std::size_t window : {0u, 2u, 50u, 61u, 100u, 130u, 500u}) {
+            EXPECT_EQ(PreTradeCheck::series_crashing(s, 0.20, window),
+                      PreTradeCheck::check_flash_crash(s.prices, 0.20, window))
+                << "window " << window;
+        }
+        for (std::size_t n : {1u, 50u, 60u, 61u, 100u, 130u, 131u}) {
+            EXPECT_EQ(PreTradeCheck::series_stable(s, n, 0.05),
+                      PreTradeCheck::is_stable_after_crash(s.prices, n, 0.05))
+                << "tail " << n;
+        }
     }
-    for (std::size_t n : {1u, 50u, 60u, 61u, 100u, 130u, 131u}) {
-        EXPECT_EQ(PreTradeCheck::series_stable(s, n, 0.05),
-                  PreTradeCheck::is_stable_after_crash(s.prices, n, 0.05))
-            << "tail " << n;
-    }
+}
+
+TEST(WideBookTest, ARealCrashStillTripsWhenItWidensTheBook) {
+    using xop::PreTradeCheck;
+    // Dexie in a real crash: takers eat the stale bids, the asks stay put,
+    // and the book is wide exactly while the price falls.
+    std::vector<Sample> h;
+    add_blocks(h, 60, 1.635256, 299.5);
+    add_blocks(h, 20, 1.20, 4500.0);
+    const auto s = PreTradeCheck::crash_series(h, 2000.0);
+    EXPECT_EQ(s.left_out, 20u);
+    EXPECT_TRUE(PreTradeCheck::series_crashing(s, 0.20, 100))
+        << "a wide-book price still counts as a low";
+}
+
+TEST(WideBookTest, ARealCrashThatMovesBothSidesStillTrips) {
+    using xop::PreTradeCheck;
+    std::vector<Sample> h;
+    add_blocks(h, 60, 1.635256, 299.5);
+    add_blocks(h, 3, 1.40, 2600.0);   // bids pulled first: wide
+    add_blocks(h, 20, 1.20, 350.0);   // asks follow: a 27% drop, normal width
+    const auto s = PreTradeCheck::crash_series(h, 2000.0);
+    EXPECT_EQ(s.left_out, 3u);
+    EXPECT_TRUE(PreTradeCheck::series_crashing(s, 0.20, 100));
+}
+
+TEST(WideBookTest, OnlyACountedPriceCanSetTheHigh) {
+    using xop::PreTradeCheck;
+    std::vector<Sample> h;
+    add_blocks(h, 60, 1.00, 300.0);
+    add_blocks(h, 10, 1.50, 5000.0);
+    add_blocks(h, 10, 1.10, 300.0);
+    EXPECT_FALSE(PreTradeCheck::series_crashing(
+        PreTradeCheck::crash_series(h, 2000.0), 0.20, 100));
+    EXPECT_TRUE(PreTradeCheck::series_crashing(
+        PreTradeCheck::crash_series(h, 6000.0), 0.20, 100))
+        << "the same 1.50 from a book inside the limit is a high";
 }
 
 TEST(WideBookTest, TheCrashWindowSpansTheSameBlocksWhenMostSamplesAreWide) {
@@ -411,15 +451,11 @@ TEST(WideBookTest, TheCrashWindowSpansTheSameBlocksWhenMostSamplesAreWide) {
         const bool narrow = i % 10 == 0;
         add_blocks(h, 1, narrow ? 0.79 : 1.20, narrow ? 300.0 : 5000.0);
     }
-    const auto s = PreTradeCheck::crash_series(h, 2000.0);
-    ASSERT_LT(s.prices.size(), 100u);
-    EXPECT_TRUE(PreTradeCheck::check_flash_crash(s.prices, 0.20, 100))
-        << "cut after filtering, the last 100 counted prices reach back "
-           "600 blocks to the drop";
-    EXPECT_FALSE(PreTradeCheck::series_crashing(s, 0.20, 100))
+    EXPECT_FALSE(PreTradeCheck::series_crashing(
+        PreTradeCheck::crash_series(h, 2000.0), 0.20, 100))
         << "the drop left the 100-block window ~500 blocks ago";
 
-    std::vector<Sample> fresh(h.begin(), h.begin() + 50);
+    const std::vector<Sample> fresh(h.begin(), h.begin() + 50);
     EXPECT_TRUE(PreTradeCheck::series_crashing(
         PreTradeCheck::crash_series(fresh, 2000.0), 0.20, 100))
         << "inside the window it still trips";
@@ -428,8 +464,7 @@ TEST(WideBookTest, TheCrashWindowSpansTheSameBlocksWhenMostSamplesAreWide) {
 TEST(WideBookTest, IntermittentWideBooksCannotHoldRecoveryForever) {
     using xop::PreTradeCheck;
     // A full 1,000-entry buffer after an old crash, with a normal-width
-    // book only every 11th block: never stale (the newest counted price is
-    // at most 10 blocks old), and fewer than 100 counted prices in total.
+    // book only every 11th block and a fake 1.20 mid in between.
     std::vector<Sample> h;
     add_blocks(h, 1, 1.00, 300.0);
     add_blocks(h, 1, 0.79, 300.0);
@@ -438,27 +473,24 @@ TEST(WideBookTest, IntermittentWideBooksCannotHoldRecoveryForever) {
         add_blocks(h, 1, narrow ? 0.79 : 1.20, narrow ? 300.0 : 5000.0);
     }
     const auto s = PreTradeCheck::crash_series(h, 2000.0);
-    ASSERT_LT(s.prices.size(), 100u);
-    EXPECT_FALSE(PreTradeCheck::price_history_is_stale(
-        s.newest_block, h.back().block_height, 10));
     EXPECT_FALSE(PreTradeCheck::is_stable_after_crash(s.prices, 100, 0.05))
-        << "100 counted prices would never exist";
+        << "counting the fake 1.20s, it never looks stable";
     EXPECT_FALSE(PreTradeCheck::series_crashing(s, 0.20, 100));
     EXPECT_TRUE(PreTradeCheck::series_stable(s, 50, 0.05));
     EXPECT_TRUE(PreTradeCheck::series_stable(s, 100, 0.05));
 }
 
-TEST(WideBookTest, RecoveryStillNeedsTheFullTailAndEveryCountedPriceInIt) {
+TEST(WideBookTest, RecoveryJudgesOnlyCountedPricesInTheFullTail) {
     using xop::PreTradeCheck;
     std::vector<Sample> h;
     add_blocks(h, 40, 0.80, 300.0);
     add_blocks(h, 20, 1.20, 5000.0);
     auto s = PreTradeCheck::crash_series(h, 2000.0);
     EXPECT_FALSE(PreTradeCheck::series_stable(s, 61, 0.05))
-        << "60 entries cannot show 61 stable blocks";
+        << "60 blocks cannot show 61 stable blocks";
     EXPECT_TRUE(PreTradeCheck::series_stable(s, 60, 0.05));
-    EXPECT_FALSE(PreTradeCheck::series_stable(s, 20, 0.05))
-        << "no counted price in the tail is no evidence of stability";
+    EXPECT_TRUE(PreTradeCheck::series_stable(s, 20, 0.05))
+        << "a tail with no counted price abstains";
 
     add_blocks(h, 1, 0.70, 300.0);    // the 0.80s are now 14% off the newest
     s = PreTradeCheck::crash_series(h, 2000.0);
@@ -466,41 +498,29 @@ TEST(WideBookTest, RecoveryStillNeedsTheFullTailAndEveryCountedPriceInIt) {
     EXPECT_TRUE(PreTradeCheck::series_stable(s, 21, 0.05));
 }
 
-TEST(WideBookTest, ARealCrashThatMovesBothSidesStillTrips) {
+TEST(WideBookTest, ABookThatNeverNarrowsCanNeitherTripNorHold) {
     using xop::PreTradeCheck;
     std::vector<Sample> h;
-    add_blocks(h, 60, 1.635256, 299.5);
-    add_blocks(h, 3, 1.40, 2600.0);   // bids pulled first: wide, left out
-    add_blocks(h, 20, 1.20, 350.0);   // asks follow: a 27% drop, normal width
+    for (int i = 0; i < 60; ++i) {
+        add_blocks(h, 1, i % 2 == 0 ? 2.15 : 1.50, 6976.4);
+    }
     const auto s = PreTradeCheck::crash_series(h, 2000.0);
-    EXPECT_EQ(s.left_out, 3u);
-    EXPECT_TRUE(PreTradeCheck::series_crashing(s, 0.20, 100));
-}
-
-TEST(WideBookTest, ABookTooWideToPriceGoesStaleLikeAPairWithNoMid) {
-    using xop::PreTradeCheck;
-    std::vector<Sample> h;
-    add_blocks(h, 60, 1.635256, 299.5);
-    const xop::BlockHeight last_counted = h.back().block_height;
-    add_blocks(h, 15, 2.150028, 6976.4);
-    const auto s = PreTradeCheck::crash_series(h, 2000.0);
-    EXPECT_EQ(s.left_out, 15u);
-    EXPECT_EQ(s.newest_block, last_counted)
-        << "the staleness rule judges the newest COUNTED price";
-    EXPECT_TRUE(PreTradeCheck::price_history_is_stale(
-        s.newest_block, h.back().block_height, 10));
-
-    const auto none = PreTradeCheck::crash_series(
-        std::vector<Sample>{{9497700, 2.15, 6976.4}}, 2000.0);
-    EXPECT_TRUE(none.prices.empty());
-    EXPECT_EQ(none.newest_block, 0u);
+    EXPECT_EQ(s.left_out, h.size());
+    EXPECT_FALSE(PreTradeCheck::series_crashing(s, 0.20, 100));
+    EXPECT_TRUE(PreTradeCheck::series_stable(s, 50, 0.05));
+    EXPECT_FALSE(PreTradeCheck::series_stable(s, 100, 0.05))
+        << "still needs the blocks";
 }
 
 TEST(WideBookTest, PricesConvertToMojosAsTheEngineDid) {
     const auto s = xop::PreTradeCheck::crash_series(
-        std::vector<Sample>{{1, 1.586815, 178.5}}, 2000.0);
-    ASSERT_EQ(s.prices.size(), 1u);
+        std::vector<Sample>{{1, 1.586815, 178.5}, {2, 2.150028, 6976.4}},
+        2000.0);
+    ASSERT_EQ(s.prices.size(), 2u);
     EXPECT_EQ(s.prices[0], 1'586'815'000'000LL);
+    EXPECT_EQ(s.prices[1], 2'150'028'000'000LL);
+    EXPECT_EQ(s.counted, (std::vector<bool>{true, false}));
+    EXPECT_EQ(s.left_out, 1u);
 }
 
 static_assert(xop::PreTradeCheck::crash_sample_counts(1999.0, 2000.0));

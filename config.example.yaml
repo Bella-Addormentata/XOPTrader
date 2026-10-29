@@ -887,11 +887,12 @@ risk:
   # it would otherwise hold EVERY pair paused. On 2026-10-21 that kept
   # offers paused for over a day. 0 keeps every pair in (old behaviour).
   flash_crash_stale_history_blocks: 10  # [OPTIONAL, default: 10]
-  # A mid from a book wider than this (bps) is not counted by the crash and
-  # recovery checks. When one side of a thin book vanishes, the mid jumps by
-  # half the gap, and the fall back reads as a crash: on 2026-10-29 XCH/BYC's
-  # near ask kept vanishing (6,976 bps books, mid 1.6 -> 2.15 -> 1.5) and
-  # held every pair paused. A real crash that moves both sides still counts.
+  # A mid from a book wider than this (bps) can mark a low but never the
+  # high the crash check measures a drop from, and is not used to judge
+  # recovery. When one side of a thin book vanishes, the mid jumps by half
+  # the gap, and the fall back reads as a crash: on 2026-10-29 XCH/BYC's near
+  # ask kept vanishing (6,976 bps books, mid 1.6 -> 2.15 -> 1.5) and held
+  # every pair paused. A real crash still trips even when it widens the book.
   # Crossed books (spread 0) always count. 0 counts every sample (old
   # behaviour).
   flash_crash_max_spread_bps: 2000  # [OPTIONAL, default: 2000]

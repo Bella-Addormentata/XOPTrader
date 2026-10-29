@@ -4704,53 +4704,45 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
 
         for (const auto& pair : config_.pairs) {
             if (!pair.enabled) continue;
-            const auto history = market_data_->get_price_history(pair.name);
+            auto history = market_data_->get_price_history(pair.name);
             if (history.empty()) continue;
-
-            // [WIDEBOOK 2026-10-29] A mid from a book wider than
-            // flash_crash_max_spread_bps is not a price these checks count:
-            // a thin book losing one side for a few minutes moved XCH/BYC's
-            // mid 1.635 -> 2.150 -> 1.587 and held every pair in Crash.
-            // The window and the recovery tails below still count history
-            // entries, wide or not; only the prices inside them are filtered.
-            const auto series = PreTradeCheck::crash_series(
-                history, config_.risk.flash_crash_max_spread_bps);
-            if (series.left_out > 0
-                && !PreTradeCheck::crash_sample_counts(
-                       history.back().spread_bps,
-                       config_.risk.flash_crash_max_spread_bps)) {
-                spdlog::debug("[Engine] Flash crash check: {} newest mid "
-                              "{:.6f} comes from a {:.0f} bps book (max {:.0f})"
-                              " -- not counted; {} of {} samples left out",
-                              pair.name, history.back().price,
-                              history.back().spread_bps,
-                              config_.risk.flash_crash_max_spread_bps,
-                              series.left_out, history.size());
-            }
 
             // [STALEHIST 2026-10-22] A pair that stopped publishing a mid
             // keeps a frozen history that can never pass (or leave) these
             // checks, and on 2026-10-21 it held every pair in Recovery for
             // over a day. It is not quoted without a mid, so leave it out.
-            // [WIDEBOOK] Judged on the newest COUNTED price: a book too wide
-            // to price for that long freezes the series just the same.
-            if (series.prices.empty()
-                || PreTradeCheck::price_history_is_stale(
-                       series.newest_block, block_height,
-                       config_.risk.flash_crash_stale_history_blocks)) {
+            if (PreTradeCheck::price_history_is_stale(
+                    history.back().block_height, block_height,
+                    config_.risk.flash_crash_stale_history_blocks)) {
                 if (flash_crash_state_ != FlashCrashState::Normal) {
                     spdlog::debug("[Engine] Flash crash check: {} left out "
-                                  "-- newest counted price is from block {}, "
-                                  "{} blocks ago", pair.name,
-                                  series.newest_block,
-                                  block_height - std::min(block_height,
-                                                          series.newest_block));
+                                  "-- newest price is from block {}, {} "
+                                  "blocks ago", pair.name,
+                                  history.back().block_height,
+                                  block_height - history.back().block_height);
                 }
                 // [REVIVE2 2026-10-22] Nor may a frozen history hold a revive
                 // pair's own state: it restarts at Normal, and is judged
                 // again on its full window as soon as its mid returns.
                 revive_crash_state_.erase(pair.name);
                 continue;
+            }
+
+            // [WIDEBOOK 2026-10-29] A mid from a book wider than
+            // flash_crash_max_spread_bps may mark a low but never the high a
+            // drop is measured from, and is not used to judge stability: a
+            // thin book losing its near ask for a few minutes moved XCH/BYC's
+            // mid 1.635 -> 2.150 -> 1.587 and held every pair in Crash.
+            const auto series = PreTradeCheck::crash_series(
+                history, config_.risk.flash_crash_max_spread_bps);
+            if (!series.counted.back()) {
+                spdlog::debug("[Engine] Flash crash check: {} newest mid "
+                              "{:.6f} comes from a {:.0f} bps book (max {:.0f})"
+                              " -- counted as a low only; {} of {} samples",
+                              pair.name, history.back().price,
+                              history.back().spread_bps,
+                              config_.risk.flash_crash_max_spread_bps,
+                              series.left_out, history.size());
             }
 
             // Check crash signal for this pair.
