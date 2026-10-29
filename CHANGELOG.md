@@ -5,6 +5,38 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.36] — 2026-10-29 — per-tier minimum offer sizes, and short of funds the tight tiers go first
+
+### Tier minimums that grow with the balances (#200)
+
+On 2026-10-29 every XCH/wUSDC.b bid sat at exactly 5 XCH: `strategy.max_offer_size_units`
+(5) capped every XCH offer and every tier shared one minimum (1 XCH). Uncapped,
+the six bids would have been 16.9 / 13.5 / 10.1 / 6.7 / 5.1 / 3.9 XCH.
+
+Two new per-pair settings, `tight_tier_min_offer_units` and
+`wide_tier_min_offer_units`, raise each tier to a straight line between the
+two (10 and 1 over 6 tiers: 10, 8.2, 6.4, 4.6, 2.8, 1). Above its minimum a
+tier keeps its `tier_size_pct` share of the pool, so it still grows with the
+balances. `strategy.max_offer_size_units` never caps a tier below its
+minimum; set it to 0 for no cap.
+
+- Short of funds, a side skips its tightest (largest) tiers first and keeps
+  the wider ones: in Step 7's pool and budget fit, in the spendable-XCH tier
+  limit, and in the pre-post exposure check. Such a side is posted widest
+  first, so an insufficient-funds stop only costs it the tighter tiers.
+- The minimums never take a side past its risk-approved pool. A side that
+  cannot fit even its widest tier at its minimum posts the plain ladder.
+- A resting offer on a tier the plan skipped, or below its tier's minimum,
+  is cancelled (recorded as `tier_min_unplanned` / `tier_min_undersized`)
+  and the plan reposted. While such an offer is still takeable, its side
+  posts nothing new, for at most 32 blocks on an unconfirmed cancel.
+- Set both or neither; each in (0, 1e6] base units, never below the pair's
+  min offer size. Not used on a pace-managed pair or on a revive pair while
+  its book is thin. Refused with `strategy.batch_offers_enabled`.
+
+Both settings are unset by default, so nothing changes until they are set.
+They apply live (no restart).
+
 ## [0.10.35] — 2026-10-29 — a thin book's fake price jump can no longer pause every pair
 
 ### The flash-crash guard ignores highs from books too wide to price (#198)
