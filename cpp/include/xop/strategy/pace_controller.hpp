@@ -640,19 +640,22 @@ static_assert(balance_is_fresh(true, 130u, 120u, 20u));
 
 /// P12: the offer-size band Step 7 enforces (engine.cpp's min-offer-size
 /// pass, which is NOT changed): min is the pair override, else 1.0 for an
-/// XCH-base pair and the global minimum otherwise; max is the pair's
-/// max_offer_size_units_override when set (0 = no cap), else the global
-/// maximum for an XCH-base pair and 0 (no cap) otherwise.  Step 7's tier
-/// minimums ([TIERMIN]) stand aside on a pace-managed pair.
+/// XCH-base pair and the global minimum otherwise; max is the global maximum
+/// for an XCH-base pair and 0 (no cap) otherwise.  [TIERMIN 2026-10-29] A
+/// pair's max_offer_size_units_override replaces the max (0 = no cap) and,
+/// as in Step 7, never caps below the pair's minimum.  Step 7's tier
+/// minimums stand aside on a pace-managed pair.
 [[nodiscard]] inline OfferSizeBand effective_offer_size_band(bool xch_base, std::optional<double> min_override,
                                                              double global_min, double global_max,
                                                              std::optional<double> max_override = std::nullopt) noexcept
 {
     OfferSizeBand b{};
     b.min_units = min_override.value_or(xch_base ? 1.0 : global_min);
-    b.max_units = max_override.has_value()
-        ? std::max(0.0, *max_override)
-        : ((xch_base && global_max > 0.0) ? global_max : 0.0);
+    if (max_override.has_value()) {
+        b.max_units = (*max_override > 0.0) ? std::max(*max_override, b.min_units) : 0.0;
+    } else {
+        b.max_units = (xch_base && global_max > 0.0) ? global_max : 0.0;
+    }
     return b;
 }
 

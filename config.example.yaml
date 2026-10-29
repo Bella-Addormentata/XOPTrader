@@ -212,14 +212,20 @@ pairs:
     # a straight line through the two (10 and 1 over 6 tiers: 10, 8.2, 6.4,
     # 4.6, 2.8, 1).  Above its minimum a tier keeps its tier_size_pct share
     # of the pool, so it grows with the balances.  Set both or neither; each
-    # must be > 0.  Never below the pair's min offer size.  If the wallet
-    # cannot fund a side's tightest tier at its minimum, that side posts the
-    # plain ladder instead.  Not used on a pace-managed pair.
+    # must be > 0 and at most 1e6.  Never below the pair's min offer size.
+    # The minimums never take a side past its risk-approved pool or what the
+    # wallet can fund: the tiers that do not fit at their minimums are
+    # dropped, widest first, and a side that cannot fit even its tightest
+    # tier posts the plain ladder instead.  Not used on a pace-managed pair
+    # or on a revive pair while its book is thin.  A resting offer smaller
+    # than its tier's minimum is replaced at the new size.
     # tight_tier_min_offer_units: 10      # [OPTIONAL, default: unset]
     # wide_tier_min_offer_units: 1        # [OPTIONAL, default: unset]
     # This pair's largest offer in base units, in place of
     # strategy.max_offer_size_units (which covers XCH-base pairs only); 0 = no
-    # cap.  No tier is capped below its own minimum.
+    # cap.  No tier is capped below its own minimum.  A resting offer larger
+    # than the cap is replaced.  Refused while strategy.batch_offers_enabled
+    # is on (a batched side is one offer, so a per-pair cap cannot hold).
     # max_offer_size_units_override: 20   # [OPTIONAL, default: unset -> strategy.max_offer_size_units]
   - base_asset_id: "xch"
     quote_asset_id: "ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac"  # BYC

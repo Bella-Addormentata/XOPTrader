@@ -369,9 +369,7 @@ TEST(SizingWiring, Step7CapsThroughThePairsOwnCapNeverBelowATiersMinimum) {
 TEST(SizingWiring, Step7UpScalesEachTierToItsOwnMinimum) {
     const std::string body = function_body(read_engine_cpp(), kLadderSignature);
     ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
-    const std::size_t on_at = position_of(body,
-        "const bool tier_minimums_on = has_tier_minimums(*pair_cfg) "
-        "&& !(config_.strategy.pace_enabled && pcs.pace.managed);");
+    const std::size_t on_at = position_of(body, "const bool tier_minimums_on = has_tier_minimums(*pair_cfg)");
     const std::size_t line_at = position_of(body,
         "tier_min_offer_units(*pair_cfg, eff_min_units, tq.tier_index, ladder_cfg.num_tiers)");
     const std::size_t upscale_at = position_of(body, "const Mojo tier_min = tier_min_mojos(tq);");
@@ -385,28 +383,73 @@ TEST(SizingWiring, Step7UpScalesEachTierToItsOwnMinimum) {
               std::string::npos);
 }
 
-TEST(SizingWiring, FundingFilterFallsBackToThePlainLadder) {
+TEST(SizingWiring, TierMinimumsStayWithinThePoolAndTheBudget) {
     const std::string body = function_body(read_engine_cpp(), kLadderSignature);
     ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
-    const std::size_t plain_at = position_of(body,
-        "plain_tier_sizes[{tq.side, tq.tier_index}] = std::max(capped, min_base_mojos);");
+    // Off on a pace-managed pair and on a revive pair while thin.
+    EXPECT_NE(position_of(body,
+        "const bool tier_minimums_on = has_tier_minimums(*pair_cfg) "
+        "&& !(config_.strategy.pace_enabled && pcs.pace.managed) "
+        "&& !(pair_cfg->revive_market && pcs.revive_thin);"), std::string::npos);
+    // Each tier's pre-cap size (its share of the pool) and plain size are
+    // taken before the cap, inside the funding filter the minimums are
+    // bounded by the side's pool and budget, and only then does a side with
+    // no known budget skip the filter.
+    const std::size_t snapshot_at = position_of(body,
+        "tier_min_sizes[{tq.side, tq.tier_index}] = {tq.size, std::max(capped, min_base_mojos)};");
+    const std::size_t cap_at = position_of(body, "const Mojo tier_cap = std::max(max_base_mojos, tier_min_mojos(tq));");
     const std::size_t funding_at = position_of(body, "[S3 rounds 5+7] Re-enforce EVERY side's funding budget");
-    const std::size_t fallback_at = position_of(body, "if (keep == 0 && !costs.empty()) {");
-    ASSERT_NE(plain_at, std::string::npos);
+    const std::size_t fit_at = position_of(body,
+        "const std::size_t fit = strategy::tiermin::tiers_within_pool("
+        "min_sizes, side_costs(), side_pool, min_budget);");
+    const std::size_t skip_at = position_of(body, "if (!budget.has_value()) continue;");
+    ASSERT_NE(snapshot_at, std::string::npos);
+    ASSERT_NE(cap_at, std::string::npos);
     ASSERT_NE(funding_at, std::string::npos);
-    ASSERT_NE(fallback_at, std::string::npos);
-    EXPECT_LT(plain_at, funding_at);
-    EXPECT_LT(funding_at, fallback_at);
-    // Restores only downwards (a revive cap may already have gone lower),
-    // then re-measures the side before the drop.
-    EXPECT_NE(position_of(body, "if (plain != plain_tier_sizes.end() && plain->second < tq.size) {"),
+    ASSERT_NE(fit_at, std::string::npos);
+    ASSERT_NE(skip_at, std::string::npos);
+    EXPECT_LT(snapshot_at, cap_at);
+    EXPECT_LT(funding_at, fit_at);
+    EXPECT_LT(fit_at, skip_at);
+    // The pool is the sum of the pre-cap sizes; a CAT without a known budget
+    // is bounded by its confirmed balance.
+    EXPECT_NE(position_of(body, "side_pool = saturating_add_mojo(side_pool, "
+                                "sz != tier_min_sizes.end() ? sz->second.first : tq.size);"),
               std::string::npos);
-    const std::size_t remeasure_at = body.find(
-        squeeze("costs = side_costs(); keep = tiers_within_budget(costs, *budget);"), fallback_at);
-    const std::size_t drop_at = body.find(squeeze("if (keep >= costs.size()) continue;"), fallback_at);
-    ASSERT_NE(remeasure_at, std::string::npos);
-    ASSERT_NE(drop_at, std::string::npos);
-    EXPECT_LT(remeasure_at, drop_at);
+    EXPECT_NE(position_of(body, "min_budget = bal->second.confirmed;"), std::string::npos);
+    // Nothing fits: the plain sizes; otherwise the tiers past the fit go,
+    // and the kept ones are recorded for Step 8.
+    const std::size_t plain_at = position_of(body,
+        "if (sz != tier_min_sizes.end()) tq.size = sz->second.second;");
+    const std::size_t record_at = position_of(body,
+        "pcs.tier_min_mojos[{side, tq.tier_index}] = tier_min_mojos(tq);");
+    ASSERT_NE(plain_at, std::string::npos);
+    ASSERT_NE(record_at, std::string::npos);
+    EXPECT_LT(fit_at, plain_at);
+    EXPECT_LT(plain_at, record_at);
+    EXPECT_LT(record_at, skip_at);
+    EXPECT_NE(position_of(body, "pcs.max_offer_mojos = max_base_mojos;"), std::string::npos);
+}
+
+TEST(SizingWiring, Step8ReplacesARestingOfferTheSizeSettingsOutgrew) {
+    const std::string body = function_body(
+        read_engine_cpp(), "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)");
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t classify_at = position_of(body, "auto tier_classes = offer_mgr_->classify_tier_staleness(");
+    const std::size_t guard_at = position_of(body,
+        "if (!config_.strategy.batch_offers_enabled "
+        "&& (!pcs.tier_min_mojos.empty() || pcs.max_offer_mojos > 0)) {");
+    const std::size_t count_at = position_of(body, "bool has_pending = !tier_classes.empty();");
+    ASSERT_NE(classify_at, std::string::npos);
+    ASSERT_NE(guard_at, std::string::npos);
+    ASSERT_NE(count_at, std::string::npos);
+    EXPECT_LT(classify_at, guard_at);
+    EXPECT_LT(guard_at, count_at);
+    EXPECT_NE(position_of(body, "const bool below_min = tier_min > 0 && size_po.size < tier_min;"),
+              std::string::npos);
+    EXPECT_NE(position_of(body, "const bool above_cap = pcs.max_offer_mojos > 0 "
+                                "&& size_po.size > std::max(pcs.max_offer_mojos, planned->size);"),
+              std::string::npos);
 }
 
 TEST(SizingWiring, PaceBandSeesThePairsOwnCap) {

@@ -19,6 +19,7 @@
 #include <xop/execution/cancel_escalation_config.hpp>
 #include <xop/strategy/fee_controller.hpp>
 #include <xop/strategy/pace_controller.hpp>
+#include <xop/strategy/tier_minimums.hpp>
 
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
@@ -4635,7 +4636,7 @@ TEST(ConfigParserTest, TierMinimums_OneWithoutTheOtherRejected) {
 }
 
 TEST(ConfigParserTest, TierMinimums_BadValuesRejected) {
-    for (const char* bad : {"0", "-1", ".inf", "-.inf", ".nan"}) {
+    for (const char* bad : {"0", "-1", "1000001", ".inf", "-.inf", ".nan"}) {
         expect_non_finite_rejected(
             with_pair_extra(std::string("tight_tier_min_offer_units: ") + bad
                             + "\n    wide_tier_min_offer_units: 1"),
@@ -4645,9 +4646,82 @@ TEST(ConfigParserTest, TierMinimums_BadValuesRejected) {
                             + "\n    wide_tier_min_offer_units: " + bad),
             "wide_tier_min_offer_units", bad);
     }
-    for (const char* bad : {"-1", ".inf", "-.inf", ".nan"}) {
+    for (const char* bad : {"-1", "1000001", ".inf", "-.inf", ".nan"}) {
         expect_non_finite_rejected(
             with_pair_extra(std::string("max_offer_size_units_override: ") + bad),
             "max_offer_size_units_override", bad);
     }
 }
+
+TEST(ConfigParserTest, PairOfferCap_RefusedWithBatching) {
+    // Batching posts a side's tiers as ONE offer, so a per-tier cap would
+    // not bound what is posted (as with the revive cap).
+    const auto batched_with = [](const std::string& pair_line) {
+        std::string y = with_strategy_keys("\n  batch_offers_enabled: true");
+        const std::string anchor = "    enabled: true";
+        y.insert(y.find(anchor) + anchor.size(), "\n    " + pair_line);
+        return y;
+    };
+    TempYaml capped(batched_with("max_offer_size_units_override: 20"));
+    try {
+        xop::load_config(capped.path());
+        ADD_FAILURE() << "a pair cap with batching was accepted";
+    } catch (const xop::ConfigError& e) {
+        EXPECT_NE(std::string(e.what()).find("batch_offers_enabled"), std::string::npos)
+            << e.what();
+    }
+    // 0 (no cap) is fine with batching, and so is a cap without it.
+    TempYaml zero(batched_with("max_offer_size_units_override: 0"));
+    EXPECT_NO_THROW(xop::load_config(zero.path()));
+    TempYaml unbatched(with_pair_extra("max_offer_size_units_override: 20"));
+    EXPECT_NO_THROW(xop::load_config(unbatched.path()));
+}
+
+TEST(TierMinimumMojos, RoundUpButNotPastAWholeMojo) {
+    namespace tmin = xop::strategy::tiermin;
+    // The 10 -> 1 XCH line over six tiers lands on whole mojos.
+    const auto pc = tier_min_pair(10.0, 1.0);
+    const xop::Mojo expected[] = {10'000'000'000'000, 8'200'000'000'000, 6'400'000'000'000,
+                                  4'600'000'000'000, 2'800'000'000'000, 1'000'000'000'000};
+    for (std::uint32_t i = 0; i < 6; ++i) {
+        EXPECT_EQ(tmin::min_units_to_mojos(xop::tier_min_offer_units(pc, 1.0, i, 6),
+                                         1'000'000'000'000),
+                  expected[i]) << "tier " << i;
+    }
+    EXPECT_EQ(tmin::min_units_to_mojos(4.6, 1'000), 4'600);
+    EXPECT_EQ(tmin::min_units_to_mojos(1.0001, 1'000), 1'001) << "never short of the figure";
+    EXPECT_EQ(tmin::min_units_to_mojos(0.0, 1'000), 0);
+    EXPECT_FALSE(tmin::min_units_to_mojos(-1.0, 1'000).has_value());
+    EXPECT_FALSE(tmin::min_units_to_mojos(1e7, 1'000'000'000'000).has_value())
+        << "past the mojo range";
+    EXPECT_FALSE(tmin::min_units_to_mojos(std::nan(""), 1'000).has_value());
+}
+
+TEST(TierMinimumMojos, CapRoundsDownAndAPositiveCapIsNeverNoCap) {
+    namespace tmin = xop::strategy::tiermin;
+    EXPECT_EQ(tmin::cap_units_to_mojos(20.0, 1'000'000'000'000), 20'000'000'000'000);
+    EXPECT_EQ(tmin::cap_units_to_mojos(5.0, 1'000'000'000'000), 5'000'000'000'000);
+    EXPECT_EQ(tmin::cap_units_to_mojos(2.5005, 1'000), 2'500) << "never past the cap";
+    EXPECT_EQ(tmin::cap_units_to_mojos(0.0001, 1'000), 1) << "0.1 mojo is still a cap";
+    EXPECT_EQ(tmin::cap_units_to_mojos(0.0, 1'000), 0) << "0 is no cap";
+    EXPECT_FALSE(tmin::cap_units_to_mojos(std::nan(""), 1'000).has_value());
+    EXPECT_FALSE(tmin::cap_units_to_mojos(1e300, 1'000).has_value());
+}
+
+TEST(TierMinimumMojos, MinimumsStayWithinThePoolAndTheBudget) {
+    namespace tmin = xop::strategy::tiermin;
+    // XCH units for readability: the floored ladder 10, 8.2, 6.4 ...
+    const std::vector<xop::Mojo> sizes{100, 82, 64, 46, 28, 10};
+    const std::vector<xop::Mojo> costs{130, 107, 83, 60, 36, 13};
+    EXPECT_EQ(tmin::tiers_within_pool(sizes, costs, 562, std::nullopt), 6u)
+        << "a big pool keeps every minimum";
+    EXPECT_EQ(tmin::tiers_within_pool(sizes, costs, 250, std::nullopt), 3u)
+        << "a 25 XCH pool keeps 10 + 8.2 + 6.4";
+    EXPECT_EQ(tmin::tiers_within_pool(sizes, costs, 99, std::nullopt), 0u)
+        << "a pool under the tight minimum sets them aside";
+    EXPECT_EQ(tmin::tiers_within_pool(sizes, costs, 562, xop::Mojo{240}), 2u)
+        << "the funding budget binds too";
+    EXPECT_EQ(tmin::tiers_within_pool(sizes, costs, 562, xop::Mojo{129}), 0u);
+    EXPECT_EQ(tmin::tiers_within_pool({}, {}, 0, std::nullopt), 0u);
+}
+

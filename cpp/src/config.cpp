@@ -1131,17 +1131,18 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             p.min_offer_size_units_override = v;
         }
         // [TIERMIN 2026-10-29] Per-tier minimums (both or neither, each
-        // finite > 0) and this pair's own largest offer (finite >= 0, 0 = no
-        // cap).  See PairConfig::tight_tier_min_offer_units.
+        // finite in (0, 1e6]) and this pair's own largest offer (finite in
+        // [0, 1e6], 0 = no cap).  1e6 units keeps every mojo product in
+        // range.  See PairConfig::tight_tier_min_offer_units.
         for (const auto& [key, field] : {
                  std::pair<const char*, std::optional<double>*>{
                      "tight_tier_min_offer_units", &p.tight_tier_min_offer_units},
                  {"wide_tier_min_offer_units", &p.wide_tier_min_offer_units}}) {
             if (item[key] && item[key].IsDefined() && !item[key].IsNull()) {
                 const double v = item[key].as<double>();
-                if (!std::isfinite(v) || !(v > 0.0)) {
+                if (!std::isfinite(v) || !(v > 0.0) || v > 1e6) {
                     throw ConfigError(idx + "." + key
-                                      + " must be a finite value > 0; got "
+                                      + " must be a finite value in (0, 1e6]; got "
                                       + std::to_string(v));
                 }
                 *field = v;
@@ -1156,9 +1157,9 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             && item["max_offer_size_units_override"].IsDefined()
             && !item["max_offer_size_units_override"].IsNull()) {
             const double v = item["max_offer_size_units_override"].as<double>();
-            if (!std::isfinite(v) || !(v >= 0.0)) {
+            if (!std::isfinite(v) || !(v >= 0.0) || v > 1e6) {
                 throw ConfigError(idx + ".max_offer_size_units_override must "
-                                  "be a finite value >= 0; got "
+                                  "be a finite value in [0, 1e6]; got "
                                   + std::to_string(v));
             }
             p.max_offer_size_units_override = v;
@@ -4950,6 +4951,23 @@ void validate_config_relations(const AppConfig& cfg)
                 "out), or give a pair its own offer_expiry_secs_override, or "
                 "set ttl_cancel_mode back to 'cancel'. With no expiry attached, "
                 "every offer keeps the hard TTL and the mode changes nothing.");
+        }
+    }
+
+    // [TIERMIN 2026-10-29] Batching merges a side's tiers into one
+    // wallet offer (post_merged_side), so a pair's own offer cap would
+    // not bound what is actually posted -- as with the revive cap below.
+    for (std::size_t i = 0; i < cfg.pairs.size(); ++i) {
+        if (cfg.strategy.batch_offers_enabled
+            && cfg.pairs[i].max_offer_size_units_override.has_value()
+            && *cfg.pairs[i].max_offer_size_units_override > 0.0) {
+            throw ConfigError(
+                "pairs[" + std::to_string(i) + "] ("
+                + cfg.pairs[i].name + "): max_offer_size_units_override "
+                "> 0 cannot be combined with "
+                "strategy.batch_offers_enabled: batching merges a side's "
+                "capped tiers into one larger offer. Disable batching, or "
+                "set the cap to 0.");
         }
     }
 

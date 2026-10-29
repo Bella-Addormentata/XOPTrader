@@ -2428,6 +2428,12 @@ private:
         // third-party book cannot price the pair by itself, so the revive
         // spread floor and size cap apply.
         bool          revive_thin{false};
+        // [TIERMIN 2026-10-29] Step 7's minimum (base mojos) for each tier
+        // it sized at its tier minimum this cycle, and the pair's offer cap
+        // (0 = none), so Step 8 can replace a resting offer the size settings
+        // have since outgrown.  Empty when Step 7 set no tier minimum.
+        std::map<std::pair<Side, std::uint8_t>, Mojo> tier_min_mojos;
+        Mojo          max_offer_mojos{0};
         // [SYNTH 2026-10-22] The error bar (bps) of the synthetic quoting
         // price published for this pair in Step 1; 0 when none was.
         double        revive_synth_sigma_bps{0.0};
