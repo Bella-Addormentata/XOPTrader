@@ -221,7 +221,8 @@ pairs:
     # or on a revive pair while its book is thin.  A resting offer smaller
     # than its tier's minimum, or on a tier skipped for want of funds, is
     # cancelled and the plan reposted.  strategy.max_offer_size_units never
-    # caps a tier below its minimum; set it to 0 for no cap.
+    # caps a tier below its minimum; set it to 0 for no cap.  Refused with
+    # strategy.batch_offers_enabled (one offer per side has no tiers).
     # tight_tier_min_offer_units: 10      # [OPTIONAL, default: unset]
     # wide_tier_min_offer_units: 1        # [OPTIONAL, default: unset]
   - base_asset_id: "xch"

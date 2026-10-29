@@ -455,17 +455,34 @@ TEST(SizingWiring, Step8RetiresRestingOffersThePlanMovedPast) {
     EXPECT_LT(classify_at, guard_at);
     EXPECT_LT(guard_at, count_at);
     // Only on a side posting minimums; an unplanned tier goes, as does one
-    // below its minimum.
-    EXPECT_NE(position_of(body, "if (!side_has_minimums(size_tc.side)) continue;"), std::string::npos);
+    // below its minimum, each with its own cancel reason.
+    const std::size_t reason_at = position_of(body,
+        "const auto tier_min_retire_reason = [&](Side s, std::uint8_t tier_index, Mojo size) -> const char* {");
+    ASSERT_NE(reason_at, std::string::npos);
+    EXPECT_LT(reason_at, guard_at);
+    EXPECT_NE(position_of(body, "if (!side_has_minimums(s)) return nullptr;"), std::string::npos);
     EXPECT_NE(position_of(body,
-        "if (!tier_planned(size_tc.side, size_tc.tier_index)) { why = \"on a tier no longer planned\"; }"),
+        "if (!tier_planned(s, tier_index)) return \"tier_min_unplanned\";"), std::string::npos);
+    EXPECT_NE(position_of(body,
+        "if (min_it != pcs.tier_min_mojos.end() && size < min_it->second) { return \"tier_min_undersized\"; }"),
         std::string::npos);
-    // While a retired offer is still in State (cancel failed or unconfirmed),
-    // its side posts nothing new.
+    EXPECT_NE(position_of(body,
+        "const char* why = tier_min_retire_reason( size_tc.side, size_tc.tier_index, size_po.size);"),
+        std::string::npos);
+    const std::size_t pace_reason_at = position_of(body, "cancel_reasons[pace_id] = \"pace_reprice\";");
+    const std::size_t retire_reason_at = position_of(body, "cancel_reasons[retired_id] = why;");
+    ASSERT_NE(pace_reason_at, std::string::npos);
+    ASSERT_NE(retire_reason_at, std::string::npos);
+    EXPECT_LT(pace_reason_at, retire_reason_at)
+        << "a tier-minimum retirement is recorded under its own reason";
+    // While a retired offer -- unplanned or undersized -- is still in State
+    // (cancel failed or unconfirmed), its side posts nothing new, not even
+    // the offer's own replacement.
     const std::size_t hold_at = position_of(body,
         "if (po.cancel_pending && block_height >= retired_at + kTierMinRetireHoldBlocks) { continue; } "
         "(po.side == Side::Bid ? hold_bid : hold_ask) = true;");
-    EXPECT_NE(position_of(body, "if (tier_planned(po.side, po.tier)) continue;"), std::string::npos);
+    EXPECT_NE(position_of(body,
+        "if (tier_min_retire_reason(po.side, po.tier, po.size) == nullptr) continue;"), std::string::npos);
     EXPECT_NE(position_of(body, "return live_ids.count(entry.first) == 0;"), std::string::npos)
         << "the retired-at map forgets offers that are gone";
     const std::size_t drop_at = position_of(body,
@@ -477,10 +494,8 @@ TEST(SizingWiring, Step8RetiresRestingOffersThePlanMovedPast) {
     EXPECT_LT(hold_at, drop_at);
     EXPECT_LT(drop_at, post_at);
     EXPECT_NE(position_of(body,
-        "if (min_it != pcs.tier_min_mojos.end() && size_po.size < min_it->second) {"),
-        std::string::npos);
-    EXPECT_NE(position_of(body,
-        "if (why != nullptr) { size_tc.staleness = execution::TierStaleness::Stale;"),
+        "if (why != nullptr) { size_tc.staleness = execution::TierStaleness::Stale; "
+        "tier_min_retire_reasons[size_tc.offer_id] = why;"),
         std::string::npos);
 }
 
@@ -520,8 +535,14 @@ TEST(SizingWiring, Step8KeepsTheWidestTiersTheExposureAllowsAndPostsThemFirst) {
               std::string::npos);
     // The exposure check keeps a tier-minimum side's widest affordable new
     // tiers before it decides the side, with the same inputs it decides on.
+    // A side without minimums keeps its plain all-or-nothing verdict.
+    const std::size_t gate_at = position_of(body,
+        "for (const Side side : {Side::Ask, Side::Bid}) { if (!side_has_minimums(side)) continue;");
     const std::size_t trim_at = position_of(body,
         "return a->tier_index > b->tier_index; });");
+    ASSERT_NE(gate_at, std::string::npos);
+    ASSERT_NE(trim_at, std::string::npos);
+    EXPECT_LT(gate_at, trim_at);
     const std::size_t verdict_at = position_of(body,
         "if (decide_for(is_ask, next).second.verdict != execution::ExposureVerdict::Ok) { break; }");
     const std::size_t erase_at = position_of(body,
@@ -547,4 +568,8 @@ TEST(SizingWiring, Step8KeepsTheWidestTiersTheExposureAllowsAndPostsThemFirst) {
     ASSERT_NE(sort_at, std::string::npos);
     ASSERT_NE(post_at, std::string::npos);
     EXPECT_LT(sort_at, post_at);
+    // Only a side posting minimums goes widest first; the other keeps tier order.
+    EXPECT_NE(position_of(body,
+        "return side_has_minimums(a.side) ? a.tier_index > b.tier_index : a.tier_index < b.tier_index;"),
+        std::string::npos);
 }

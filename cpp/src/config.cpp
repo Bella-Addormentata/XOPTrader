@@ -4939,6 +4939,20 @@ void validate_config_relations(const AppConfig& cfg)
         }
     }
 
+    // [TIERMIN 2026-10-29] Batching merges a side's tiers into one wallet
+    // offer (post_merged_side), so Step 8 could neither retire a tier the
+    // minimums skip nor resize one below its minimum inside it.
+    for (std::size_t i = 0; i < cfg.pairs.size(); ++i) {
+        if (cfg.strategy.batch_offers_enabled && has_tier_minimums(cfg.pairs[i])) {
+            throw ConfigError(
+                "pairs[" + std::to_string(i) + "] (" + cfg.pairs[i].name
+                + "): tight_tier_min_offer_units / wide_tier_min_offer_units "
+                "cannot be combined with strategy.batch_offers_enabled: "
+                "batching merges a side's tiers into one offer. Disable "
+                "batching, or remove the tier minimums.");
+        }
+    }
+
     // Cross-section: revive_market quotes from the fair-value solve with
     // no order-book reference, so its whole safety envelope is carried by
     // a handful of strategy/market-data knobs -- and several of them have

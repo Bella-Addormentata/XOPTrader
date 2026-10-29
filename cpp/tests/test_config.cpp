@@ -4581,6 +4581,32 @@ TEST(ConfigParserTest, TierMinimums_OneWithoutTheOtherRejected) {
     }
 }
 
+TEST(ConfigParserTest, TierMinimums_RefusedWithBatching) {
+    // Batching posts a side's tiers as one offer, so Step 8 could neither
+    // retire a tier the minimums skip nor one sized below its minimum.
+    std::string yaml = with_strategy_keys("\n  batch_offers_enabled: true");
+    const std::string anchor = "    enabled: true";
+    const auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(),
+                "\n    tight_tier_min_offer_units: 10\n    wide_tier_min_offer_units: 1");
+    TempYaml tmp(yaml);
+    try {
+        xop::load_config(tmp.path());
+        ADD_FAILURE() << "tier minimums accepted with batching";
+    } catch (const xop::ConfigError& e) {
+        EXPECT_NE(std::string(e.what()).find("batch_offers_enabled"), std::string::npos)
+            << e.what();
+    }
+
+    // Batching alone, and the minimums alone, still load.
+    TempYaml batched(with_strategy_keys("\n  batch_offers_enabled: true"));
+    EXPECT_NO_THROW(xop::load_config(batched.path()));
+    TempYaml minimums(with_pair_extra(
+        "tight_tier_min_offer_units: 10\n    wide_tier_min_offer_units: 1"));
+    EXPECT_NO_THROW(xop::load_config(minimums.path()));
+}
+
 TEST(ConfigParserTest, TierMinimums_BadValuesRejected) {
     for (const char* bad : {"0", "-1", "1000001", ".inf", "-.inf", ".nan"}) {
         expect_non_finite_rejected(

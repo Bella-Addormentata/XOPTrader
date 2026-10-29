@@ -13781,8 +13781,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // unplanned offer Fresh, so after the tight minimum went from 5 to
         // 10 XCH the old offer would rest until its TTL, and a skipped tier's
         // old offer would stay up beside the wider tiers that took its funds.
-        // Neither test can fire on an offer Step 7 just sized.  Not with
-        // batching, whose one offer per side carries the sum of its tiers.
+        // Neither test can fire on an offer Step 7 just sized.  Config
+        // refuses tier minimums with batching, whose one offer per side
+        // carries the sum of its tiers.
         const auto side_has_minimums = [&](Side s) {
             return std::any_of(pcs.tier_min_mojos.begin(), pcs.tier_min_mojos.end(),
                 [&](const auto& entry) { return entry.first.first == s; });
@@ -13793,24 +13794,30 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     return tq.side == s && tq.tier_index == tier_index;
                 });
         };
+        // Why a resting offer on a side posting tier minimums must go, as
+        // the cancel reason recorded for it; nullptr when it may stay.
+        const auto tier_min_retire_reason = [&](Side s, std::uint8_t tier_index,
+                                                Mojo size) -> const char* {
+            if (!side_has_minimums(s)) return nullptr;
+            if (!tier_planned(s, tier_index)) return "tier_min_unplanned";
+            const auto min_it = pcs.tier_min_mojos.find({s, tier_index});
+            if (min_it != pcs.tier_min_mojos.end() && size < min_it->second) {
+                return "tier_min_undersized";
+            }
+            return nullptr;
+        };
+        std::unordered_map<std::string, std::string> tier_min_retire_reasons;
         if (!config_.strategy.batch_offers_enabled && !pcs.tier_min_mojos.empty()) {
             for (auto& size_tc : tier_classes) {
                 if (size_tc.staleness != execution::TierStaleness::Fresh) continue;
-                if (!side_has_minimums(size_tc.side)) continue;
                 const PendingOffer size_po = state_->get_offer(size_tc.offer_id);
-                const char* why = nullptr;
-                if (!tier_planned(size_tc.side, size_tc.tier_index)) {
-                    why = "on a tier no longer planned";
-                } else {
-                    const auto min_it = pcs.tier_min_mojos.find({size_tc.side, size_tc.tier_index});
-                    if (min_it != pcs.tier_min_mojos.end() && size_po.size < min_it->second) {
-                        why = "below its tier minimum";
-                    }
-                }
+                const char* why = tier_min_retire_reason(
+                    size_tc.side, size_tc.tier_index, size_po.size);
                 if (why != nullptr) {
                     size_tc.staleness = execution::TierStaleness::Stale;
-                    spdlog::info("[Engine] Step 8: {} {} tier {} resting {} mojos is {} -- "
-                                 "retiring it",
+                    tier_min_retire_reasons[size_tc.offer_id] = why;
+                    spdlog::info("[Engine] Step 8: {} {} tier {} resting {} mojos -- "
+                                 "retiring it ({})",
                                  pair_name, (size_tc.side == Side::Bid) ? "BID" : "ASK",
                                  size_tc.tier_index, size_po.size, why);
                 }
@@ -13897,6 +13904,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         }
         for (const auto& pace_id : pace_reprice_ids) {
             cancel_reasons[pace_id] = "pace_reprice";
+        }
+        for (const auto& [retired_id, why] : tier_min_retire_reasons) {
+            cancel_reasons[retired_id] = why;
         }
 
         if (!cancelled_ids.empty()) {
@@ -16236,6 +16246,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // and never past the verdict it would give.
             if (!pcs.tier_min_mojos.empty()) {
                 for (const Side side : {Side::Ask, Side::Bid}) {
+                    if (!side_has_minimums(side)) continue;
                     const bool is_ask = (side == Side::Ask);
                     const bool checked = is_ask
                         ? (can_ask && pair_base_balance_known && pair_base_reserve_mojos > 0
@@ -16487,11 +16498,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // call actually outstanding instead of orphaning it (shutdown(), and
         // the PostingMark in offer_manager.cpp).
         // [TIERMIN 2026-10-29] A side posting tier minimums whose retired
-        // offer -- on a tier Step 7 no longer plans -- is still in State
-        // posts nothing new until it is gone: its cancel failed, or was sent
-        // and is unconfirmed, so it is still takeable, and it plus the wider
-        // plan could exceed the side's pool.  The retire pass above re-sends
-        // a failed cancel next cycle.  An unconfirmed cancel holds the side
+        // offer -- on a tier Step 7 no longer plans, or below its tier's
+        // minimum -- is still in State posts nothing new until it is gone:
+        // its cancel failed, or was sent and is unconfirmed, so it is still
+        // takeable, and it plus the new plan (its own replacement included)
+        // could exceed the side's pool.  The retire pass above re-sends a
+        // failed cancel next cycle.  An unconfirmed cancel holds the side
         // for at most kTierMinRetireHoldBlocks: one the wallet never finishes
         // (the escalation ladder owns it) must not silence the side for good.
         if (!config_.strategy.batch_offers_enabled && !pcs.tier_min_mojos.empty()) {
@@ -16500,8 +16512,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             bool hold_ask = false;
             const std::vector<PendingOffer> all_offers = state_->get_all_offers();
             for (const auto& po : all_offers) {
-                if (po.pair_name != pair_name || !side_has_minimums(po.side)) continue;
-                if (tier_planned(po.side, po.tier)) continue;
+                if (po.pair_name != pair_name) continue;
+                if (tier_min_retire_reason(po.side, po.tier, po.size) == nullptr) continue;
                 const BlockHeight retired_at =
                     tier_min_retired_at_.try_emplace(po.offer_id, block_height).first->second;
                 if (po.cancel_pending
@@ -16538,11 +16550,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // wallet then still gets its wider offers up.
         if (!pcs.tier_min_mojos.empty() && !config_.strategy.batch_offers_enabled) {
             std::stable_sort(fee_filtered_tiers.begin(), fee_filtered_tiers.end(),
-                [](const TierQuote& a, const TierQuote& b) {
+                [&](const TierQuote& a, const TierQuote& b) {
                     if (a.side != b.side) {
                         return static_cast<int>(a.side) < static_cast<int>(b.side);
                     }
-                    return a.tier_index > b.tier_index;
+                    return side_has_minimums(a.side) ? a.tier_index > b.tier_index
+                                                     : a.tier_index < b.tier_index;
                 });
         }
         int posted = co_await offer_mgr_->post_quotes(
