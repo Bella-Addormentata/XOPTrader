@@ -4711,7 +4711,8 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             // flash_crash_max_spread_bps is not a price these checks count:
             // a thin book losing one side for a few minutes moved XCH/BYC's
             // mid 1.635 -> 2.150 -> 1.587 and held every pair in Crash.
-            // What is left is judged by the rules below, unchanged.
+            // The window and the recovery tails below still count history
+            // entries, wide or not; only the prices inside them are filtered.
             const auto series = PreTradeCheck::crash_series(
                 history, config_.risk.flash_crash_max_spread_bps);
             if (series.left_out > 0
@@ -4752,8 +4753,6 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
                 continue;
             }
 
-            const std::vector<Mojo>& price_vec = series.prices;
-
             // Check crash signal for this pair.
             // [S12] Windowed: an aged spike stops counting once it
             // leaves the window.  NOTE the recovery timeline that follows:
@@ -4766,17 +4765,17 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             // still requires exactly what phase 2 always demanded, the
             // last 100 blocks inside the stability band; the phases only
             // run sequentially when a pair re-crashes DURING recovery.
-            const bool pair_crashing = PreTradeCheck::check_flash_crash(
-                price_vec,
+            const bool pair_crashing = PreTradeCheck::series_crashing(
+                series,
                 config_.risk.flash_crash_threshold_pct,
                 config_.risk.flash_crash_window_blocks);
-            const bool pair_stable_phase1 = PreTradeCheck::is_stable_after_crash(
-                price_vec,
-                static_cast<int>(config_.risk.recovery_stable_blocks_phase1),
+            const bool pair_stable_phase1 = PreTradeCheck::series_stable(
+                series,
+                config_.risk.recovery_stable_blocks_phase1,
                 config_.risk.recovery_stability_band_pct);
-            const bool pair_stable_phase2 = PreTradeCheck::is_stable_after_crash(
-                price_vec,
-                static_cast<int>(config_.risk.recovery_stable_blocks_phase2),
+            const bool pair_stable_phase2 = PreTradeCheck::series_stable(
+                series,
+                config_.risk.recovery_stable_blocks_phase2,
                 config_.risk.recovery_stability_band_pct);
 
             // [REVIVE2 2026-10-22] A revive pair runs its own state machine

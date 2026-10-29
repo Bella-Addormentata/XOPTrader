@@ -32,6 +32,7 @@
 #include "xop/config.hpp"
 #include "xop/state.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -520,20 +521,33 @@ public:
 
     /// The prices one pair's crash and recovery checks run on.
     struct CrashSeries {
-        std::vector<Mojo> prices;      ///< Counted samples, oldest first.
-        BlockHeight       newest_block{0}; ///< Block of the newest counted one.
-        std::size_t       left_out{0}; ///< Samples dropped as too wide.
+        std::vector<Mojo>        prices;    ///< Counted samples, oldest first.
+        std::vector<std::size_t> positions; ///< Each one's index in the history.
+        std::size_t              entries{0};      ///< History length, wide or not.
+        BlockHeight              newest_block{0}; ///< Block of the newest counted one.
+        std::size_t              left_out{0};     ///< Samples dropped as too wide.
+
+        /// The counted prices among the newest `n` history entries; all of
+        /// them for 0 or when `n` covers the whole history.
+        [[nodiscard]] std::vector<Mojo> newest_entries(std::size_t n) const
+        {
+            if (n == 0 || n >= entries) return prices;
+            const auto first = std::lower_bound(positions.begin(),
+                                                positions.end(), entries - n);
+            return {prices.begin() + (first - positions.begin()), prices.end()};
+        }
     };
 
     /// [WIDEBOOK 2026-10-29] Build a pair's crash-check series from its
     /// price history (oldest first; any entry type with block_height, price
     /// and spread_bps), leaving out every sample crash_sample_counts()
-    /// rejects. A sample left out is not a price at all, so the existing
-    /// rules then apply to what remains unchanged: the window is the newest
-    /// flash_crash_window_blocks COUNTED samples, and newest_block is what
-    /// price_history_is_stale() judges -- a pair whose book has stayed too
-    /// wide to price is left out exactly like a pair with no mid, and cannot
-    /// hold every other pair paused with a frozen history.
+    /// rejects. The crash window and the recovery tails still count history
+    /// ENTRIES, wide or not (series_crashing / series_stable), so dropping a
+    /// sample never stretches them back over older blocks; only the prices
+    /// inside them are filtered. newest_block is what price_history_is_stale()
+    /// judges -- a pair whose book has stayed too wide to price is left out
+    /// exactly like a pair with no mid, and cannot hold every other pair
+    /// paused with a frozen history.
     ///
     /// On 2026-10-29 the XCH/BYC book's near ask kept vanishing for a few
     /// minutes. The mid went 1.635 -> 2.150 (a 6,976 bps book) -> 1.587: a
@@ -546,16 +560,48 @@ public:
     {
         CrashSeries s;
         s.prices.reserve(history.size());
+        s.positions.reserve(history.size());
         for (const auto& e : history) {
+            ++s.entries;
             if (!crash_sample_counts(e.spread_bps, max_spread_bps)) {
                 ++s.left_out;
                 continue;
             }
             s.prices.push_back(static_cast<Mojo>(
                 std::llround(e.price * static_cast<double>(kMojosPerXch))));
+            s.positions.push_back(s.entries - 1);
             s.newest_block = e.block_height;
         }
         return s;
+    }
+
+    /// [WIDEBOOK 2026-10-29] check_flash_crash() on the counted prices among
+    /// the newest `window` history entries (0 = all). Cutting the window
+    /// before filtering keeps its horizon at `window` blocks: cut after, a
+    /// pair whose book is mostly too wide would keep a crash from hundreds
+    /// of blocks back inside its last `window` counted samples.
+    [[nodiscard]]
+    static bool series_crashing(const CrashSeries& s, double threshold,
+                                std::size_t window)
+    {
+        return check_flash_crash(s.newest_entries(window), threshold);
+    }
+
+    /// [WIDEBOOK 2026-10-29] is_stable_after_crash() over the newest
+    /// `required_entries` history entries: the history must be that long,
+    /// and every counted price among them must lie within `stability_band`
+    /// of the newest counted one. Counting entries, not counted samples,
+    /// means intermittent wide books cannot hold Recovery forever by leaving
+    /// fewer than `required_entries` counted prices in the whole buffer.
+    [[nodiscard]]
+    static bool series_stable(const CrashSeries& s,
+                              std::size_t required_entries,
+                              double stability_band)
+    {
+        if (s.entries < required_entries) return false;
+        const auto tail = s.newest_entries(required_entries);
+        return !tail.empty()
+            && is_stable_after_crash(tail, tail.size(), stability_band);
     }
 
     /// Compute the recommended rebalancing buffer multiplier during network
