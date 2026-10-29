@@ -473,7 +473,7 @@ TEST(SizingWiring, Step8XchLimiterSkipsTightTiersFirstUnderTierMinimums) {
         read_engine_cpp(), "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)");
     ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
     const std::size_t branch_at = position_of(body,
-        "if (!pcs.tier_min_mojos.empty()) { std::vector<Mojo> tier_costs;");
+        "if (widest_first) { std::vector<Mojo> tier_costs;");
     const std::size_t lowest_at = position_of(body,
         "strategy::tiermin::lowest_affordable_tier_widest_first( tier_costs, 0, max_tier, xch_budget);");
     const std::size_t keep_at = position_of(body, "if (tq.tier_index >= lowest_kept) {");
@@ -490,4 +490,45 @@ TEST(SizingWiring, Step8XchLimiterSkipsTightTiersFirstUnderTierMinimums) {
     EXPECT_NE(position_of(body,
         "keep_ti = widest_first ? std::max(keep_ti, tq.tier_index) "
         ": std::min(keep_ti, tq.tier_index);"), std::string::npos);
+}
+
+TEST(SizingWiring, Step8KeepsTheWidestTiersTheExposureAllowsAndPostsThemFirst) {
+    const std::string body = function_body(
+        read_engine_cpp(), "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)");
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    // The XCH limit charges only the sides the pair may post.
+    EXPECT_NE(position_of(body,
+        "auto side_may_post = [&](Side side) { return !widest_first "
+        "|| (side == Side::Bid ? can_bid : can_ask); };"), std::string::npos);
+    EXPECT_NE(position_of(body, "if (!side_may_post(tq.side)) continue; const std::string resting_key ="),
+              std::string::npos);
+    // The exposure check keeps a tier-minimum side's widest affordable new
+    // tiers before it decides the side, with the same inputs it decides on.
+    const std::size_t trim_at = position_of(body,
+        "return a->tier_index > b->tier_index; });");
+    const std::size_t verdict_at = position_of(body,
+        "if (decide_for(is_ask, next).second.verdict != execution::ExposureVerdict::Ok) { break; }");
+    const std::size_t erase_at = position_of(body,
+        "return tq.side == side && tq.tier_index < lowest_kept;");
+    const std::size_t planned_at = position_of(body, "Mojo planned_ask = 0;");
+    const std::size_t decide_at = position_of(body,
+        "return decide_for(is_ask, is_ask ? planned_ask : planned_bid);");
+    ASSERT_NE(trim_at, std::string::npos);
+    ASSERT_NE(verdict_at, std::string::npos);
+    ASSERT_NE(erase_at, std::string::npos);
+    ASSERT_NE(planned_at, std::string::npos);
+    ASSERT_NE(decide_at, std::string::npos);
+    EXPECT_LT(trim_at, verdict_at);
+    EXPECT_LT(verdict_at, erase_at);
+    EXPECT_LT(erase_at, planned_at);
+    EXPECT_LT(planned_at, decide_at);
+    // Posted widest first within each side.
+    const std::size_t sort_at = position_of(body,
+        "if (!pcs.tier_min_mojos.empty() && !config_.strategy.batch_offers_enabled) "
+        "{ std::stable_sort(fee_filtered_tiers.begin(), fee_filtered_tiers.end(),");
+    const std::size_t post_at = position_of(body,
+        "int posted = co_await offer_mgr_->post_quotes(");
+    ASSERT_NE(sort_at, std::string::npos);
+    ASSERT_NE(post_at, std::string::npos);
+    EXPECT_LT(sort_at, post_at);
 }

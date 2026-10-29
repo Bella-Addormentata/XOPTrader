@@ -15294,6 +15294,16 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             constexpr Mojo kUtxoOverheadMojos =
                 static_cast<Mojo>(250000000000LL);  // 0.25 * 1e12
 
+            // [TIERMIN 2026-10-29] A pair posting tier minimums keeps its
+            // wider tiers when short (below), and charges only the sides it
+            // may post: the side filter below would drop the rest anyway,
+            // and charging them would trim tiers the budget can fund.
+            const bool widest_first = !pcs.tier_min_mojos.empty();
+            auto side_may_post = [&](Side side) {
+                return !widest_first
+                    || (side == Side::Bid ? can_bid : can_ask);
+            };
+
             // Safety margin: 20% headroom above fee reserve.
             constexpr double kSafetyMarginPct = 0.20;
 
@@ -15354,6 +15364,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     int tier_offer_count = 0;
                     for (const auto& tq : fee_filtered_tiers) {
                         if (tq.tier_index != ti) continue;
+                        if (!side_may_post(tq.side)) continue;
                         const std::string resting_key =
                             std::to_string(static_cast<int>(tq.side))
                             + "_" + std::to_string(tq.tier_index);
@@ -15374,7 +15385,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 // short of XCH it skips the tightest tiers and keeps the
                 // wider ones, as the operator asked; always at least the
                 // widest.  Every other pair keeps its tight tiers, below.
-                if (!pcs.tier_min_mojos.empty()) {
+                if (widest_first) {
                     std::vector<Mojo> tier_costs;
                     tier_costs.reserve(static_cast<std::size_t>(max_tier) + 1);
                     for (int ti = 0; ti <= static_cast<int>(max_tier); ++ti) {
@@ -15453,12 +15464,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 // on a pair posting tier minimums its widest, smallest tier.
                 const auto orig_size = fee_filtered_tiers.size();
                 if (orig_size > 0) {
-                    const bool widest_first = !pcs.tier_min_mojos.empty();
                     // Find the tier_index to keep.
                     uint8_t keep_ti = widest_first ? 0 : 255;
-                    for (const auto& tq : fee_filtered_tiers)
+                    for (const auto& tq : fee_filtered_tiers) {
+                        if (!side_may_post(tq.side)) continue;
                         keep_ti = widest_first ? std::max(keep_ti, tq.tier_index)
                                                : std::min(keep_ti, tq.tier_index);
+                    }
 
                     std::vector<TierQuote> trimmed;
                     for (const auto& tq : fee_filtered_tiers) {
@@ -16169,6 +16181,106 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     QuoteMpu{pair_cfg->quote_mojos_per_unit}).v;
             };
 
+            // [S71 2026-09-20] The SAME verdict the resting-offer check above
+            // asked for, with the new tiers as `planned`: decide_exposure.
+            // Legacy inputs are the old ones (spendable, this pair's pending)
+            // and any non-Ok verdict suppresses, which is exactly the old
+            // exposure_breaches_reserve(spendable, pending+new, 0, reserve).
+            // Unified projects from `owned` against every resting offer that
+            // spends the asset -- re-read from State here, so an offer the
+            // first site just cancelled (cancel_pending) is already out of
+            // the sum -- and also refuses tiers the FREE coins cannot fund.
+            const std::vector<execution::RestingSpend> prepost_claims =
+                exposure_unified ? exposure_resting_claims()
+                                 : std::vector<execution::RestingSpend>{};
+            const auto inputs_for = [&](bool is_ask, Mojo planned) {
+                execution::ExposureInputs in;
+                in.owned_mojos     = is_ask ? pair_base_owned : pair_quote_owned;
+                in.spendable_mojos = is_ask ? pair_base_spendable
+                                            : pair_quote_spendable;
+                in.resting_spend_mojos = exposure_unified
+                    ? execution::resting_spend_on_asset(
+                          prepost_claims,
+                          is_ask ? pair_cfg->base_asset_id
+                                 : pair_cfg->quote_asset_id)
+                    : (is_ask ? pair_base_pending_spend : pair_quote_pending_spend);
+                in.planned_spend_mojos = planned;
+                in.reserve_mojos = is_ask ? pair_base_reserve_mojos
+                                          : pair_quote_reserve_mojos;
+                // [review #164] Legacy's prepost_claims is empty, so this is
+                // false for it; unified refuses to ADD exposure while any
+                // live resting offer's spend cannot be read.
+                in.resting_incomplete =
+                    execution::has_unmapped_live_claim(prepost_claims);
+                return in;
+            };
+            const auto decide_for = [&](bool is_ask, Mojo planned) {
+                const execution::ExposureInputs in = inputs_for(is_ask, planned);
+                return std::make_pair(
+                    in, execution::decide_exposure(
+                            exposure_unified, in,
+                            config_.strategy.exposure_cancel_hysteresis_pct));
+            };
+            const auto tier_spend = [&](const TierQuote& tq) -> Mojo {
+                return (tq.side == Side::Ask)
+                    ? tq.size
+                    : quote_cost_for_base_size(BaseMojos{tq.size}, tq.price);
+            };
+
+            // [TIERMIN 2026-10-29] A side posting tier minimums that cannot
+            // fund all its new tiers keeps the widest ones that fit instead
+            // of losing the whole side below, as the operator asked: its
+            // tight tiers are its largest.  Only where the check below runs,
+            // and never past the verdict it would give.
+            if (!pcs.tier_min_mojos.empty()) {
+                for (const Side side : {Side::Ask, Side::Bid}) {
+                    const bool is_ask = (side == Side::Ask);
+                    const bool checked = is_ask
+                        ? (can_ask && pair_base_balance_known && pair_base_reserve_mojos > 0
+                           && (!exposure_unified || pair_base_owned_known))
+                        : (can_bid && pair_quote_balance_known && pair_quote_reserve_mojos > 0
+                           && (!exposure_unified || pair_quote_owned_known));
+                    if (!checked) continue;
+                    std::vector<const TierQuote*> side_tiers;
+                    for (const auto& tq : fee_filtered_tiers) {
+                        if (tq.side == side) side_tiers.push_back(&tq);
+                    }
+                    std::sort(side_tiers.begin(), side_tiers.end(),
+                        [](const TierQuote* a, const TierQuote* b) {
+                            return a->tier_index > b->tier_index;
+                        });
+                    Mojo planned = 0;
+                    std::uint8_t lowest_kept = 255;
+                    for (const TierQuote* tq : side_tiers) {
+                        const Mojo next = saturating_add_mojo(planned, tier_spend(*tq));
+                        if (decide_for(is_ask, next).second.verdict
+                            != execution::ExposureVerdict::Ok) {
+                            break;
+                        }
+                        planned = next;
+                        lowest_kept = tq->tier_index;
+                    }
+                    // Nothing fits: leave the side whole, so the check below
+                    // gives the verdict (and any cancel) it always has.
+                    if (lowest_kept == 255 || side_tiers.empty()
+                        || lowest_kept == side_tiers.back()->tier_index) {
+                        continue;
+                    }
+                    const auto before = fee_filtered_tiers.size();
+                    fee_filtered_tiers.erase(
+                        std::remove_if(fee_filtered_tiers.begin(), fee_filtered_tiers.end(),
+                            [&](const TierQuote& tq) {
+                                return tq.side == side && tq.tier_index < lowest_kept;
+                            }),
+                        fee_filtered_tiers.end());
+                    spdlog::info("[Engine] Step 8: {} {} kept the {} widest new "
+                                 "tier(s) its exposure allows, skipping {} tighter",
+                                 pair_name, is_ask ? "ASK" : "BID",
+                                 side_tiers.size() - (before - fee_filtered_tiers.size()),
+                                 before - fee_filtered_tiers.size());
+                }
+            }
+
             Mojo pending_plus_new_ask = pair_base_pending_spend;
             Mojo pending_plus_new_bid = pair_quote_pending_spend;
             for (const auto& tq : fee_filtered_tiers) {
@@ -16185,15 +16297,6 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 }
             }
 
-            // [S71 2026-09-20] The SAME verdict the resting-offer check above
-            // asked for, with the new tiers as `planned`: decide_exposure.
-            // Legacy inputs are the old ones (spendable, this pair's pending)
-            // and any non-Ok verdict suppresses, which is exactly the old
-            // exposure_breaches_reserve(spendable, pending+new, 0, reserve).
-            // Unified projects from `owned` against every resting offer that
-            // spends the asset -- re-read from State here, so an offer the
-            // first site just cancelled (cancel_pending) is already out of
-            // the sum -- and also refuses tiers the FREE coins cannot fund.
             Mojo planned_ask = 0;
             Mojo planned_bid = 0;
             for (const auto& tq : fee_filtered_tiers) {
@@ -16205,32 +16308,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         quote_cost_for_base_size(BaseMojos{tq.size}, tq.price));
                 }
             }
-            const std::vector<execution::RestingSpend> prepost_claims =
-                exposure_unified ? exposure_resting_claims()
-                                 : std::vector<execution::RestingSpend>{};
             const auto projection_for = [&](bool is_ask) {
-                execution::ExposureInputs in;
-                in.owned_mojos     = is_ask ? pair_base_owned : pair_quote_owned;
-                in.spendable_mojos = is_ask ? pair_base_spendable
-                                            : pair_quote_spendable;
-                in.resting_spend_mojos = exposure_unified
-                    ? execution::resting_spend_on_asset(
-                          prepost_claims,
-                          is_ask ? pair_cfg->base_asset_id
-                                 : pair_cfg->quote_asset_id)
-                    : (is_ask ? pair_base_pending_spend : pair_quote_pending_spend);
-                in.planned_spend_mojos = is_ask ? planned_ask : planned_bid;
-                in.reserve_mojos = is_ask ? pair_base_reserve_mojos
-                                          : pair_quote_reserve_mojos;
-                // [review #164] Legacy's prepost_claims is empty, so this is
-                // false for it; unified refuses to ADD exposure while any
-                // live resting offer's spend cannot be read.
-                in.resting_incomplete =
-                    execution::has_unmapped_live_claim(prepost_claims);
-                return std::make_pair(
-                    in, execution::decide_exposure(
-                            exposure_unified, in,
-                            config_.strategy.exposure_cancel_hysteresis_pct));
+                return decide_for(is_ask, is_ask ? planned_ask : planned_bid);
             };
 
             bool suppress_ask_projection = false;
@@ -16405,6 +16484,19 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // in State -- so a keep stop delivered by a signal waits for the ONE
         // call actually outstanding instead of orphaning it (shutdown(), and
         // the PostingMark in offer_manager.cpp).
+        // [TIERMIN 2026-10-29] A pair posting tier minimums posts each side
+        // widest first: post_quotes stops a side at its first insufficient-
+        // funds reply, and the tight tiers are the largest, so a short
+        // wallet then still gets its wider offers up.
+        if (!pcs.tier_min_mojos.empty() && !config_.strategy.batch_offers_enabled) {
+            std::stable_sort(fee_filtered_tiers.begin(), fee_filtered_tiers.end(),
+                [](const TierQuote& a, const TierQuote& b) {
+                    if (a.side != b.side) {
+                        return static_cast<int>(a.side) < static_cast<int>(b.side);
+                    }
+                    return a.tier_index > b.tier_index;
+                });
+        }
         int posted = co_await offer_mgr_->post_quotes(
             *pair_cfg, fee_filtered_tiers, block_height, fee_override);
 
