@@ -1330,11 +1330,13 @@ private:
     /// Returns 0.0 if no price data is available at all.
     /// [SYNTH] `synthetic_used`, when given, is set to whether a synthetic
     /// reference contributed to the returned mid.
-    /// [WIDEBOOK 2026-10-29] `orderbook_used`, when given, is set to whether
-    /// the DEX leg was PairState::orderbook_mid.
+    /// [WIDEBOOK 2026-10-29] `dex_book_spread_bps`, when given, is set to the
+    /// width of the book the DEX leg came from: orderbook_spread_bps for the
+    /// cached orderbook_mid, the dex BBO's own width for a BBO midpoint
+    /// (filtered or raw), 0 for a last trade or no DEX leg.
     double compute_mid(const PairState& ps,
                        bool* synthetic_used = nullptr,
-                       bool* orderbook_used = nullptr) const;
+                       double* dex_book_spread_bps = nullptr) const;
 
     /// Compute the spread in basis points from best_bid and best_ask.
     /// Returns 0.0 if either side is zero (no two-sided market).

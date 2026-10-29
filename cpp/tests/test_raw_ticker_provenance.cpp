@@ -413,3 +413,28 @@ TEST(RawTickerProvenance, AFilteredBookRecordsItsSpreadInHistory)
     ASSERT_EQ(h.size(), 1u);
     EXPECT_NEAR(h[0].spread_bps, kSpreadBps, 1e-6);
 }
+
+TEST(RawTickerProvenance, AStaleCachedMidFallsBackToTheTickerWithItsWidth)
+{
+    MarketDataConfig cfg = provenance_cfg();
+    // Any orderbook mid is older than a negative threshold, so compute_mid
+    // falls back to the dex BBO midpoint -- the raw ticker's, after it.
+    cfg.stale_threshold = std::chrono::minutes(-1);
+    State state;
+    MarketDataFeed feed(cfg, state);
+    feed.ingest_block_height(100);
+    feed.ingest_competing_offers(
+        kPair,
+        {third_party("tp-bid", Side::Bid, kBid),
+         third_party("tp-ask", Side::Ask, 108.0)},
+        {}, xop::kMojosPerXch, 1'000);
+    feed.ingest_dexie(kPair, kBid, 108.0, /*last=*/83.40, /*vol_24h=*/0.21);
+    feed.refresh({kPair});
+
+    const auto h = feed.get_price_history(kPair);
+    ASSERT_EQ(h.size(), 1u);
+    EXPECT_DOUBLE_EQ(state.get_market(kPair).spread_bps, 0.0)
+        << "the published spread stays 0 for the raw ticker (PR #159)";
+    EXPECT_GT(h[0].spread_bps, 2000.0)
+        << "the history keeps the width of the book the mid came from";
+}

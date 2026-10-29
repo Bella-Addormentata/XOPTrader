@@ -413,8 +413,8 @@ void MarketDataFeed::refresh(const std::vector<std::string>& enabled_pairs) {
 
         // Step 4: Compute aggregated mid-price.
         bool synthetic_used = false;
-        bool orderbook_used = false;
-        ps.mid_price     = compute_mid(ps, &synthetic_used, &orderbook_used);
+        double dex_book_spread_bps = 0.0;
+        ps.mid_price     = compute_mid(ps, &synthetic_used, &dex_book_spread_bps);
         ps.mid_synthetic = synthetic_used;
 
         // Step 4b: [S20 2026-08-24] Plausibility gate.  Runs BEFORE the
@@ -479,13 +479,13 @@ void MarketDataFeed::refresh(const std::vector<std::string>& enabled_pairs) {
             // pairs -> history (never reversed).  Documented and safe.
             //
             // [WIDEBOOK 2026-10-29] Recorded with the width of the book the
-            // mid came from.  After a failed offers fetch spread_bps is 0
-            // (raw ticker, Step 5) while compute_mid may still serve the
-            // cached orderbook_mid; that mid keeps its own book's width, or
-            // a cached fake high from a wide book would count as a price.
+            // DEX leg came from, not the published spread_bps.  After a
+            // failed offers fetch spread_bps is 0 (raw ticker, Step 5) while
+            // compute_mid serves the cached orderbook_mid, or once that is
+            // stale the raw ticker's midpoint; either kept at 0 bps, a fake
+            // high from a wide book would count as a price.
             append_price_history(pair_name, current_block, ps.mid_price,
-                                 orderbook_used ? ps.orderbook_spread_bps
-                                                : ps.spread_bps);
+                                 dex_book_spread_bps);
         }
 
         // Step 9: Publish snapshot to shared State.
@@ -1461,9 +1461,9 @@ void MarketDataFeed::set_whale_max_spread_multiplier(double multiplier) {
 
 double MarketDataFeed::compute_mid(const PairState& ps,
                                    bool* synthetic_used,
-                                   bool* orderbook_used) const {
+                                   double* dex_book_spread_bps) const {
     if (synthetic_used != nullptr) *synthetic_used = false;
-    if (orderbook_used != nullptr) *orderbook_used = false;
+    if (dex_book_spread_bps != nullptr) *dex_book_spread_bps = 0.0;
     // [MEDIUM-1] Snapshot config under shared_lock (ISO/IEC 5055 -- CWE-362).
     const auto cfg = [&] { std::shared_lock lk(mtx_config_); return config_; }();
 
@@ -1490,13 +1490,22 @@ double MarketDataFeed::compute_mid(const PairState& ps,
             <= cfg.stale_threshold);
     if (cfg.orderbook_mid_enabled && ps.orderbook_mid > 0.0 && ob_fresh) {
         dex_mid = ps.orderbook_mid;
-        if (orderbook_used != nullptr) *orderbook_used = true;
+        if (dex_book_spread_bps != nullptr) {
+            *dex_book_spread_bps = ps.orderbook_spread_bps;
+        }
         spdlog::debug("[MarketData] {} using orderbook_mid={:.6f}",
                       ps.pair_name, dex_mid);
     }
     // Case 1: Two-sided dexie order book.
     else if (ps.dex_best_bid > 0.0 && ps.dex_best_ask > 0.0) {
         dex_mid = (ps.dex_best_bid + ps.dex_best_ask) / 2.0;
+        // Raw or filtered: the raw ticker also holds our own offers, so its
+        // width can only understate the third-party book's, never invent
+        // a wide one.
+        if (dex_book_spread_bps != nullptr) {
+            *dex_book_spread_bps =
+                compute_spread_bps(ps.dex_best_bid, ps.dex_best_ask);
+        }
     }
     // Case 2: One-sided dexie -- NO dex mid.
     //
