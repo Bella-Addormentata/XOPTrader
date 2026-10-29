@@ -1588,6 +1588,51 @@ TEST(SidePoolsTest, PairedWhenBothSidesHaveAPoolElseEachItsOwn) {
     EXPECT_EQ(ask_only.ask, 3'000);
 }
 
+// [TIERMIN 2026-10-29] Unpaired, each side keeps its own pool.
+TEST(SidePoolsTest, UnpairedEachSideKeepsItsOwnPool) {
+    const auto both = LiquidityEngine::side_pools(5'000, 3'000, false);
+    EXPECT_EQ(both.bid, 5'000);
+    EXPECT_EQ(both.ask, 3'000);
+    const auto negative = LiquidityEngine::side_pools(-1, 3'000, false);
+    EXPECT_EQ(negative.bid, 0);
+    EXPECT_EQ(negative.ask, 3'000);
+}
+
+// The XCH/wUSDC.b case on 2026-10-29: a 31.8 XCH bid pool and a 1 XCH ask
+// (drift-tapered, then floored).  Paired, the bids are sized from 1 XCH;
+// with pair_side_pools off they are sized from 31.8 XCH, the asks still
+// from 1 XCH.
+TEST(SidePoolsTest, TheLadderSizesEachSideFromItsOwnPoolWhenUnpaired) {
+    LiquidityConfig cfg;
+    cfg.num_tiers = 3;
+    cfg.tier_spacing_bps = {50.0, 100.0, 150.0};
+    cfg.tier_size_pct = {0.5, 0.3, 0.2};
+    LiquidityEngine engine("XCH/TEST", cfg);
+    const std::int64_t xch = 1'000'000'000'000LL;
+    const std::int64_t bid_pool = 318 * xch / 10;
+    const std::int64_t ask_pool = xch;
+    auto side_sum = [](const std::vector<TierQuote>& ladder, Side side) {
+        std::int64_t sum = 0;
+        for (const auto& tq : ladder) {
+            if (tq.side == side) sum += tq.size;
+        }
+        return sum;
+    };
+    const auto paired = engine.compute_ladder(
+        1'000'000, 0.0, 0.5, bid_pool, ask_pool, cfg);
+    EXPECT_EQ(side_sum(paired, Side::Bid), 15 * xch / 10)
+        << "paired, the bids are sized from the 1 XCH ask pool (tier 0 "
+           "raised to 1 XCH, then 0.3 + 0.2)";
+    cfg.pair_side_pools = false;
+    const auto unpaired = engine.compute_ladder(
+        1'000'000, 0.0, 0.5, bid_pool, ask_pool, cfg);
+    EXPECT_NEAR(static_cast<double>(side_sum(unpaired, Side::Bid)),
+                static_cast<double>(bid_pool), 3.0)
+        << "0.5 + 0.3 + 0.2 of the bid's own pool, each floored to a mojo";
+    EXPECT_EQ(side_sum(unpaired, Side::Ask), side_sum(paired, Side::Ask))
+        << "the ask is unchanged";
+}
+
 TEST(SidePoolsTest, TiersPastTierZeroStayWithinThePool) {
     LiquidityConfig cfg;
     cfg.num_tiers = 3;

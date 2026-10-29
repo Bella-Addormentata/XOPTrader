@@ -86,6 +86,21 @@ namespace xop::strategy::tiermin {
     return lowest;
 }
 
+/// Whether Step 7 sizes a pair's two ladder sides from the smaller pool
+/// (`LiquidityEngine::side_pools` pairing) or each from its own.  Pairing
+/// stays the rule, except on a pair posting tier minimums where exactly one
+/// side was both tapered by the drift guard (0 < scale < 1) and then lifted
+/// to the pair minimum by the deploy-idle floor: that 1-unit side would
+/// otherwise cut the other side to one unit too, so it could post only its
+/// widest tier.  A side the strategy itself sized small (no drift taper)
+/// keeps the pairing.
+[[nodiscard]] constexpr bool pair_side_pools(bool tier_minimums_on,
+                                             bool bid_guard_floored,
+                                             bool ask_guard_floored) noexcept
+{
+    return !(tier_minimums_on && bid_guard_floored != ask_guard_floored);
+}
+
 }  // namespace xop::strategy::tiermin
 
 #endif  // XOP_STRATEGY_TIER_MINIMUMS_HPP

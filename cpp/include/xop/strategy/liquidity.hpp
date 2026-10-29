@@ -380,6 +380,14 @@ struct LiquidityConfig {
     /// Empty vector = no fill data available (skip fill-rate sizing).
     std::vector<double> tier_fill_rates;
 
+    /// [TIERMIN 2026-10-29] Whether build_raw_ladder sizes both sides from
+    /// the smaller pool (side_pools) or each from its own (runtime data, not
+    /// YAML config).  Set by the engine before calling compute_ladder:
+    /// false only on a tier-minimum pair whose one side the drift guard
+    /// tapered and the deploy-idle floor then lifted to the minimum
+    /// (strategy::tiermin::pair_side_pools).
+    bool pair_side_pools{true};
+
     // -- Competitive anchor pricing -----------------------------------------
 
     /// When enabled, anchor Tier 0 on each side to the best competing
@@ -630,8 +638,11 @@ public:
     /// have one, so paired tiers match, else the one side's own (negative
     /// inputs read as 0).  The tiers can sum past it -- tier 0 is raised to
     /// 1 XCH -- so Step 7 bounds its tier minimums by this, not by the sum.
+    /// pair = false sizes each side from its own pool
+    /// (LiquidityConfig::pair_side_pools).
     static SidePools side_pools(std::int64_t available_capital,
-                                std::int64_t available_inventory) noexcept;
+                                std::int64_t available_inventory,
+                                bool pair = true) noexcept;
 
     // -- State tracking (call after successful offer placement) --------------
 

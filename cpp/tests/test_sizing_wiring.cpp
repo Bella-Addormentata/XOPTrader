@@ -365,7 +365,7 @@ TEST(SizingWiring, Step7NeverCapsATierBelowItsMinimum) {
 TEST(SizingWiring, Step7UpScalesEachTierToItsOwnMinimum) {
     const std::string body = function_body(read_engine_cpp(), kLadderSignature);
     ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
-    const std::size_t on_at = position_of(body, "const bool tier_minimums_on = has_tier_minimums(*pair_cfg)");
+    const std::size_t on_at = position_of(body, "const bool tier_minimums_on = ladder_tier_minimums_on;");
     const std::size_t line_at = position_of(body,
         "tier_min_offer_units(*pair_cfg, eff_min_units, tq.tier_index, ladder_cfg.num_tiers)");
     const std::size_t upscale_at = position_of(body, "const Mojo tier_min = tier_min_mojos(tq);");
@@ -384,9 +384,12 @@ TEST(SizingWiring, TierMinimumsStayWithinThePoolAndTheBudget) {
     ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
     // Off on a pace-managed pair and on a revive pair while thin.
     EXPECT_NE(position_of(body,
-        "const bool tier_minimums_on = has_tier_minimums(*pair_cfg) "
+        "const bool ladder_tier_minimums_on = pair_cfg "
+        "&& has_tier_minimums(*pair_cfg) "
         "&& !(config_.strategy.pace_enabled && pcs.pace.managed) "
         "&& !(pair_cfg->revive_market && pcs.revive_thin);"), std::string::npos);
+    EXPECT_NE(position_of(body, "const bool tier_minimums_on = ladder_tier_minimums_on;"),
+              std::string::npos);
     // Each tier's pre-cap size (its share of the pool) and plain size are
     // taken before the cap, inside the funding filter the minimums are
     // bounded by the side's pool and budget, and only then does a side with
@@ -421,7 +424,8 @@ TEST(SizingWiring, TierMinimumsStayWithinThePoolAndTheBudget) {
     // The pools are the ones the ladder was sized from.
     const std::size_t ladder_at = position_of(body, "avail_capital, avail_inventory, ladder_cfg); }");
     const std::size_t pools_at = position_of(body,
-        "pcs.ladder_pools = LiquidityEngine::side_pools(avail_capital, avail_inventory);");
+        "pcs.ladder_pools = LiquidityEngine::side_pools( "
+        "avail_capital, avail_inventory, ladder_cfg.pair_side_pools);");
     ASSERT_NE(ladder_at, std::string::npos);
     ASSERT_NE(pools_at, std::string::npos);
     EXPECT_LT(ladder_at, pools_at);
@@ -439,6 +443,50 @@ TEST(SizingWiring, TierMinimumsStayWithinThePoolAndTheBudget) {
     EXPECT_LT(fit_at, plain_at);
     EXPECT_LT(plain_at, record_at);
     EXPECT_LT(record_at, skip_at);
+}
+
+// [TIERMIN 2026-10-29] On a tier-minimum pair a drift-tapered side the
+// deploy-idle floor lifted to the pair minimum stops pairing the other side's
+// pool down to it.  On 2026-10-29 that left XCH/wUSDC.b one 1 XCH bid from a
+// 31.8 XCH bid pool.  Mutation-checked: fails against ef264fe.
+TEST(SizingWiring, AFlooredDriftTaperedSideDoesNotShrinkTheOtherSide) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    // The floor marks a side only when the drift guard tapered it, and only
+    // when it actually lifted that side's pool.
+    const std::size_t bid_floor_at = position_of(body,
+        "const Mojo floored = apply_deploy_idle_floor( avail_capital, min_pool, "
+        "floor_bid, drift_bid_scale,");
+    const std::size_t bid_mark_at = position_of(body,
+        "bid_guard_floored = drift_bid_scale < 1.0; avail_capital = floored;");
+    const std::size_t ask_floor_at = position_of(body,
+        "const Mojo floored = apply_deploy_idle_floor( avail_inventory, min_pool, "
+        "floor_ask, drift_ask_scale,");
+    const std::size_t ask_mark_at = position_of(body,
+        "ask_guard_floored = drift_ask_scale < 1.0; avail_inventory = floored;");
+    ASSERT_NE(bid_floor_at, std::string::npos);
+    ASSERT_NE(bid_mark_at, std::string::npos);
+    ASSERT_NE(ask_floor_at, std::string::npos);
+    ASSERT_NE(ask_mark_at, std::string::npos);
+    EXPECT_LT(bid_floor_at, bid_mark_at);
+    EXPECT_LT(bid_mark_at, ask_floor_at);
+    EXPECT_LT(ask_floor_at, ask_mark_at);
+    // The ladder config carries the verdict into compute_ladder, and the
+    // recorded pools use the same verdict.
+    const std::size_t verdict_at = position_of(body,
+        "ladder_cfg.pair_side_pools = strategy::tiermin::pair_side_pools( "
+        "ladder_tier_minimums_on, bid_guard_floored, ask_guard_floored);");
+    const std::size_t ladder_at = position_of(body, "pcs.ladder = liq.compute_ladder(");
+    const std::size_t pools_at = position_of(body,
+        "pcs.ladder_pools = LiquidityEngine::side_pools( "
+        "avail_capital, avail_inventory, ladder_cfg.pair_side_pools);");
+    ASSERT_NE(verdict_at, std::string::npos);
+    ASSERT_NE(ladder_at, std::string::npos);
+    ASSERT_NE(pools_at, std::string::npos);
+    EXPECT_LT(ask_mark_at, verdict_at);
+    EXPECT_LT(verdict_at, ladder_at);
+    EXPECT_LT(ladder_at, pools_at);
+    EXPECT_EQ(count_of(body, "LiquidityEngine::side_pools("), 1u);
 }
 
 TEST(SizingWiring, Step8RetiresRestingOffersThePlanMovedPast) {
