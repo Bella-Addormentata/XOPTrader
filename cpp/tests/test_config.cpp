@@ -4659,6 +4659,21 @@ TEST(TierMinimumMojos, ShortOfFundsTheTightestTiersGoFirst) {
     EXPECT_EQ(tmin::widest_tiers_within_pool({}, {}, 0, std::nullopt), 0u);
 }
 
+// [TIERMIN 2026-10-29] Only a tier-minimum pair with exactly one side both
+// drift-tapered and floored sizes its sides from their own pools.
+TEST(TierMinimumMojos, PairSidePoolsUnlessOneSideIsAFlooredTaper) {
+    namespace tmin = xop::strategy::tiermin;
+    EXPECT_TRUE(tmin::pair_side_pools(false, false, false));
+    EXPECT_TRUE(tmin::pair_side_pools(false, true, false))
+        << "no tier minimums: pairing as before";
+    EXPECT_TRUE(tmin::pair_side_pools(true, false, false))
+        << "no floored taper";
+    EXPECT_TRUE(tmin::pair_side_pools(true, true, true))
+        << "both sides floored: they are equal anyway";
+    EXPECT_FALSE(tmin::pair_side_pools(true, true, false));
+    EXPECT_FALSE(tmin::pair_side_pools(true, false, true));
+}
+
 TEST(TierMinimumMojos, XchLimiterKeepsTheWidestTiersFirst) {
     namespace tmin = xop::strategy::tiermin;
     // New XCH each tier locks, tier 0 first.

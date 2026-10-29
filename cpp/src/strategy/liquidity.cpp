@@ -140,13 +140,15 @@ LiquidityEngine::LiquidityEngine(const std::string& pair_name,
 // ===========================================================================
 
 SidePools LiquidityEngine::side_pools(std::int64_t available_capital,
-                                      std::int64_t available_inventory) noexcept
+                                      std::int64_t available_inventory,
+                                      bool pair) noexcept
 {
     // Clamp capital/inventory to non-negative values.  Negative values
     // would indicate a data error upstream; defensive clamping prevents
     // nonsensical negative offer sizes.
     const std::int64_t cap = std::max(available_capital,    static_cast<std::int64_t>(0));
     const std::int64_t inv = std::max(available_inventory,  static_cast<std::int64_t>(0));
+    if (!pair) return SidePools{cap, inv};
 
     // -- Symmetric bid/ask sizing with one-sided recovery -------------------
     // When both sides are available, use the smaller pool so paired bid/ask
@@ -178,7 +180,8 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
         return ladder;
     }
 
-    const SidePools pools = side_pools(available_capital, available_inventory);
+    const SidePools pools = side_pools(available_capital, available_inventory,
+                                       cfg.pair_side_pools);
     const std::int64_t bid_pool = pools.bid;
     const std::int64_t ask_pool = pools.ask;
 

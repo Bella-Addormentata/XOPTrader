@@ -10094,6 +10094,11 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         // taper (still acquiring; may be floored).
         double drift_bid_scale = 1.0;
         double drift_ask_scale = 1.0;
+        // [TIERMIN 2026-10-29] Set by the deploy-idle floor when it lifted a
+        // side the drift guard had tapered (0 < scale < 1); read when the
+        // ladder decides whether to pair the two sides' pools.
+        bool bid_guard_floored = false;
+        bool ask_guard_floored = false;
 
         // -- Asset-level soft drift guard ---------------------------------
         // Acts as a "soft wall" on top of pair-level ratio rebalancing:
@@ -10287,6 +10292,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                                  pair_cfg->quote_asset_id,
                                  required_quote_units,
                                  floor_min_units);
+                    bid_guard_floored = drift_bid_scale < 1.0;
                     avail_capital = floored;
                 }
             }
@@ -10315,6 +10321,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                                      / static_cast<double>(pair_cfg->base_mojos_per_unit),
                                  pair_cfg->base_asset_id,
                                  floor_min_units);
+                    ask_guard_floored = drift_ask_scale < 1.0;
                     avail_inventory = floored;
                 }
             }
@@ -10844,6 +10851,29 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         ladder_cfg.book_bid_side_anchor_ok = comp_book.bid_side_anchor_ok;
         ladder_cfg.book_ask_side_anchor_ok = comp_book.ask_side_anchor_ok;
 
+        // [TIERMIN 2026-10-29] Whether this pair posts per-tier minimums (also
+        // read by the minimum-size pass below).  A pace-managed pair keeps the
+        // pace plan's sizes and a revive pair on a thin book its revive cap.
+        const bool ladder_tier_minimums_on = pair_cfg
+            && has_tier_minimums(*pair_cfg)
+            && !(config_.strategy.pace_enabled && pcs.pace.managed)
+            && !(pair_cfg->revive_market && pcs.revive_thin);
+        // On such a pair, a side the drift guard tapered and the deploy-idle
+        // floor then lifted to the pair minimum no longer cuts the other
+        // side's pool to that minimum.  On 2026-10-29 the XCH/wUSDC.b ask was
+        // tapered to ~0.1 XCH and floored to 1, and pairing cut the 31.8 XCH
+        // bid pool to 1 XCH: one bid, its widest tier, instead of five.
+        ladder_cfg.pair_side_pools = strategy::tiermin::pair_side_pools(
+            ladder_tier_minimums_on, bid_guard_floored, ask_guard_floored);
+        if (!ladder_cfg.pair_side_pools) {
+            spdlog::info("[Engine] Step 7: {} ladder sides sized from their "
+                         "own pools (bid {} / ask {} base mojos): the {} "
+                         "pool is a drift-tapered side floored to the pair "
+                         "minimum",
+                         pair_name, avail_capital, avail_inventory,
+                         bid_guard_floored ? "bid" : "ask");
+        }
+
         // Generate the tier ladder.
         // When competing offers are available, uses the gap-aware overload
         // that analyses the order book for gaps and applies adverse-
@@ -10859,7 +10889,8 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 avail_capital, avail_inventory, ladder_cfg);
         }
         // [TIERMIN 2026-10-29] The pools those tiers were sized from.
-        pcs.ladder_pools = LiquidityEngine::side_pools(avail_capital, avail_inventory);
+        pcs.ladder_pools = LiquidityEngine::side_pools(
+            avail_capital, avail_inventory, ladder_cfg.pair_side_pools);
 
         // -----------------------------------------------------------------
         // Order-book competitive cap: ensure every tier is priced at least
@@ -12197,9 +12228,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             // 2026-10-29 every XCH/wUSDC.b bid sat at the flat 5 XCH cap
             // (tier 0 would have been 16.9 XCH) and the operator asked for
             // 10 XCH at the tight tier down to 1 XCH at the wide one.
-            const bool tier_minimums_on = has_tier_minimums(*pair_cfg)
-                && !(config_.strategy.pace_enabled && pcs.pace.managed)
-                && !(pair_cfg->revive_market && pcs.revive_thin);
+            const bool tier_minimums_on = ladder_tier_minimums_on;
             auto tier_min_units = [&](const TierQuote& tq) {
                 return tier_minimums_on
                     ? tier_min_offer_units(*pair_cfg, eff_min_units,
