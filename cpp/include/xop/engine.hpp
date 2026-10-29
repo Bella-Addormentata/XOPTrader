@@ -3069,6 +3069,11 @@ private:
     // posts nothing on the asset's pairs: an offer the drain could not cancel
     // may still rest.
     std::unordered_map<std::string, BlockHeight> state_verified_undrained_;
+    // [TIERMIN 2026-10-29] Offer id -> the block Step 8 first found it
+    // resting on a tier a tier-minimum side no longer plans.  Its side posts
+    // nothing new while it is live, or while its cancel is unconfirmed for up
+    // to kTierMinRetireHoldBlocks after that; dropped once the offer is gone.
+    std::unordered_map<std::string, BlockHeight> tier_min_retired_at_;
     // [SEED-FAIL-CLOSED review round 9, #172's review] Assets a booked fill
     // moved.  Step 2 books a fill into State with record_buy/record_sell, and
     // Step 8 sets State to the wallet's balance; a take the wallet already

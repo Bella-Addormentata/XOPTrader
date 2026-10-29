@@ -13783,21 +13783,23 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // old offer would stay up beside the wider tiers that took its funds.
         // Neither test can fire on an offer Step 7 just sized.  Not with
         // batching, whose one offer per side carries the sum of its tiers.
+        const auto side_has_minimums = [&](Side s) {
+            return std::any_of(pcs.tier_min_mojos.begin(), pcs.tier_min_mojos.end(),
+                [&](const auto& entry) { return entry.first.first == s; });
+        };
+        const auto tier_planned = [&](Side s, std::uint8_t tier_index) {
+            return std::any_of(pcs.ladder.begin(), pcs.ladder.end(),
+                [&](const TierQuote& tq) {
+                    return tq.side == s && tq.tier_index == tier_index;
+                });
+        };
         if (!config_.strategy.batch_offers_enabled && !pcs.tier_min_mojos.empty()) {
-            auto side_has_minimums = [&](Side s) {
-                return std::any_of(pcs.tier_min_mojos.begin(), pcs.tier_min_mojos.end(),
-                    [&](const auto& entry) { return entry.first.first == s; });
-            };
             for (auto& size_tc : tier_classes) {
                 if (size_tc.staleness != execution::TierStaleness::Fresh) continue;
                 if (!side_has_minimums(size_tc.side)) continue;
-                const auto planned = std::find_if(pcs.ladder.begin(), pcs.ladder.end(),
-                    [&](const TierQuote& tq) {
-                        return tq.side == size_tc.side && tq.tier_index == size_tc.tier_index;
-                    });
                 const PendingOffer size_po = state_->get_offer(size_tc.offer_id);
                 const char* why = nullptr;
-                if (planned == pcs.ladder.end()) {
+                if (!tier_planned(size_tc.side, size_tc.tier_index)) {
                     why = "on a tier no longer planned";
                 } else {
                     const auto min_it = pcs.tier_min_mojos.find({size_tc.side, size_tc.tier_index});
@@ -16484,6 +16486,52 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // in State -- so a keep stop delivered by a signal waits for the ONE
         // call actually outstanding instead of orphaning it (shutdown(), and
         // the PostingMark in offer_manager.cpp).
+        // [TIERMIN 2026-10-29] A side posting tier minimums whose retired
+        // offer -- on a tier Step 7 no longer plans -- is still in State
+        // posts nothing new until it is gone: its cancel failed, or was sent
+        // and is unconfirmed, so it is still takeable, and it plus the wider
+        // plan could exceed the side's pool.  The retire pass above re-sends
+        // a failed cancel next cycle.  An unconfirmed cancel holds the side
+        // for at most kTierMinRetireHoldBlocks: one the wallet never finishes
+        // (the escalation ladder owns it) must not silence the side for good.
+        if (!config_.strategy.batch_offers_enabled && !pcs.tier_min_mojos.empty()) {
+            constexpr BlockHeight kTierMinRetireHoldBlocks = 32;
+            bool hold_bid = false;
+            bool hold_ask = false;
+            const std::vector<PendingOffer> all_offers = state_->get_all_offers();
+            for (const auto& po : all_offers) {
+                if (po.pair_name != pair_name || !side_has_minimums(po.side)) continue;
+                if (tier_planned(po.side, po.tier)) continue;
+                const BlockHeight retired_at =
+                    tier_min_retired_at_.try_emplace(po.offer_id, block_height).first->second;
+                if (po.cancel_pending
+                    && block_height >= retired_at + kTierMinRetireHoldBlocks) {
+                    continue;
+                }
+                (po.side == Side::Bid ? hold_bid : hold_ask) = true;
+            }
+            std::unordered_set<std::string> live_ids;
+            for (const auto& po : all_offers) live_ids.insert(po.offer_id);
+            std::erase_if(tier_min_retired_at_, [&](const auto& entry) {
+                return live_ids.count(entry.first) == 0;
+            });
+            if (hold_bid || hold_ask) {
+                const auto before = fee_filtered_tiers.size();
+                fee_filtered_tiers.erase(
+                    std::remove_if(fee_filtered_tiers.begin(), fee_filtered_tiers.end(),
+                        [&](const TierQuote& tq) {
+                            return (tq.side == Side::Bid) ? hold_bid : hold_ask;
+                        }),
+                    fee_filtered_tiers.end());
+                if (fee_filtered_tiers.size() < before) {
+                    spdlog::info("[Engine] Step 8: {} holds {} new tier(s){}{} until "
+                                 "its retired offers are gone",
+                                 pair_name, before - fee_filtered_tiers.size(),
+                                 hold_bid ? " BID" : "", hold_ask ? " ASK" : "");
+                }
+            }
+        }
+
         // [TIERMIN 2026-10-29] A pair posting tier minimums posts each side
         // widest first: post_quotes stops a side at its first insufficient-
         // funds reply, and the tight tiers are the largest, so a short

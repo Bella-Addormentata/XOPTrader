@@ -458,8 +458,24 @@ TEST(SizingWiring, Step8RetiresRestingOffersThePlanMovedPast) {
     // below its minimum.
     EXPECT_NE(position_of(body, "if (!side_has_minimums(size_tc.side)) continue;"), std::string::npos);
     EXPECT_NE(position_of(body,
-        "if (planned == pcs.ladder.end()) { why = \"on a tier no longer planned\"; }"),
+        "if (!tier_planned(size_tc.side, size_tc.tier_index)) { why = \"on a tier no longer planned\"; }"),
         std::string::npos);
+    // While a retired offer is still in State (cancel failed or unconfirmed),
+    // its side posts nothing new.
+    const std::size_t hold_at = position_of(body,
+        "if (po.cancel_pending && block_height >= retired_at + kTierMinRetireHoldBlocks) { continue; } "
+        "(po.side == Side::Bid ? hold_bid : hold_ask) = true;");
+    EXPECT_NE(position_of(body, "if (tier_planned(po.side, po.tier)) continue;"), std::string::npos);
+    EXPECT_NE(position_of(body, "return live_ids.count(entry.first) == 0;"), std::string::npos)
+        << "the retired-at map forgets offers that are gone";
+    const std::size_t drop_at = position_of(body,
+        "return (tq.side == Side::Bid) ? hold_bid : hold_ask;");
+    const std::size_t post_at = position_of(body, "int posted = co_await offer_mgr_->post_quotes(");
+    ASSERT_NE(hold_at, std::string::npos);
+    ASSERT_NE(drop_at, std::string::npos);
+    ASSERT_NE(post_at, std::string::npos);
+    EXPECT_LT(hold_at, drop_at);
+    EXPECT_LT(drop_at, post_at);
     EXPECT_NE(position_of(body,
         "if (min_it != pcs.tier_min_mojos.end() && size_po.size < min_it->second) {"),
         std::string::npos);
