@@ -5,6 +5,35 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.38] — 2026-10-30 — pairs that spend the same coin share it instead of racing for it
+
+### Coin budgets (#204)
+
+Several pair sides spend the same coin. XCH is sold by the XCH/wUSDC.b,
+XCH/BYC and XCH/DBX asks and spent by the wmilliETH.b/XCH bids; wUSDC.b
+funds the XCH/wUSDC.b and BYC/wUSDC.b bids; BYC funds the XCH/BYC bids and
+the BYC/wUSDC.b asks. Until now Step 7 sized every one of those sides as if
+it held the whole coin, and Step 8 posted the pairs one after another, so a
+coin that ran short went first come, first served: the pairs posted early
+took what they wanted and a later pair's side was suppressed, or on a pair
+with tier minimums lost its tight tiers.
+
+Now each Step 7 records how much of its coin every side wants. When the
+sides together want more than the coin's balance minus its reserve, the
+balance is split between them in proportion to what each wants, so every
+side gets the same fraction of its ask. No side gets more than it asked
+for, and what one side leaves goes to the others. Coins locked in our own
+resting offers count on both sides of that sum. A side on a pair with tier
+minimums that gets a smaller share skips its tight tiers first, as before.
+
+While the coins cover every side, nothing changes: on 2026-10-29 about 69
+of ~93 XCH was free. When a coin is short the engine logs
+"Step 7: coin ... short -- N sides want ...", then for each capped side
+"ask pool ... (its share of ...)" or "bid pool ... (its share, ...)".
+
+New setting `strategy.coin_budgets_enabled`, on by default, applies live.
+Set it to `false` to go back to first come, first served.
+
 ## [0.10.37] — 2026-10-29 — a small guarded side no longer shrinks the other side's tiers
 
 ### Each side keeps its own pool when the floor lifted a drift-tapered side (#202)
