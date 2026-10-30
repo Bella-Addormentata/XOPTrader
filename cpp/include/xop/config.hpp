@@ -1387,6 +1387,18 @@ struct StrategyConfig {
     /// targets.  Applies live.  Default true.
     bool     target_gap_sizing_enabled{true};
 
+    /// [COINBUDGET 2026-10-30] Share a coin between the pair sides that spend
+    /// it (xop/strategy/coin_budget.hpp).  XCH/wUSDC.b, XCH/BYC and XCH/DBX
+    /// asks sell the same XCH, the wmilliETH.b/XCH bids spend it too, and
+    /// wUSDC.b and BYC each fund two pairs; Step 7 sized every side as if it
+    /// held the whole coin, and Step 8 then posted first come, first served.
+    /// With this on, when last heartbeat's sides together wanted more of a
+    /// coin than its confirmed balance minus its reserve, each side's pool is
+    /// capped at its share: the same fraction of what it asked for, never
+    /// more than that, with what a side leaves passed to the others.  Nothing
+    /// is capped while the claims fit.  Applies live.  Default true.
+    bool     coin_budgets_enabled{true};
+
     // -- [PACE 2026-09-13] Pace controller (default OFF) -------------------
     // Sells an overweight CAT QUOTE asset toward its asset_target_allocations
     // band, at a bounded daily budget, through the bid ladder of its XCH/<K>

@@ -9401,6 +9401,84 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         }
     }
 
+    // -- [COINBUDGET 2026-10-30] Shares of the coins several sides spend ----
+    // XCH/wUSDC.b, XCH/BYC and XCH/DBX asks sell the same XCH (and the
+    // wmilliETH.b/XCH bids spend it); wUSDC.b and BYC each fund two pairs.
+    // Each side below is capped at the coin's whole balance minus its reserve,
+    // so without this a short coin went to whichever pair Step 8 posted
+    // first.  Last heartbeat's claims, against the balances now: a coin whose
+    // claims fit is left alone; a short one is split in proportion to them.
+    // The balance is the one the final caps below use (confirmed minus the
+    // reserve), so a coin with no observed balance is not split.
+    if (config_.strategy.coin_budgets_enabled) {
+        auto coin_budget_now = [&](const std::string& coin, Mojo mpu)
+            -> std::optional<Mojo> {
+            if (coin == "xch") {
+                const Mojo reserve = (config_.strategy.fee_reserve_xch > 0.0)
+                    ? static_cast<Mojo>(std::llround(
+                          config_.strategy.fee_reserve_xch
+                          * static_cast<double>(kMojosPerXch)))
+                    : Mojo{0};
+                return std::max(Mojo{0}, xch_confirmed_balance_ - reserve);
+            }
+            const auto bit = cached_wallet_balances_.find(coin);
+            if (bit == cached_wallet_balances_.end()) return std::nullopt;
+            const auto reserve_units = execution::sizing_reserve_units(
+                config_.strategy.asset_reserve_units,
+                config_.strategy.min_reserve_units,
+                config_.strategy.wallet_balance_caps_enabled, coin);
+            const Mojo reserve = reserve_units.has_value()
+                ? execution::reserve_units_to_mojos(*reserve_units, mpu)
+                : Mojo{0};
+            return execution::cap_pool_above_reserve(
+                bit->second.confirmed, bit->second.confirmed, reserve);
+        };
+        struct CoinSide {
+            PairCycleState* pcs;
+            bool            is_bid;
+            double          demand;
+        };
+        std::map<std::string, std::pair<Mojo, std::vector<CoinSide>>> by_coin;
+        for (auto& [pair_name, pcs] : cycle_) {
+            const auto it = coin_claims_.find(pair_name);
+            if (it == coin_claims_.end()) continue;
+            for (const auto* c : {&it->second.bid, &it->second.ask}) {
+                if (c->coin.empty() || !(c->demand > 0.0)) continue;
+                auto& entry = by_coin[c->coin];
+                entry.first = c->mpu;
+                entry.second.push_back({&pcs, c == &it->second.bid, c->demand});
+            }
+        }
+        for (auto& [coin, entry] : by_coin) {
+            if (entry.second.size() < 2) continue;
+            const auto coin_balance = coin_budget_now(coin, entry.first);
+            if (!coin_balance.has_value()) continue;
+            std::vector<strategy::coin_budget::Claim> claims;
+            claims.reserve(entry.second.size());
+            double wanted = 0.0;
+            for (const auto& cs : entry.second) {
+                claims.push_back({cs.demand, cs.demand});
+                wanted += cs.demand;
+            }
+            const auto shares = strategy::coin_budget::split(*coin_balance, claims);
+            if (!shares.has_value()) continue;
+            for (std::size_t i = 0; i < entry.second.size(); ++i) {
+                auto& cs = entry.second[i];
+                (cs.is_bid ? cs.pcs->coin_share_bid : cs.pcs->coin_share_ask) =
+                    (*shares)[i];
+            }
+            spdlog::info("[Engine] Step 7: coin {} short -- {} sides want {:.0f} "
+                         "mojos of {} (balance minus reserve); each gets "
+                         "{:.1f}% of its claim",
+                         coin.substr(0, 12), entry.second.size(), wanted,
+                         *coin_balance,
+                         100.0 * static_cast<double>(*coin_balance) / wanted);
+        }
+    }
+    // This heartbeat's claims are recorded below as each side is sized; a
+    // pair that is not sized this heartbeat claims nothing next time.
+    coin_claims_.clear();
+
     for (auto& [pair_name, pcs] : cycle_) {
         if (!pcs.quote_valid) continue;
 
@@ -10383,8 +10461,8 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         // idle floor -- each of which can RAISE a pool after capping -- and
         // it capped at the FULL balance, silently restoring the fee reserve
         // deducted upstream.  Applied here, after every pool-raising
-        // transform, against confirmed-minus-reserve, it is the last word:
-        // no later step in this function touches the pool sizes.
+        // transform, against confirmed-minus-reserve, it is the last word
+        // but one: only the [COINBUDGET] share below lowers a pool after it.
         //
         // No `> 0` guard on the balance: the refresh KEEPS the previous
         // cached value on RPC failure (see the Step 7 balance query), so a
@@ -10524,6 +10602,76 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                                      r->first, r->second);
                         avail_capital = *bid_cap;
                     }
+                }
+            }
+        }
+
+        // [TIERMIN 2026-10-29] Whether this pair posts per-tier minimums (also
+        // read by the minimum-size pass below).  A pace-managed pair keeps the
+        // pace plan's sizes and a revive pair on a thin book its revive cap.
+        const bool ladder_tier_minimums_on = pair_cfg
+            && has_tier_minimums(*pair_cfg)
+            && !(config_.strategy.pace_enabled && pcs.pace.managed)
+            && !(pair_cfg->revive_market && pcs.revive_thin);
+        // On such a pair, a side the drift guard tapered and the deploy-idle
+        // floor then lifted to the pair minimum no longer cuts the other
+        // side's pool to that minimum.  On 2026-10-29 the XCH/wUSDC.b ask was
+        // tapered to ~0.1 XCH and floored to 1, and pairing cut the 31.8 XCH
+        // bid pool to 1 XCH: one bid, its widest tier, instead of five.
+        const bool ladder_pairs_pools = strategy::tiermin::pair_side_pools(
+            ladder_tier_minimums_on, bid_guard_floored, ask_guard_floored);
+
+        // -- [COINBUDGET 2026-10-30] This side's claim on its coin, and its share
+        // The claim is what each side would use of the coin it spends, paired
+        // the way the ladder pairs its sides, after the whole-coin caps above;
+        // the next Step 7 splits a short coin by these (see the top of this
+        // function).  The share set there then caps the side: no later step
+        // in this function touches the pool sizes.
+        if (pair_cfg && config_.strategy.coin_budgets_enabled) {
+            auto coin_key = [](const std::string& id) {
+                return (id == "XCH") ? std::string{"xch"} : id;
+            };
+            const std::string bid_coin = coin_key(pair_cfg->quote_asset_id);
+            const std::string ask_coin = coin_key(pair_cfg->base_asset_id);
+            const Mojo base_mpu  = pair_cfg->base_mojos_per_unit;
+            const Mojo quote_mpu = (bid_coin == "xch")
+                ? kMojosPerXch
+                : pair_cfg->quote_mojos_per_unit;
+            const SidePools wanted = LiquidityEngine::side_pools(
+                avail_capital, avail_inventory, ladder_pairs_pools);
+            const double bid_claim = (market_mid > 0.0 && base_mpu > 0 && quote_mpu > 0)
+                ? static_cast<double>(wanted.bid) / static_cast<double>(base_mpu)
+                      * market_mid * static_cast<double>(quote_mpu)
+                : 0.0;
+            auto& claims = coin_claims_[pair_name];
+            claims.bid = CoinClaim{bid_coin, quote_mpu, bid_claim};
+            claims.ask = CoinClaim{ask_coin, base_mpu, static_cast<double>(wanted.ask)};
+
+            if (pcs.coin_share_ask.has_value()
+                && avail_inventory > *pcs.coin_share_ask) {
+                spdlog::info("[Engine] Step 7: {} ask pool {} -> {} base mojos "
+                             "(its share of {} the pairs spending it want more "
+                             "of than it holds)",
+                             pair_name, avail_inventory, *pcs.coin_share_ask,
+                             ask_coin.substr(0, 12));
+                avail_inventory = *pcs.coin_share_ask;
+            }
+            if (pcs.coin_share_bid.has_value() && base_mpu > 0 && quote_mpu > 0) {
+                // The share is the quote coin's mojos: what it buys at the mid,
+                // floored, as the wallet caps above convert.  A missing mid
+                // skips; the no-order-book guard owns that case.
+                const auto share_cap = try_affordable_base_mojos(
+                    static_cast<double>(*pcs.coin_share_bid),
+                    static_cast<double>(quote_mpu),
+                    market_mid,
+                    static_cast<double>(base_mpu));
+                if (share_cap.has_value() && avail_capital > *share_cap) {
+                    spdlog::info("[Engine] Step 7: {} bid pool {} -> {} base "
+                                 "mojos (its share, {} mojos, of {} the pairs "
+                                 "spending it want more of than it holds)",
+                                 pair_name, avail_capital, *share_cap,
+                                 *pcs.coin_share_bid, bid_coin.substr(0, 12));
+                    avail_capital = *share_cap;
                 }
             }
         }
@@ -10851,20 +10999,9 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         ladder_cfg.book_bid_side_anchor_ok = comp_book.bid_side_anchor_ok;
         ladder_cfg.book_ask_side_anchor_ok = comp_book.ask_side_anchor_ok;
 
-        // [TIERMIN 2026-10-29] Whether this pair posts per-tier minimums (also
-        // read by the minimum-size pass below).  A pace-managed pair keeps the
-        // pace plan's sizes and a revive pair on a thin book its revive cap.
-        const bool ladder_tier_minimums_on = pair_cfg
-            && has_tier_minimums(*pair_cfg)
-            && !(config_.strategy.pace_enabled && pcs.pace.managed)
-            && !(pair_cfg->revive_market && pcs.revive_thin);
-        // On such a pair, a side the drift guard tapered and the deploy-idle
-        // floor then lifted to the pair minimum no longer cuts the other
-        // side's pool to that minimum.  On 2026-10-29 the XCH/wUSDC.b ask was
-        // tapered to ~0.1 XCH and floored to 1, and pairing cut the 31.8 XCH
-        // bid pool to 1 XCH: one bid, its widest tier, instead of five.
-        ladder_cfg.pair_side_pools = strategy::tiermin::pair_side_pools(
-            ladder_tier_minimums_on, bid_guard_floored, ask_guard_floored);
+        // [TIERMIN 2026-10-29] Size each side from its own pool when the
+        // verdict above (ladder_pairs_pools) says so.
+        ladder_cfg.pair_side_pools = ladder_pairs_pools;
         if (!ladder_cfg.pair_side_pools) {
             spdlog::info("[Engine] Step 7: {} ladder sides sized from their "
                          "own pools (bid {} / ask {} base mojos): the {} "
