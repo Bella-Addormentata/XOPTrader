@@ -529,6 +529,17 @@ TEST(SizingWiring, ACoinSeveralSidesSpendIsSplitBetweenThem) {
     EXPECT_LT(gate_at, split_at);
     EXPECT_LT(split_at, clear_at);
     EXPECT_LT(clear_at, loop_at);
+    // A short coin zeroes every side that could spend it before handing out
+    // the shares, so a side that claimed nothing gets 0, not the whole coin.
+    const std::size_t zero_at = position_of(body,
+        "(is_bid ? spender->coin_share_bid : spender->coin_share_ask) = Mojo{0};");
+    const std::size_t assign_at = position_of(body,
+        "(cs.is_bid ? cs.pcs->coin_share_bid : cs.pcs->coin_share_ask) = (*shares)[i];");
+    ASSERT_NE(zero_at, std::string::npos);
+    ASSERT_NE(assign_at, std::string::npos);
+    EXPECT_LT(split_at, zero_at);
+    EXPECT_LT(zero_at, assign_at);
+    EXPECT_LT(assign_at, clear_at);
     // In the loop: the claim is recorded after the final whole-coin caps,
     // paired the way the ladder pairs, and BEFORE the share caps the side;
     // the shares come before the ladder is built.
@@ -564,6 +575,24 @@ TEST(SizingWiring, ACoinSeveralSidesSpendIsSplitBetweenThem) {
     EXPECT_NE(position_of(body,
         "const auto share_cap = try_affordable_base_mojos( "
         "static_cast<double>(*pcs.coin_share_bid),"), std::string::npos);
+    // The funding filter after the up-scale and pace passes holds a side to
+    // its share as well, before the tier-minimum fit and the cumulative cut.
+    const std::size_t funding_at = position_of(body,
+        "std::optional<Mojo> budget = known_budget(funding_asset);");
+    const std::size_t share_budget_at = position_of(body,
+        "budget = budget.has_value() ? std::min(*budget, *share) : *share;");
+    const std::size_t fit_at = position_of(body,
+        "const std::size_t fit = strategy::tiermin::widest_tiers_within_pool(");
+    const std::size_t cut_at = position_of(body,
+        "const std::size_t keep = tiers_within_budget(costs, *budget);");
+    ASSERT_NE(funding_at, std::string::npos);
+    ASSERT_NE(share_budget_at, std::string::npos);
+    ASSERT_NE(fit_at, std::string::npos);
+    ASSERT_NE(cut_at, std::string::npos);
+    EXPECT_LT(ladder_at, funding_at);
+    EXPECT_LT(funding_at, share_budget_at);
+    EXPECT_LT(share_budget_at, fit_at);
+    EXPECT_LT(share_budget_at, cut_at);
 }
 
 TEST(SizingWiring, Step8RetiresRestingOffersThePlanMovedPast) {

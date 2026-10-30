@@ -108,4 +108,22 @@ TEST(CoinBudget, SharesNeverSumPastTheBudget) {
     EXPECT_LE(sum(*large), big);
 }
 
+TEST(CoinBudget, PastTwoToTheFiftyThirdTheSharesStillFitTheBudget) {
+    // Two halves of 9007199254740995 both round up to 4503599627370498 in
+    // double: the second takes only what the first left.
+    const Mojo odd = 9'007'199'254'740'995LL;
+    const auto halves = split(odd, {{1e16, 1e16}, {1e16, 1e16}});
+    ASSERT_TRUE(halves.has_value());
+    EXPECT_LE(sum(*halves), odd);
+    EXPECT_GE((*halves)[0], 0);
+    EXPECT_GE((*halves)[1], 0);
+    // At Mojo max the double budget is 2^63, which no Mojo holds.
+    const Mojo max = std::numeric_limits<Mojo>::max();
+    const auto at_max = split(max, {{1e19, 1e19}, {1e17, 1e17}});
+    ASSERT_TRUE(at_max.has_value());
+    EXPECT_GE((*at_max)[0], 0);
+    EXPECT_GE((*at_max)[1], 0);
+    EXPECT_LE((*at_max)[0], max - (*at_max)[1]);
+}
+
 }  // namespace

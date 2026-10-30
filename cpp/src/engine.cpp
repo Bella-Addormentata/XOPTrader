@@ -9439,7 +9439,17 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             double          demand;
         };
         std::map<std::string, std::pair<Mojo, std::vector<CoinSide>>> by_coin;
+        // Every side this heartbeat could size from each coin, claim or not:
+        // while a coin is short, a side that claimed nothing last heartbeat
+        // gets a share of 0, not the whole coin.
+        std::map<std::string, std::vector<std::pair<PairCycleState*, bool>>> spenders;
         for (auto& [pair_name, pcs] : cycle_) {
+            if (const PairConfig* pc = find_pair_config(pair_name)) {
+                spenders[strategy::coin_budget::coin_key(pc->quote_asset_id)]
+                    .emplace_back(&pcs, true);
+                spenders[strategy::coin_budget::coin_key(pc->base_asset_id)]
+                    .emplace_back(&pcs, false);
+            }
             const auto it = coin_claims_.find(pair_name);
             if (it == coin_claims_.end()) continue;
             for (const auto* c : {&it->second.bid, &it->second.ask}) {
@@ -9462,6 +9472,9 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
             const auto shares = strategy::coin_budget::split(*coin_balance, claims);
             if (!shares.has_value()) continue;
+            for (const auto& [spender, is_bid] : spenders[coin]) {
+                (is_bid ? spender->coin_share_bid : spender->coin_share_ask) = Mojo{0};
+            }
             for (std::size_t i = 0; i < entry.second.size(); ++i) {
                 auto& cs = entry.second[i];
                 (cs.is_bid ? cs.pcs->coin_share_bid : cs.pcs->coin_share_ask) =
@@ -10628,11 +10641,10 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         // function).  The share set there then caps the side: no later step
         // in this function touches the pool sizes.
         if (pair_cfg && config_.strategy.coin_budgets_enabled) {
-            auto coin_key = [](const std::string& id) {
-                return (id == "XCH") ? std::string{"xch"} : id;
-            };
-            const std::string bid_coin = coin_key(pair_cfg->quote_asset_id);
-            const std::string ask_coin = coin_key(pair_cfg->base_asset_id);
+            const std::string bid_coin =
+                strategy::coin_budget::coin_key(pair_cfg->quote_asset_id);
+            const std::string ask_coin =
+                strategy::coin_budget::coin_key(pair_cfg->base_asset_id);
             const Mojo base_mpu  = pair_cfg->base_mojos_per_unit;
             const Mojo quote_mpu = (bid_coin == "xch")
                 ? kMojosPerXch
@@ -12569,7 +12581,18 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                     const std::string& funding_asset =
                         is_ask ? pair_cfg->base_asset_id
                                : pair_cfg->quote_asset_id;
-                    const auto budget = known_budget(funding_asset);
+                    // [COINBUDGET 2026-10-30] A side holding a share of a
+                    // short coin stays within it here too: the up-scale and
+                    // pace passes above can raise its tiers past the
+                    // share-capped pool.  The share is in the funding
+                    // asset's mojos, as this budget is.
+                    std::optional<Mojo> budget = known_budget(funding_asset);
+                    if (const auto& share = is_ask ? pcs.coin_share_ask
+                                                   : pcs.coin_share_bid;
+                        share.has_value()) {
+                        budget = budget.has_value() ? std::min(*budget, *share)
+                                                    : *share;
+                    }
 
                     auto tier_cost = [&](const TierQuote& tq) -> Mojo {
                         if (is_ask) {

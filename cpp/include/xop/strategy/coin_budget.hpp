@@ -40,9 +40,17 @@
 #include <cmath>
 #include <cstddef>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace xop::strategy::coin_budget {
+
+/// The key a coin is split under: "xch" for XCH however a pair spells it,
+/// else the CAT asset id.
+[[nodiscard]] inline std::string coin_key(const std::string& asset_id)
+{
+    return (asset_id == "XCH") ? std::string{"xch"} : asset_id;
+}
 
 /// One pair side that spends the coin.
 struct Claim {
@@ -55,7 +63,8 @@ struct Claim {
 /// the budget is negative), and then nothing is capped.  Weighted water
 /// filling: the budget is split by weight, no claim gets more than its
 /// demand, and what a claim leaves passes to the rest by weight.  Shares
-/// floor to whole mojos, so they never sum past the budget.
+/// floor to whole mojos, taken from an integer remainder, so they never sum
+/// past the budget at any magnitude.
 [[nodiscard]] inline std::optional<std::vector<Mojo>> split(
     Mojo budget, const std::vector<Claim>& claims)
 {
@@ -101,10 +110,20 @@ struct Claim {
         break;
     }
 
+    // Whole mojos out of an integer remainder: a budget past 2^53 rounds in
+    // double (two halves of 9007199254740995 both round up), and one at Mojo
+    // max rounds to 2^63, which no Mojo holds.  A share at or past what is
+    // left takes exactly what is left, so the shares never sum past the
+    // budget and no out-of-range double is cast.
     std::vector<Mojo> out(n, 0);
+    Mojo left = budget;
     for (std::size_t i = 0; i < n; ++i) {
-        const double s = std::clamp(std::floor(share[i]), 0.0, budget_d);
-        out[i] = static_cast<Mojo>(s);
+        const double s = std::floor(share[i]);
+        const Mojo m = !(s > 0.0)                         ? Mojo{0}
+                     : (s >= static_cast<double>(left))   ? left
+                                                          : static_cast<Mojo>(s);
+        out[i] = m;
+        left -= m;
     }
     return out;
 }
