@@ -4498,6 +4498,29 @@ TEST(ConfigParserTest, TargetGapSizing_DefaultsOnAndParsesFalse) {
     }
 }
 
+// [COINBUDGET 2026-10-30] strategy.coin_budgets_enabled: on by default -- it
+// caps nothing while every coin covers its claims -- and the rollback is to
+// write `false`.
+TEST(ConfigParserTest, CoinBudgets_DefaultsOnAndParsesFalse) {
+    {
+        TempYaml tmp(kMinimalValidYaml);
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_TRUE(cfg.strategy.coin_budgets_enabled);
+    }
+    EXPECT_TRUE(xop::StrategyConfig{}.coin_budgets_enabled)
+        << "a default-constructed StrategyConfig agrees with the parser";
+    {
+        TempYaml tmp(pace_with_strategy("  coin_budgets_enabled: false\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_FALSE(cfg.strategy.coin_budgets_enabled);
+    }
+    {
+        TempYaml tmp(pace_with_strategy("  coin_budgets_enabled: ~\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_TRUE(cfg.strategy.coin_budgets_enabled) << "null keeps the default";
+    }
+}
+
 // -- [TIERMIN 2026-10-29] Per-tier minimum offer sizes ----------------------
 // On 2026-10-29 every XCH/wUSDC.b bid sat at the flat 5 XCH cap and the
 // operator asked for 10 XCH at the tight tier down to 1 XCH at the wide one,

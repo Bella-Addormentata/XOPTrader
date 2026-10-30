@@ -474,19 +474,125 @@ TEST(SizingWiring, AFlooredDriftTaperedSideDoesNotShrinkTheOtherSide) {
     // The ladder config carries the verdict into compute_ladder, and the
     // recorded pools use the same verdict.
     const std::size_t verdict_at = position_of(body,
-        "ladder_cfg.pair_side_pools = strategy::tiermin::pair_side_pools( "
+        "const bool ladder_pairs_pools = strategy::tiermin::pair_side_pools( "
         "ladder_tier_minimums_on, bid_guard_floored, ask_guard_floored);");
+    const std::size_t carried_at = position_of(body,
+        "ladder_cfg.pair_side_pools = ladder_pairs_pools;");
     const std::size_t ladder_at = position_of(body, "pcs.ladder = liq.compute_ladder(");
     const std::size_t pools_at = position_of(body,
         "pcs.ladder_pools = LiquidityEngine::side_pools( "
         "avail_capital, avail_inventory, ladder_cfg.pair_side_pools);");
     ASSERT_NE(verdict_at, std::string::npos);
+    ASSERT_NE(carried_at, std::string::npos);
     ASSERT_NE(ladder_at, std::string::npos);
     ASSERT_NE(pools_at, std::string::npos);
     EXPECT_LT(ask_mark_at, verdict_at);
-    EXPECT_LT(verdict_at, ladder_at);
+    EXPECT_LT(verdict_at, carried_at);
+    EXPECT_LT(carried_at, ladder_at);
     EXPECT_LT(ladder_at, pools_at);
-    EXPECT_EQ(count_of(body, "LiquidityEngine::side_pools("), 1u);
+    // Twice: here, and the coin-budget claim, which pairs the same way.
+    EXPECT_EQ(count_of(body, "LiquidityEngine::side_pools("), 2u);
+}
+
+// [COINBUDGET 2026-10-30] A coin several pair sides spend is split between
+// them (strategy/coin_budget.hpp) instead of going to whichever pair Step 8
+// posts first.  Mutation-checked: fails against 51bf04f.
+TEST(SizingWiring, ACoinSeveralSidesSpendIsSplitBetweenThem) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    // Before the pair loop: last heartbeat's claims against the balance the
+    // final caps use, split only where two or more sides claim a coin, and
+    // then cleared so each heartbeat claims afresh.
+    const std::size_t gate_at = position_of(body,
+        "if (config_.strategy.coin_budgets_enabled) { auto coin_budget_now =");
+    const std::size_t xch_budget_at = position_of(body,
+        "return std::max(Mojo{0}, xch_confirmed_balance_ - reserve);");
+    const std::size_t cat_budget_at = position_of(body,
+        "return execution::cap_pool_above_reserve( bit->second.confirmed, "
+        "bit->second.confirmed, reserve);");
+    const std::size_t lone_at = position_of(body, "if (entry.second.size() < 2) continue;");
+    const std::size_t weights_at = position_of(body, "claims.push_back({cs.demand, cs.demand});");
+    const std::size_t split_at = position_of(body,
+        "const auto shares = strategy::coin_budget::split(*coin_balance, claims);");
+    const std::size_t clear_at = position_of(body, "coin_claims_.clear();");
+    const std::size_t loop_at = position_of(body,
+        "for (auto& [pair_name, pcs] : cycle_) { if (!pcs.quote_valid) continue; "
+        "auto liq_it = liquidity_engines_.find(pair_name);");
+    ASSERT_NE(gate_at, std::string::npos);
+    ASSERT_NE(xch_budget_at, std::string::npos);
+    ASSERT_NE(cat_budget_at, std::string::npos);
+    ASSERT_NE(lone_at, std::string::npos);
+    ASSERT_NE(weights_at, std::string::npos);
+    ASSERT_NE(split_at, std::string::npos);
+    ASSERT_NE(clear_at, std::string::npos);
+    ASSERT_NE(loop_at, std::string::npos);
+    EXPECT_LT(gate_at, split_at);
+    EXPECT_LT(split_at, clear_at);
+    EXPECT_LT(clear_at, loop_at);
+    // A short coin zeroes every side that could spend it before handing out
+    // the shares, so a side that claimed nothing gets 0, not the whole coin.
+    const std::size_t zero_at = position_of(body,
+        "(is_bid ? spender->coin_share_bid : spender->coin_share_ask) = Mojo{0};");
+    const std::size_t assign_at = position_of(body,
+        "(cs.is_bid ? cs.pcs->coin_share_bid : cs.pcs->coin_share_ask) = (*shares)[i];");
+    ASSERT_NE(zero_at, std::string::npos);
+    ASSERT_NE(assign_at, std::string::npos);
+    EXPECT_LT(split_at, zero_at);
+    EXPECT_LT(zero_at, assign_at);
+    EXPECT_LT(assign_at, clear_at);
+    // In the loop: the claim is recorded after the final whole-coin caps,
+    // paired the way the ladder pairs, and BEFORE the share caps the side;
+    // the shares come before the ladder is built.
+    const std::size_t reserve_caps_at = position_of(body,
+        "[GAS-RESERVE 2026-10-24] FINAL per-asset reserve caps");
+    const std::size_t claim_at = position_of(body,
+        "const SidePools wanted = LiquidityEngine::side_pools( "
+        "avail_capital, avail_inventory, ladder_pairs_pools);");
+    const std::size_t record_at = position_of(body, "auto& claims = coin_claims_[pair_name];");
+    const std::size_t ask_share_at = position_of(body,
+        "avail_inventory = *pcs.coin_share_ask;");
+    const std::size_t bid_share_at = position_of(body, "avail_capital = *share_cap;");
+    const std::size_t ladder_at = position_of(body, "pcs.ladder = liq.compute_ladder(");
+    ASSERT_NE(reserve_caps_at, std::string::npos);
+    ASSERT_NE(claim_at, std::string::npos);
+    ASSERT_NE(record_at, std::string::npos);
+    ASSERT_NE(ask_share_at, std::string::npos);
+    ASSERT_NE(bid_share_at, std::string::npos);
+    ASSERT_NE(ladder_at, std::string::npos);
+    EXPECT_LT(loop_at, reserve_caps_at);
+    EXPECT_LT(reserve_caps_at, claim_at);
+    EXPECT_LT(claim_at, record_at);
+    EXPECT_LT(record_at, ask_share_at);
+    EXPECT_LT(ask_share_at, bid_share_at);
+    EXPECT_LT(bid_share_at, ladder_at);
+    // A bid claims its quote coin at the mid; the share converts back the
+    // way the wallet caps do.
+    EXPECT_NE(position_of(body,
+        "claims.bid = CoinClaim{bid_coin, quote_mpu, bid_claim};"), std::string::npos);
+    EXPECT_NE(position_of(body,
+        "claims.ask = CoinClaim{ask_coin, base_mpu, static_cast<double>(wanted.ask)};"),
+        std::string::npos);
+    EXPECT_NE(position_of(body,
+        "const auto share_cap = try_affordable_base_mojos( "
+        "static_cast<double>(*pcs.coin_share_bid),"), std::string::npos);
+    // The funding filter after the up-scale and pace passes holds a side to
+    // its share as well, before the tier-minimum fit and the cumulative cut.
+    const std::size_t funding_at = position_of(body,
+        "std::optional<Mojo> budget = known_budget(funding_asset);");
+    const std::size_t share_budget_at = position_of(body,
+        "budget = budget.has_value() ? std::min(*budget, *share) : *share;");
+    const std::size_t fit_at = position_of(body,
+        "const std::size_t fit = strategy::tiermin::widest_tiers_within_pool(");
+    const std::size_t cut_at = position_of(body,
+        "const std::size_t keep = tiers_within_budget(costs, *budget);");
+    ASSERT_NE(funding_at, std::string::npos);
+    ASSERT_NE(share_budget_at, std::string::npos);
+    ASSERT_NE(fit_at, std::string::npos);
+    ASSERT_NE(cut_at, std::string::npos);
+    EXPECT_LT(ladder_at, funding_at);
+    EXPECT_LT(funding_at, share_budget_at);
+    EXPECT_LT(share_budget_at, fit_at);
+    EXPECT_LT(share_budget_at, cut_at);
 }
 
 TEST(SizingWiring, Step8RetiresRestingOffersThePlanMovedPast) {

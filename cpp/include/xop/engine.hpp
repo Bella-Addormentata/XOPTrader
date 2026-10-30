@@ -63,6 +63,7 @@
 #include "xop/strategy/base.hpp"
 #include "xop/strategy/spread.hpp"
 #include "xop/strategy/liquidity.hpp"
+#include "xop/strategy/coin_budget.hpp"
 #include "xop/strategy/arbitrage.hpp"
 #include "xop/strategy/depeg_detector.hpp"
 
@@ -2436,6 +2437,11 @@ private:
         // [TIERMIN 2026-10-29] The risk-approved pool (base mojos) each side's
         // tiers were sized from this cycle, which bounds its tier minimums.
         SidePools     ladder_pools{};
+        // [COINBUDGET 2026-10-30] Each side's share (in the mojos of the coin
+        // it spends) of a coin its pairs together want more of than it holds,
+        // set at the start of Step 7; nullopt while the coin's claims fit.
+        std::optional<Mojo> coin_share_bid;
+        std::optional<Mojo> coin_share_ask;
         // [SYNTH 2026-10-22] The error bar (bps) of the synthetic quoting
         // price published for this pair in Step 1; 0 when none was.
         double        revive_synth_sigma_bps{0.0};
@@ -2480,6 +2486,21 @@ private:
 
     /// Per-pair cycle state for the current block.
     std::unordered_map<std::string, PairCycleState> cycle_;
+
+    /// [COINBUDGET 2026-10-30] What one pair side's sizing wanted of the coin
+    /// it spends in the last Step 7, in that coin's mojos
+    /// (strategy/coin_budget.hpp).  cycle_ is rebuilt every heartbeat, so the
+    /// claims live here until the next Step 7 splits a short coin by them.
+    struct CoinClaim {
+        std::string coin{};   ///< "xch" or the CAT asset id
+        Mojo        mpu{0};   ///< the coin's mojos per unit, for its reserve
+        double      demand{0.0};
+    };
+    struct PairCoinClaims {
+        CoinClaim bid{};
+        CoinClaim ask{};
+    };
+    std::unordered_map<std::string, PairCoinClaims> coin_claims_;
 
     // -- Ratio-based inventory rebalance mode (per pair) -------------------
     enum class RatioRebalanceMode : std::uint8_t {

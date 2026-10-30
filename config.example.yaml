@@ -694,6 +694,12 @@ strategy:
                                        #   Risk limits and caps still apply. Off while a targeted coin's wallet balance is
                                        #   missing or older than pace_max_balance_age_blocks, or it has no price (logged); no
                                        #   effect without targets. Applies live; false = size bids from q_max alone, as before.
+  coin_budgets_enabled: true           # [OPTIONAL, default: true] Share a coin between the pair sides that spend it (XCH: the
+                                       #   XCH-base asks and XCH-quote bids; a CAT: the bids it funds and its asks). When last
+                                       #   heartbeat's sides together wanted more than the coin's confirmed balance minus its
+                                       #   reserve, each side's pool is capped at the same fraction of what it asked for, and
+                                       #   what a side leaves passes to the others. Nothing is capped while they fit. Applies
+                                       #   live; false = each side may size from the whole coin, first come first served.
   xch_ask_throttle_enabled: true       # [OPTIONAL, default: true] Enable smooth XCH ask throttling
   xch_ask_throttle_caution_xch: 2.0    # [OPTIONAL, default: 2.0] Start mild ask throttling below this
   xch_ask_throttle_low_xch: 1.0        # [OPTIONAL, default: 1.0] Stronger ask throttling below this
