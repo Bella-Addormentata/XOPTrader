@@ -200,6 +200,20 @@ Solution solve_pair(const std::vector<Anchor>& anchors,
 double combine_sigma_bps(const std::vector<double>& terms);
 
 // ---------------------------------------------------------------------------
+// stale_sigma_bps -- the staleness term of a book observation's sigma.
+//
+// per_print_bps for every heartbeat since the book's mid last MOVED, so a
+// frozen book loses its vote in the solve.  [STALECAP 2026-10-31] Capped at
+// max_bps (<= 0 means no cap): uncapped, a quiet book never stops growing.
+// The XCH/BYC Dexie book sat at 1.4303/1.4577 for ~676 heartbeats, read
+// ~3381 bps, and the sigma-scaled width floor pushed its ladder 40-75% off
+// the market.  A cap above fair_value_max_sigma_bps still keeps a frozen
+// book from producing a usable fair value on its own.  A negative or
+// non-finite input contributes nothing, as in combine_sigma_bps.
+// ---------------------------------------------------------------------------
+double stale_sigma_bps(double per_print_bps, int print_age, double max_bps);
+
+// ---------------------------------------------------------------------------
 // amm_sigma_bps -- uncertainty of an AMM implied price, from POOL DEPTH.
 //
 // WHY A FLAT CONSTANT WAS WRONG

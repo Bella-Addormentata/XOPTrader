@@ -2632,7 +2632,7 @@ TEST(ConfigParserTest, S33BookSideAgreeOverride_NegativeRejected) {
 }
 
 TEST(ConfigParserTest, StrategyNonNegativeKnobs_NonFiniteRejected) {
-    // The shared opt_non_negative helper feeds all 23 keys below, so the hole
+    // The shared opt_non_negative helper feeds all 24 keys below, so the hole
     // was 23 keys wide -- including activity_book_weight, newly exposed as a
     // global by this branch.  Every one of them is a magnitude whose
     // documented "disabled" setting is 0 (config.hpp), so none wants +inf.
@@ -2648,6 +2648,7 @@ TEST(ConfigParserTest, StrategyNonNegativeKnobs_NonFiniteRejected) {
                             "fair_value_amm_max_age_sec",
                             "fair_value_min_book_sigma_bps",
                             "fair_value_stale_sigma_bps_per_print",
+                            "fair_value_stale_sigma_max_bps",
                             "fair_value_depth_ref_bps",
                             "fair_value_max_sigma_bps",
                             "fair_value_tight_sigma_bps",
@@ -4538,6 +4539,42 @@ TEST(ConfigParserTest, MinimumTiersFirst_DefaultsOnAndParsesFalse) {
         TempYaml tmp(pace_with_strategy("  minimum_tiers_first: ~\n"));
         const auto cfg = xop::load_config(tmp.path());
         EXPECT_TRUE(cfg.strategy.minimum_tiers_first) << "null keeps the default";
+    }
+}
+
+// [STALECAP 2026-10-31] The staleness ceiling ships at 500 bps, parses any
+// non-negative value (0 = no ceiling), and refuses a negative one.
+TEST(ConfigParserTest, StaleSigmaMax_DefaultsTo500AndParses) {
+    {
+        TempYaml tmp(kMinimalValidYaml);
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_stale_sigma_max_bps, 500.0);
+        EXPECT_GT(cfg.strategy.fair_value_stale_sigma_max_bps,
+                  cfg.strategy.fair_value_max_sigma_bps)
+            << "a frozen book alone must never yield a usable fair value";
+    }
+    EXPECT_DOUBLE_EQ(xop::StrategyConfig{}.fair_value_stale_sigma_max_bps, 500.0)
+        << "a default-constructed StrategyConfig agrees with the parser";
+    {
+        TempYaml tmp(pace_with_strategy("  fair_value_stale_sigma_max_bps: 0\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_stale_sigma_max_bps, 0.0)
+            << "0 is the documented 'no ceiling' setting";
+    }
+    {
+        TempYaml tmp(pace_with_strategy("  fair_value_stale_sigma_max_bps: 1000\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_stale_sigma_max_bps, 1000.0);
+    }
+    {
+        // At or below the usable ceiling only warns: it must still load.
+        TempYaml tmp(pace_with_strategy("  fair_value_stale_sigma_max_bps: 150\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_stale_sigma_max_bps, 150.0);
+    }
+    {
+        TempYaml tmp(pace_with_strategy("  fair_value_stale_sigma_max_bps: -1\n"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
     }
 }
 

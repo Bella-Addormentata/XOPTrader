@@ -96,13 +96,15 @@ enum : int { kPairXchUsdc = 0, kPairXchByc = 1, kPairBycUsdc = 2 };
 
 const StrategyConfig kDefaults{};
 
-/// Edge sigma exactly as Engine::update_fair_values builds it.
-double book_sigma(double spread_bps, int print_age, double n_offers = 1.0) {
+/// Edge sigma exactly as Engine::update_fair_values builds it.  stale_max_bps
+/// defaults to the shipped staleness ceiling; 0 replays the uncapped term.
+double book_sigma(double spread_bps, int print_age, double n_offers = 1.0,
+                  double stale_max_bps = kDefaults.fair_value_stale_sigma_max_bps) {
     return fv::combine_sigma_bps({
         std::max(std::abs(spread_bps) / 2.0,
                  kDefaults.fair_value_min_book_sigma_bps),
-        kDefaults.fair_value_stale_sigma_bps_per_print
-            * static_cast<double>(print_age),
+        fv::stale_sigma_bps(kDefaults.fair_value_stale_sigma_bps_per_print,
+                            print_age, stale_max_bps),
         kDefaults.fair_value_depth_ref_bps / std::sqrt(std::max(1.0, n_offers)),
     });
 }
@@ -367,6 +369,52 @@ TEST(FairValueSolver, AFrozenBookLosesInfluenceAsItAges) {
     EXPECT_LT(sigma_at(10), sigma_at(60));
     // A book frozen for an hour of heartbeats can no longer clear the bar.
     EXPECT_GT(sigma_at(60), kDefaults.fair_value_max_sigma_bps);
+}
+
+// [STALECAP 2026-10-31] The staleness term grows per heartbeat and stops at
+// its ceiling; 0 (or a non-finite ceiling) means no ceiling.
+TEST(FairValueSolver, StaleSigmaGrowsPerHeartbeatAndStopsAtItsCeiling) {
+    EXPECT_DOUBLE_EQ(fv::stale_sigma_bps(5.0, 0, 500.0), 0.0);
+    EXPECT_DOUBLE_EQ(fv::stale_sigma_bps(5.0, 10, 500.0), 50.0);
+    EXPECT_DOUBLE_EQ(fv::stale_sigma_bps(5.0, 100, 500.0), 500.0);
+    EXPECT_DOUBLE_EQ(fv::stale_sigma_bps(5.0, 676, 500.0), 500.0);
+    EXPECT_DOUBLE_EQ(fv::stale_sigma_bps(5.0, 676, 0.0), 3380.0);
+    EXPECT_DOUBLE_EQ(
+        fv::stale_sigma_bps(5.0, 676, std::numeric_limits<double>::infinity()),
+        3380.0);
+    EXPECT_DOUBLE_EQ(
+        fv::stale_sigma_bps(5.0, 676, std::numeric_limits<double>::quiet_NaN()),
+        3380.0);
+    // Nonsense contributes nothing, as in combine_sigma_bps.
+    EXPECT_DOUBLE_EQ(fv::stale_sigma_bps(5.0, -3, 500.0), 0.0);
+    EXPECT_DOUBLE_EQ(fv::stale_sigma_bps(0.0, 676, 500.0), 0.0);
+    EXPECT_DOUBLE_EQ(fv::stale_sigma_bps(-5.0, 676, 500.0), 0.0);
+    EXPECT_DOUBLE_EQ(
+        fv::stale_sigma_bps(std::numeric_limits<double>::quiet_NaN(), 676,
+                            500.0),
+        0.0);
+}
+
+// The ceiling must not undo what the term is for: a book that has stopped
+// moving still cannot price a pair on its own, however long it sits.
+TEST(FairValueSolver, ACappedFrozenBookStillCannotPriceAPairAlone) {
+    auto sigma_at = [](int print_age) {
+        const std::vector<fv::Anchor> anchors = {
+            fv::Anchor{"wusdc", 1.0, 100.0}};
+        const std::vector<fv::Edge> edges = {
+            fv::Edge{"byc", "wusdc", 1.10,
+                     book_sigma(60.0, print_age), 2, true}};
+        const auto s = fv::solve_pair(anchors, edges, "byc", "wusdc", -1);
+        EXPECT_TRUE(s.ok);
+        return s.sigma_bps;
+    };
+    ASSERT_GT(kDefaults.fair_value_stale_sigma_max_bps,
+              kDefaults.fair_value_max_sigma_bps)
+        << "the shipped ceiling must sit above the usable ceiling";
+    EXPECT_GT(sigma_at(676), kDefaults.fair_value_max_sigma_bps);
+    EXPECT_GT(sigma_at(100'000), kDefaults.fair_value_max_sigma_bps);
+    // ...and it is bounded: a day of quiet reads the same as two hours.
+    EXPECT_DOUBLE_EQ(sigma_at(676), sigma_at(100'000));
 }
 
 TEST(FairValueSolver, CombineSigmaIsQuadratureAndIgnoresNonsense) {
@@ -1494,6 +1542,53 @@ TEST(UncertaintyQuoting, DefaultsProtectAnUnconfiguredDeployment) {
     const StrategyConfig d{};
     EXPECT_TRUE(d.quote_center_blend_enabled);
     EXPECT_DOUBLE_EQ(d.quote_width_sigma_mult, 1.0);  // one standard deviation
+}
+
+// The live case (2026-10-31): the XCH/BYC Dexie book sat still at
+// 1.4303/1.4577 (~190 bps) for ~676 heartbeats, and so did the BYC/wUSDC.b
+// book the external estimate is routed through.  Uncapped, both read ~3380
+// bps, the blend combined ~2390 bps, and the width floor put the ladder
+// 24%+ either side of the centre (bids 0.33-0.69, asks 2.05-2.29 against a
+// ~1.44 market).  Capped at the default 500 bps, the floor is a few percent.
+TEST(UncertaintyQuoting, AQuietBookNoLongerPushesTheLadderHalfwayOut) {
+    const double xch_byc_mid    = std::sqrt(1.4303 * 1.4577);
+    const double xch_byc_spread = std::log(1.4577 / 1.4303) * 10'000.0;
+    const int    quiet          = 676;
+
+    auto floor_with = [&](double stale_max_bps) {
+        const std::vector<fv::Anchor> anchors = {
+            fv::Anchor{"xch",   1.21, kDefaults.fair_value_feed_sigma_bps},
+            fv::Anchor{"wusdc", 1.00, kDefaults.fair_value_feed_sigma_bps},
+        };
+        const std::vector<fv::Edge> edges = {
+            fv::Edge{"xch", "wusdc", 1.21,
+                     book_sigma(200.0, 0, 4.0, stale_max_bps),
+                     kPairXchUsdc, true},
+            fv::Edge{"xch", "byc", xch_byc_mid,
+                     book_sigma(xch_byc_spread, quiet, 3.0, stale_max_bps),
+                     kPairXchByc, true},
+            fv::Edge{"byc", "wusdc", 0.84,
+                     book_sigma(300.0, quiet, 2.0, stale_max_bps),
+                     kPairBycUsdc, true},
+        };
+        const auto est = fv::solve_pair(anchors, edges, "xch", "byc",
+                                        kPairXchByc);
+        EXPECT_TRUE(est.ok);
+        const auto blend = fv::blend_quote_center(
+            xch_byc_mid,
+            book_sigma(xch_byc_spread, quiet, 3.0, stale_max_bps),
+            est.price, est.sigma_bps);
+        EXPECT_TRUE(blend.ok);
+        // A frozen route never makes the estimate usable, capped or not.
+        EXPECT_GT(est.sigma_bps, kDefaults.fair_value_max_sigma_bps);
+        return min_half_spread_bps(blend.sigma_bps);
+    };
+
+    const double uncapped = floor_with(0.0);
+    const double capped   = floor_with(kDefaults.fair_value_stale_sigma_max_bps);
+    EXPECT_GT(uncapped, 2'000.0) << "the live width: ~2391 bps";
+    EXPECT_LT(capped, 400.0);
+    EXPECT_GT(capped, 300.0) << "still wider than a moving book's floor";
 }
 
 // The accessor contract: an estimate whose sigma exceeds the clamp ceiling is

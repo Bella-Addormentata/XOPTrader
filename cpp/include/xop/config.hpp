@@ -927,6 +927,16 @@ struct StrategyConfig {
     /// being able to outvote anything.
     double   fair_value_stale_sigma_bps_per_print{5.0};
 
+    /// [STALECAP 2026-10-31] Ceiling (bps) on that staleness term; 0 = no
+    /// ceiling.  Without one, a book that simply goes quiet never stops
+    /// growing: the XCH/BYC Dexie book sat still at 1.4303/1.4577 for ~676
+    /// heartbeats, read ~3381 bps, and the sigma-scaled width floor
+    /// (quote_width_sigma_mult) pushed its ladder 40-75% off the market.
+    /// Default 500 bps, reached after ~100 heartbeats (~55 min): still above
+    /// fair_value_max_sigma_bps, so a frozen book alone never yields a usable
+    /// fair value, and a quiet pair quotes a few percent wide, not halfway.
+    double   fair_value_stale_sigma_max_bps{500.0};
+
     /// Depth term: uncertainty (bps) attributed to a book observed with a
     /// single resting third-party offer, decaying as 1/sqrt(n) with the offer
     /// count.  Default 30 bps -- small next to the width and staleness terms,

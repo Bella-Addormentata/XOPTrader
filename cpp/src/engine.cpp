@@ -9160,7 +9160,10 @@ void Engine::update_fair_values()
             //            heartbeats to drift away from the truth while still
             //            reporting an age of zero seconds.  This is the term
             //            that demotes a frozen book, and it is the reason
-            //            dex_print_age was added in da85235.
+            //            dex_print_age was added in da85235.  [STALECAP
+            //            2026-10-31] Capped at fair_value_stale_sigma_max_bps
+            //            (default 500): a quiet XCH/BYC book reached ~3381 bps
+            //            uncapped and its ladder quoted 40-75% off market.
             //   depth -- a book held up by one resting offer is one
             //            cancellation away from meaning nothing.
             const double n_offers = static_cast<double>(std::max<std::size_t>(
@@ -9168,8 +9171,9 @@ void Engine::update_fair_values()
             const double sigma_bps = fv::combine_sigma_bps({
                 std::max(std::abs(gp.obs.spread_bps) / 2.0,
                          sc.fair_value_min_book_sigma_bps),
-                sc.fair_value_stale_sigma_bps_per_print
-                    * static_cast<double>(std::max(0, gp.obs.print_age)),
+                fv::stale_sigma_bps(sc.fair_value_stale_sigma_bps_per_print,
+                                    gp.obs.print_age,
+                                    sc.fair_value_stale_sigma_max_bps),
                 sc.fair_value_depth_ref_bps / std::sqrt(n_offers),
             });
 
@@ -9576,8 +9580,10 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 book_sigma_bps = fv::combine_sigma_bps({
                     std::max(std::abs(obs.spread_bps) / 2.0,
                              config_.strategy.fair_value_min_book_sigma_bps),
-                    config_.strategy.fair_value_stale_sigma_bps_per_print
-                        * static_cast<double>(std::max(0, obs.print_age)),
+                    fv::stale_sigma_bps(
+                        config_.strategy.fair_value_stale_sigma_bps_per_print,
+                        obs.print_age,
+                        config_.strategy.fair_value_stale_sigma_max_bps),
                     config_.strategy.fair_value_depth_ref_bps
                         / std::sqrt(n_offers),
                 });

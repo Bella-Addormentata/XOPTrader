@@ -599,6 +599,8 @@ strategy:
   # fair_value_amm_max_age_sec: 300
   # fair_value_min_book_sigma_bps: 10    # Floor on a book mid's uncertainty
   # fair_value_stale_sigma_bps_per_print: 5   # Per heartbeat since the mid MOVED
+  # fair_value_stale_sigma_max_bps: 500  # Ceiling on that term (0 = none); keeps a quiet
+  #                                      # book from pushing its ladder far off market
   # fair_value_depth_ref_bps: 30         # Thin-book term, decays as 1/sqrt(n)
   # fair_value_max_sigma_bps: 200        # Above this: UNAVAILABLE, widen not clamp
   # fair_value_tight_sigma_bps: 150      # At or below: highest confidence tiers
