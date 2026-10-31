@@ -4764,6 +4764,69 @@ TEST(TierMinimumMojos, ASideHoldingExactlyItsMinimumLadderKeepsEveryTier) {
         << "why a raised side is trimmed to its minimums";
 }
 
+// [TIERFIRST 2026-10-31] A side whose pool holds every tier minimum keeps
+// every tier: the growth past the minimums shrinks to fit, not the tight
+// tier.  Short of the minimums, the widest that fit share what the pool holds.
+TEST(TierMinimumMojos, APoolHoldingEveryMinimumKeepsEveryTierAndTheGrowthShrinks) {
+    namespace tmin = xop::strategy::tiermin;
+    // XCH tenths, tightest first.  Minimums 10, 8.2, 6.4, 4.6, 2.8, 1 (33).
+    const std::vector<xop::Mojo> mins{100, 82, 64, 46, 28, 10};
+    // A 35 XCH pool split 30/25/18/12/8/7 %, then raised to the minimums:
+    // 10.5, 8.75, 6.4, 4.6, 2.8, 2.45 -- 35.5, past the pool.
+    const std::vector<xop::Mojo> weights{105, 87, 63, 42, 28, 24};
+    const std::vector<xop::Mojo> sizes{105, 87, 64, 46, 28, 24};
+    ASSERT_EQ(tmin::widest_tiers_within_pool(sizes, sizes, 350, std::nullopt), 5u)
+        << "before: the tight tier went although all six minimums fit";
+
+    const auto fitted = tmin::fit_tier_sizes_to_pool(sizes, mins, weights, 350);
+    ASSERT_EQ(fitted.size(), 6u);
+    xop::Mojo total = 0;
+    for (std::size_t i = 0; i < fitted.size(); ++i) {
+        EXPECT_GE(fitted[i], mins[i]) << "tier " << i << " keeps its minimum";
+        EXPECT_LE(fitted[i], sizes[i]) << "tier " << i << " never grows";
+        total += fitted[i];
+    }
+    EXPECT_LE(total, 350);
+    EXPECT_GE(total, 345) << "the pool is used, not just the minimums";
+    EXPECT_EQ(tmin::widest_tiers_within_pool(fitted, fitted, 350, std::nullopt), 6u);
+
+    // Exactly the minimum ladder: every tier at its minimum.
+    EXPECT_EQ(tmin::fit_tier_sizes_to_pool(sizes, mins, weights, 330), mins);
+
+    // Sizes that already fit are left alone.
+    EXPECT_EQ(tmin::fit_tier_sizes_to_pool(sizes, mins, weights, 355), sizes);
+
+    // 30 XCH: the five widest minimums (23) fit, the tight tier does not.
+    // Those five share the 30 and the fit skips the tight one.
+    const auto short_pool = tmin::fit_tier_sizes_to_pool(sizes, mins, weights, 300);
+    EXPECT_EQ(short_pool[0], sizes[0]) << "left for the fit to skip";
+    xop::Mojo kept = 0;
+    for (std::size_t i = 1; i < short_pool.size(); ++i) {
+        EXPECT_GE(short_pool[i], mins[i]);
+        kept += short_pool[i];
+    }
+    EXPECT_LE(kept, 300);
+    EXPECT_EQ(tmin::widest_tiers_within_pool(short_pool, short_pool, 300, std::nullopt), 5u);
+
+    // A flat minimum (1 XCH a tier) behaves the same way.
+    const std::vector<xop::Mojo> flat_mins(6, 10);
+    const std::vector<xop::Mojo> flat_weights{18, 15, 11, 7, 5, 4};  // a 6 XCH pool
+    const std::vector<xop::Mojo> flat_sizes{18, 15, 11, 10, 10, 10};  // 7.4 XCH
+    const auto flat = tmin::fit_tier_sizes_to_pool(flat_sizes, flat_mins, flat_weights, 60);
+    xop::Mojo flat_total = 0;
+    for (std::size_t i = 0; i < flat.size(); ++i) {
+        EXPECT_GE(flat[i], 10);
+        flat_total += flat[i];
+    }
+    EXPECT_LE(flat_total, 60);
+    EXPECT_EQ(tmin::widest_tiers_within_pool(flat, flat, 60, std::nullopt), 6u);
+
+    // Under the widest minimum: unchanged, the fit sets the minimums aside.
+    EXPECT_EQ(tmin::fit_tier_sizes_to_pool(sizes, mins, weights, 9), sizes);
+    // Mismatched inputs: unchanged.
+    EXPECT_EQ(tmin::fit_tier_sizes_to_pool(sizes, {1, 2}, weights, 350), sizes);
+}
+
 // [TIERMIN 2026-10-29] Only a tier-minimum pair with exactly one side both
 // drift-tapered and floored sizes its sides from their own pools.
 TEST(TierMinimumMojos, PairSidePoolsUnlessOneSideIsAFlooredTaper) {

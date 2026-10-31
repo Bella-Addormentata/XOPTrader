@@ -211,6 +211,20 @@ TEST(CoinBudget, ASideWhoseWidestTierIsPastItsDemandGetsNoMinimumTiers) {
     EXPECT_EQ((*shares)[0], 200) << "only what is left, not 4 + 1 out of turn";
 }
 
+TEST(CoinBudget, ABidsDemandCoversItsRoundedUpTiers) {
+    // Six 1-XCH bid tiers at a mid of 0.0015 in a 1,000-mojo quote coin cost
+    // 1.5 mojos each, rounded up to 2: 12 in all, against a demand of 9 when
+    // the whole side is priced as one sum.  Claimed at 9, the first pass
+    // stops after four tiers; Step 7 now claims at least the 12.
+    const std::vector<double> tiers(6, 2.0);
+    const auto short_demand = split(30, {{9.0, 9.0, tiers}, {100.0, 100.0, {}}});
+    ASSERT_TRUE(short_demand.has_value());
+    EXPECT_LT((*short_demand)[0], 12);
+    const auto covered = split(30, {{12.0, 12.0, tiers}, {100.0, 100.0, {}}});
+    ASSERT_TRUE(covered.has_value());
+    EXPECT_EQ((*covered)[0], 12) << "all six minimum tiers";
+}
+
 TEST(CoinBudget, AWeightlessSideStillGetsItsMinimumTiers) {
     const auto shares = split(100, {{50.0, 0.0, {10.0, 20.0}}, {80.0, 1.0, {}}});
     ASSERT_TRUE(shares.has_value());

@@ -2442,11 +2442,6 @@ private:
         // set at the start of Step 7; nullopt while the coin's claims fit.
         std::optional<Mojo> coin_share_bid;
         std::optional<Mojo> coin_share_ask;
-        // [TIERFIRST 2026-10-31] The full ladder of minimum offers (base
-        // mojos) a side was raised to this cycle; 0 when it was not.  A side
-        // that still holds it after the caps keeps every tier at its minimum.
-        Mojo          min_tiers_pool_bid{0};
-        Mojo          min_tiers_pool_ask{0};
         // [SYNTH 2026-10-22] The error bar (bps) of the synthetic quoting
         // price published for this pair in Step 1; 0 when none was.
         double        revive_synth_sigma_bps{0.0};

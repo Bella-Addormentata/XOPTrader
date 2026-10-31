@@ -10483,14 +10483,8 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                              lift_ask ? min_tiers_pool : avail_inventory,
                              min_tiers);
             }
-            if (lift_bid) {
-                avail_capital = min_tiers_pool;
-                pcs.min_tiers_pool_bid = min_tiers_pool;
-            }
-            if (lift_ask) {
-                avail_inventory = min_tiers_pool;
-                pcs.min_tiers_pool_ask = min_tiers_pool;
-            }
+            if (lift_bid) avail_capital = min_tiers_pool;
+            if (lift_ask) avail_inventory = min_tiers_pool;
         }
 
         // -- [PACE 2026-09-13] Pace pool composition -------------------------
@@ -10745,8 +10739,23 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         * market_mid * static_cast<double>(quote_mpu)));
                 }
             }
+            // Each bid tier's cost is rounded up on its own, so the tiers
+            // the bid's own pool covers can cost a few mojos more than its
+            // demand priced as one sum, and the split would then fund one
+            // tier fewer of them first.  The demand is at least their cost.
+            double bid_demand = bid_claim;
+            {
+                double base_sum = 0.0;
+                double cost_sum = 0.0;
+                for (std::size_t i = 0; i < bid_tiers.size() && i < ask_tiers.size(); ++i) {
+                    base_sum += ask_tiers[i];
+                    if (base_sum > static_cast<double>(wanted.bid)) break;
+                    cost_sum += bid_tiers[i];
+                }
+                bid_demand = std::max(bid_demand, cost_sum);
+            }
             auto& claims = coin_claims_[pair_name];
-            claims.bid = CoinClaim{bid_coin, quote_mpu, bid_claim, std::move(bid_tiers)};
+            claims.bid = CoinClaim{bid_coin, quote_mpu, bid_demand, std::move(bid_tiers)};
             claims.ask = CoinClaim{ask_coin, base_mpu, static_cast<double>(wanted.ask),
                                    std::move(ask_tiers)};
 
@@ -12498,6 +12507,23 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         {tq.size, std::max(capped, min_base_mojos)};
                 }
             }
+            // [TIERFIRST 2026-10-31] Whether the funding pass below fits each
+            // side's sizes to its pool minimums first (tiermin::
+            // fit_tier_sizes_to_pool), and each tier's share of the pool
+            // before the cap and the minimums, which its growth follows.  Not
+            // on a pace-managed pair (the pace plan sizes it) or a revive
+            // pair on a thin book (its revive cap does), nor without a
+            // minimum to keep.
+            const bool fit_minimums_first = config_.strategy.minimum_tiers_first
+                && !(config_.strategy.pace_enabled && pcs.pace.managed)
+                && !(pair_cfg->revive_market && pcs.revive_thin)
+                && (tier_minimums_on || min_base_mojos > 0);
+            std::map<std::pair<Side, std::uint8_t>, Mojo> tier_shares;
+            if (fit_minimums_first) {
+                for (const auto& tq : pcs.ladder) {
+                    tier_shares[{tq.side, tq.tier_index}] = tq.size;
+                }
+            }
 
             if (xch_base_pair && max_base_mojos > 0) {
                 int capped_tiers = 0;
@@ -12551,21 +12577,6 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                     spdlog::info("[Engine] Step 7: {} up-scaled {} tiers to "
                                  "the min offer size ({:.2f} units)",
                                  pair_name, bumped_tiers, eff_min_units);
-                }
-            }
-
-            // [TIERFIRST 2026-10-31] A side raised to its ladder of minimum
-            // offers posts exactly those minimums.  Its pool was set to their
-            // sum, so a tier whose share of that pool beats its minimum would
-            // take the excess from a tighter one, and the fit below would
-            // skip the tightest tier even with the pool and the coin's share
-            // holding the whole ladder.
-            if (tier_minimums_on
-                && (pcs.min_tiers_pool_bid > 0 || pcs.min_tiers_pool_ask > 0)) {
-                for (auto& tq : pcs.ladder) {
-                    const bool lifted = (tq.side == Side::Bid)
-                        ? pcs.min_tiers_pool_bid > 0 : pcs.min_tiers_pool_ask > 0;
-                    if (lifted) tq.size = tier_min_mojos(tq);
                 }
             }
 
@@ -12786,6 +12797,59 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                     // wallet's last reply carried it (an incomplete reply
                     // reads 0 and would set them aside for nothing), else
                     // the pool alone does and Step 8 checks each offer.
+                    // [TIERFIRST 2026-10-31] Minimums first, then growth: the
+                    // up-scale raised each tier to its minimum on top of its
+                    // share of the pool, so a side whose pool (or coin share)
+                    // holds every minimum could still sum past it and lose
+                    // its tight tier below, or its widest to the budget
+                    // trim.  The growth shrinks instead: every tier whose
+                    // minimum fits keeps it, and the rest of the pool is
+                    // shared out among them by their shares.  The pool is
+                    // the sum of those shares (they already reflect any
+                    // throttle), plus a mojo a tier for the ladder's
+                    // rounding, within the one compute_ladder was given.
+                    // A pair without tier minimums is fitted only while its
+                    // coin is short (its pool is its share) and only when
+                    // every tier's minimum fits; otherwise it keeps the
+                    // up-scale and the budget trim it always had.
+                    Mojo share_pool = 0;
+                    const bool side_has_share = is_ask ? pcs.coin_share_ask.has_value()
+                                                       : pcs.coin_share_bid.has_value();
+                    if (fit_minimums_first && (tier_minimums_on || side_has_share)) {
+                        std::vector<Mojo> cur_sizes;
+                        std::vector<Mojo> mins;
+                        std::vector<Mojo> shares;
+                        Mojo mins_total = 0;
+                        for (const auto& tq : pcs.ladder) {
+                            if (tq.side != side) continue;
+                            const auto sh = tier_shares.find({tq.side, tq.tier_index});
+                            const Mojo w = sh != tier_shares.end() ? sh->second : tq.size;
+                            cur_sizes.push_back(tq.size);
+                            mins.push_back(tier_min_mojos(tq));
+                            mins_total = saturating_add_mojo(mins_total, mins.back());
+                            shares.push_back(w);
+                            share_pool = saturating_add_mojo(share_pool, w);
+                        }
+                        share_pool = std::min<Mojo>(
+                            saturating_add_mojo(share_pool,
+                                                static_cast<Mojo>(cur_sizes.size())),
+                            is_ask ? pcs.ladder_pools.ask : pcs.ladder_pools.bid);
+                        const std::vector<Mojo> fitted =
+                            (tier_minimums_on || mins_total <= share_pool)
+                                ? strategy::tiermin::fit_tier_sizes_to_pool(
+                                      cur_sizes, mins, shares, share_pool)
+                                : cur_sizes;
+                        if (fitted != cur_sizes) {
+                            std::size_t k = 0;
+                            for (auto& tq : pcs.ladder) {
+                                if (tq.side == side) tq.size = fitted[k++];
+                            }
+                            spdlog::info("[Engine] Step 7: {} {} minimum tiers first: "
+                                         "growth shrunk so the tiers whose minimums "
+                                         "fit the pool of {} base mojos keep them",
+                                         pair_name, is_ask ? "ASK" : "BID", share_pool);
+                        }
+                    }
                     if (tier_minimums_on) {
                         std::optional<Mojo> min_budget = budget;
                         if (!min_budget.has_value()) {
@@ -12811,16 +12875,10 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         }
                         side_pool = std::min<Mojo>(side_pool,
                             is_ask ? pcs.ladder_pools.ask : pcs.ladder_pools.bid);
-                        // [TIERFIRST 2026-10-31] A side raised to its ladder
-                        // of minimum offers posts exactly those minimums (the
-                        // trim above), out of the pool compute_ladder was
-                        // given after the caps and the coin's share: all of
-                        // them when that pool still holds the ladder, else
-                        // the widest that fit.  Not the sum of the pre-cap
-                        // sizes, which rounding can leave a mojo short.
-                        if ((is_ask ? pcs.min_tiers_pool_ask : pcs.min_tiers_pool_bid) > 0) {
-                            side_pool = is_ask ? pcs.ladder_pools.ask : pcs.ladder_pools.bid;
-                        }
+                        // [TIERFIRST 2026-10-31] The pool the sizes were just
+                        // fitted to, so a side holding its whole minimum
+                        // ladder is not a rounding mojo short of it here.
+                        if (fit_minimums_first) side_pool = share_pool;
                         const std::size_t fit = strategy::tiermin::widest_tiers_within_pool(
                             min_sizes, side_costs(), side_pool, min_budget);
                         if (fit == 0 && !min_sizes.empty()) {
