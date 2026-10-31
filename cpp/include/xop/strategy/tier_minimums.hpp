@@ -205,14 +205,28 @@ template <class CostFn>
     return lowest;
 }
 
+/// [TIERMIN 2026-10-31] Whether a side the deploy-idle floor has just lifted
+/// to the pair minimum counts as "floored" for `pair_side_pools`: a side the
+/// drift guard tapered (0 < scale < 1), or a side with no pool at all before
+/// the floor.  The strategy turned that second one off -- on 2026-10-31
+/// XCH/DBX held 104.8 XCH against q_max 100, so Step 6 sized its bid 0 --
+/// and the floor only puts back a token offer.  Left at 0, side_pools would
+/// already size the other side from its own pool (its one-sided recovery);
+/// the token offer must not take that away.  It did: the 1 XCH bid cut the
+/// asks' 104 XCH pool to 1 XCH, one ask tier.  A side the strategy sized
+/// small but not 0, with no drift taper, keeps the pairing.
+[[nodiscard]] constexpr bool floored_side_unpairs(Mojo pool_before_floor,
+                                                  double drift_scale) noexcept
+{
+    return drift_scale < 1.0 || pool_before_floor <= 0;
+}
+
 /// Whether Step 7 sizes a pair's two ladder sides from the smaller pool
 /// (`LiquidityEngine::side_pools` pairing) or each from its own.  Pairing
 /// stays the rule, except on a pair posting tier minimums where exactly one
-/// side was both tapered by the drift guard (0 < scale < 1) and then lifted
-/// to the pair minimum by the deploy-idle floor: that 1-unit side would
-/// otherwise cut the other side to one unit too, so it could post only its
-/// widest tier.  A side the strategy itself sized small (no drift taper)
-/// keeps the pairing.
+/// side was lifted to the pair minimum by the deploy-idle floor and
+/// `floored_side_unpairs` holds for it: that 1-unit side would otherwise cut
+/// the other side to one unit too, so it could post only its widest tier.
 [[nodiscard]] constexpr bool pair_side_pools(bool tier_minimums_on,
                                              bool bid_guard_floored,
                                              bool ask_guard_floored) noexcept

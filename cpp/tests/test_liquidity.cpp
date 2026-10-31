@@ -11,6 +11,7 @@
 
 #include <xop/config.hpp>
 #include <xop/strategy/liquidity.hpp>
+#include <xop/strategy/tier_minimums.hpp>
 #include <xop/execution/market_data.hpp>
 #include <xop/state.hpp>
 
@@ -1631,6 +1632,25 @@ TEST(SidePoolsTest, TheLadderSizesEachSideFromItsOwnPoolWhenUnpaired) {
         << "0.5 + 0.3 + 0.2 of the bid's own pool, each floored to a mojo";
     EXPECT_EQ(side_sum(unpaired, Side::Ask), side_sum(paired, Side::Ask))
         << "the ask is unchanged";
+}
+
+// The XCH/DBX case on 2026-10-31: the bid was 0 at q_max and the deploy-idle
+// floor lifted it to 1 XCH; the ask pool was 104 XCH.  Left at 0 the bid
+// already let the asks keep their own pool (one-sided recovery); the floored
+// 1 XCH bid must not take that away, so the floored side unpairs the pair
+// (tiermin::floored_side_unpairs).
+TEST(SidePoolsTest, ATokenFlooredBidDoesNotCutTheAsksPool) {
+    namespace tmin = xop::strategy::tiermin;
+    const std::int64_t xch = 1'000'000'000'000LL;
+    EXPECT_EQ(LiquidityEngine::side_pools(0, 104 * xch, true).ask, 104 * xch)
+        << "bid off: the asks size from their own pool";
+    EXPECT_EQ(LiquidityEngine::side_pools(xch, 104 * xch, true).ask, xch)
+        << "paired, the 1 XCH floored bid cut the asks to 1 XCH (the bug)";
+    const bool pair = tmin::pair_side_pools(
+        true, tmin::floored_side_unpairs(0, 1.0), false);
+    const auto pools = LiquidityEngine::side_pools(xch, 104 * xch, pair);
+    EXPECT_EQ(pools.bid, xch);
+    EXPECT_EQ(pools.ask, 104 * xch);
 }
 
 TEST(SidePoolsTest, TiersPastTierZeroStayWithinThePool) {

@@ -449,21 +449,28 @@ TEST(SizingWiring, TierMinimumsStayWithinThePoolAndTheBudget) {
 // deploy-idle floor lifted to the pair minimum stops pairing the other side's
 // pool down to it.  On 2026-10-29 that left XCH/wUSDC.b one 1 XCH bid from a
 // 31.8 XCH bid pool.  Mutation-checked: fails against ef264fe.
+// [TIERMIN 2026-10-31] So does a side that had no pool before the floor: on
+// 2026-10-31 the XCH/DBX bid (0 at q_max) floored to 1 XCH left one ask
+// from a 104 XCH ask pool.
 TEST(SizingWiring, AFlooredDriftTaperedSideDoesNotShrinkTheOtherSide) {
     const std::string body = function_body(read_engine_cpp(), kLadderSignature);
     ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
-    // The floor marks a side only when the drift guard tapered it, and only
-    // when it actually lifted that side's pool.
+    // The floor marks a side when the drift guard tapered it or it had no
+    // pool before the floor (floored_side_unpairs reads the pool BEFORE the
+    // floor's value replaces it), and only when it actually lifted that
+    // side's pool.
     const std::size_t bid_floor_at = position_of(body,
         "const Mojo floored = apply_deploy_idle_floor( avail_capital, min_pool, "
         "floor_bid, drift_bid_scale,");
     const std::size_t bid_mark_at = position_of(body,
-        "bid_guard_floored = drift_bid_scale < 1.0; avail_capital = floored;");
+        "bid_guard_floored = strategy::tiermin::floored_side_unpairs( "
+        "avail_capital, drift_bid_scale); avail_capital = floored;");
     const std::size_t ask_floor_at = position_of(body,
         "const Mojo floored = apply_deploy_idle_floor( avail_inventory, min_pool, "
         "floor_ask, drift_ask_scale,");
     const std::size_t ask_mark_at = position_of(body,
-        "ask_guard_floored = drift_ask_scale < 1.0; avail_inventory = floored;");
+        "ask_guard_floored = strategy::tiermin::floored_side_unpairs( "
+        "avail_inventory, drift_ask_scale); avail_inventory = floored;");
     ASSERT_NE(bid_floor_at, std::string::npos);
     ASSERT_NE(bid_mark_at, std::string::npos);
     ASSERT_NE(ask_floor_at, std::string::npos);
@@ -632,7 +639,8 @@ TEST(SizingWiring, ASideIsRaisedToItsMinimumTiersBeforeTheCaps) {
     const std::size_t on_at = position_of(body,
         "const bool ladder_tier_minimums_on = pair_cfg && has_tier_minimums(*pair_cfg)");
     const std::size_t ask_floor_at = position_of(body,
-        "ask_guard_floored = drift_ask_scale < 1.0; avail_inventory = floored;");
+        "ask_guard_floored = strategy::tiermin::floored_side_unpairs( "
+        "avail_inventory, drift_ask_scale); avail_inventory = floored;");
     const std::size_t gate_at = position_of(body,
         "if (config_.strategy.minimum_tiers_first && ladder_tier_minimums_on "
         "&& pair_cfg->base_mojos_per_unit > 0) {");

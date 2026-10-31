@@ -4896,6 +4896,28 @@ TEST(TierMinimumMojos, PairSidePoolsUnlessOneSideIsAFlooredTaper) {
     EXPECT_FALSE(tmin::pair_side_pools(true, false, true));
 }
 
+// [TIERMIN 2026-10-31] A floored side unpairs when the drift guard tapered it
+// or when it had no pool before the floor.  On 2026-10-31 the XCH/DBX bid
+// was 0 at q_max (no taper) and floored to 1 XCH; pairing then cut the
+// asks' 104 XCH pool to 1 XCH.  A side sized small but not 0, untapered,
+// still pairs.
+TEST(TierMinimumMojos, AFlooredSideThatWasOffOrTaperedUnpairs) {
+    namespace tmin = xop::strategy::tiermin;
+    constexpr xop::Mojo xch = 1'000'000'000'000;
+    EXPECT_TRUE(tmin::floored_side_unpairs(0, 1.0))
+        << "switched off before the floor (XCH/DBX bid at q_max)";
+    EXPECT_TRUE(tmin::floored_side_unpairs(-1, 1.0))
+        << "a negative pool is no pool";
+    EXPECT_TRUE(tmin::floored_side_unpairs(xch / 10, 0.05))
+        << "drift-tapered (XCH/wUSDC.b ask, 2026-10-29)";
+    EXPECT_TRUE(tmin::floored_side_unpairs(0, 0.5));
+    EXPECT_FALSE(tmin::floored_side_unpairs(xch / 2, 1.0))
+        << "sized small by the strategy, untapered: keeps the pairing";
+    // The XCH/DBX case: the floored bid unpairs the pair (the ask was not
+    // floored), so side_pools sizes the asks from their own pool.
+    EXPECT_FALSE(tmin::pair_side_pools(true, tmin::floored_side_unpairs(0, 1.0), false));
+}
+
 TEST(TierMinimumMojos, XchLimiterKeepsTheWidestTiersFirst) {
     namespace tmin = xop::strategy::tiermin;
     // New XCH each tier locks, tier 0 first.
