@@ -4827,6 +4827,60 @@ TEST(TierMinimumMojos, APoolHoldingEveryMinimumKeepsEveryTierAndTheGrowthShrinks
     EXPECT_EQ(tmin::fit_tier_sizes_to_pool(sizes, {1, 2}, weights, 350), sizes);
 }
 
+// Past 2^53 mojos a double cannot hold every mojo: the fitted sizes are
+// summed and clamped in whole mojos, so they never pass the pool.
+TEST(TierMinimumMojos, FittedSizesStayWithinAPoolPastDoublePrecision) {
+    namespace tmin = xop::strategy::tiermin;
+    const xop::Mojo pool = 9'007'199'254'740'995;
+    const std::vector<xop::Mojo> sizes{6'000'000'000'000'000, 4'503'599'627'370'498};
+    const std::vector<xop::Mojo> mins{6'000'000'000'000'000, 1'000'000'000'000};
+    const std::vector<xop::Mojo> weights{4'503'599'627'370'498, 4'503'599'627'370'498};
+    const auto fitted = tmin::fit_tier_sizes_to_pool(sizes, mins, weights, pool);
+    ASSERT_EQ(fitted.size(), 2u);
+    EXPECT_EQ(fitted[0], mins[0]);
+    EXPECT_GE(fitted[1], mins[1]);
+    EXPECT_LE(fitted[1], sizes[1]);
+    EXPECT_LE(fitted[0], pool - fitted[1]) << "within the pool to the mojo";
+    EXPECT_EQ(tmin::widest_tiers_within_pool(fitted, fitted, pool, std::nullopt), 2u);
+}
+
+// The growth also shrinks to the funding budget: six 1.5-XCH bids just under
+// a mid of 0.001 in a 1,000-mojo quote coin fit a 9 XCH pool but cost 2
+// quote mojos each (12) against a 9-mojo share, while the six 1-XCH minimums
+// cost 1 each.  Only the growth goes; every tier stays.
+TEST(TierMinimumMojos, TheGrowthAlsoShrinksToTheFundingBudget) {
+    namespace tmin = xop::strategy::tiermin;
+    const xop::Mojo xch = 1'000'000'000'000;
+    const std::vector<xop::Mojo> mins(6, xch);
+    const std::vector<xop::Mojo> sizes(6, xch + xch / 2);
+    const std::vector<xop::Mojo> weights = sizes;
+    // Quote mojos at 0.000999 quote units per XCH, 1,000 mojos a unit, rounded up.
+    auto cost = [&](std::size_t, xop::Mojo size) -> xop::Mojo {
+        const double q = static_cast<double>(size) / static_cast<double>(xch) * 0.999;
+        return static_cast<xop::Mojo>(std::ceil(q));
+    };
+    const auto pool_only = tmin::fit_tier_sizes_to_pool(sizes, mins, weights, 9 * xch);
+    EXPECT_EQ(pool_only, sizes) << "the sizes already fit the pool";
+    const auto fitted = tmin::fit_tier_sizes_to_pool_and_budget(
+        sizes, mins, weights, 9 * xch, xop::Mojo{9}, cost);
+    std::vector<xop::Mojo> costs;
+    for (std::size_t i = 0; i < fitted.size(); ++i) {
+        EXPECT_GE(fitted[i], mins[i]);
+        costs.push_back(cost(i, fitted[i]));
+    }
+    EXPECT_EQ(tmin::widest_tiers_within_pool(fitted, costs, 9 * xch, xop::Mojo{9}), 6u)
+        << "every tier, at its minimum or a little over";
+    // Without a known budget, or when it covers the sizes, nothing more moves.
+    EXPECT_EQ(tmin::fit_tier_sizes_to_pool_and_budget(
+                  sizes, mins, weights, 9 * xch, std::nullopt, cost), sizes);
+    EXPECT_EQ(tmin::fit_tier_sizes_to_pool_and_budget(
+                  sizes, mins, weights, 9 * xch, xop::Mojo{12}, cost), sizes);
+    // When even the minimums cost more, the pool fit stands and the funding
+    // fit skips tiers as before.
+    EXPECT_EQ(tmin::fit_tier_sizes_to_pool_and_budget(
+                  sizes, mins, weights, 9 * xch, xop::Mojo{5}, cost), sizes);
+}
+
 // [TIERMIN 2026-10-29] Only a tier-minimum pair with exactly one side both
 // drift-tapered and floored sizes its sides from their own pools.
 TEST(TierMinimumMojos, PairSidePoolsUnlessOneSideIsAFlooredTaper) {

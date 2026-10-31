@@ -714,8 +714,16 @@ TEST(SizingWiring, ASideIsRaisedToItsMinimumTiersBeforeTheCaps) {
         "is_ask ? pcs.ladder_pools.ask : pcs.ladder_pools.bid);");
     const std::size_t fitted_at = position_of(body,
         "(tier_minimums_on || mins_total <= share_pool) "
-        "? strategy::tiermin::fit_tier_sizes_to_pool(cur_sizes, mins, shares, share_pool) "
-        ": cur_sizes;");
+        "? strategy::tiermin::fit_tier_sizes_to_pool_and_budget(cur_sizes, mins, shares, "
+        "share_pool, min_budget, cost_at) : cur_sizes;");
+    const std::size_t cost_at_at = position_of(body,
+        "TierQuote at = side_tiers[i]; at.size = size; return tier_cost(at);");
+    const std::size_t min_budget_at = position_of(body,
+        "std::optional<Mojo> min_budget = budget; "
+        "if (tier_minimums_on && !min_budget.has_value()) {");
+    ASSERT_NE(cost_at_at, std::string::npos);
+    ASSERT_NE(min_budget_at, std::string::npos);
+    EXPECT_LT(min_budget_at, cost_at_at) << "the budget is resolved before the fit";
     const std::size_t held_at = position_of(body,
         "if (fit_minimums_first) side_pool = share_pool;");
     const std::size_t fit_at = position_of(body,

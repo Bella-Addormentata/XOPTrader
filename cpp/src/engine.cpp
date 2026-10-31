@@ -12804,7 +12804,9 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                     // its tight tier below, or its widest to the budget
                     // trim.  The growth shrinks instead: every tier whose
                     // minimum fits keeps it, and the rest of the pool is
-                    // shared out among them by their shares.  The pool is
+                    // shared out among them by their shares, and shrinks
+                    // further while their cost passes the funding budget
+                    // (when known).  The pool is
                     // the sum of those shares (they already reflect any
                     // throttle), plus a mojo a tier for the ladder's
                     // rounding, within the one compute_ladder was given.
@@ -12812,10 +12814,20 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                     // coin is short (its pool is its share) and only when
                     // every tier's minimum fits; otherwise it keeps the
                     // up-scale and the budget trim it always had.
+                    // The funding budget the minimums are held to (above).
+                    std::optional<Mojo> min_budget = budget;
+                    if (tier_minimums_on && !min_budget.has_value()) {
+                        const auto bal = cached_wallet_balances_.find(funding_asset);
+                        if (bal != cached_wallet_balances_.end()
+                            && bal->second.fields_validated) {
+                            min_budget = bal->second.confirmed;
+                        }
+                    }
                     Mojo share_pool = 0;
                     const bool side_has_share = is_ask ? pcs.coin_share_ask.has_value()
                                                        : pcs.coin_share_bid.has_value();
                     if (fit_minimums_first && (tier_minimums_on || side_has_share)) {
+                        std::vector<TierQuote> side_tiers;
                         std::vector<Mojo> cur_sizes;
                         std::vector<Mojo> mins;
                         std::vector<Mojo> shares;
@@ -12824,6 +12836,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                             if (tq.side != side) continue;
                             const auto sh = tier_shares.find({tq.side, tq.tier_index});
                             const Mojo w = sh != tier_shares.end() ? sh->second : tq.size;
+                            side_tiers.push_back(tq);
                             cur_sizes.push_back(tq.size);
                             mins.push_back(tier_min_mojos(tq));
                             mins_total = saturating_add_mojo(mins_total, mins.back());
@@ -12834,10 +12847,17 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                             saturating_add_mojo(share_pool,
                                                 static_cast<Mojo>(cur_sizes.size())),
                             is_ask ? pcs.ladder_pools.ask : pcs.ladder_pools.bid);
+                        // What tier i would cost the funding asset at `size`.
+                        auto cost_at = [&](std::size_t i, Mojo size) -> Mojo {
+                            TierQuote at = side_tiers[i];
+                            at.size = size;
+                            return tier_cost(at);
+                        };
                         const std::vector<Mojo> fitted =
                             (tier_minimums_on || mins_total <= share_pool)
-                                ? strategy::tiermin::fit_tier_sizes_to_pool(
-                                      cur_sizes, mins, shares, share_pool)
+                                ? strategy::tiermin::fit_tier_sizes_to_pool_and_budget(
+                                      cur_sizes, mins, shares, share_pool, min_budget,
+                                      cost_at)
                                 : cur_sizes;
                         if (fitted != cur_sizes) {
                             std::size_t k = 0;
@@ -12851,14 +12871,6 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         }
                     }
                     if (tier_minimums_on) {
-                        std::optional<Mojo> min_budget = budget;
-                        if (!min_budget.has_value()) {
-                            const auto bal = cached_wallet_balances_.find(funding_asset);
-                            if (bal != cached_wallet_balances_.end()
-                                && bal->second.fields_validated) {
-                                min_budget = bal->second.confirmed;
-                            }
-                        }
                         // The side's pool is the one its tiers were sized
                         // from, or the sum of their pre-cap sizes when a
                         // later pass (the low-balance throttle) shrank them:

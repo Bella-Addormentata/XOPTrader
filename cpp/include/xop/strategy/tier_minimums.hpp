@@ -103,17 +103,23 @@ namespace xop::strategy::tiermin {
         if (mins[i] < 0 || sizes[i] < mins[i] || weights[i] < 0) return sizes;
     }
 
-    // Sum of the kept tiers at a given mu, each clamped to [min, size].
+    // A kept tier at a given mu, clamped in whole mojos to [min, size], so
+    // its minimum and its size stay exact at any magnitude.
     auto sized = [&](double mu, std::size_t i) -> Mojo {
         const double grown = std::floor(mu * static_cast<double>(weights[i]));
-        const double upper = static_cast<double>(sizes[i]);
-        const double lower = static_cast<double>(mins[i]);
-        return static_cast<Mojo>(std::clamp(grown, lower, upper));
+        if (!(grown > 0.0)) return mins[i];
+        if (grown >= static_cast<double>(sizes[i])) return sizes[i];
+        return std::clamp(static_cast<Mojo>(grown), mins[i], sizes[i]);
     };
-    auto sum_at = [&](double mu) -> double {
-        double sum = 0.0;
-        for (std::size_t i = first; i < n; ++i) sum += static_cast<double>(sized(mu, i));
-        return sum;
+    // Integer sum of the kept tiers, saturating past the pool.
+    auto fits_at = [&](double mu) {
+        Mojo sum = 0;
+        for (std::size_t i = first; i < n; ++i) {
+            const Mojo t = sized(mu, i);
+            if (sum > pool - t) return false;
+            sum += t;
+        }
+        return true;
     };
     double hi = 1.0;
     for (std::size_t i = first; i < n; ++i) {
@@ -121,18 +127,61 @@ namespace xop::strategy::tiermin {
             hi = std::max(hi, static_cast<double>(sizes[i]) / static_cast<double>(weights[i]) + 1.0);
         }
     }
-    double lo = 0.0;  // sum_at(0) is the kept minimums, which fit
-    if (sum_at(hi) <= static_cast<double>(pool)) {
+    double lo = 0.0;  // at 0 every kept tier is at its minimum, and they fit
+    if (fits_at(hi)) {
         lo = hi;
     } else {
         for (int iter = 0; iter < 200; ++iter) {
             const double mid = 0.5 * (lo + hi);
-            if (sum_at(mid) <= static_cast<double>(pool)) lo = mid; else hi = mid;
+            if (fits_at(mid)) lo = mid; else hi = mid;
         }
     }
     std::vector<Mojo> out = sizes;
     for (std::size_t i = first; i < n; ++i) out[i] = sized(lo, i);
     return out;
+}
+
+/// [TIERFIRST 2026-10-31] fit_tier_sizes_to_pool, and then the kept tiers'
+/// growth shrinks further while their funding cost passes `budget` (when
+/// known).  `cost(i, size)` is what tier i would cost the funding asset at
+/// `size` (an ask its base mojos, a bid its quote at its own price, rounded
+/// up), nondecreasing in size.  The pool the sizes are fitted to is lowered,
+/// never below the kept tiers' minimums, to the largest whose sizes the
+/// budget pays for.  When the kept minimums alone cost more than the budget
+/// the pool fit is returned and the funding fit skips tiers as before.
+template <class CostFn>
+[[nodiscard]] std::vector<Mojo> fit_tier_sizes_to_pool_and_budget(
+    const std::vector<Mojo>& sizes, const std::vector<Mojo>& mins,
+    const std::vector<Mojo>& weights, Mojo pool, std::optional<Mojo> budget,
+    CostFn cost)
+{
+    std::vector<Mojo> out = fit_tier_sizes_to_pool(sizes, mins, weights, pool);
+    const std::size_t n = sizes.size();
+    if (!budget.has_value() || *budget < 0 || mins.size() != n || pool <= 0) return out;
+    const std::vector<Mojo> wide_mins(mins.rbegin(), mins.rend());
+    const std::size_t keep = tiers_within_budget(wide_mins, pool);
+    if (keep == 0) return out;
+    const std::size_t first = n - keep;
+    auto kept_cost_fits = [&](const std::vector<Mojo>& v) {
+        Mojo sum = 0;
+        for (std::size_t i = first; i < n; ++i) {
+            const Mojo c = cost(i, v[i]);
+            if (c < 0 || sum > *budget - c) return false;
+            sum += c;
+        }
+        return true;
+    };
+    if (kept_cost_fits(out)) return out;
+    Mojo lo = 0;  // the kept minimums
+    for (std::size_t i = first; i < n; ++i) lo += mins[i];
+    if (!kept_cost_fits(fit_tier_sizes_to_pool(sizes, mins, weights, lo))) return out;
+    Mojo hi = pool;  // does not fit
+    while (hi - lo > 1) {
+        const Mojo mid = lo + (hi - lo) / 2;
+        if (kept_cost_fits(fit_tier_sizes_to_pool(sizes, mins, weights, mid))) lo = mid;
+        else hi = mid;
+    }
+    return fit_tier_sizes_to_pool(sizes, mins, weights, lo);
 }
 
 /// How many of the tiers in [min_tier, max_tier] Step 8's XCH limiter keeps
