@@ -60,8 +60,10 @@ That term now stops at `strategy.fair_value_stale_sigma_max_bps`:
 
 - Default 500, or `0` for no limit. Applies live.
 - On the same numbers, the first bid and ask sit near 1.39 and 1.50.
-- A frozen book on its own still never gives a usable fair value, because
-  the limit stays above `fair_value_max_sigma_bps`.
+- With the defaults (500 against `fair_value_max_sigma_bps` 200), a frozen
+  book on its own still never gives a usable fair value. That holds only
+  while the limit stays above `fair_value_max_sigma_bps`; if either is
+  changed so the limit is at or below it, the engine loads but warns.
 
 ## [0.10.38] — 2026-10-30 — pairs that spend the same coin share it instead of racing for it
 
