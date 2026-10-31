@@ -4521,6 +4521,26 @@ TEST(ConfigParserTest, CoinBudgets_DefaultsOnAndParsesFalse) {
     }
 }
 
+TEST(ConfigParserTest, MinimumTiersFirst_DefaultsOnAndParsesFalse) {
+    {
+        TempYaml tmp(kMinimalValidYaml);
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_TRUE(cfg.strategy.minimum_tiers_first);
+    }
+    EXPECT_TRUE(xop::StrategyConfig{}.minimum_tiers_first)
+        << "a default-constructed StrategyConfig agrees with the parser";
+    {
+        TempYaml tmp(pace_with_strategy("  minimum_tiers_first: false\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_FALSE(cfg.strategy.minimum_tiers_first);
+    }
+    {
+        TempYaml tmp(pace_with_strategy("  minimum_tiers_first: ~\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_TRUE(cfg.strategy.minimum_tiers_first) << "null keeps the default";
+    }
+}
+
 // -- [TIERMIN 2026-10-29] Per-tier minimum offer sizes ----------------------
 // On 2026-10-29 every XCH/wUSDC.b bid sat at the flat 5 XCH cap and the
 // operator asked for 10 XCH at the tight tier down to 1 XCH at the wide one,

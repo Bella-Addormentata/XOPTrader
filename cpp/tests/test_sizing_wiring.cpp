@@ -613,6 +613,78 @@ TEST(SizingWiring, ACoinSeveralSidesSpendIsSplitBetweenThem) {
     EXPECT_LT(share_budget_at, cut_at);
 }
 
+// [TIERFIRST 2026-10-31] On a pair posting tier minimums, a side sized below
+// its full ladder of minimum offers is raised to it -- after the deploy-idle
+// floor and before the pace pools and the final wallet caps, so the caps
+// and the coin's share still bound it -- but never a side Step 6 zeroed, the
+// drift guard tapered or stopped, or ratio rebalancing leaves alone.  A side
+// that still holds that ladder after the caps keeps every tier.
+TEST(SizingWiring, ASideIsRaisedToItsMinimumTiersBeforeTheCaps) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t on_at = position_of(body,
+        "const bool ladder_tier_minimums_on = pair_cfg && has_tier_minimums(*pair_cfg)");
+    const std::size_t ask_floor_at = position_of(body,
+        "ask_guard_floored = drift_ask_scale < 1.0; avail_inventory = floored;");
+    const std::size_t gate_at = position_of(body,
+        "if (config_.strategy.minimum_tiers_first && ladder_tier_minimums_on) {");
+    const std::size_t pool_at = position_of(body,
+        "tier_min_offer_units(*pair_cfg, floor_min_units, t, min_tiers), "
+        "pair_cfg->base_mojos_per_unit);");
+    const std::size_t lift_bid_at = position_of(body,
+        "const bool lift_bid = floor_bid && drift_bid_scale >= 1.0 "
+        "&& pcs.risk_quote.bid_size > 0 && avail_capital > 0 "
+        "&& avail_capital < min_tiers_pool;");
+    const std::size_t lift_ask_at = position_of(body,
+        "const bool lift_ask = floor_ask && drift_ask_scale >= 1.0 "
+        "&& pcs.risk_quote.ask_size > 0 && avail_inventory > 0 "
+        "&& avail_inventory < min_tiers_pool;");
+    const std::size_t set_bid_at = position_of(body,
+        "if (lift_bid) { avail_capital = min_tiers_pool; "
+        "pcs.min_tiers_pool_bid = min_tiers_pool; }");
+    const std::size_t set_ask_at = position_of(body,
+        "if (lift_ask) { avail_inventory = min_tiers_pool; "
+        "pcs.min_tiers_pool_ask = min_tiers_pool; }");
+    const std::size_t pace_at = position_of(body,
+        "if (config_.strategy.pace_enabled && pcs.pace.managed && pair_cfg) {");
+    const std::size_t caps_at = position_of(body, "[v0.7.38 -> S3 round-2] FINAL XCH wallet caps");
+    ASSERT_NE(on_at, std::string::npos);
+    ASSERT_NE(ask_floor_at, std::string::npos);
+    ASSERT_NE(gate_at, std::string::npos);
+    ASSERT_NE(pool_at, std::string::npos);
+    ASSERT_NE(lift_bid_at, std::string::npos);
+    ASSERT_NE(lift_ask_at, std::string::npos);
+    ASSERT_NE(set_bid_at, std::string::npos);
+    ASSERT_NE(set_ask_at, std::string::npos);
+    ASSERT_NE(pace_at, std::string::npos);
+    ASSERT_NE(caps_at, std::string::npos);
+    EXPECT_LT(on_at, gate_at);
+    EXPECT_LT(ask_floor_at, gate_at);
+    EXPECT_LT(gate_at, pool_at);
+    EXPECT_LT(pool_at, lift_bid_at);
+    EXPECT_LT(lift_bid_at, set_bid_at);
+    EXPECT_LT(lift_ask_at, set_ask_at);
+    EXPECT_LT(set_ask_at, pace_at);
+    EXPECT_LT(pace_at, caps_at);
+    // The fit keeps every tier of a side that still holds the ladder.
+    const std::size_t held_at = position_of(body,
+        "if (min_tiers_pool > 0 && (is_ask ? pcs.ladder_pools.ask : pcs.ladder_pools.bid) "
+        ">= min_tiers_pool) {");
+    const std::size_t widened_at = position_of(body, "side_pool = std::max(side_pool, min_sizes_sum);");
+    const std::size_t fit_at = position_of(body,
+        "const std::size_t fit = strategy::tiermin::widest_tiers_within_pool(");
+    ASSERT_NE(held_at, std::string::npos);
+    ASSERT_NE(widened_at, std::string::npos);
+    ASSERT_NE(fit_at, std::string::npos);
+    EXPECT_LT(caps_at, held_at);
+    EXPECT_LT(held_at, widened_at);
+    EXPECT_LT(widened_at, fit_at);
+    // With the switch off, no side claims minimum tiers in the coin split.
+    EXPECT_NE(position_of(body,
+        "const std::uint32_t claim_tiers = config_.strategy.minimum_tiers_first "
+        "? liq.config().num_tiers : 0u;"), std::string::npos);
+}
+
 TEST(SizingWiring, Step8RetiresRestingOffersThePlanMovedPast) {
     const std::string body = function_body(
         read_engine_cpp(), "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)");

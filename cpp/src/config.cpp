@@ -1838,6 +1838,10 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         && !node["coin_budgets_enabled"].IsNull()) {
         cfg.coin_budgets_enabled = node["coin_budgets_enabled"].as<bool>();
     }
+    if (node["minimum_tiers_first"] && node["minimum_tiers_first"].IsDefined()
+        && !node["minimum_tiers_first"].IsNull()) {
+        cfg.minimum_tiers_first = node["minimum_tiers_first"].as<bool>();
+    }
 
     // [PACE 2026-09-13] Pace controller keys (default OFF).  Every double goes
     // through read_optional_finite_in_range and every count through

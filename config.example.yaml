@@ -700,6 +700,13 @@ strategy:
                                        #   reserve, each side's pool is capped at the same fraction of what it asked for, and
                                        #   what a side leaves passes to the others. Nothing is capped while they fit. Applies
                                        #   live; false = each side may size from the whole coin, first come first served.
+  minimum_tiers_first: true            # [OPTIONAL, default: true] Fill every pair's minimum tiers before any pair's tiers
+                                       #   grow past their minimums. On a pair with tight/wide_tier_min_offer_units, a side
+                                       #   sized below its full ladder of minimum offers is raised to it (not a side the drift
+                                       #   guard tapered or stopped); wallet caps and the coin's share still bound it, and short
+                                       #   of funds its tight tiers are skipped first. A short coin funds every side's minimum
+                                       #   tiers, widest first, before splitting the rest by demand. Applies live; false = each
+                                       #   side sizes from its own pool and a short coin is split by demand alone, as before.
   xch_ask_throttle_enabled: true       # [OPTIONAL, default: true] Enable smooth XCH ask throttling
   xch_ask_throttle_caution_xch: 2.0    # [OPTIONAL, default: 2.0] Start mild ask throttling below this
   xch_ask_throttle_low_xch: 1.0        # [OPTIONAL, default: 1.0] Stronger ask throttling below this

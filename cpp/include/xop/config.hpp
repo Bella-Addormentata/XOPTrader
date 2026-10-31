@@ -1398,6 +1398,17 @@ struct StrategyConfig {
     /// more than that, with what a side leaves passed to the others.  Nothing
     /// is capped while the claims fit.  Applies live.  Default true.
     bool     coin_budgets_enabled{true};
+    /// [TIERFIRST 2026-10-31] Fill every pair's minimum tiers before any
+    /// pair's tiers grow past their minimums (operator, 2026-10-31).  On a
+    /// pair with tier minimums, a side the strategy sized below its full
+    /// ladder of minimum offers is raised to it (not a side the drift guard
+    /// tapered or stopped, nor the side ratio rebalancing leaves alone); the
+    /// wallet caps and the coin's share still bound it, and short of funds
+    /// the tight tiers are skipped first.  A short coin then funds every
+    /// side's minimum tiers, widest tier first, before the rest is split by
+    /// demand.  Applies live.  Default true; false sizes each side from its
+    /// own pool and splits a short coin by demand alone, as before.
+    bool     minimum_tiers_first{true};
 
     // -- [PACE 2026-09-13] Pace controller (default OFF) -------------------
     // Sells an overweight CAT QUOTE asset toward its asset_target_allocations

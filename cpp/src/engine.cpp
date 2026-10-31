@@ -10300,6 +10300,15 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
         }
 
+        // [TIERMIN 2026-10-29] Whether this pair posts per-tier minimums (also
+        // read by the minimum-tier floor, the ladder pairing and the
+        // minimum-size pass below).  A pace-managed pair keeps the
+        // pace plan's sizes and a revive pair on a thin book its revive cap.
+        const bool ladder_tier_minimums_on = pair_cfg
+            && has_tier_minimums(*pair_cfg)
+            && !(config_.strategy.pace_enabled && pcs.pace.managed)
+            && !(pair_cfg->revive_market && pcs.revive_thin);
+
         // -- Deploy-idle-inventory floor: when risk/allocator scaling has
         // collapsed a side's pool below the pair's minimum offer size
         // despite the wallet holding ample balance to back at least one
@@ -10415,6 +10424,52 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                                  floor_min_units);
                     ask_guard_floored = drift_ask_scale < 1.0;
                     avail_inventory = floored;
+                }
+            }
+
+            // -- [TIERFIRST 2026-10-31] Minimum-tier floor -------------------
+            // The operator asked (2026-10-31) that every pair get its tiers
+            // filled before any pair's tiers grow.  On a pair posting tier
+            // minimums, a side the strategy sized below its full ladder of
+            // minimum offers -- q_max, Step 6's limits, the allocator: on
+            // 2026-10-31 XCH/DBX held 98.4 XCH against q_max 100 and posted
+            // one 1 XCH tier a side -- is raised to that ladder.  Not a side
+            // Step 6 zeroed, the drift guard tapered or stopped, or ratio
+            // rebalancing leaves alone: those trade less of the coin on
+            // purpose.  The wallet caps and the coin's share below still
+            // bound it, and short of funds the tight tiers go first.
+            if (config_.strategy.minimum_tiers_first && ladder_tier_minimums_on) {
+                const std::uint32_t min_tiers = liq.config().num_tiers;
+                Mojo min_tiers_pool = 0;
+                for (std::uint32_t t = 0; t < min_tiers; ++t) {
+                    const auto m = strategy::tiermin::min_units_to_mojos(
+                        tier_min_offer_units(*pair_cfg, floor_min_units, t, min_tiers),
+                        pair_cfg->base_mojos_per_unit);
+                    if (m.has_value()) min_tiers_pool = saturating_add_mojo(min_tiers_pool, *m);
+                }
+                const bool lift_bid = floor_bid && drift_bid_scale >= 1.0
+                    && pcs.risk_quote.bid_size > 0 && avail_capital > 0
+                    && avail_capital < min_tiers_pool;
+                const bool lift_ask = floor_ask && drift_ask_scale >= 1.0
+                    && pcs.risk_quote.ask_size > 0 && avail_inventory > 0
+                    && avail_inventory < min_tiers_pool;
+                if (lift_bid || lift_ask) {
+                    spdlog::info("[Engine] Step 7: {} minimum tiers first: bid "
+                                 "pool {} -> {}, ask pool {} -> {} base mojos "
+                                 "({} tiers at their minimums)",
+                                 pair_name, avail_capital,
+                                 lift_bid ? min_tiers_pool : avail_capital,
+                                 avail_inventory,
+                                 lift_ask ? min_tiers_pool : avail_inventory,
+                                 min_tiers);
+                }
+                if (lift_bid) {
+                    avail_capital = min_tiers_pool;
+                    pcs.min_tiers_pool_bid = min_tiers_pool;
+                }
+                if (lift_ask) {
+                    avail_inventory = min_tiers_pool;
+                    pcs.min_tiers_pool_ask = min_tiers_pool;
                 }
             }
         }
@@ -10620,13 +10675,6 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
         }
 
-        // [TIERMIN 2026-10-29] Whether this pair posts per-tier minimums (also
-        // read by the minimum-size pass below).  A pace-managed pair keeps the
-        // pace plan's sizes and a revive pair on a thin book its revive cap.
-        const bool ladder_tier_minimums_on = pair_cfg
-            && has_tier_minimums(*pair_cfg)
-            && !(config_.strategy.pace_enabled && pcs.pace.managed)
-            && !(pair_cfg->revive_market && pcs.revive_thin);
         // On such a pair, a side the drift guard tapered and the deploy-idle
         // floor then lifted to the pair minimum no longer cuts the other
         // side's pool to that minimum.  On 2026-10-29 the XCH/wUSDC.b ask was
@@ -10662,7 +10710,8 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             // funds these on every side before any side's tiers grow.
             std::vector<double> ask_tiers;
             std::vector<double> bid_tiers;
-            const std::uint32_t claim_tiers = liq.config().num_tiers;
+            const std::uint32_t claim_tiers = config_.strategy.minimum_tiers_first
+                ? liq.config().num_tiers : 0u;
             for (std::uint32_t t = claim_tiers; t-- > 0;) {
                 const double units = ladder_tier_minimums_on
                     ? tier_min_offer_units(*pair_cfg, floor_min_units, t, claim_tiers)
@@ -12728,6 +12777,21 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         }
                         side_pool = std::min<Mojo>(side_pool,
                             is_ask ? pcs.ladder_pools.ask : pcs.ladder_pools.bid);
+                        // [TIERFIRST 2026-10-31] A side raised to its full
+                        // ladder of minimum offers that still holds it after
+                        // the caps keeps every tier: the tiers whose share of
+                        // the pool beats their minimum push the sum past it.
+                        const Mojo min_tiers_pool = is_ask
+                            ? pcs.min_tiers_pool_ask : pcs.min_tiers_pool_bid;
+                        if (min_tiers_pool > 0
+                            && (is_ask ? pcs.ladder_pools.ask : pcs.ladder_pools.bid)
+                                   >= min_tiers_pool) {
+                            Mojo min_sizes_sum = 0;
+                            for (const Mojo m : min_sizes) {
+                                min_sizes_sum = saturating_add_mojo(min_sizes_sum, m);
+                            }
+                            side_pool = std::max(side_pool, min_sizes_sum);
+                        }
                         const std::size_t fit = strategy::tiermin::widest_tiers_within_pool(
                             min_sizes, side_costs(), side_pool, min_budget);
                         if (fit == 0 && !min_sizes.empty()) {
