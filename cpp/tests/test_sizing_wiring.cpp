@@ -511,7 +511,8 @@ TEST(SizingWiring, ACoinSeveralSidesSpendIsSplitBetweenThem) {
         "return execution::cap_pool_above_reserve( bit->second.confirmed, "
         "bit->second.confirmed, reserve);");
     const std::size_t lone_at = position_of(body, "if (entry.second.size() < 2) continue;");
-    const std::size_t weights_at = position_of(body, "claims.push_back({cs.demand, cs.demand});");
+    const std::size_t weights_at = position_of(body,
+        "claims.push_back({cs.demand, cs.demand, *cs.tiers});");
     const std::size_t split_at = position_of(body,
         "const auto shares = strategy::coin_budget::split(*coin_balance, claims);");
     const std::size_t clear_at = position_of(body, "coin_claims_.clear();");
@@ -568,10 +569,34 @@ TEST(SizingWiring, ACoinSeveralSidesSpendIsSplitBetweenThem) {
     // A bid claims its quote coin at the mid; the share converts back the
     // way the wallet caps do.
     EXPECT_NE(position_of(body,
-        "claims.bid = CoinClaim{bid_coin, quote_mpu, bid_claim};"), std::string::npos);
-    EXPECT_NE(position_of(body,
-        "claims.ask = CoinClaim{ask_coin, base_mpu, static_cast<double>(wanted.ask)};"),
+        "claims.bid = CoinClaim{bid_coin, quote_mpu, bid_demand, std::move(bid_tiers)};"),
         std::string::npos);
+    // ...at least the rounded-up cost of the minimum tiers its own pool
+    // covers, so the split's first pass can fund every one of them.
+    EXPECT_NE(position_of(body,
+        "if (base_sum > static_cast<double>(wanted.bid)) break; cost_sum += bid_tiers[i];"),
+        std::string::npos);
+    EXPECT_NE(position_of(body, "bid_demand = std::max(bid_demand, cost_sum);"),
+        std::string::npos);
+    EXPECT_NE(position_of(body,
+        "claims.ask = CoinClaim{ask_coin, base_mpu, static_cast<double>(wanted.ask), "
+        "std::move(ask_tiers)};"),
+        std::string::npos);
+    // [TIERFIRST 2026-10-31] Each side also claims its minimum tiers, widest
+    // first: its tier minimums, or the pair minimum at every tier; a bid's
+    // in its quote coin at the mid, rounded up to whole mojos.
+    const std::size_t tiers_at = position_of(body,
+        "for (std::uint32_t t = claim_tiers; t-- > 0;) { const double units = "
+        "ladder_tier_minimums_on ? tier_min_offer_units(*pair_cfg, floor_min_units, "
+        "t, claim_tiers) : floor_min_units;");
+    const std::size_t bid_tier_at = position_of(body,
+        "bid_tiers.push_back(std::ceil( static_cast<double>(*tier_mojos) / "
+        "static_cast<double>(base_mpu) * market_mid * static_cast<double>(quote_mpu)));");
+    ASSERT_NE(tiers_at, std::string::npos);
+    ASSERT_NE(bid_tier_at, std::string::npos);
+    EXPECT_LT(claim_at, tiers_at);
+    EXPECT_LT(tiers_at, bid_tier_at);
+    EXPECT_LT(bid_tier_at, record_at);
     EXPECT_NE(position_of(body,
         "const auto share_cap = try_affordable_base_mojos( "
         "static_cast<double>(*pcs.coin_share_bid),"), std::string::npos);
@@ -593,6 +618,142 @@ TEST(SizingWiring, ACoinSeveralSidesSpendIsSplitBetweenThem) {
     EXPECT_LT(funding_at, share_budget_at);
     EXPECT_LT(share_budget_at, fit_at);
     EXPECT_LT(share_budget_at, cut_at);
+}
+
+// [TIERFIRST 2026-10-31] On a pair posting tier minimums, a side sized below
+// its full ladder of minimum offers is raised to it -- after the deploy-idle
+// floor and before the pace pools and the final wallet caps, so the caps
+// and the coin's share still bound it -- but never a side Step 6 zeroed, the
+// drift guard tapered or stopped, or ratio rebalancing leaves alone.  A side
+// that still holds that ladder after the caps keeps every tier.
+TEST(SizingWiring, ASideIsRaisedToItsMinimumTiersBeforeTheCaps) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t on_at = position_of(body,
+        "const bool ladder_tier_minimums_on = pair_cfg && has_tier_minimums(*pair_cfg)");
+    const std::size_t ask_floor_at = position_of(body,
+        "ask_guard_floored = drift_ask_scale < 1.0; avail_inventory = floored;");
+    const std::size_t gate_at = position_of(body,
+        "if (config_.strategy.minimum_tiers_first && ladder_tier_minimums_on "
+        "&& pair_cfg->base_mojos_per_unit > 0) {");
+    const std::size_t pool_at = position_of(body,
+        "const Mojo m = std::max(pair_min_mojos, strategy::tiermin::min_units_to_mojos("
+        "tier_min_offer_units(*pair_cfg, floor_min_units, t, min_tiers), "
+        "pair_cfg->base_mojos_per_unit).value_or(pair_min_mojos));");
+    // Its own block, after the deploy-idle floor's: neither
+    // deploy_idle_inventory_enabled nor a flat minimum of 0 turns it off.
+    const std::size_t ratio_at = position_of(body,
+        "const bool floor_bid = (idle_ratio_mode != RatioRebalanceMode::AcquireQuote);");
+    const std::size_t idle_if_at = position_of(body,
+        "if (pair_cfg && config_.strategy.deploy_idle_inventory_enabled "
+        "&& pair_cfg->base_mojos_per_unit > 0 && floor_min_units > 0.0) {");
+    ASSERT_NE(ratio_at, std::string::npos);
+    ASSERT_NE(idle_if_at, std::string::npos);
+    EXPECT_LT(ratio_at, idle_if_at);
+    const std::size_t lift_bid_at = position_of(body,
+        "const bool lift_bid = floor_bid && drift_bid_scale >= 1.0 "
+        "&& pcs.risk_quote.bid_size > 0 && avail_capital > 0 "
+        "&& avail_capital < min_tiers_pool;");
+    const std::size_t lift_ask_at = position_of(body,
+        "const bool lift_ask = floor_ask && drift_ask_scale >= 1.0 "
+        "&& pcs.risk_quote.ask_size > 0 && avail_inventory > 0 "
+        "&& avail_inventory < min_tiers_pool;");
+    const std::size_t set_bid_at = position_of(body,
+        "if (lift_bid) avail_capital = min_tiers_pool;");
+    const std::size_t set_ask_at = position_of(body,
+        "if (lift_ask) avail_inventory = min_tiers_pool;");
+    const std::size_t pace_at = position_of(body,
+        "if (config_.strategy.pace_enabled && pcs.pace.managed && pair_cfg) {");
+    const std::size_t caps_at = position_of(body, "[v0.7.38 -> S3 round-2] FINAL XCH wallet caps");
+    ASSERT_NE(on_at, std::string::npos);
+    ASSERT_NE(ask_floor_at, std::string::npos);
+    ASSERT_NE(gate_at, std::string::npos);
+    ASSERT_NE(pool_at, std::string::npos);
+    ASSERT_NE(lift_bid_at, std::string::npos);
+    ASSERT_NE(lift_ask_at, std::string::npos);
+    ASSERT_NE(set_bid_at, std::string::npos);
+    ASSERT_NE(set_ask_at, std::string::npos);
+    ASSERT_NE(pace_at, std::string::npos);
+    ASSERT_NE(caps_at, std::string::npos);
+    EXPECT_LT(on_at, gate_at);
+    EXPECT_LT(ask_floor_at, gate_at);
+    if (idle_if_at != std::string::npos && gate_at != std::string::npos
+        && idle_if_at < gate_at) {
+        long depth = 0;
+        for (std::size_t i = idle_if_at; i < gate_at; ++i) {
+            if (body[i] == '{') ++depth;
+            if (body[i] == '}') --depth;
+        }
+        EXPECT_EQ(depth, 0) << "the minimum-tier floor sits outside the deploy-idle block";
+    }
+    EXPECT_LT(gate_at, pool_at);
+    EXPECT_LT(pool_at, lift_bid_at);
+    EXPECT_LT(lift_bid_at, set_bid_at);
+    EXPECT_LT(lift_ask_at, set_ask_at);
+    EXPECT_LT(set_ask_at, pace_at);
+    EXPECT_LT(pace_at, caps_at);
+    // Minimums first, then growth: after the up-scale and before the funding
+    // fit, each side's sizes are fitted to the pool their pre-cap shares sum
+    // to (a mojo a tier for rounding), within the one compute_ladder was
+    // given; a pair without tier minimums only while its coin is short and
+    // its minimums all fit; and the fit measures them against that pool.
+    const std::size_t upscale_at = position_of(body,
+        "\"[Engine] Step 7: {} up-scaled {} tiers to \"");
+    const std::size_t shares_at = position_of(body,
+        "tier_shares[{tq.side, tq.tier_index}] = tq.size;");
+    const std::size_t fit_on_at = position_of(body,
+        "const bool fit_minimums_first = config_.strategy.minimum_tiers_first "
+        "&& !(config_.strategy.pace_enabled && pcs.pace.managed) "
+        "&& !(pair_cfg->revive_market && pcs.revive_thin) "
+        "&& (tier_minimums_on || min_base_mojos > 0);");
+    const std::size_t gate_fit_at = position_of(body,
+        "if (fit_minimums_first && (tier_minimums_on || side_has_share)) {");
+    const std::size_t pool_fit_at = position_of(body,
+        "share_pool = std::min<Mojo>(saturating_add_mojo(share_pool, "
+        "static_cast<Mojo>(cur_sizes.size())), "
+        "is_ask ? pcs.ladder_pools.ask : pcs.ladder_pools.bid);");
+    const std::size_t fitted_at = position_of(body,
+        "(tier_minimums_on || mins_total <= share_pool) "
+        "? strategy::tiermin::fit_tier_sizes_to_pool_and_budget(cur_sizes, mins, shares, "
+        "share_pool, min_budget, cost_at) : cur_sizes;");
+    const std::size_t cost_at_at = position_of(body,
+        "TierQuote at = side_tiers[i]; at.size = size; return tier_cost(at);");
+    const std::size_t min_budget_at = position_of(body,
+        "std::optional<Mojo> min_budget = budget; "
+        "if (tier_minimums_on && !min_budget.has_value()) {");
+    ASSERT_NE(cost_at_at, std::string::npos);
+    ASSERT_NE(min_budget_at, std::string::npos);
+    EXPECT_LT(min_budget_at, cost_at_at) << "the budget is resolved before the fit";
+    const std::size_t held_at = position_of(body,
+        "if (fit_minimums_first) side_pool = share_pool;");
+    const std::size_t fit_at = position_of(body,
+        "const std::size_t fit = strategy::tiermin::widest_tiers_within_pool(");
+    const std::size_t trim_budget_at = position_of(body,
+        "const std::size_t keep = tiers_within_budget(costs, *budget);");
+    ASSERT_NE(upscale_at, std::string::npos);
+    ASSERT_NE(shares_at, std::string::npos);
+    ASSERT_NE(fit_on_at, std::string::npos);
+    ASSERT_NE(gate_fit_at, std::string::npos);
+    ASSERT_NE(pool_fit_at, std::string::npos);
+    ASSERT_NE(fitted_at, std::string::npos);
+    ASSERT_NE(held_at, std::string::npos);
+    ASSERT_NE(fit_at, std::string::npos);
+    ASSERT_NE(trim_budget_at, std::string::npos);
+    EXPECT_LT(caps_at, shares_at);
+    EXPECT_LT(shares_at, upscale_at) << "the shares are the sizes before the up-scale";
+    EXPECT_LT(fit_on_at, gate_fit_at);
+    EXPECT_LT(upscale_at, gate_fit_at);
+    EXPECT_LT(gate_fit_at, pool_fit_at);
+    EXPECT_LT(pool_fit_at, fitted_at);
+    EXPECT_LT(fitted_at, held_at);
+    EXPECT_LT(held_at, fit_at);
+    EXPECT_LT(fit_at, trim_budget_at);
+    EXPECT_EQ(position_of(body, "side_pool = std::max(side_pool, min_sizes_sum);"),
+              std::string::npos) << "no pool widened past what the caps left";
+    // With the switch off, no side claims minimum tiers in the coin split.
+    EXPECT_NE(position_of(body,
+        "const std::uint32_t claim_tiers = config_.strategy.minimum_tiers_first "
+        "? liq.config().num_tiers : 0u;"), std::string::npos);
 }
 
 TEST(SizingWiring, Step8RetiresRestingOffersThePlanMovedPast) {

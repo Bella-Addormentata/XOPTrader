@@ -65,6 +65,125 @@ namespace xop::strategy::tiermin {
     return n;
 }
 
+/// [TIERFIRST 2026-10-31] One side's tier sizes fitted to its pool, minimums
+/// first.  `sizes` are the tiers as Step 7 has them after the cap and the
+/// up-scale (each at least its minimum), `mins` each tier's minimum, and
+/// `weights` each tier's share of the pool before both (the growth it would
+/// get), all in base mojos and ladder order, tightest first.  When the sizes
+/// already fit `pool` they are returned unchanged.  Otherwise the most of the
+/// side's WIDEST tiers whose minimums fit the pool keep their minimum, and
+/// what the pool holds past those minimums is shared out among them by
+/// weight -- each tier max(min, mu * weight), never above its current size,
+/// with mu the largest that keeps their sum within the pool.  The tighter
+/// tiers in front of them are left as they are, for the funding fit to skip.
+/// So a pool that holds every minimum keeps every tier, and the growth
+/// shrinks first: raising tiers to their minimums from their share of the
+/// pool used to push the sum past it and cost the side its tight tier even
+/// with the whole minimum ladder funded.  When even the widest minimum does
+/// not fit, the sizes are returned unchanged and the fit sets them aside.
+[[nodiscard]] inline std::vector<Mojo> fit_tier_sizes_to_pool(const std::vector<Mojo>& sizes,
+                                                              const std::vector<Mojo>& mins,
+                                                              const std::vector<Mojo>& weights,
+                                                              Mojo pool)
+{
+    const std::size_t n = sizes.size();
+    if (mins.size() != n || weights.size() != n || pool <= 0) return sizes;
+    Mojo total = 0;
+    for (const Mojo s : sizes) {
+        if (s < 0 || total > pool - s) { total = pool + 1; break; }
+        total += s;
+    }
+    if (total <= pool) return sizes;
+
+    const std::vector<Mojo> wide_mins(mins.rbegin(), mins.rend());
+    const std::size_t keep = tiers_within_budget(wide_mins, pool);
+    if (keep == 0) return sizes;
+    const std::size_t first = n - keep;  // the kept tiers are [first, n)
+    for (std::size_t i = first; i < n; ++i) {
+        if (mins[i] < 0 || sizes[i] < mins[i] || weights[i] < 0) return sizes;
+    }
+
+    // A kept tier at a given mu, clamped in whole mojos to [min, size], so
+    // its minimum and its size stay exact at any magnitude.
+    auto sized = [&](double mu, std::size_t i) -> Mojo {
+        const double grown = std::floor(mu * static_cast<double>(weights[i]));
+        if (!(grown > 0.0)) return mins[i];
+        if (grown >= static_cast<double>(sizes[i])) return sizes[i];
+        return std::clamp(static_cast<Mojo>(grown), mins[i], sizes[i]);
+    };
+    // Integer sum of the kept tiers, saturating past the pool.
+    auto fits_at = [&](double mu) {
+        Mojo sum = 0;
+        for (std::size_t i = first; i < n; ++i) {
+            const Mojo t = sized(mu, i);
+            if (sum > pool - t) return false;
+            sum += t;
+        }
+        return true;
+    };
+    double hi = 1.0;
+    for (std::size_t i = first; i < n; ++i) {
+        if (weights[i] > 0) {
+            hi = std::max(hi, static_cast<double>(sizes[i]) / static_cast<double>(weights[i]) + 1.0);
+        }
+    }
+    double lo = 0.0;  // at 0 every kept tier is at its minimum, and they fit
+    if (fits_at(hi)) {
+        lo = hi;
+    } else {
+        for (int iter = 0; iter < 200; ++iter) {
+            const double mid = 0.5 * (lo + hi);
+            if (fits_at(mid)) lo = mid; else hi = mid;
+        }
+    }
+    std::vector<Mojo> out = sizes;
+    for (std::size_t i = first; i < n; ++i) out[i] = sized(lo, i);
+    return out;
+}
+
+/// [TIERFIRST 2026-10-31] fit_tier_sizes_to_pool, and then the kept tiers'
+/// growth shrinks further while their funding cost passes `budget` (when
+/// known).  `cost(i, size)` is what tier i would cost the funding asset at
+/// `size` (an ask its base mojos, a bid its quote at its own price, rounded
+/// up), nondecreasing in size.  The pool the sizes are fitted to is lowered,
+/// never below the kept tiers' minimums, to the largest whose sizes the
+/// budget pays for.  When the kept minimums alone cost more than the budget
+/// the pool fit is returned and the funding fit skips tiers as before.
+template <class CostFn>
+[[nodiscard]] std::vector<Mojo> fit_tier_sizes_to_pool_and_budget(
+    const std::vector<Mojo>& sizes, const std::vector<Mojo>& mins,
+    const std::vector<Mojo>& weights, Mojo pool, std::optional<Mojo> budget,
+    CostFn cost)
+{
+    std::vector<Mojo> out = fit_tier_sizes_to_pool(sizes, mins, weights, pool);
+    const std::size_t n = sizes.size();
+    if (!budget.has_value() || *budget < 0 || mins.size() != n || pool <= 0) return out;
+    const std::vector<Mojo> wide_mins(mins.rbegin(), mins.rend());
+    const std::size_t keep = tiers_within_budget(wide_mins, pool);
+    if (keep == 0) return out;
+    const std::size_t first = n - keep;
+    auto kept_cost_fits = [&](const std::vector<Mojo>& v) {
+        Mojo sum = 0;
+        for (std::size_t i = first; i < n; ++i) {
+            const Mojo c = cost(i, v[i]);
+            if (c < 0 || sum > *budget - c) return false;
+            sum += c;
+        }
+        return true;
+    };
+    if (kept_cost_fits(out)) return out;
+    Mojo lo = 0;  // the kept minimums
+    for (std::size_t i = first; i < n; ++i) lo += mins[i];
+    if (!kept_cost_fits(fit_tier_sizes_to_pool(sizes, mins, weights, lo))) return out;
+    Mojo hi = pool;  // does not fit
+    while (hi - lo > 1) {
+        const Mojo mid = lo + (hi - lo) / 2;
+        if (kept_cost_fits(fit_tier_sizes_to_pool(sizes, mins, weights, mid))) lo = mid;
+        else hi = mid;
+    }
+    return fit_tier_sizes_to_pool(sizes, mins, weights, lo);
+}
+
 /// How many of the tiers in [min_tier, max_tier] Step 8's XCH limiter keeps
 /// for a pair with tier minimums: the widest first while their summed cost
 /// (`tier_costs[i]` is tier min_tier + i's) fits `budget`, and always at

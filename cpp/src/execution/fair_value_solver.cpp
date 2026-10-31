@@ -251,6 +251,15 @@ double combine_sigma_bps(const std::vector<double>& terms) {
     return std::sqrt(sum_sq);
 }
 
+double stale_sigma_bps(double per_print_bps, int print_age, double max_bps) {
+    if (!std::isfinite(per_print_bps) || per_print_bps <= 0.0 || print_age <= 0) {
+        return 0.0;
+    }
+    const double grown = per_print_bps * static_cast<double>(print_age);
+    if (std::isfinite(max_bps) && max_bps > 0.0) return std::min(grown, max_bps);
+    return grown;
+}
+
 double amm_sigma_bps(double pool_usd, double floor_bps, double depth_k_bps) {
     // An observation whose depth we cannot measure is an observation we cannot
     // weight.  Say so rather than substituting an optimistic constant -- that

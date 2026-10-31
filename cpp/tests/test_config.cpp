@@ -2632,7 +2632,7 @@ TEST(ConfigParserTest, S33BookSideAgreeOverride_NegativeRejected) {
 }
 
 TEST(ConfigParserTest, StrategyNonNegativeKnobs_NonFiniteRejected) {
-    // The shared opt_non_negative helper feeds all 23 keys below, so the hole
+    // The shared opt_non_negative helper feeds all 24 keys below, so the hole
     // was 23 keys wide -- including activity_book_weight, newly exposed as a
     // global by this branch.  Every one of them is a magnitude whose
     // documented "disabled" setting is 0 (config.hpp), so none wants +inf.
@@ -2648,6 +2648,7 @@ TEST(ConfigParserTest, StrategyNonNegativeKnobs_NonFiniteRejected) {
                             "fair_value_amm_max_age_sec",
                             "fair_value_min_book_sigma_bps",
                             "fair_value_stale_sigma_bps_per_print",
+                            "fair_value_stale_sigma_max_bps",
                             "fair_value_depth_ref_bps",
                             "fair_value_max_sigma_bps",
                             "fair_value_tight_sigma_bps",
@@ -4521,6 +4522,62 @@ TEST(ConfigParserTest, CoinBudgets_DefaultsOnAndParsesFalse) {
     }
 }
 
+TEST(ConfigParserTest, MinimumTiersFirst_DefaultsOnAndParsesFalse) {
+    {
+        TempYaml tmp(kMinimalValidYaml);
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_TRUE(cfg.strategy.minimum_tiers_first);
+    }
+    EXPECT_TRUE(xop::StrategyConfig{}.minimum_tiers_first)
+        << "a default-constructed StrategyConfig agrees with the parser";
+    {
+        TempYaml tmp(pace_with_strategy("  minimum_tiers_first: false\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_FALSE(cfg.strategy.minimum_tiers_first);
+    }
+    {
+        TempYaml tmp(pace_with_strategy("  minimum_tiers_first: ~\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_TRUE(cfg.strategy.minimum_tiers_first) << "null keeps the default";
+    }
+}
+
+// [STALECAP 2026-10-31] The staleness ceiling ships at 500 bps, parses any
+// non-negative value (0 = no ceiling), and refuses a negative one.
+TEST(ConfigParserTest, StaleSigmaMax_DefaultsTo500AndParses) {
+    {
+        TempYaml tmp(kMinimalValidYaml);
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_stale_sigma_max_bps, 500.0);
+        EXPECT_GT(cfg.strategy.fair_value_stale_sigma_max_bps,
+                  cfg.strategy.fair_value_max_sigma_bps)
+            << "a frozen book alone must never yield a usable fair value";
+    }
+    EXPECT_DOUBLE_EQ(xop::StrategyConfig{}.fair_value_stale_sigma_max_bps, 500.0)
+        << "a default-constructed StrategyConfig agrees with the parser";
+    {
+        TempYaml tmp(pace_with_strategy("  fair_value_stale_sigma_max_bps: 0\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_stale_sigma_max_bps, 0.0)
+            << "0 is the documented 'no ceiling' setting";
+    }
+    {
+        TempYaml tmp(pace_with_strategy("  fair_value_stale_sigma_max_bps: 1000\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_stale_sigma_max_bps, 1000.0);
+    }
+    {
+        // At or below the usable ceiling only warns: it must still load.
+        TempYaml tmp(pace_with_strategy("  fair_value_stale_sigma_max_bps: 150\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_stale_sigma_max_bps, 150.0);
+    }
+    {
+        TempYaml tmp(pace_with_strategy("  fair_value_stale_sigma_max_bps: -1\n"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+}
+
 // -- [TIERMIN 2026-10-29] Per-tier minimum offer sizes ----------------------
 // On 2026-10-29 every XCH/wUSDC.b bid sat at the flat 5 XCH cap and the
 // operator asked for 10 XCH at the tight tier down to 1 XCH at the wide one,
@@ -4680,6 +4737,148 @@ TEST(TierMinimumMojos, ShortOfFundsTheTightestTiersGoFirst) {
         << "the funding budget binds too";
     EXPECT_EQ(tmin::widest_tiers_within_pool(sizes, costs, 562, xop::Mojo{12}), 0u);
     EXPECT_EQ(tmin::widest_tiers_within_pool({}, {}, 0, std::nullopt), 0u);
+}
+
+// [TIERFIRST 2026-10-31] A side raised to its ladder of minimum offers posts
+// exactly those minimums, so a pool and a coin share that hold exactly that
+// ladder keep every tier.  Sized from its share of the pool and raised to
+// the minimums instead, one tier's share beats its minimum (25% of 33 XCH is
+// 8.25 against 8.2), the sum passes the ladder, and the tight tier goes.
+TEST(TierMinimumMojos, ASideHoldingExactlyItsMinimumLadderKeepsEveryTier) {
+    namespace tmin = xop::strategy::tiermin;
+    // XCH tenths, tightest first: minimums 10, 8.2, 6.4, 4.6, 2.8, 1 (33).
+    const std::vector<xop::Mojo> minimums{100, 82, 64, 46, 28, 10};
+    const std::vector<xop::Mojo> costs{130, 107, 83, 60, 36, 13};
+    xop::Mojo ladder = 0;
+    for (const xop::Mojo m : minimums) ladder += m;
+    xop::Mojo share = 0;
+    for (const xop::Mojo c : costs) share += c;
+    EXPECT_EQ(tmin::widest_tiers_within_pool(minimums, costs, ladder, share), 6u)
+        << "the pool and the coin's share hold the ladder exactly";
+    EXPECT_EQ(tmin::widest_tiers_within_pool(minimums, costs, ladder - 1, share), 5u)
+        << "a mojo short of it, the tight tier goes first";
+
+    const std::vector<xop::Mojo> grown{100, 83, 64, 46, 28, 10};
+    const std::vector<xop::Mojo> grown_costs{130, 108, 83, 60, 36, 13};
+    EXPECT_EQ(tmin::widest_tiers_within_pool(grown, grown_costs, ladder, share), 5u)
+        << "why a raised side is trimmed to its minimums";
+}
+
+// [TIERFIRST 2026-10-31] A side whose pool holds every tier minimum keeps
+// every tier: the growth past the minimums shrinks to fit, not the tight
+// tier.  Short of the minimums, the widest that fit share what the pool holds.
+TEST(TierMinimumMojos, APoolHoldingEveryMinimumKeepsEveryTierAndTheGrowthShrinks) {
+    namespace tmin = xop::strategy::tiermin;
+    // XCH tenths, tightest first.  Minimums 10, 8.2, 6.4, 4.6, 2.8, 1 (33).
+    const std::vector<xop::Mojo> mins{100, 82, 64, 46, 28, 10};
+    // A 35 XCH pool split 30/25/18/12/8/7 %, then raised to the minimums:
+    // 10.5, 8.75, 6.4, 4.6, 2.8, 2.45 -- 35.5, past the pool.
+    const std::vector<xop::Mojo> weights{105, 87, 63, 42, 28, 24};
+    const std::vector<xop::Mojo> sizes{105, 87, 64, 46, 28, 24};
+    ASSERT_EQ(tmin::widest_tiers_within_pool(sizes, sizes, 350, std::nullopt), 5u)
+        << "before: the tight tier went although all six minimums fit";
+
+    const auto fitted = tmin::fit_tier_sizes_to_pool(sizes, mins, weights, 350);
+    ASSERT_EQ(fitted.size(), 6u);
+    xop::Mojo total = 0;
+    for (std::size_t i = 0; i < fitted.size(); ++i) {
+        EXPECT_GE(fitted[i], mins[i]) << "tier " << i << " keeps its minimum";
+        EXPECT_LE(fitted[i], sizes[i]) << "tier " << i << " never grows";
+        total += fitted[i];
+    }
+    EXPECT_LE(total, 350);
+    EXPECT_GE(total, 345) << "the pool is used, not just the minimums";
+    EXPECT_EQ(tmin::widest_tiers_within_pool(fitted, fitted, 350, std::nullopt), 6u);
+
+    // Exactly the minimum ladder: every tier at its minimum.
+    EXPECT_EQ(tmin::fit_tier_sizes_to_pool(sizes, mins, weights, 330), mins);
+
+    // Sizes that already fit are left alone.
+    EXPECT_EQ(tmin::fit_tier_sizes_to_pool(sizes, mins, weights, 355), sizes);
+
+    // 30 XCH: the five widest minimums (23) fit, the tight tier does not.
+    // Those five share the 30 and the fit skips the tight one.
+    const auto short_pool = tmin::fit_tier_sizes_to_pool(sizes, mins, weights, 300);
+    EXPECT_EQ(short_pool[0], sizes[0]) << "left for the fit to skip";
+    xop::Mojo kept = 0;
+    for (std::size_t i = 1; i < short_pool.size(); ++i) {
+        EXPECT_GE(short_pool[i], mins[i]);
+        kept += short_pool[i];
+    }
+    EXPECT_LE(kept, 300);
+    EXPECT_EQ(tmin::widest_tiers_within_pool(short_pool, short_pool, 300, std::nullopt), 5u);
+
+    // A flat minimum (1 XCH a tier) behaves the same way.
+    const std::vector<xop::Mojo> flat_mins(6, 10);
+    const std::vector<xop::Mojo> flat_weights{18, 15, 11, 7, 5, 4};  // a 6 XCH pool
+    const std::vector<xop::Mojo> flat_sizes{18, 15, 11, 10, 10, 10};  // 7.4 XCH
+    const auto flat = tmin::fit_tier_sizes_to_pool(flat_sizes, flat_mins, flat_weights, 60);
+    xop::Mojo flat_total = 0;
+    for (std::size_t i = 0; i < flat.size(); ++i) {
+        EXPECT_GE(flat[i], 10);
+        flat_total += flat[i];
+    }
+    EXPECT_LE(flat_total, 60);
+    EXPECT_EQ(tmin::widest_tiers_within_pool(flat, flat, 60, std::nullopt), 6u);
+
+    // Under the widest minimum: unchanged, the fit sets the minimums aside.
+    EXPECT_EQ(tmin::fit_tier_sizes_to_pool(sizes, mins, weights, 9), sizes);
+    // Mismatched inputs: unchanged.
+    EXPECT_EQ(tmin::fit_tier_sizes_to_pool(sizes, {1, 2}, weights, 350), sizes);
+}
+
+// Past 2^53 mojos a double cannot hold every mojo: the fitted sizes are
+// summed and clamped in whole mojos, so they never pass the pool.
+TEST(TierMinimumMojos, FittedSizesStayWithinAPoolPastDoublePrecision) {
+    namespace tmin = xop::strategy::tiermin;
+    const xop::Mojo pool = 9'007'199'254'740'995;
+    const std::vector<xop::Mojo> sizes{6'000'000'000'000'000, 4'503'599'627'370'498};
+    const std::vector<xop::Mojo> mins{6'000'000'000'000'000, 1'000'000'000'000};
+    const std::vector<xop::Mojo> weights{4'503'599'627'370'498, 4'503'599'627'370'498};
+    const auto fitted = tmin::fit_tier_sizes_to_pool(sizes, mins, weights, pool);
+    ASSERT_EQ(fitted.size(), 2u);
+    EXPECT_EQ(fitted[0], mins[0]);
+    EXPECT_GE(fitted[1], mins[1]);
+    EXPECT_LE(fitted[1], sizes[1]);
+    EXPECT_LE(fitted[0], pool - fitted[1]) << "within the pool to the mojo";
+    EXPECT_EQ(tmin::widest_tiers_within_pool(fitted, fitted, pool, std::nullopt), 2u);
+}
+
+// The growth also shrinks to the funding budget: six 1.5-XCH bids just under
+// a mid of 0.001 in a 1,000-mojo quote coin fit a 9 XCH pool but cost 2
+// quote mojos each (12) against a 9-mojo share, while the six 1-XCH minimums
+// cost 1 each.  Only the growth goes; every tier stays.
+TEST(TierMinimumMojos, TheGrowthAlsoShrinksToTheFundingBudget) {
+    namespace tmin = xop::strategy::tiermin;
+    const xop::Mojo xch = 1'000'000'000'000;
+    const std::vector<xop::Mojo> mins(6, xch);
+    const std::vector<xop::Mojo> sizes(6, xch + xch / 2);
+    const std::vector<xop::Mojo> weights = sizes;
+    // Quote mojos at 0.000999 quote units per XCH, 1,000 mojos a unit, rounded up.
+    auto cost = [&](std::size_t, xop::Mojo size) -> xop::Mojo {
+        const double q = static_cast<double>(size) / static_cast<double>(xch) * 0.999;
+        return static_cast<xop::Mojo>(std::ceil(q));
+    };
+    const auto pool_only = tmin::fit_tier_sizes_to_pool(sizes, mins, weights, 9 * xch);
+    EXPECT_EQ(pool_only, sizes) << "the sizes already fit the pool";
+    const auto fitted = tmin::fit_tier_sizes_to_pool_and_budget(
+        sizes, mins, weights, 9 * xch, xop::Mojo{9}, cost);
+    std::vector<xop::Mojo> costs;
+    for (std::size_t i = 0; i < fitted.size(); ++i) {
+        EXPECT_GE(fitted[i], mins[i]);
+        costs.push_back(cost(i, fitted[i]));
+    }
+    EXPECT_EQ(tmin::widest_tiers_within_pool(fitted, costs, 9 * xch, xop::Mojo{9}), 6u)
+        << "every tier, at its minimum or a little over";
+    // Without a known budget, or when it covers the sizes, nothing more moves.
+    EXPECT_EQ(tmin::fit_tier_sizes_to_pool_and_budget(
+                  sizes, mins, weights, 9 * xch, std::nullopt, cost), sizes);
+    EXPECT_EQ(tmin::fit_tier_sizes_to_pool_and_budget(
+                  sizes, mins, weights, 9 * xch, xop::Mojo{12}, cost), sizes);
+    // When even the minimums cost more, the pool fit stands and the funding
+    // fit skips tiers as before.
+    EXPECT_EQ(tmin::fit_tier_sizes_to_pool_and_budget(
+                  sizes, mins, weights, 9 * xch, xop::Mojo{5}, cost), sizes);
 }
 
 // [TIERMIN 2026-10-29] Only a tier-minimum pair with exactly one side both

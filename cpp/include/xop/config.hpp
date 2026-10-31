@@ -927,6 +927,16 @@ struct StrategyConfig {
     /// being able to outvote anything.
     double   fair_value_stale_sigma_bps_per_print{5.0};
 
+    /// [STALECAP 2026-10-31] Ceiling (bps) on that staleness term; 0 = no
+    /// ceiling.  Without one, a book that simply goes quiet never stops
+    /// growing: the XCH/BYC Dexie book sat still at 1.4303/1.4577 for ~676
+    /// heartbeats, read ~3381 bps, and the sigma-scaled width floor
+    /// (quote_width_sigma_mult) pushed its ladder 40-75% off the market.
+    /// Default 500 bps, reached after ~100 heartbeats (~55 min): still above
+    /// fair_value_max_sigma_bps, so a frozen book alone never yields a usable
+    /// fair value, and a quiet pair quotes a few percent wide, not halfway.
+    double   fair_value_stale_sigma_max_bps{500.0};
+
     /// Depth term: uncertainty (bps) attributed to a book observed with a
     /// single resting third-party offer, decaying as 1/sqrt(n) with the offer
     /// count.  Default 30 bps -- small next to the width and staleness terms,
@@ -1398,6 +1408,17 @@ struct StrategyConfig {
     /// more than that, with what a side leaves passed to the others.  Nothing
     /// is capped while the claims fit.  Applies live.  Default true.
     bool     coin_budgets_enabled{true};
+    /// [TIERFIRST 2026-10-31] Fill every pair's minimum tiers before any
+    /// pair's tiers grow past their minimums (operator, 2026-10-31).  On a
+    /// pair with tier minimums, a side the strategy sized below its full
+    /// ladder of minimum offers is raised to it (not a side the drift guard
+    /// tapered or stopped, nor the side ratio rebalancing leaves alone); the
+    /// wallet caps and the coin's share still bound it, and short of funds
+    /// the tight tiers are skipped first.  A short coin then funds every
+    /// side's minimum tiers, widest tier first, before the rest is split by
+    /// demand.  Applies live.  Default true; false sizes each side from its
+    /// own pool and splits a short coin by demand alone, as before.
+    bool     minimum_tiers_first{true};
 
     // -- [PACE 2026-09-13] Pace controller (default OFF) -------------------
     // Sells an overweight CAT QUOTE asset toward its asset_target_allocations

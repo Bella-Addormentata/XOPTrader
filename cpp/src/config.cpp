@@ -1399,6 +1399,8 @@ StrategyConfig parse_strategy(const YAML::Node& root)
                      cfg.fair_value_min_book_sigma_bps);
     opt_non_negative("fair_value_stale_sigma_bps_per_print",
                      cfg.fair_value_stale_sigma_bps_per_print);
+    opt_non_negative("fair_value_stale_sigma_max_bps",
+                     cfg.fair_value_stale_sigma_max_bps);
     opt_non_negative("fair_value_depth_ref_bps",
                      cfg.fair_value_depth_ref_bps);
     opt_non_negative("fair_value_max_sigma_bps",
@@ -1461,6 +1463,23 @@ StrategyConfig parse_strategy(const YAML::Node& root)
                           + std::to_string(cfg.fair_value_tight_sigma_bps)
                           + ") must be <= fair_value_max_sigma_bps ("
                           + std::to_string(cfg.fair_value_max_sigma_bps) + ")");
+    }
+
+    // [STALECAP 2026-10-31] A staleness ceiling at or below the usable
+    // ceiling lets a book that has not moved for hours price a pair on its
+    // own.  Warn rather than refuse: raising fair_value_max_sigma_bps is a
+    // legitimate choice and must not stop an existing config from loading.
+    if (cfg.fair_value_stale_sigma_max_bps > 0.0
+        && cfg.fair_value_stale_sigma_max_bps
+               <= cfg.fair_value_max_sigma_bps) {
+        spdlog::warn("[Config] {}.fair_value_stale_sigma_max_bps ({:.0f}) is "
+                     "at or below fair_value_max_sigma_bps ({:.0f}): a book "
+                     "that has stopped moving can still give a usable fair "
+                     "value on its own. Use 0 (no ceiling) or a value above "
+                     "{:.0f}.",
+                     sec, cfg.fair_value_stale_sigma_max_bps,
+                     cfg.fair_value_max_sigma_bps,
+                     cfg.fair_value_max_sigma_bps);
     }
 
     // Optional: high-volatility regime multiplier.  Default 1.80.
@@ -1837,6 +1856,10 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     if (node["coin_budgets_enabled"] && node["coin_budgets_enabled"].IsDefined()
         && !node["coin_budgets_enabled"].IsNull()) {
         cfg.coin_budgets_enabled = node["coin_budgets_enabled"].as<bool>();
+    }
+    if (node["minimum_tiers_first"] && node["minimum_tiers_first"].IsDefined()
+        && !node["minimum_tiers_first"].IsNull()) {
+        cfg.minimum_tiers_first = node["minimum_tiers_first"].as<bool>();
     }
 
     // [PACE 2026-09-13] Pace controller keys (default OFF).  Every double goes
