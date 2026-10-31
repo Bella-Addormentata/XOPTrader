@@ -9434,9 +9434,10 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 bit->second.confirmed, bit->second.confirmed, reserve);
         };
         struct CoinSide {
-            PairCycleState* pcs;
-            bool            is_bid;
-            double          demand;
+            PairCycleState*            pcs;
+            bool                       is_bid;
+            double                     demand;
+            const std::vector<double>* tiers;
         };
         std::map<std::string, std::pair<Mojo, std::vector<CoinSide>>> by_coin;
         // Every side this heartbeat could size from each coin, claim or not:
@@ -9456,7 +9457,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 if (c->coin.empty() || !(c->demand > 0.0)) continue;
                 auto& entry = by_coin[c->coin];
                 entry.first = c->mpu;
-                entry.second.push_back({&pcs, c == &it->second.bid, c->demand});
+                entry.second.push_back({&pcs, c == &it->second.bid, c->demand, &c->tiers});
             }
         }
         for (auto& [coin, entry] : by_coin) {
@@ -9467,7 +9468,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             claims.reserve(entry.second.size());
             double wanted = 0.0;
             for (const auto& cs : entry.second) {
-                claims.push_back({cs.demand, cs.demand});
+                claims.push_back({cs.demand, cs.demand, *cs.tiers});
                 wanted += cs.demand;
             }
             const auto shares = strategy::coin_budget::split(*coin_balance, claims);
@@ -10655,9 +10656,31 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 ? static_cast<double>(wanted.bid) / static_cast<double>(base_mpu)
                       * market_mid * static_cast<double>(quote_mpu)
                 : 0.0;
+            // [TIERFIRST 2026-10-31] The side's minimum offer sizes, widest
+            // tier first, in whole mojos of the coin it spends: its tier
+            // minimums, or the pair minimum at every tier.  A short coin
+            // funds these on every side before any side's tiers grow.
+            std::vector<double> ask_tiers;
+            std::vector<double> bid_tiers;
+            const std::uint32_t claim_tiers = liq.config().num_tiers;
+            for (std::uint32_t t = claim_tiers; t-- > 0;) {
+                const double units = ladder_tier_minimums_on
+                    ? tier_min_offer_units(*pair_cfg, floor_min_units, t, claim_tiers)
+                    : floor_min_units;
+                const auto tier_mojos =
+                    strategy::tiermin::min_units_to_mojos(units, base_mpu);
+                if (!tier_mojos.has_value() || *tier_mojos <= 0) break;
+                ask_tiers.push_back(static_cast<double>(*tier_mojos));
+                if (market_mid > 0.0 && base_mpu > 0 && quote_mpu > 0) {
+                    bid_tiers.push_back(std::ceil(
+                        static_cast<double>(*tier_mojos) / static_cast<double>(base_mpu)
+                        * market_mid * static_cast<double>(quote_mpu)));
+                }
+            }
             auto& claims = coin_claims_[pair_name];
-            claims.bid = CoinClaim{bid_coin, quote_mpu, bid_claim};
-            claims.ask = CoinClaim{ask_coin, base_mpu, static_cast<double>(wanted.ask)};
+            claims.bid = CoinClaim{bid_coin, quote_mpu, bid_claim, std::move(bid_tiers)};
+            claims.ask = CoinClaim{ask_coin, base_mpu, static_cast<double>(wanted.ask),
+                                   std::move(ask_tiers)};
 
             if (pcs.coin_share_ask.has_value()
                 && avail_inventory > *pcs.coin_share_ask) {

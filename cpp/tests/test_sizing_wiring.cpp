@@ -511,7 +511,8 @@ TEST(SizingWiring, ACoinSeveralSidesSpendIsSplitBetweenThem) {
         "return execution::cap_pool_above_reserve( bit->second.confirmed, "
         "bit->second.confirmed, reserve);");
     const std::size_t lone_at = position_of(body, "if (entry.second.size() < 2) continue;");
-    const std::size_t weights_at = position_of(body, "claims.push_back({cs.demand, cs.demand});");
+    const std::size_t weights_at = position_of(body,
+        "claims.push_back({cs.demand, cs.demand, *cs.tiers});");
     const std::size_t split_at = position_of(body,
         "const auto shares = strategy::coin_budget::split(*coin_balance, claims);");
     const std::size_t clear_at = position_of(body, "coin_claims_.clear();");
@@ -568,10 +569,27 @@ TEST(SizingWiring, ACoinSeveralSidesSpendIsSplitBetweenThem) {
     // A bid claims its quote coin at the mid; the share converts back the
     // way the wallet caps do.
     EXPECT_NE(position_of(body,
-        "claims.bid = CoinClaim{bid_coin, quote_mpu, bid_claim};"), std::string::npos);
-    EXPECT_NE(position_of(body,
-        "claims.ask = CoinClaim{ask_coin, base_mpu, static_cast<double>(wanted.ask)};"),
+        "claims.bid = CoinClaim{bid_coin, quote_mpu, bid_claim, std::move(bid_tiers)};"),
         std::string::npos);
+    EXPECT_NE(position_of(body,
+        "claims.ask = CoinClaim{ask_coin, base_mpu, static_cast<double>(wanted.ask), "
+        "std::move(ask_tiers)};"),
+        std::string::npos);
+    // [TIERFIRST 2026-10-31] Each side also claims its minimum tiers, widest
+    // first: its tier minimums, or the pair minimum at every tier; a bid's
+    // in its quote coin at the mid, rounded up to whole mojos.
+    const std::size_t tiers_at = position_of(body,
+        "for (std::uint32_t t = claim_tiers; t-- > 0;) { const double units = "
+        "ladder_tier_minimums_on ? tier_min_offer_units(*pair_cfg, floor_min_units, "
+        "t, claim_tiers) : floor_min_units;");
+    const std::size_t bid_tier_at = position_of(body,
+        "bid_tiers.push_back(std::ceil( static_cast<double>(*tier_mojos) / "
+        "static_cast<double>(base_mpu) * market_mid * static_cast<double>(quote_mpu)));");
+    ASSERT_NE(tiers_at, std::string::npos);
+    ASSERT_NE(bid_tier_at, std::string::npos);
+    EXPECT_LT(claim_at, tiers_at);
+    EXPECT_LT(tiers_at, bid_tier_at);
+    EXPECT_LT(bid_tier_at, record_at);
     EXPECT_NE(position_of(body,
         "const auto share_cap = try_affordable_base_mojos( "
         "static_cast<double>(*pcs.coin_share_bid),"), std::string::npos);

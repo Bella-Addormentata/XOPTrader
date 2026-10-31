@@ -2495,6 +2495,10 @@ private:
         std::string coin{};   ///< "xch" or the CAT asset id
         Mojo        mpu{0};   ///< the coin's mojos per unit, for its reserve
         double      demand{0.0};
+        /// [TIERFIRST 2026-10-31] The side's minimum offer sizes, widest tier
+        /// first, in the coin's whole mojos: funded first when the coin is
+        /// short (strategy::coin_budget::Claim::tiers).
+        std::vector<double> tiers{};
     };
     struct PairCoinClaims {
         CoinClaim bid{};
