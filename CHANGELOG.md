@@ -5,6 +5,36 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.40] — 2026-10-31 — a pair at its q_max keeps its full ladder on the other side
+
+### A token floored side no longer cuts the other side (#208)
+
+On 2026-10-31, the day v0.10.39 went live, an XCH/DBX bid filled for
+6.4 XCH. That put the pair at 104.8 XCH against its q_max of 100, and the
+following happened:
+
+- Step 6 sized the bid 0, as it should.
+- The deploy-idle floor put back a 1 XCH token bid.
+- Side pairing then cut the asks' 104 XCH pool to that same 1 XCH, so the
+  pair posted a single ask tier.
+
+Had the bid been left at 0, the asks would already have kept their own pool.
+
+On a pair with tier minimums, a side the floor lifted to the pair minimum
+no longer shrinks the other side if either:
+
+- the drift guard tapered it (as in 0.10.37), or
+- it had no pool at all before the floor (new).
+
+A side the strategy sized small but not 0 still pairs. Pairs without tier
+minimums are unchanged.
+
+**What to expect.** While XCH/DBX's bid is held at q_max, its asks are
+sized from their own XCH, capped by the wallet. Coin budgets still share
+XCH between the pairs that spend it, minimum tiers first. The log line
+"ladder sides sized from their own pools" now names both reasons:
+"drift-tapered or switched-off side floored to the pair minimum".
+
 ## [0.10.39] — 2026-10-31 — every pair's minimum tiers come first, and a quiet book no longer pushes its ladder far off market
 
 ### Minimum tiers first (#206)
