@@ -15,6 +15,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <initializer_list>
 #include <limits>
 #include <vector>
 
@@ -124,6 +125,85 @@ TEST(CoinBudget, PastTwoToTheFiftyThirdTheSharesStillFitTheBudget) {
     EXPECT_GE((*at_max)[0], 0);
     EXPECT_GE((*at_max)[1], 0);
     EXPECT_LE((*at_max)[0], max - (*at_max)[1]);
+}
+
+// -- [TIERFIRST 2026-10-31] Minimum tiers first ----------------------------
+// The operator asked that every pair get its tiers filled before any pair's
+// tiers grow past their minimums, leaving the tight tiers blank when the
+// coin runs out.
+
+std::vector<double> xch_ladder(std::initializer_list<double> units) {
+    std::vector<double> out;
+    for (const double u : units) out.push_back(u * 1e12);
+    return out;
+}
+
+TEST(CoinBudget, EveryLadderGetsItsMinimumTiersBeforeAnyGrows) {
+    // 60 XCH; three ask sides with 10..1 XCH tier minimums.  The third side
+    // wants 20 XCH, so only its widest four tiers (14.8 XCH) count.  Level by
+    // level from the widest: 3 + 8.4 + 13.8 + 19.2 = 44.4 XCH funds four
+    // tiers on every side; the fifth level (8.2 + 8.2 = 16.4) does not fit
+    // the 15.6 left, so one side gets it and the pass ends.  The 7.4 XCH
+    // left is then split by weight.
+    const Mojo xch = 1'000'000'000'000LL;
+    const auto ladder = xch_ladder({1.0, 2.8, 4.6, 6.4, 8.2, 10.0});
+    std::vector<Claim> claims{{40.0 * xch, 40.0 * xch, ladder},
+                              {40.0 * xch, 40.0 * xch, ladder},
+                              {20.0 * xch, 20.0 * xch, ladder}};
+    const auto shares = split(60 * xch, claims);
+    ASSERT_TRUE(shares.has_value());
+    EXPECT_NEAR(static_cast<double>((*shares)[0]), 23.0e12 + 2.96e12, 2.0);
+    EXPECT_NEAR(static_cast<double>((*shares)[1]), 14.8e12 + 2.96e12, 2.0);
+    EXPECT_NEAR(static_cast<double>((*shares)[2]), 14.8e12 + 1.48e12, 2.0);
+    EXPECT_LE(sum(*shares), 60 * xch);
+}
+
+TEST(CoinBudget, ASmallLadderIsFilledBeforeABigClaimGrows) {
+    // 60 XCH: a 126 XCH claim of plain tiers and a 33 XCH ladder.  By
+    // proportion alone the ladder would get 12.5 XCH, four of its six tiers;
+    // minimum tiers first, the big claim's own minimum tiers (6 x 1 XCH)
+    // and the whole ladder come first, and the big claim gets the rest.
+    const Mojo xch = 1'000'000'000'000LL;
+    const std::vector<Claim> claims{
+        {126.0 * xch, 126.0 * xch, xch_ladder({1, 1, 1, 1, 1, 1})},
+        {33.0 * xch, 33.0 * xch, xch_ladder({1.0, 2.8, 4.6, 6.4, 8.2, 10.0})}};
+    const auto shares = split(60 * xch, claims);
+    ASSERT_TRUE(shares.has_value());
+    EXPECT_EQ((*shares)[1], 33 * xch);
+    EXPECT_EQ((*shares)[0], 27 * xch);
+}
+
+TEST(CoinBudget, ALevelThatDoesNotFitGoesToItsCheapestTiersAndEndsThePass) {
+    // 2.5 units for widest tiers of 1, 1 and 2.8: the two 1-unit tiers fit,
+    // the 2.8 does not, and no side gets a second tier.  The 0.5 left is
+    // split by weight.
+    const auto shares = split(250, {{1000.0, 1.0, {100.0, 100.0}},
+                                    {1000.0, 1.0, {280.0, 280.0}},
+                                    {1000.0, 1.0, {100.0, 100.0}}});
+    ASSERT_TRUE(shares.has_value());
+    EXPECT_EQ((*shares)[0], 100 + 16);
+    EXPECT_EQ((*shares)[1], 0 + 16);
+    EXPECT_EQ((*shares)[2], 100 + 16);
+    EXPECT_LE(sum(*shares), 250);
+}
+
+TEST(CoinBudget, OnlyTheTiersWithinASidesDemandCount) {
+    // Demand 5 with tiers 1, 2.8, 4.6: the third would take the side to 8.4,
+    // past what it asked for, so the first pass funds 3.8 and the side never
+    // gets more than its 5.
+    const auto shares = split(600, {{500.0, 500.0, {100.0, 280.0, 460.0}},
+                                    {1000.0, 1000.0, {}}});
+    ASSERT_TRUE(shares.has_value());
+    EXPECT_LE((*shares)[0], 500);
+    EXPECT_GE((*shares)[0], 380);
+    EXPECT_LE(sum(*shares), 600);
+}
+
+TEST(CoinBudget, AWeightlessSideStillGetsItsMinimumTiers) {
+    const auto shares = split(100, {{50.0, 0.0, {10.0, 20.0}}, {80.0, 1.0, {}}});
+    ASSERT_TRUE(shares.has_value());
+    EXPECT_EQ((*shares)[0], 30) << "its minimum tiers, nothing past them";
+    EXPECT_EQ((*shares)[1], 70);
 }
 
 }  // namespace

@@ -23,6 +23,17 @@
 // heartbeat behind the sizing it caps; a side that claimed nothing last
 // heartbeat gets no share while its coin is short, and claims again this one.
 //
+// [TIERFIRST 2026-10-31] Minimum tiers first.  The operator asked that every
+// pair get its tiers filled before any pair's tiers grow past their
+// minimums.  A side on a pair with tier minimums claims them too (its
+// minimum offer sizes, widest tier first, in the coin's mojos), and a short
+// coin is split in two passes: first the minimum tiers, one tier level at a
+// time from the widest, so every side gets its widest tier before any side
+// gets its next one; then what is left, by weight as above, up to what each
+// side still wants.  A level that does not fit whole goes to its cheapest
+// tiers first and ends the first pass, so the tight tiers are the ones left
+// blank.
+//
 // Unit-tested in tests/test_coin_budget.cpp; the engine wiring is pinned by
 // tests/test_sizing_wiring.cpp.
 //
@@ -55,16 +66,111 @@ namespace xop::strategy::coin_budget {
 /// One pair side that spends the coin.
 struct Claim {
     double demand{0.0};  ///< what its sizing wanted, in the coin's mojos; <= 0 or NaN claims nothing
-    double weight{0.0};  ///< its weight in the split; <= 0 or NaN gets nothing while the coin is short
+    double weight{0.0};  ///< its weight in the split; <= 0 or NaN gets no more than its minimum tiers while the coin is short
+    /// [TIERFIRST] Its minimum offer sizes, widest tier first, in the coin's
+    /// mojos: what the first pass funds.  Empty on a pair without tier
+    /// minimums.  Only the run of tiers whose sum fits `demand` counts.
+    std::vector<double> tiers{};
 };
+
+namespace detail {
+
+/// Weighted water filling of `budget` over `caps`: split by weight, none
+/// past its cap, what one leaves passed to the rest by weight.  A cap or
+/// weight that is not a positive finite number gets nothing.
+[[nodiscard]] inline std::vector<double> water_fill(double budget,
+                                                    const std::vector<double>& caps,
+                                                    const std::vector<double>& weights)
+{
+    auto valid = [](double x) { return std::isfinite(x) && x > 0.0; };
+    const std::size_t n = caps.size();
+    std::vector<double> share(n, 0.0);
+    std::vector<bool> open(n, false);
+    for (std::size_t i = 0; i < n; ++i) {
+        open[i] = valid(caps[i]) && valid(weights[i]);
+    }
+    double fixed_sum = 0.0;
+    // Each pass either settles every open claim or fixes at least one at its
+    // cap, so n + 1 passes always finish.
+    for (std::size_t pass = 0; pass <= n; ++pass) {
+        double total_weight = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (open[i]) total_weight += weights[i];
+        }
+        if (!(total_weight > 0.0)) break;
+        const double remaining = std::max(0.0, budget - fixed_sum);
+        bool fixed_any = false;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!open[i]) continue;
+            if (remaining * (weights[i] / total_weight) >= caps[i]) {
+                share[i] = caps[i];
+                fixed_sum += caps[i];
+                open[i] = false;
+                fixed_any = true;
+            }
+        }
+        if (fixed_any) continue;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (open[i]) share[i] = remaining * (weights[i] / total_weight);
+        }
+        break;
+    }
+    return share;
+}
+
+/// [TIERFIRST] The first pass: each claim's funded minimum tiers, one tier
+/// level at a time from the widest.  A level that does not fit whole goes to
+/// its cheapest tiers while they fit, and ends the pass.
+[[nodiscard]] inline std::vector<double> minimum_tiers(double budget,
+                                                       const std::vector<Claim>& claims)
+{
+    auto valid = [](double x) { return std::isfinite(x) && x > 0.0; };
+    const std::size_t n = claims.size();
+    std::vector<double> funded(n, 0.0);
+    double left = budget;
+    for (std::size_t level = 0;; ++level) {
+        // The claims whose tier at this level is still within their demand.
+        std::vector<std::size_t> wanting;
+        double level_cost = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto& c = claims[i];
+            if (!valid(c.demand) || level >= c.tiers.size()) continue;
+            const double t = c.tiers[level];
+            if (!valid(t) || funded[i] + t > c.demand) continue;
+            wanting.push_back(i);
+            level_cost += t;
+        }
+        if (wanting.empty()) break;
+        if (level_cost <= left) {
+            for (const std::size_t i : wanting) funded[i] += claims[i].tiers[level];
+            left -= level_cost;
+            continue;
+        }
+        std::stable_sort(wanting.begin(), wanting.end(),
+                         [&](std::size_t a, std::size_t b) {
+                             return claims[a].tiers[level] < claims[b].tiers[level];
+                         });
+        for (const std::size_t i : wanting) {
+            const double t = claims[i].tiers[level];
+            if (t > left) break;
+            funded[i] += t;
+            left -= t;
+        }
+        break;
+    }
+    return funded;
+}
+
+}  // namespace detail
 
 /// Each claim's share of `budget` (the coin's mojos), in claim order, when
 /// the claims together want more than the budget; nullopt when they fit (or
-/// the budget is negative), and then nothing is capped.  Weighted water
-/// filling: the budget is split by weight, no claim gets more than its
-/// demand, and what a claim leaves passes to the rest by weight.  Shares
-/// floor to whole mojos, taken from an integer remainder, so they never sum
-/// past the budget at any magnitude.
+/// the budget is negative), and then nothing is capped.  First each claim's
+/// minimum tiers (`Claim::tiers`, see detail::minimum_tiers), then weighted
+/// water filling of the rest: split by weight, no claim past its demand, and
+/// what a claim leaves passed to the rest by weight.  Shares floor to whole
+/// mojos, taken from an integer remainder, so they never sum past the budget
+/// at any magnitude.
 [[nodiscard]] inline std::optional<std::vector<Mojo>> split(
     Mojo budget, const std::vector<Claim>& claims)
 {
@@ -78,37 +184,18 @@ struct Claim {
     if (!(total > budget_d)) return std::nullopt;
 
     const std::size_t n = claims.size();
-    std::vector<double> share(n, 0.0);
-    std::vector<bool> open(n, false);
+    std::vector<double> share = detail::minimum_tiers(budget_d, claims);
+    double funded = 0.0;
+    for (const double f : share) funded += f;
+    std::vector<double> rest(n, 0.0);
+    std::vector<double> weights(n, 0.0);
     for (std::size_t i = 0; i < n; ++i) {
-        open[i] = valid(claims[i].demand) && valid(claims[i].weight);
+        rest[i] = valid(claims[i].demand) ? claims[i].demand - share[i] : 0.0;
+        weights[i] = claims[i].weight;
     }
-    double fixed_sum = 0.0;
-    // Each pass either settles every open claim or fixes at least one at its
-    // demand, so n + 1 passes always finish.
-    for (std::size_t pass = 0; pass <= n; ++pass) {
-        double weights = 0.0;
-        for (std::size_t i = 0; i < n; ++i) {
-            if (open[i]) weights += claims[i].weight;
-        }
-        if (!(weights > 0.0)) break;
-        const double remaining = std::max(0.0, budget_d - fixed_sum);
-        bool fixed_any = false;
-        for (std::size_t i = 0; i < n; ++i) {
-            if (!open[i]) continue;
-            if (remaining * (claims[i].weight / weights) >= claims[i].demand) {
-                share[i] = claims[i].demand;
-                fixed_sum += claims[i].demand;
-                open[i] = false;
-                fixed_any = true;
-            }
-        }
-        if (fixed_any) continue;
-        for (std::size_t i = 0; i < n; ++i) {
-            if (open[i]) share[i] = remaining * (claims[i].weight / weights);
-        }
-        break;
-    }
+    const std::vector<double> extra =
+        detail::water_fill(std::max(0.0, budget_d - funded), rest, weights);
+    for (std::size_t i = 0; i < n; ++i) share[i] += extra[i];
 
     // Whole mojos out of an integer remainder: a budget past 2^53 rounds in
     // double (two halves of 9007199254740995 both round up), and one at Mojo
