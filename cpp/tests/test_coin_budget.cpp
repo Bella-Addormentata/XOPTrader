@@ -199,6 +199,18 @@ TEST(CoinBudget, OnlyTheTiersWithinASidesDemandCount) {
     EXPECT_LE(sum(*shares), 600);
 }
 
+TEST(CoinBudget, ASideWhoseWidestTierIsPastItsDemandGetsNoMinimumTiers) {
+    // Tight minimum below the wide one (the parser accepts it): widest-first
+    // tiers 10, 7, 4, 1 against a demand of 5.  The ladder fit drops tiers
+    // from the tight end, so 4 + 1 without the 10 is no ladder at all; the
+    // side gets nothing in the first pass, only its weighted share after.
+    const auto shares = split(1200, {{500.0, 1.0, {1000.0, 700.0, 400.0, 100.0}},
+                                     {1000.0, 1000.0, {100.0, 100.0, 100.0, 100.0}}});
+    ASSERT_TRUE(shares.has_value());
+    EXPECT_EQ((*shares)[1], 1000) << "the other side's minimums, then its demand";
+    EXPECT_EQ((*shares)[0], 200) << "only what is left, not 4 + 1 out of turn";
+}
+
 TEST(CoinBudget, AWeightlessSideStillGetsItsMinimumTiers) {
     const auto shares = split(100, {{50.0, 0.0, {10.0, 20.0}}, {80.0, 1.0, {}}});
     ASSERT_TRUE(shares.has_value());

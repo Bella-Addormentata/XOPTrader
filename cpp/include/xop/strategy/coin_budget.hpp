@@ -120,13 +120,17 @@ namespace detail {
 
 /// [TIERFIRST] The first pass: each claim's funded minimum tiers, one tier
 /// level at a time from the widest.  A level that does not fit whole goes to
-/// its cheapest tiers while they fit, and ends the pass.
+/// its cheapest tiers while they fit, and ends the pass.  A claim only ever
+/// funds a contiguous run of tiers from its widest: the first tier that is
+/// invalid or past its demand closes it, as the ladder fit drops tiers from
+/// the tight end and could not use a tighter tier without the wider ones.
 [[nodiscard]] inline std::vector<double> minimum_tiers(double budget,
                                                        const std::vector<Claim>& claims)
 {
     auto valid = [](double x) { return std::isfinite(x) && x > 0.0; };
     const std::size_t n = claims.size();
     std::vector<double> funded(n, 0.0);
+    std::vector<bool> closed(n, false);
     double left = budget;
     for (std::size_t level = 0;; ++level) {
         // The claims whose tier at this level is still within their demand.
@@ -134,9 +138,10 @@ namespace detail {
         double level_cost = 0.0;
         for (std::size_t i = 0; i < n; ++i) {
             const auto& c = claims[i];
-            if (!valid(c.demand) || level >= c.tiers.size()) continue;
+            if (closed[i]) continue;
+            if (!valid(c.demand) || level >= c.tiers.size()) { closed[i] = true; continue; }
             const double t = c.tiers[level];
-            if (!valid(t) || funded[i] + t > c.demand) continue;
+            if (!valid(t) || funded[i] + t > c.demand) { closed[i] = true; continue; }
             wanting.push_back(i);
             level_cost += t;
         }

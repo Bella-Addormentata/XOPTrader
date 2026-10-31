@@ -4739,6 +4739,31 @@ TEST(TierMinimumMojos, ShortOfFundsTheTightestTiersGoFirst) {
     EXPECT_EQ(tmin::widest_tiers_within_pool({}, {}, 0, std::nullopt), 0u);
 }
 
+// [TIERFIRST 2026-10-31] A side raised to its ladder of minimum offers posts
+// exactly those minimums, so a pool and a coin share that hold exactly that
+// ladder keep every tier.  Sized from its share of the pool and raised to
+// the minimums instead, one tier's share beats its minimum (25% of 33 XCH is
+// 8.25 against 8.2), the sum passes the ladder, and the tight tier goes.
+TEST(TierMinimumMojos, ASideHoldingExactlyItsMinimumLadderKeepsEveryTier) {
+    namespace tmin = xop::strategy::tiermin;
+    // XCH tenths, tightest first: minimums 10, 8.2, 6.4, 4.6, 2.8, 1 (33).
+    const std::vector<xop::Mojo> minimums{100, 82, 64, 46, 28, 10};
+    const std::vector<xop::Mojo> costs{130, 107, 83, 60, 36, 13};
+    xop::Mojo ladder = 0;
+    for (const xop::Mojo m : minimums) ladder += m;
+    xop::Mojo share = 0;
+    for (const xop::Mojo c : costs) share += c;
+    EXPECT_EQ(tmin::widest_tiers_within_pool(minimums, costs, ladder, share), 6u)
+        << "the pool and the coin's share hold the ladder exactly";
+    EXPECT_EQ(tmin::widest_tiers_within_pool(minimums, costs, ladder - 1, share), 5u)
+        << "a mojo short of it, the tight tier goes first";
+
+    const std::vector<xop::Mojo> grown{100, 83, 64, 46, 28, 10};
+    const std::vector<xop::Mojo> grown_costs{130, 108, 83, 60, 36, 13};
+    EXPECT_EQ(tmin::widest_tiers_within_pool(grown, grown_costs, ladder, share), 5u)
+        << "why a raised side is trimmed to its minimums";
+}
+
 // [TIERMIN 2026-10-29] Only a tier-minimum pair with exactly one side both
 // drift-tapered and floored sizes its sides from their own pools.
 TEST(TierMinimumMojos, PairSidePoolsUnlessOneSideIsAFlooredTaper) {

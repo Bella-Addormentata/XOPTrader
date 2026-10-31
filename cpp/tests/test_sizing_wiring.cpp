@@ -627,10 +627,22 @@ TEST(SizingWiring, ASideIsRaisedToItsMinimumTiersBeforeTheCaps) {
     const std::size_t ask_floor_at = position_of(body,
         "ask_guard_floored = drift_ask_scale < 1.0; avail_inventory = floored;");
     const std::size_t gate_at = position_of(body,
-        "if (config_.strategy.minimum_tiers_first && ladder_tier_minimums_on) {");
+        "if (config_.strategy.minimum_tiers_first && ladder_tier_minimums_on "
+        "&& pair_cfg->base_mojos_per_unit > 0) {");
     const std::size_t pool_at = position_of(body,
+        "const Mojo m = std::max(pair_min_mojos, strategy::tiermin::min_units_to_mojos("
         "tier_min_offer_units(*pair_cfg, floor_min_units, t, min_tiers), "
-        "pair_cfg->base_mojos_per_unit);");
+        "pair_cfg->base_mojos_per_unit).value_or(pair_min_mojos));");
+    // Its own block, after the deploy-idle floor's: neither
+    // deploy_idle_inventory_enabled nor a flat minimum of 0 turns it off.
+    const std::size_t ratio_at = position_of(body,
+        "const bool floor_bid = (idle_ratio_mode != RatioRebalanceMode::AcquireQuote);");
+    const std::size_t idle_if_at = position_of(body,
+        "if (pair_cfg && config_.strategy.deploy_idle_inventory_enabled "
+        "&& pair_cfg->base_mojos_per_unit > 0 && floor_min_units > 0.0) {");
+    ASSERT_NE(ratio_at, std::string::npos);
+    ASSERT_NE(idle_if_at, std::string::npos);
+    EXPECT_LT(ratio_at, idle_if_at);
     const std::size_t lift_bid_at = position_of(body,
         "const bool lift_bid = floor_bid && drift_bid_scale >= 1.0 "
         "&& pcs.risk_quote.bid_size > 0 && avail_capital > 0 "
@@ -660,25 +672,42 @@ TEST(SizingWiring, ASideIsRaisedToItsMinimumTiersBeforeTheCaps) {
     ASSERT_NE(caps_at, std::string::npos);
     EXPECT_LT(on_at, gate_at);
     EXPECT_LT(ask_floor_at, gate_at);
+    if (idle_if_at != std::string::npos && gate_at != std::string::npos
+        && idle_if_at < gate_at) {
+        long depth = 0;
+        for (std::size_t i = idle_if_at; i < gate_at; ++i) {
+            if (body[i] == '{') ++depth;
+            if (body[i] == '}') --depth;
+        }
+        EXPECT_EQ(depth, 0) << "the minimum-tier floor sits outside the deploy-idle block";
+    }
     EXPECT_LT(gate_at, pool_at);
     EXPECT_LT(pool_at, lift_bid_at);
     EXPECT_LT(lift_bid_at, set_bid_at);
     EXPECT_LT(lift_ask_at, set_ask_at);
     EXPECT_LT(set_ask_at, pace_at);
     EXPECT_LT(pace_at, caps_at);
-    // The fit keeps every tier of a side that still holds the ladder.
+    // A raised side posts exactly its minimums, after the up-scale, and the
+    // fit measures them against the pool compute_ladder was given.
+    const std::size_t upscale_at = position_of(body,
+        "\"[Engine] Step 7: {} up-scaled {} tiers to \"");
+    const std::size_t trim_at = position_of(body,
+        "if (lifted) tq.size = tier_min_mojos(tq);");
     const std::size_t held_at = position_of(body,
-        "if (min_tiers_pool > 0 && (is_ask ? pcs.ladder_pools.ask : pcs.ladder_pools.bid) "
-        ">= min_tiers_pool) {");
-    const std::size_t widened_at = position_of(body, "side_pool = std::max(side_pool, min_sizes_sum);");
+        "if ((is_ask ? pcs.min_tiers_pool_ask : pcs.min_tiers_pool_bid) > 0) { "
+        "side_pool = is_ask ? pcs.ladder_pools.ask : pcs.ladder_pools.bid; }");
     const std::size_t fit_at = position_of(body,
         "const std::size_t fit = strategy::tiermin::widest_tiers_within_pool(");
+    ASSERT_NE(upscale_at, std::string::npos);
+    ASSERT_NE(trim_at, std::string::npos);
     ASSERT_NE(held_at, std::string::npos);
-    ASSERT_NE(widened_at, std::string::npos);
     ASSERT_NE(fit_at, std::string::npos);
-    EXPECT_LT(caps_at, held_at);
-    EXPECT_LT(held_at, widened_at);
-    EXPECT_LT(widened_at, fit_at);
+    EXPECT_LT(caps_at, upscale_at);
+    EXPECT_LT(upscale_at, trim_at);
+    EXPECT_LT(trim_at, held_at);
+    EXPECT_LT(held_at, fit_at);
+    EXPECT_EQ(position_of(body, "side_pool = std::max(side_pool, min_sizes_sum);"),
+              std::string::npos) << "no pool widened past what the caps left";
     // With the switch off, no side claims minimum tiers in the coin split.
     EXPECT_NE(position_of(body,
         "const std::uint32_t claim_tiers = config_.strategy.minimum_tiers_first "
