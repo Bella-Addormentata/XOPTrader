@@ -10401,7 +10401,8 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                                  pair_cfg->quote_asset_id,
                                  required_quote_units,
                                  floor_min_units);
-                    bid_guard_floored = drift_bid_scale < 1.0;
+                    bid_guard_floored = strategy::tiermin::floored_side_unpairs(
+                        avail_capital, drift_bid_scale);
                     avail_capital = floored;
                 }
             }
@@ -10430,7 +10431,8 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                                      / static_cast<double>(pair_cfg->base_mojos_per_unit),
                                  pair_cfg->base_asset_id,
                                  floor_min_units);
-                    ask_guard_floored = drift_ask_scale < 1.0;
+                    ask_guard_floored = strategy::tiermin::floored_side_unpairs(
+                        avail_inventory, drift_ask_scale);
                     avail_inventory = floored;
                 }
             }
@@ -10688,11 +10690,14 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
         }
 
-        // On such a pair, a side the drift guard tapered and the deploy-idle
-        // floor then lifted to the pair minimum no longer cuts the other
-        // side's pool to that minimum.  On 2026-10-29 the XCH/wUSDC.b ask was
-        // tapered to ~0.1 XCH and floored to 1, and pairing cut the 31.8 XCH
-        // bid pool to 1 XCH: one bid, its widest tier, instead of five.
+        // On such a pair, a side the deploy-idle floor lifted to the pair
+        // minimum -- one the drift guard tapered, or one that had no pool
+        // before the floor -- no longer cuts the other side's pool to that
+        // minimum.  On 2026-10-29 the XCH/wUSDC.b ask was tapered to ~0.1 XCH
+        // and floored to 1, and pairing cut the 31.8 XCH bid pool to 1 XCH:
+        // one bid, its widest tier, instead of five.  On 2026-10-31 the
+        // XCH/DBX bid was 0 at q_max and floored to 1 XCH, and pairing cut
+        // the 104 XCH ask pool to 1 XCH the same way.
         const bool ladder_pairs_pools = strategy::tiermin::pair_side_pools(
             ladder_tier_minimums_on, bid_guard_floored, ask_guard_floored);
 
@@ -11117,8 +11122,8 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         if (!ladder_cfg.pair_side_pools) {
             spdlog::info("[Engine] Step 7: {} ladder sides sized from their "
                          "own pools (bid {} / ask {} base mojos): the {} "
-                         "pool is a drift-tapered side floored to the pair "
-                         "minimum",
+                         "pool is a drift-tapered or switched-off side "
+                         "floored to the pair minimum",
                          pair_name, avail_capital, avail_inventory,
                          bid_guard_floored ? "bid" : "ask");
         }
