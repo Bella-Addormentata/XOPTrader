@@ -5,6 +5,66 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.39] — 2026-10-31 — every pair's minimum tiers come first, and a quiet book no longer pushes its ladder far off market
+
+### Minimum tiers first (#206)
+
+On a pair with tier minimums, a side's own sizing could leave it with a
+single tier even when the wallet held plenty. On 2026-10-31 XCH/DBX posted
+one bid and one ask of 1 XCH, because its bid size was `q_max 100 - q 98.43`.
+
+Now every pair gets its full ladder of minimum tiers before any pair's
+tiers grow.
+
+**When a shared coin is short**
+
+- The coin split funds minimum tiers first, level by level from the
+  widest tier.
+- A level that does not fit whole goes to the cheapest tiers. The rest is
+  then split in proportion to demand, as before.
+
+**Raising a side to its minimum ladder**
+
+- On a pair with tier minimums, Step 7 raises a side whose sizing leaves it
+  below its minimum ladder up to the sum of its minimums.
+- This happens before the wallet caps and the coin's share. So a side never
+  spends more than the wallet holds, and tiers stay blank where funds are
+  short.
+- The drift guard, ratio rebalancing and a zero size from Step 6 still win.
+
+**Sizing within a side**
+
+- Minimums come before growth. A side whose pool holds every tier minimum
+  keeps every tier, and the growth above the minimums shrinks to fit
+  instead.
+- Before, raising tiers to their minimums on top of their share of the
+  pool could push the side past its pool, and its tight tier was skipped.
+- The growth also shrinks to the side's funding budget.
+
+Log signs:
+
+- `Step 7: <pair> minimum tiers first: bid pool A -> B, ask pool C -> D`
+- `minimum tiers first: growth shrunk ...`
+
+New setting `strategy.minimum_tiers_first`, on by default, applies live.
+Set it to `false` to go back to v0.10.38's sizing.
+
+### A still book's uncertainty is capped (#206)
+
+A book's uncertainty grew by 5 bps for every heartbeat its mid did not
+move, with no limit. The XCH/BYC Dexie book sat at 1.4303/1.4577 for about
+676 heartbeats and read ~3381 bps. The ladder's minimum width then pushed
+bids to 0.33-0.69 and asks to 2.05-2.29, against a market near 1.44.
+
+That term now stops at `strategy.fair_value_stale_sigma_max_bps`:
+
+- Default 500, or `0` for no limit. Applies live.
+- On the same numbers, the first bid and ask sit near 1.39 and 1.50.
+- With the defaults (500 against `fair_value_max_sigma_bps` 200), a frozen
+  book on its own still never gives a usable fair value. That holds only
+  while the limit stays above `fair_value_max_sigma_bps`; if either is
+  changed so the limit is at or below it, the engine loads but warns.
+
 ## [0.10.38] — 2026-10-30 — pairs that spend the same coin share it instead of racing for it
 
 ### Coin budgets (#204)
