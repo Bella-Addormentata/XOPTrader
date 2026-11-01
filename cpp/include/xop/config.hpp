@@ -16,9 +16,11 @@
 #define XOP_CONFIG_HPP
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -481,6 +483,24 @@ inline std::int64_t apply_deploy_idle_floor(std::int64_t pool,
 //   tier_size_pct     -- fraction of allocated capital placed at each tier.
 //                        Values must sum to approximately 1.0.
 // ---------------------------------------------------------------------------
+/// [COINPOOL-TOKEN 2026-11-01] One CAT's own coin pool: keep `count` spare
+/// coins of `units` display units each.  See StrategyConfig::cat_coin_pool_tokens.
+struct CatCoinPoolTarget {
+    int    count{0};
+    double units{0.0};
+};
+
+/// [COINPOOL-TOKEN 2026-11-01] How a cat_coin_pool_tokens key is compared:
+/// case-insensitive, and an asset id with or without its 0x prefix.
+[[nodiscard]] inline std::string cat_pool_token_key(std::string token)
+{
+    std::transform(token.begin(), token.end(), token.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (token.size() > 2 && token[0] == '0' && token[1] == 'x') token.erase(0, 2);
+    return token;
+}
+
 struct StrategyConfig {
     double   gamma{0.01};
     double   kappa{1.5};
@@ -1550,6 +1570,20 @@ struct StrategyConfig {
     /// For BYC (1000 mojos/unit), a value of 50.0 → 50,000 mojos.
     /// Default: 50.0 units.
     double   cat_coin_pool_target_units{50.0};
+
+    /// [COINPOOL-TOKEN 2026-11-01] Per-token CAT coin pools, keyed by the
+    /// token's name as the pair names spell it (e.g. "wUSDC.b") or by its
+    /// asset id.  When this is non-empty, ONLY the tokens listed here are
+    /// split, each to its own count and size, and cat_coin_pool_target_count
+    /// / cat_coin_pool_target_units are ignored: one size for every CAT
+    /// split DBX into coins no DBX tier could use, and asked wmilliETH.b for
+    /// more than it held.  A listed token's pool is checked every heartbeat
+    /// while it is short, before Step 8 posts, and splits only when a free
+    /// coin can make at least one coin of its size -- so a coin freed by a
+    /// cancelled or refreshed offer is split before a new offer locks it
+    /// whole again (2026-11-01: wUSDC.b sat in ~100-unit coins and four bids
+    /// worth ~125 locked ~430).  Empty (the default) keeps the global setting.
+    std::map<std::string, CatCoinPoolTarget> cat_coin_pool_tokens;
 
     // -- Gap-aware dynamic tier spacing -------------------------------------
 

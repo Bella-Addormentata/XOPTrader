@@ -889,7 +889,11 @@ private:
     /// for concurrent multi-tier offer creation.  Called at startup and
     /// periodically (every coin_pool_interval_blocks).  Uses CoinManager
     /// ensure_split() to self-send if the free coin count is too low.
-    boost::asio::awaitable<void> step_maintain_coin_pool(BlockHeight block_height);
+    /// [COINPOOL-TOKEN 2026-11-01] `tokens_only` runs just the per-token CAT
+    /// pools (strategy.cat_coin_pool_tokens), every heartbeat, without
+    /// touching the XCH pool or the periodic schedule.
+    boost::asio::awaitable<void> step_maintain_coin_pool(BlockHeight block_height,
+                                                         bool tokens_only = false);
 
     // -- Connection management -----------------------------------------------
 
@@ -2528,6 +2532,10 @@ private:
     /// down because whole coins lock them, so the hint is logged at info
     /// once per episode.
     std::set<std::string> wait_grow_whole_coin_warned_;
+    /// [WAITGROW-MIN 2026-11-01] Pair sides ("pair|bid" / "pair|ask") whose
+    /// tiers with no offer were started at their minimum, so the line logs at
+    /// info once per episode.
+    std::set<std::string> wait_grow_started_logged_;
 
     // -- Ratio-based inventory rebalance mode (per pair) -------------------
     enum class RatioRebalanceMode : std::uint8_t {

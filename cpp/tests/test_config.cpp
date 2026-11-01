@@ -11,6 +11,7 @@
 // ISO/IEC 27001:2022 -- no real secrets in test fixtures.
 // ISO/IEC 5055       -- deterministic tests; no undefined behaviour.
 
+#include "xop/execution/coin_pool_verdict.hpp"
 #include <filesystem>
 #include <gtest/gtest.h>
 
@@ -4562,6 +4563,79 @@ TEST(ConfigParserTest, WaitToGrow_DefaultsOnAndParsesFalse) {
         const auto cfg = xop::load_config(tmp.path());
         EXPECT_TRUE(cfg.strategy.wait_to_grow) << "null keeps the default";
     }
+}
+
+// [COINPOOL-TOKEN 2026-11-01] Per-token CAT coin pools: empty by default (the
+// global CAT pool setting stands), parsed per token, and a malformed entry is
+// refused rather than skipped.
+TEST(ConfigParserTest, CatCoinPoolTokens_DefaultEmptyParsedAndValidated) {
+    {
+        TempYaml tmp(kMinimalValidYaml);
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_TRUE(cfg.strategy.cat_coin_pool_tokens.empty());
+    }
+    EXPECT_TRUE(xop::StrategyConfig{}.cat_coin_pool_tokens.empty());
+    {
+        TempYaml tmp(pace_with_strategy(
+            "  cat_coin_pool_tokens:\n"
+            "    wUSDC.b: {count: 12, units: 10.0}\n"
+            "    BYC: {count: 0, units: 5}\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        ASSERT_EQ(cfg.strategy.cat_coin_pool_tokens.size(), 2u);
+        const auto& w = cfg.strategy.cat_coin_pool_tokens.at("wUSDC.b");
+        EXPECT_EQ(w.count, 12);
+        EXPECT_DOUBLE_EQ(w.units, 10.0);
+        EXPECT_EQ(cfg.strategy.cat_coin_pool_tokens.at("BYC").count, 0);
+    }
+    {
+        TempYaml tmp(pace_with_strategy("  cat_coin_pool_tokens: {}\n"));
+        EXPECT_TRUE(xop::load_config(tmp.path()).strategy.cat_coin_pool_tokens.empty());
+    }
+    for (const char* bad : {
+             "  cat_coin_pool_tokens: [wUSDC.b]\n",
+             "  cat_coin_pool_tokens:\n    wUSDC.b: 12\n",
+             "  cat_coin_pool_tokens:\n    wUSDC.b: {count: 12}\n",
+             "  cat_coin_pool_tokens:\n    wUSDC.b: {count: -1, units: 10}\n",
+             "  cat_coin_pool_tokens:\n    wUSDC.b: {count: 12, units: 0}\n",
+             "  cat_coin_pool_tokens:\n    wUSDC.b: {count: 12, units: 10}\n"
+             "    wusdc.B: {count: 4, units: 5}\n",
+         }) {
+        TempYaml tmp(pace_with_strategy(bad));
+        EXPECT_THROW((void)xop::load_config(tmp.path()), xop::ConfigError) << bad;
+    }
+}
+
+// [COINPOOL-TOKEN 2026-11-01] Which pool a CAT keeps.
+TEST(CatCoinPoolTarget, GlobalPoolForEveryCatUntilTokensAreListed) {
+    using xop::CatCoinPoolTarget;
+    using xop::execution::cat_pool_target;
+    const std::map<std::string, CatCoinPoolTarget> none;
+    const auto g = cat_pool_target(none, "fa4a18", "wUSDC.b", 10, 50.0);
+    ASSERT_TRUE(g.has_value());
+    EXPECT_EQ(g->count, 10);
+    EXPECT_DOUBLE_EQ(g->units, 50.0);
+    EXPECT_FALSE(cat_pool_target(none, "fa4a18", "wUSDC.b", 0, 50.0).has_value())
+        << "a global count of 0 splits nothing";
+}
+
+TEST(CatCoinPoolTarget, ListedTokensOnlyMatchedByNameOrAssetId) {
+    using xop::CatCoinPoolTarget;
+    using xop::execution::cat_pool_target;
+    const std::map<std::string, CatCoinPoolTarget> listed{
+        {"wUSDC.b", {12, 10.0}},
+        {"0xDB1A9020", {0, 5.0}},
+        {"byc", {4, 2.0}},
+    };
+    const auto w = cat_pool_target(listed, "fa4a18", "wUSDC.b", 10, 50.0);
+    ASSERT_TRUE(w.has_value());
+    EXPECT_EQ(w->count, 12);
+    EXPECT_DOUBLE_EQ(w->units, 10.0);
+    EXPECT_EQ(cat_pool_target(listed, "x", "BYC", 10, 50.0)->count, 4)
+        << "names compare without case";
+    EXPECT_FALSE(cat_pool_target(listed, "db1a9020", "DBX", 10, 50.0).has_value())
+        << "matched by asset id (0x and case ignored), and a count of 0 keeps no pool";
+    EXPECT_FALSE(cat_pool_target(listed, "ae1536", "wmilliETH.b", 10, 50.0).has_value())
+        << "an unlisted token keeps no pool, whatever the global setting";
 }
 
 // [STALECAP 2026-10-31] The staleness ceiling ships at 500 bps, parses any
