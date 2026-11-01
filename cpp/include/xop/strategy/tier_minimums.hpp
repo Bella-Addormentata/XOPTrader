@@ -382,8 +382,8 @@ struct RestingTier {
 /// and the fewest picks win (on a tie, the set that leaves the most coin
 /// over).  The most missing
 /// tiers that can be funded, widest (smallest) first, are the target.
-/// Nothing is picked when the free coin funds every missing tier already,
-/// when no reclaim funds even the widest one (a reclaim that funds nothing
+/// Nothing is picked when the free coin already funds every missing tier a
+/// reclaim could, when no reclaim funds even the widest one (a reclaim that funds nothing
 /// would only shrink the book), or when `commit_frac` is not above 0 (the
 /// lock ledger then posts nothing spent from the coin, a replacement
 /// included).  An offer on a tier with no plan is left to the caller.
@@ -442,6 +442,9 @@ struct RestingTier {
     caps.erase(std::unique(caps.begin(), caps.end()), caps.end());
 
     for (std::size_t count = wanted.size(); count > 0; --count) {
+        // No reclaim funds more tiers than these, and the free coin funds
+        // these already: retiring anything would buy nothing.
+        if (!(shortfall(count, 0.0L, 0.0L, 0) > 0.0L)) return {};
         std::vector<std::size_t> best;
         long double best_gap = 0.0L;
         bool found = false;

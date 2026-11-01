@@ -5149,6 +5149,13 @@ TEST(WaitToGrow, ReclaimFundsTheWidestMissingTiersItCanAndNeverNone) {
     const std::vector<tmin::RestingTier> two{{8, 4}, {5, 3}};
     EXPECT_EQ(tmin::tiers_to_reclaim({10, 3}, 0, 1.0, two, 0.10),
               (std::vector<std::size_t>{0}));
+    // A 100 tier no reclaim funds, and a 3 tier the 3 free funds already:
+    // retiring the grown offer would buy nothing.
+    const std::vector<tmin::RestingTier> one{{8, 4}};
+    EXPECT_TRUE(tmin::tiers_to_reclaim({100, 3}, 3, 1.0, one, 0.10).empty());
+    EXPECT_EQ(tmin::tiers_to_reclaim({100, 3}, 2, 1.0, one, 0.10),
+              (std::vector<std::size_t>{0}))
+        << "with 2 free, the 4 it gives back funds the 3 tier";
 }
 
 // A retired offer must be posted again at its planned size.  With 0.5 XCH
