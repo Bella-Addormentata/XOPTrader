@@ -375,14 +375,19 @@ struct RestingTier {
 /// planned size, so it counts as one more tier to fund (and may be the
 /// largest).  Candidates are the resting offers that lock more than
 /// `tolerance` (a fraction) past their planned size -- their growth --
-/// largest excess first; one whose replacement would raise the need by more
-/// than it gives back is passed over.  The most missing tiers that can be
-/// funded, widest (smallest) first, are the target: the fewest candidates
-/// that fund them are picked.  Nothing is picked when the free coin funds
-/// every missing tier already, or when no reclaim funds even the widest one
-/// (a reclaim that funds nothing would only shrink the book).  An offer on a
-/// tier with no plan is left to the caller.  Returns indices into `resting`,
-/// largest excess first.
+/// largest excess first.  The largest replacement sets the cycle-cap room,
+/// so a pick can widen the gap on its own yet close it with others: for each
+/// cap on the largest replacement (each candidate's planned size), the
+/// candidates under it are taken largest excess first until the gap closes,
+/// and the fewest picks win (on a tie, the set that leaves the most coin
+/// over).  The most missing
+/// tiers that can be funded, widest (smallest) first, are the target.
+/// Nothing is picked when the free coin funds every missing tier already,
+/// when no reclaim funds even the widest one (a reclaim that funds nothing
+/// would only shrink the book), or when `commit_frac` is not above 0 (the
+/// lock ledger then posts nothing spent from the coin, a replacement
+/// included).  An offer on a tier with no plan is left to the caller.
+/// Returns indices into `resting`, largest excess first.
 [[nodiscard]] inline std::vector<std::size_t> tiers_to_reclaim(
     const std::vector<Mojo>& missing, Mojo free_coin, double commit_frac,
     const std::vector<RestingTier>& resting, double tolerance)
@@ -392,6 +397,9 @@ struct RestingTier {
         if (m > 0) wanted.push_back(m);
     }
     if (wanted.empty()) return {};
+    // A fraction of 0 (or NaN, which the ledger reads as 0) posts nothing
+    // spent from the coin: neither the missing tiers nor a replacement.
+    if (!(commit_frac > 0.0)) return {};
     std::stable_sort(wanted.begin(), wanted.end());  // widest (smallest) first
     const long double free_now = static_cast<long double>(std::max<Mojo>(free_coin, 0));
 
@@ -423,27 +431,49 @@ struct RestingTier {
     };
     if (!(shortfall(wanted.size(), 0.0L, 0.0L, 0) > 0.0L)) return {};
 
+    // Each cap on the largest replacement, smallest first.  Every candidate
+    // under a cap gives back more than it costs once the cap's room is paid,
+    // so if any set whose largest replacement is the cap closes the gap, all
+    // the candidates under it do: the sweep finds a set whenever one exists,
+    // and taking them largest excess first keeps it short.
+    std::vector<Mojo> caps;
+    for (const std::size_t i : grown) caps.push_back(resting[i].planned);
+    std::sort(caps.begin(), caps.end());
+    caps.erase(std::unique(caps.begin(), caps.end()), caps.end());
+
     for (std::size_t count = wanted.size(); count > 0; --count) {
-        std::vector<std::size_t> out;
-        long double planned_sum = 0.0L;
-        long double locked_sum = 0.0L;
-        Mojo largest = 0;
-        long double gap = shortfall(count, 0.0L, 0.0L, 0);
-        for (const std::size_t i : grown) {
-            if (!(gap > 0.0L)) break;
-            const auto& r = resting[i];
-            const Mojo largest_with = std::max(largest, r.planned);
-            const long double gap_with = shortfall(
-                count, planned_sum + static_cast<long double>(r.planned),
-                locked_sum + static_cast<long double>(r.locked), largest_with);
-            if (!(gap_with < gap)) continue;  // its replacement costs more than it frees
-            out.push_back(i);
-            planned_sum += static_cast<long double>(r.planned);
-            locked_sum += static_cast<long double>(r.locked);
-            largest = largest_with;
-            gap = gap_with;
+        std::vector<std::size_t> best;
+        long double best_gap = 0.0L;
+        bool found = false;
+        for (const Mojo cap : caps) {
+            std::vector<std::size_t> out;
+            long double planned_sum = 0.0L;
+            long double locked_sum = 0.0L;
+            Mojo largest = 0;
+            bool closed = false;
+            long double gap = 0.0L;
+            for (const std::size_t i : grown) {
+                const auto& r = resting[i];
+                if (r.planned > cap) continue;
+                out.push_back(i);
+                planned_sum += static_cast<long double>(r.planned);
+                locked_sum += static_cast<long double>(r.locked);
+                largest = std::max(largest, r.planned);
+                gap = shortfall(count, planned_sum, locked_sum, largest);
+                if (!(gap > 0.0L)) {
+                    closed = true;
+                    break;
+                }
+            }
+            if (closed
+                && (!found || out.size() < best.size()
+                    || (out.size() == best.size() && gap < best_gap))) {
+                best = std::move(out);
+                best_gap = gap;
+                found = true;
+            }
         }
-        if (!(gap > 0.0L)) return out;
+        if (found) return best;
     }
     return {};
 }

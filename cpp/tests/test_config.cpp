@@ -5166,6 +5166,37 @@ TEST(WaitToGrow, ReclaimCountsTheReplacementAndItsLockCapRoom) {
         << "2 free already funds the 1 XCH tier and its room";
 }
 
+// The largest replacement sets the lock-cap room once, so two grown offers
+// can fund a tier together that neither funds alone.  With 0.5 XCH free, a
+// missing 1 XCH tier and two resting 31 XCH offers planned at 20: one gives
+// back 31 against 1 + 20 + 20 of room; both give back 62 against 1 + 40 + 20.
+TEST(WaitToGrow, ReclaimTakesGrownTiersTogetherWhenOnlyTogetherTheyFundTheRoom) {
+    namespace tmin = xop::strategy::tiermin;
+    const std::vector<tmin::RestingTier> two{{31 * kWgXch, 20 * kWgXch},
+                                             {31 * kWgXch, 20 * kWgXch}};
+    EXPECT_EQ(tmin::tiers_to_reclaim({1 * kWgXch}, kWgXch / 2, 0.5, two, 0.10),
+              (std::vector<std::size_t>{0, 1}));
+    // A small grown tier funds the missing one alone: the big one, whose
+    // replacement needs 40 of room, is not taken with it.
+    const std::vector<tmin::RestingTier> mixed{{50, 40}, {9, 1}, {8, 1}};
+    EXPECT_EQ(tmin::tiers_to_reclaim({1}, 0, 0.5, mixed, 0.10),
+              (std::vector<std::size_t>{1}));
+}
+
+// strategy.xch_cycle_commit_frac 0 stops XCH-funded posting: the lock ledger
+// would refuse the replacement and the missing tier alike.
+TEST(WaitToGrow, NothingIsReclaimedWhileTheLockCapPostsNothing) {
+    namespace tmin = xop::strategy::tiermin;
+    const std::vector<tmin::RestingTier> resting{{15 * kWgXch, 10 * kWgXch}};
+    EXPECT_TRUE(tmin::tiers_to_reclaim({1 * kWgXch}, 0, 0.0, resting, 0.10).empty());
+    EXPECT_TRUE(tmin::tiers_to_reclaim({1 * kWgXch}, 0, -0.5, resting, 0.10).empty());
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_TRUE(tmin::tiers_to_reclaim({1 * kWgXch}, 0, nan, resting, 0.10).empty());
+    EXPECT_EQ(tmin::tiers_to_reclaim({1 * kWgXch}, 0, 1.0, resting, 0.10),
+              (std::vector<std::size_t>{0}))
+        << "uncapped, the 15 given back fund 1 + 10";
+}
+
 TEST(WaitToGrow, NothingIsReclaimedWithoutAnUnfundedTier) {
     namespace tmin = xop::strategy::tiermin;
     const std::vector<tmin::RestingTier> resting{{30, 10}};
