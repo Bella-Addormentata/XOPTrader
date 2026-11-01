@@ -3085,6 +3085,11 @@ private:
         // consumer must check freshness or it may reconcile against a
         // pre-fill balance and undo the fill (PNL-BASIS-PERSIST 2026-07-30).
         BlockHeight as_of_block{0};
+        // [WAITGROW 2026-11-01] When the wallet answered (wall clock).  An
+        // offer State records after this is not yet out of `spendable`, so
+        // Step 7's lockable amount must not count it a second time as an
+        // offer.  Default (epoch) when a writer did not stamp it.
+        Timestamp as_of_ts{};
         // [S19 review round 28] True only when the RPC response actually
         // carried confirmed_wallet_balance AND pending_change.  Writers
         // default missing fields to zero for the spendable-gating

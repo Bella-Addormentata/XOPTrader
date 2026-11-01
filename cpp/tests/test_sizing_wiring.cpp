@@ -715,7 +715,8 @@ TEST(SizingWiring, ASideIsRaisedToItsMinimumTiersBeforeTheCaps) {
         "&& !(pair_cfg->revive_market && pcs.revive_thin) "
         "&& (tier_minimums_on || min_base_mojos > 0);");
     const std::size_t gate_fit_at = position_of(body,
-        "if (fit_minimums_first && (tier_minimums_on || side_has_share)) {");
+        "if (fit_minimums_first "
+        "&& (tier_minimums_on || side_has_share || lockable.has_value())) {");
     const std::size_t pool_fit_at = position_of(body,
         "share_pool = std::min<Mojo>(saturating_add_mojo(share_pool, "
         "static_cast<Mojo>(cur_sizes.size())), "
@@ -723,8 +724,10 @@ TEST(SizingWiring, ASideIsRaisedToItsMinimumTiersBeforeTheCaps) {
     EXPECT_NE(position_of(body,
         "const bool fits_minimums = tier_minimums_on || mins_total <= share_pool;"),
         std::string::npos);
+    // Only a side with tier minimums or a share is fitted to its pool; one
+    // there for its lockable coin alone keeps its sizes for the hold below.
     const std::size_t fitted_at = position_of(body,
-        "const std::vector<Mojo> fitted = fits_minimums "
+        "const std::vector<Mojo> fitted = (fits_minimums && (tier_minimums_on || side_has_share)) "
         "? strategy::tiermin::fit_tier_sizes_to_pool_and_budget(cur_sizes, mins, shares, "
         "share_pool, min_budget, cost_at) : cur_sizes;");
     const std::size_t cost_at_at = position_of(body,
@@ -952,7 +955,7 @@ TEST(SizingWiring, WaitToGrowHoldsTheGrowthAfterTheMinimumsFirstFit) {
     const std::string body = function_body(read_engine_cpp(), kLadderSignature);
     ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
     const std::size_t fitted_at = position_of(body,
-        "const std::vector<Mojo> fitted = fits_minimums "
+        "const std::vector<Mojo> fitted = (fits_minimums && (tier_minimums_on || side_has_share)) "
         "? strategy::tiermin::fit_tier_sizes_to_pool_and_budget(");
     const std::size_t hold_at = position_of(body,
         "if (fits_minimums && lockable.has_value()) {");
@@ -972,9 +975,36 @@ TEST(SizingWiring, WaitToGrowHoldsTheGrowthAfterTheMinimumsFirstFit) {
     EXPECT_LT(hold_at, call_at);
     EXPECT_LT(call_at, pre_at);
     EXPECT_LT(pre_at, fit_at) << "the funding fit skips what the held sizes cannot fund";
+    const std::size_t lockable_at = position_of(body,
+        "const std::optional<Mojo> lockable = is_ask ? pcs.lockable_ask : pcs.lockable_bid;");
+    ASSERT_NE(lockable_at, std::string::npos);
+    EXPECT_LT(lockable_at, fitted_at);
+}
+
+// [WAITGROW review] Step 8 reads a coin's balance before it posts, so an
+// offer State records after that read is still in its spendable and must
+// not be counted again as an offer; and claims that fit split the lockable
+// budget in proportion, never giving the same surplus to two sides.
+TEST(SizingWiring, WaitToGrowCountsEachCoinOnce) {
+    const std::string engine = read_engine_cpp();
+    const std::string body = function_body(engine, kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t stamp_at = position_of(body,
+        "&& bit->second.as_of_ts != Timestamp{} "
+        "&& po.created_at_ts > bit->second.as_of_ts) { continue; } "
+        "auto& slot = held[{po.pair_name, is_bid}];");
+    EXPECT_NE(stamp_at, std::string::npos);
     EXPECT_NE(position_of(body,
-        "const std::optional<Mojo> lockable = is_ask ? pcs.lockable_ask : pcs.lockable_bid;"),
-        std::string::npos);
+        "const double part = std::floor(static_cast<double>(budget) "
+        "* (gs.claim->demand / demand_total));"), std::string::npos);
+    // Every balance-cache writer stamps the read.
+    const std::string all = squeeze(engine);
+    EXPECT_EQ(count_of(all, "{spendable, confirmed, pending, block_height, "
+                            "std::chrono::system_clock::now(), fields_validated};"), 2u);
+    EXPECT_EQ(count_of(all, "{spendable, observed, pending, block_height, "
+                            "std::chrono::system_clock::now(), fields_validated};"), 1u);
+    EXPECT_EQ(count_of(all, "std::chrono::system_clock::now(), pace_fields_validated};"), 1u);
+    EXPECT_EQ(count_of(all, "e.as_of_ts = std::chrono::system_clock::now();"), 1u);
 }
 
 TEST(SizingWiring, WaitToGrowReclaimsGrowthAtTheEndOfStep7AndStep8RetiresIt) {

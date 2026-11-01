@@ -368,29 +368,32 @@ struct RestingTier {
 /// [WAITGROW] Which resting offers to retire so that a coin's planned tiers
 /// with no offer can be funded.  `missing` holds what each of those tiers
 /// would lock at its planned size, and `free_coin` what the coin has free.
-/// For XCH, `commit_frac` is strategy.xch_cycle_commit_frac and the largest
-/// missing tier also needs its cycle_cap_headroom free; pass 1 for a CAT.
-/// When the free coin covers them, nothing is retired.  Otherwise the
-/// resting offers that lock more than `tolerance` (a fraction) past their
-/// planned size -- their growth -- are retired, largest excess first, until
-/// what they give back covers the shortfall, or all of them when even that
-/// does not.  An offer on a tier with no plan is left to the caller.
-/// Returns indices into `resting`, largest excess first.
+/// For XCH, `commit_frac` is strategy.xch_cycle_commit_frac: one posting
+/// cycle may lock only that fraction of what is free, so the largest offer
+/// still to post needs its cycle_cap_headroom free besides; pass 1 for a CAT.
+/// A retired offer gives back what it locks and must be posted again at its
+/// planned size, so it counts as one more tier to fund (and may be the
+/// largest).  Candidates are the resting offers that lock more than
+/// `tolerance` (a fraction) past their planned size -- their growth --
+/// largest excess first; one whose replacement would raise the need by more
+/// than it gives back is passed over.  The most missing tiers that can be
+/// funded, widest (smallest) first, are the target: the fewest candidates
+/// that fund them are picked.  Nothing is picked when the free coin funds
+/// every missing tier already, or when no reclaim funds even the widest one
+/// (a reclaim that funds nothing would only shrink the book).  An offer on a
+/// tier with no plan is left to the caller.  Returns indices into `resting`,
+/// largest excess first.
 [[nodiscard]] inline std::vector<std::size_t> tiers_to_reclaim(
     const std::vector<Mojo>& missing, Mojo free_coin, double commit_frac,
     const std::vector<RestingTier>& resting, double tolerance)
 {
-    long double need = 0.0L;
-    Mojo largest = 0;
+    std::vector<Mojo> wanted;
     for (const Mojo m : missing) {
-        if (m <= 0) continue;
-        need += static_cast<long double>(m);
-        largest = std::max(largest, m);
+        if (m > 0) wanted.push_back(m);
     }
-    if (largest <= 0) return {};
-    need += static_cast<long double>(cycle_cap_headroom(largest, commit_frac));
-    const long double shortfall = need - static_cast<long double>(std::max<Mojo>(free_coin, 0));
-    if (!(shortfall > 0.0L)) return {};
+    if (wanted.empty()) return {};
+    std::stable_sort(wanted.begin(), wanted.end());  // widest (smallest) first
+    const long double free_now = static_cast<long double>(std::max<Mojo>(free_coin, 0));
 
     const long double tol = (std::isfinite(tolerance) && tolerance > 0.0)
         ? static_cast<long double>(tolerance) : 0.0L;
@@ -405,14 +408,44 @@ struct RestingTier {
         return resting[a].locked - resting[a].planned
              > resting[b].locked - resting[b].planned;
     });
-    std::vector<std::size_t> out;
-    long double freed = 0.0L;
-    for (const std::size_t i : grown) {
-        if (freed >= shortfall) break;
-        out.push_back(i);
-        freed += static_cast<long double>(resting[i].locked - resting[i].planned);
+
+    // What the first `count` wanted tiers, plus the picked replacements, need
+    // beyond what is free and what the picks give back.
+    auto shortfall = [&](std::size_t count, long double picked_planned,
+                         long double picked_locked, Mojo largest) {
+        long double need = picked_planned;
+        for (std::size_t k = 0; k < count; ++k) {
+            need += static_cast<long double>(wanted[k]);
+            largest = std::max(largest, wanted[k]);
+        }
+        need += static_cast<long double>(cycle_cap_headroom(largest, commit_frac));
+        return need - free_now - picked_locked;
+    };
+    if (!(shortfall(wanted.size(), 0.0L, 0.0L, 0) > 0.0L)) return {};
+
+    for (std::size_t count = wanted.size(); count > 0; --count) {
+        std::vector<std::size_t> out;
+        long double planned_sum = 0.0L;
+        long double locked_sum = 0.0L;
+        Mojo largest = 0;
+        long double gap = shortfall(count, 0.0L, 0.0L, 0);
+        for (const std::size_t i : grown) {
+            if (!(gap > 0.0L)) break;
+            const auto& r = resting[i];
+            const Mojo largest_with = std::max(largest, r.planned);
+            const long double gap_with = shortfall(
+                count, planned_sum + static_cast<long double>(r.planned),
+                locked_sum + static_cast<long double>(r.locked), largest_with);
+            if (!(gap_with < gap)) continue;  // its replacement costs more than it frees
+            out.push_back(i);
+            planned_sum += static_cast<long double>(r.planned);
+            locked_sum += static_cast<long double>(r.locked);
+            largest = largest_with;
+            gap = gap_with;
+        }
+        if (!(gap > 0.0L)) return out;
     }
-    return out;
+    return {};
 }
 
 }  // namespace xop::strategy::tiermin

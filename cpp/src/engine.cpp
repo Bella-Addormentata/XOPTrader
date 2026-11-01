@@ -8217,7 +8217,8 @@ asio::awaitable<void> Engine::refresh_pace_balances(BlockHeight block_height)
             // The liveness refresh's exact write shape: a defaulted zero is
             // never marked validated.
             cached_wallet_balances_[*pace_id] =
-                {spendable, confirmed, pending, block_height, pace_fields_validated};
+                {spendable, confirmed, pending, block_height,
+                 std::chrono::system_clock::now(), pace_fields_validated};
             if (!pace_fields_validated) {
                 pace_failure = "the reply lacks confirmed_wallet_balance or pending_change";
             }
@@ -9552,11 +9553,21 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             if (!pc) continue;
             const bool is_bid = (po.side == Side::Bid);
             const Mojo locked = wait_grow_lock(po.side, po.size, po.price, *pc);
+            const std::string po_coin = strategy::coin_budget::coin_key(
+                is_bid ? pc->quote_asset_id : pc->base_asset_id);
+            auto& top = largest_offer[po_coin];
+            top = std::max(top, locked);
+            // Step 8 reads each coin's balance before it posts, so an offer
+            // recorded after the cached read still sits in that read's
+            // spendable: counted again here it would be counted twice.
+            if (const auto bit = cached_wallet_balances_.find(po_coin);
+                bit != cached_wallet_balances_.end()
+                && bit->second.as_of_ts != Timestamp{}
+                && po.created_at_ts > bit->second.as_of_ts) {
+                continue;
+            }
             auto& slot = held[{po.pair_name, is_bid}];
             slot = saturating_add_mojo(slot, locked);
-            auto& top = largest_offer[strategy::coin_budget::coin_key(
-                is_bid ? pc->quote_asset_id : pc->base_asset_id)];
-            top = std::max(top, locked);
         }
         struct GrowSide {
             PairCycleState*  pcs;
@@ -9673,13 +9684,15 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 Mojo lock = 0;
                 if (shares.has_value()) {
                     lock = (*shares)[k];
-                } else {
-                    // The claims fit: a side may lock all but what the
-                    // others claim.
-                    const double others = demand_total - gs.claim->demand;
-                    const double left = static_cast<double>(budget) - std::max(0.0, others);
-                    lock = (left >= static_cast<double>(budget)) ? budget
-                         : (left > 0.0) ? static_cast<Mojo>(left) : Mojo{0};
+                } else if (demand_total > 0.0) {
+                    // The claims fit: the budget is split in proportion to
+                    // them, so each side gets at least its claim and the
+                    // parts never sum past the budget.
+                    const double part = std::floor(static_cast<double>(budget)
+                                                   * (gs.claim->demand / demand_total));
+                    lock = !(part > 0.0)                                ? Mojo{0}
+                         : (part >= static_cast<double>(budget))        ? budget
+                                                                        : static_cast<Mojo>(part);
                 }
                 (gs.is_bid ? gs.pcs->lockable_bid : gs.pcs->lockable_ask) = lock;
             }
@@ -13033,7 +13046,14 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                     Mojo share_pool = 0;
                     const bool side_has_share = is_ask ? pcs.coin_share_ask.has_value()
                                                        : pcs.coin_share_bid.has_value();
-                    if (fit_minimums_first && (tier_minimums_on || side_has_share)) {
+                    // [WAITGROW 2026-11-01] The coin the side can lock (set at
+                    // the top of Step 7); a side with one is held to it below
+                    // even on a pair without tier minimums whose coin is not
+                    // short.
+                    const std::optional<Mojo> lockable =
+                        is_ask ? pcs.lockable_ask : pcs.lockable_bid;
+                    if (fit_minimums_first
+                        && (tier_minimums_on || side_has_share || lockable.has_value())) {
                         std::vector<TierQuote> side_tiers;
                         std::vector<Mojo> cur_sizes;
                         std::vector<Mojo> mins;
@@ -13062,7 +13082,8 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         };
                         const bool fits_minimums =
                             tier_minimums_on || mins_total <= share_pool;
-                        const std::vector<Mojo> fitted = fits_minimums
+                        const std::vector<Mojo> fitted =
+                            (fits_minimums && (tier_minimums_on || side_has_share))
                             ? strategy::tiermin::fit_tier_sizes_to_pool_and_budget(
                                   cur_sizes, mins, shares, share_pool, min_budget,
                                   cost_at)
@@ -13086,8 +13107,6 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         // tier stays at its minimum.  The size each tier had
                         // before is kept for Step 8's size-staleness rule, so
                         // the hold alone never cancels a resting offer.
-                        const std::optional<Mojo> lockable =
-                            is_ask ? pcs.lockable_ask : pcs.lockable_bid;
                         if (fits_minimums && lockable.has_value()) {
                             (is_ask ? pcs.wait_to_grow_ask : pcs.wait_to_grow_bid) = true;
                             bool held_at_minimums = false;
@@ -13800,7 +13819,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         && bal_json.contains("pending_change");
                     cached_wallet_balances_[asset] =
                         {spendable, observed, pending, block_height,
-                         fields_validated};
+                         std::chrono::system_clock::now(), fields_validated};
                     previous = reconcile_state_position(asset, observed,
                                                         fields_validated,
                                                         block_height);
@@ -14294,7 +14313,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         && bal_json.contains("pending_change");
                     cached_wallet_balances_[asset] =
                         {spendable, confirmed, pending, block_height,
-                         fields_validated};
+                         std::chrono::system_clock::now(), fields_validated};
                     // [SEED-FAIL-CLOSED 2026-09-22] The main loop never reads
                     // the assets of a pair with an empty ladder -- a suspended
                     // pair's, for one -- yet they count in every other pair's
@@ -14949,7 +14968,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             && bal_json.contains("pending_change");
                         cached_wallet_balances_[sb.label] =
                             {spendable, confirmed, pending, block_height,
-                             fields_validated};
+                             std::chrono::system_clock::now(), fields_validated};
                         // [SEED-FAIL-CLOSED 2026-09-22] State follows the
                         // wallet on every validated read.  The recovery this
                         // replaces fired only while State's position was
@@ -22492,6 +22511,7 @@ asio::awaitable<bool> Engine::fetch_bridge_balance(const AssetId& asset,
                                           static_cast<Mojo>(0));
         e.as_of_block = block_height;
         e.fields_validated = true;  // presence checked above
+        e.as_of_ts = std::chrono::system_clock::now();
         cached_wallet_balances_[asset] = e;
         if (validated != nullptr) *validated = true;
         co_return e.pending_change == 0;

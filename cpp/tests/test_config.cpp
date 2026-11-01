@@ -5135,14 +5135,35 @@ TEST(WaitToGrow, ReclaimRetiresTheMostGrownTiersUntilTheShortfallIsCovered) {
         << "a CAT needs no lock-cap room: 1.2 short, the most grown tier covers it";
 }
 
-TEST(WaitToGrow, ReclaimTakesEveryGrownTierWhenEvenThatFallsShort) {
+// A reclaim that funds no missing tier would only shrink the book.  When the
+// grown tiers cannot fund every missing tier, the widest ones they can fund
+// are the target.
+TEST(WaitToGrow, ReclaimFundsTheWidestMissingTiersItCanAndNeverNone) {
     namespace tmin = xop::strategy::tiermin;
-    const std::vector<xop::Mojo> missing{100};
+    // 10 + 30 of growth on offer; the third is within 10% of its plan and the
+    // fourth has no plan (the caller retires unplanned tiers on its own).
     const std::vector<tmin::RestingTier> resting{{30, 20}, {50, 20}, {21, 20}, {40, 0}};
-    // 10 + 30 of growth; the third is within 10% of its plan and the fourth
-    // has no plan (the caller retires unplanned tiers on its own).
-    EXPECT_EQ(tmin::tiers_to_reclaim(missing, 0, 1.0, resting, 0.10),
-              (std::vector<std::size_t>{1, 0}));
+    EXPECT_TRUE(tmin::tiers_to_reclaim({100}, 0, 1.0, resting, 0.10).empty())
+        << "40 of growth cannot fund a 100 tier";
+    // Tiers of 10 and 3 with nothing free: 6 of growth funds the 3 alone.
+    const std::vector<tmin::RestingTier> two{{8, 4}, {5, 3}};
+    EXPECT_EQ(tmin::tiers_to_reclaim({10, 3}, 0, 1.0, two, 0.10),
+              (std::vector<std::size_t>{0}));
+}
+
+// A retired offer must be posted again at its planned size.  With 0.5 XCH
+// free, a missing 1 XCH tier and a resting 30 XCH offer planned at 20, the
+// lock cap lets only about 15 of the 30.5 XCH then free be locked in a cycle:
+// the 20 XCH replacement could not post, so the offer is not retired.
+TEST(WaitToGrow, ReclaimCountsTheReplacementAndItsLockCapRoom) {
+    namespace tmin = xop::strategy::tiermin;
+    const std::vector<tmin::RestingTier> resting{{30 * kWgXch, 20 * kWgXch}};
+    EXPECT_TRUE(tmin::tiers_to_reclaim({1 * kWgXch}, kWgXch / 2, 0.5, resting, 0.10).empty());
+    EXPECT_EQ(tmin::tiers_to_reclaim({1 * kWgXch}, kWgXch / 2, 1.0, resting, 0.10),
+              (std::vector<std::size_t>{0}))
+        << "without the cap, the 30.5 then free fund both";
+    EXPECT_TRUE(tmin::tiers_to_reclaim({1 * kWgXch}, 2 * kWgXch, 0.5, resting, 0.10).empty())
+        << "2 free already funds the 1 XCH tier and its room";
 }
 
 TEST(WaitToGrow, NothingIsReclaimedWithoutAnUnfundedTier) {
