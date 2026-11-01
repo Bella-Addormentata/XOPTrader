@@ -1152,21 +1152,39 @@ TEST(SizingWiring, ListedTokenCoinPoolsAreCheckedEveryHeartbeatBeforeStep7) {
         "const auto pool = execution::cat_pool_target( per_token, asset_id, info.display_name, "
         "cat_target_count, cat_target_units); if (!pool.has_value()) continue; "
         "const int pool_count = pool->count;");
+    // [review] The coin size is converted checked: a finite size can still
+    // scale past the Mojo range.
+    const std::size_t mojos_at = position_of(pool,
+        "const std::optional<Mojo> checked_target = to_mojo_checked( "
+        "pool->units * static_cast<double>(info.mojos_per_unit));");
+    // [review] One coin read per CAT: the pool counts the free coins of its
+    // size, as ensure_split() does, and the same coins decide the split.
+    const std::size_t count_at = position_of(pool,
+        "cat_reading.pool_ready_count = static_cast<int>( "
+        "execution::CoinManager::count_pool_ready_coins( cat_free_coins, target_mojos));");
     const std::size_t verdict_at = position_of(pool,
         "execution::decide_coin_pool_action( cat_reading, pool_count, cat_pending);");
-    // Checked every heartbeat, a listed pool splits only when a free coin can
-    // make a coin of its size: offers holding every coin is the usual state.
+    // Checked every heartbeat, a pool splits only when a free coin can make a
+    // coin of its size: offers holding every coin is the usual state.
     const std::size_t splittable_at = position_of(pool,
+        "for (const auto& c : cat_free_coins) { if (c.coin_name.empty()) continue; "
         "if (execution::CoinManager::plan_split_for_coin( c.amount, needed, target_mojos, 0).batch >= 1)");
     const std::size_t split_at = position_of(pool,
         "co_await coin_mgr_->ensure_split( info.wallet_id, pool_count, target_mojos, split_fee);");
     ASSERT_NE(target_at, std::string::npos);
+    ASSERT_NE(mojos_at, std::string::npos);
+    ASSERT_NE(count_at, std::string::npos);
     ASSERT_NE(verdict_at, std::string::npos);
     ASSERT_NE(splittable_at, std::string::npos);
     ASSERT_NE(split_at, std::string::npos);
-    EXPECT_LT(target_at, verdict_at);
+    EXPECT_LT(target_at, mojos_at);
+    EXPECT_LT(mojos_at, count_at);
+    EXPECT_LT(count_at, verdict_at);
     EXPECT_LT(verdict_at, splittable_at);
     EXPECT_LT(splittable_at, split_at);
+    EXPECT_EQ(count_of(pool, "coin_mgr_->count_free_coins(info.wallet_id)"), 0u)
+        << "a count of every free coin lets big coins satisfy a pool of small ones";
+    EXPECT_EQ(count_of(pool, "coin_mgr_->get_spendable_coins("), 1u);
     EXPECT_EQ(count_of(pool, "cat_target_count, target_mojos"), 0u)
         << "no CAT split uses the global count once tokens are listed";
 }

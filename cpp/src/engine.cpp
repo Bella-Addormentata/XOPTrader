@@ -28712,6 +28712,9 @@ void Engine::check_pause_flag()
 //   target count  = config_.strategy.cat_coin_pool_target_count
 //   denomination  = config_.strategy.cat_coin_pool_target_units (in display units)
 //   mojos         = target_units * mojos_per_unit for that asset
+//   (or, when strategy.cat_coin_pool_tokens lists any token, only the listed
+//   tokens, each with its own count and units -- [COINPOOL-TOKEN])
+//   counted       = free coins of the pool's size (half to twice it)
 //
 // The function collects unique (wallet_id, mojos_per_unit) pairs across all
 // enabled pair configs, then runs ensure_split() for each one.
@@ -28920,13 +28923,16 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height,
                 cat_target_units);
             if (!pool.has_value()) continue;
             const int pool_count = pool->count;
-            // Compute target denomination in mojos.
-            const auto target_mojos = static_cast<Mojo>(
-                std::llround(pool->units * static_cast<double>(info.mojos_per_unit)));
+            // Compute target denomination in mojos.  [COINPOOL-TOKEN review]
+            // Checked: a finite, positive size can still scale past the Mojo
+            // range, and llround does not report that.
+            const std::optional<Mojo> checked_target = to_mojo_checked(
+                pool->units * static_cast<double>(info.mojos_per_unit));
+            const Mojo target_mojos = checked_target.value_or(0);
 
             if (target_mojos <= 0) {
-                spdlog::warn("[Engine] Coin pool: {} target_mojos=0 "
-                             "(units={}, mpu={}), skipping",
+                spdlog::warn("[Engine] Coin pool: {} target {} units (mpu={}) is not "
+                             "a usable coin size in mojos, skipping",
                              info.display_name, pool->units,
                              info.mojos_per_unit);
                 continue;
@@ -28958,13 +28964,23 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height,
             // because "already correct" is not a property that survives edits.
             // (It is also dead in production: cat_coin_pool_target_count is 0,
             // so only the broken XCH branch has been running live.)
+            //
+            // [COINPOOL-TOKEN review 2026-11-01] The pool counts the free coins
+            // of ITS size (CoinManager::is_pool_ready_coin, half to twice the
+            // target), as ensure_split() does: counting every free coin let
+            // twelve 2,000-unit coins satisfy a pool of twelve 10-unit coins.
+            // The same read decides below whether any free coin can split.
             execution::CoinPoolReading cat_reading;
+            std::vector<execution::CoinInfo> cat_free_coins;
             if (!cat_pending) {
                 try {
-                    if (auto n = co_await coin_mgr_->count_free_coins(
+                    if (auto coins = co_await coin_mgr_->get_spendable_coins(
                                      info.wallet_id)) {
+                        cat_free_coins = std::move(*coins);
                         cat_reading.read_ok          = true;
-                        cat_reading.pool_ready_count = *n;
+                        cat_reading.pool_ready_count = static_cast<int>(
+                            execution::CoinManager::count_pool_ready_coins(
+                                cat_free_coins, target_mojos));
                     } else {
                         spdlog::warn("[Engine] Coin pool: {} free-coin read "
                                      "FAILED (wid={}) -- pool state unknown, "
@@ -28975,7 +28991,7 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height,
                     // Backstop only -- see the XCH branch above. Both real
                     // failure modes arrive as nullopt at the `else` branch,
                     // not here.
-                    spdlog::warn("[Engine] Coin pool: {} count_free_coins failed: {}",
+                    spdlog::warn("[Engine] Coin pool: {} free-coin read failed: {}",
                                  info.display_name, e.what());
                 }
             }
@@ -28986,46 +29002,39 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height,
             if (cat_action == execution::CoinPoolAction::Skip) continue;
 
             if (cat_action == execution::CoinPoolAction::Satisfied) {
-                spdlog::debug("[Engine] Coin pool: {} {} free coins >= target {} -- OK",
+                spdlog::debug("[Engine] Coin pool: {} {} free coins of {:.1f} units "
+                              ">= target {} -- OK",
                               info.display_name, cat_reading.pool_ready_count,
-                              pool_count);
+                              pool->units, pool_count);
                 continue;
             }
 
-            // [COINPOOL-TOKEN 2026-11-01] A per-token pool is checked every
-            // heartbeat, so it splits only when a free coin can make at least
-            // one coin of its size: everything locked in offers is the usual
-            // state, not a failure to log each heartbeat.
-            if (!per_token.empty()) {
+            // [COINPOOL-TOKEN 2026-11-01] A listed pool is checked every
+            // heartbeat, so a CAT pool splits only when a free coin can make
+            // at least one coin of its size: every coin locked in offers is
+            // the usual state, not a failure to log each heartbeat.
+            {
+                const int needed = pool_count - cat_reading.pool_ready_count;
                 bool splittable = false;
-                try {
-                    if (const auto coins = co_await coin_mgr_->get_spendable_coins(
-                            info.wallet_id)) {
-                        const int needed = pool_count - cat_reading.pool_ready_count;
-                        for (const auto& c : *coins) {
-                            if (c.coin_name.empty()) continue;
-                            if (execution::CoinManager::plan_split_for_coin(
-                                    c.amount, needed, target_mojos, 0).batch >= 1) {
-                                splittable = true;
-                                break;
-                            }
-                        }
+                for (const auto& c : cat_free_coins) {
+                    if (c.coin_name.empty()) continue;
+                    if (execution::CoinManager::plan_split_for_coin(
+                            c.amount, needed, target_mojos, 0).batch >= 1) {
+                        splittable = true;
+                        break;
                     }
-                } catch (const std::exception& e) {
-                    spdlog::debug("[Engine] Coin pool: {} coin read failed: {}",
-                                  info.display_name, e.what());
                 }
                 if (!splittable) {
-                    spdlog::debug("[Engine] Coin pool: {} {} free coins < target {}, "
-                                  "but no free coin is big enough to split into "
-                                  "{:.1f}-unit coins -- waiting for one",
+                    spdlog::debug("[Engine] Coin pool: {} {} free coins of {:.1f} units "
+                                  "< target {}, but no free coin is big enough to "
+                                  "split into them -- waiting for one",
                                   info.display_name, cat_reading.pool_ready_count,
-                                  pool_count, pool->units);
+                                  pool->units, pool_count);
                     continue;
                 }
             }
 
-            spdlog::info("[Engine] Coin pool: {} {} free coins < target {} -- "
+            spdlog::info("[Engine] Coin pool: {} {} free coins of its size < target {} -- "
                          "splitting to create {} more coins of {:.1f} units "
                          "({} mojos) each",
                          info.display_name, cat_reading.pool_ready_count,

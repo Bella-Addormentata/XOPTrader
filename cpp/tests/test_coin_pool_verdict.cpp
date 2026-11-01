@@ -263,6 +263,40 @@ TEST(CoinPoolVerdict, ASuccessfulReadFiltersDustAndLockedCoinsAndSortsBySize)
     EXPECT_EQ((*read)[1].coin_name, "small");
 }
 
+// [COINPOOL-TOKEN review 2026-11-01] Dust is per asset.  One 1,000,000-mojo
+// threshold for every wallet is 0.000001 XCH but 1,000 units of a CAT (1,000
+// mojos per unit), so a 100-unit wUSDC.b coin (100,000 mojos) was dropped as
+// dust and the CAT coin pool could never see, count or split it.
+TEST(CoinPoolVerdict, CatWalletsDropOnlyCoinsBelowOneUnitAsDust)
+{
+    EXPECT_EQ(CoinManager::dust_threshold_for(1), 1'000'000LL)
+        << "the XCH wallet keeps its 0.000001 XCH threshold";
+    EXPECT_EQ(CoinManager::dust_threshold_for(2), 1'000LL)
+        << "a CAT wallet: one unit";
+    EXPECT_EQ(CoinManager::dust_threshold_for(7), 1'000LL);
+
+    const RawCoins records{
+        coin_record("hundred",  100'000LL),   // 100 wUSDC.b
+        coin_record("ten",       10'000LL),   // 10 wUSDC.b
+        coin_record("one",        1'000LL),   // 1 wUSDC.b
+        coin_record("dust",         999LL),   // 0.999 wUSDC.b
+    };
+    const auto read = run_awaitable(CoinManager::collect_spendable_coins(
+        [records](std::int64_t) -> asio::awaitable<RawCoins> {
+            co_return records;
+        },
+        /*wallet_id=*/2,
+        CoinManager::dust_threshold_for(2),
+        [](const std::string&) { return false; },
+        /*logger=*/nullptr));
+    ASSERT_TRUE(read.has_value());
+    ASSERT_EQ(read->size(), 3U);
+    EXPECT_EQ((*read)[0].coin_name, "hundred");
+    EXPECT_EQ((*read)[2].coin_name, "one");
+    // ...and a pool of 10-unit coins counts the coins of its size only.
+    EXPECT_EQ(CoinManager::count_pool_ready_coins(*read, 10'000LL), 1U);
+}
+
 // ---------------------------------------------------------------------------
 // std::nullopt and an empty vector are different values.
 //

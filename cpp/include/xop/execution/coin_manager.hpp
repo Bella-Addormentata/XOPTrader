@@ -312,6 +312,19 @@ public:
      */
     asio::awaitable<std::optional<int>> count_free_coins(std::int64_t wallet_id);
 
+    /// [COINPOOL-TOKEN review 2026-11-01] Coins strictly below this are dust
+    /// in a wallet's spendable read.  One threshold for every wallet used to
+    /// be 1,000,000 mojos, which is 0.000001 XCH but 1,000 units of a CAT
+    /// (1,000 mojos per unit), so every CAT coin under 1,000 units was
+    /// invisible to the CAT coin pool and could never be split.  A CAT coin
+    /// is dust below one unit.
+    static constexpr Mojo kXchDustThresholdMojos = 1'000'000;  // 0.000001 XCH
+    static constexpr Mojo kCatDustThresholdMojos = 1'000;      // 1 CAT unit
+    [[nodiscard]] static constexpr Mojo dust_threshold_for(std::int64_t wallet_id) noexcept
+    {
+        return wallet_id == 1 ? kXchDustThresholdMojos : kCatDustThresholdMojos;
+    }
+
     /**
      * @brief Check whether a coin is already close to the target pool size.
      *
@@ -547,8 +560,6 @@ private:
     /// Default transaction fee for coin splits (mojos).  From config.
     Mojo default_split_fee_{100'000'000};  // 0.0001 XCH
 
-    /// Minimum coin size to consider useful (filters dust).  Mojos.
-    Mojo dust_threshold_{1'000'000};  // 0.000001 XCH
 
     /// Target XCH coin-pool denomination in mojos (wallet 1 only).
     Mojo xch_pool_target_mojos_{0};
