@@ -481,6 +481,30 @@ struct RestingTier {
     return {};
 }
 
+/// [WAITGROW-MIN 2026-11-01] How many blocks a tier's last resting offer
+/// still sizes its replacement after that offer left the book.  A refresh
+/// whose replacement could not post while the old offer still held its coin
+/// posts it once the cancel lands, a block or two later, at the size the
+/// tier had; a tier missing for longer than this starts at its minimum.
+inline constexpr std::uint32_t kReplacementSizeBlocks = 3;
+
+/// [WAITGROW-MIN 2026-11-01] The size a planned tier with no resting offer
+/// starts at under wait to grow: its minimum, so a missing tier never grows
+/// out of the coin the side's resting offers hold.  On 2026-11-01 the
+/// XCH/DBX 10 XCH tight ask, refused by the XCH lock cap at 10.5 XCH, kept
+/// growing (to 12.1 XCH) while it waited.  A tier whose own offer left the
+/// book within kReplacementSizeBlocks keeps that offer's size instead (never
+/// above the plan, never below the minimum): a refresh replacement deferred
+/// until its cancel lands is not a first placement, and resetting it to the
+/// minimum would keep every deferred refresh from ever growing.
+[[nodiscard]] inline Mojo start_size_without_offer(Mojo planned, Mojo min,
+                                                   std::optional<Mojo> recent_offer)
+{
+    if (planned <= min) return planned;
+    if (!recent_offer.has_value()) return min;
+    return std::clamp(*recent_offer, min, planned);
+}
+
 }  // namespace xop::strategy::tiermin
 
 #endif  // XOP_STRATEGY_TIER_MINIMUMS_HPP

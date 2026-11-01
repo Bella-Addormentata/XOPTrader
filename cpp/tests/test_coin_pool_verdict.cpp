@@ -267,19 +267,18 @@ TEST(CoinPoolVerdict, ASuccessfulReadFiltersDustAndLockedCoinsAndSortsBySize)
 // threshold for every wallet is 0.000001 XCH but 1,000 units of a CAT (1,000
 // mojos per unit), so a 100-unit wUSDC.b coin (100,000 mojos) was dropped as
 // dust and the CAT coin pool could never see, count or split it.
-TEST(CoinPoolVerdict, CatWalletsDropOnlyCoinsBelowOneUnitAsDust)
+TEST(CoinPoolVerdict, NoCatCoinIsDust)
 {
     EXPECT_EQ(CoinManager::dust_threshold_for(1), 1'000'000LL)
         << "the XCH wallet keeps its 0.000001 XCH threshold";
-    EXPECT_EQ(CoinManager::dust_threshold_for(2), 1'000LL)
-        << "a CAT wallet: one unit";
-    EXPECT_EQ(CoinManager::dust_threshold_for(7), 1'000LL);
+    EXPECT_EQ(CoinManager::dust_threshold_for(2), 1LL) << "a CAT wallet";
+    EXPECT_EQ(CoinManager::dust_threshold_for(7), 1LL);
 
     const RawCoins records{
         coin_record("hundred",  100'000LL),   // 100 wUSDC.b
         coin_record("ten",       10'000LL),   // 10 wUSDC.b
-        coin_record("one",        1'000LL),   // 1 wUSDC.b
-        coin_record("dust",         999LL),   // 0.999 wUSDC.b
+        coin_record("half",         500LL),   // 0.5 wUSDC.b
+        coin_record("mojo",           1LL),
     };
     const auto read = run_awaitable(CoinManager::collect_spendable_coins(
         [records](std::int64_t) -> asio::awaitable<RawCoins> {
@@ -290,11 +289,50 @@ TEST(CoinPoolVerdict, CatWalletsDropOnlyCoinsBelowOneUnitAsDust)
         [](const std::string&) { return false; },
         /*logger=*/nullptr));
     ASSERT_TRUE(read.has_value());
-    ASSERT_EQ(read->size(), 3U);
+    ASSERT_EQ(read->size(), 4U);
     EXPECT_EQ((*read)[0].coin_name, "hundred");
-    EXPECT_EQ((*read)[2].coin_name, "one");
     // ...and a pool of 10-unit coins counts the coins of its size only.
     EXPECT_EQ(CoinManager::count_pool_ready_coins(*read, 10'000LL), 1U);
+}
+
+// [COINPOOL-TOKEN review round 2] Every coin a CAT split makes stays visible
+// to the next read.  A pool of two 1-unit coins holding one 1-unit coin
+// takes the half-split fallback: two 0.5-unit coins, both in the pool's band.
+// Under a one-unit dust floor both would vanish, and the pool would go from
+// one coin to none.
+TEST(CoinPoolVerdict, ACatSplitNeverMakesACoinTheNextReadDrops)
+{
+    const xop::Mojo unit = 1'000;
+    const auto plan = CoinManager::plan_split_for_coin(unit, 2, unit, 0);
+    ASSERT_EQ(plan.batch, 1);
+    const xop::Mojo change = unit - plan.split_amount * plan.batch;
+    const RawCoins after{coin_record("out", plan.split_amount),
+                         coin_record("change", change)};
+    const auto read = run_awaitable(CoinManager::collect_spendable_coins(
+        [after](std::int64_t) -> asio::awaitable<RawCoins> {
+            co_return after;
+        },
+        /*wallet_id=*/2,
+        CoinManager::dust_threshold_for(2),
+        [](const std::string&) { return false; },
+        /*logger=*/nullptr));
+    ASSERT_TRUE(read.has_value());
+    ASSERT_EQ(read->size(), 2U) << "the split's outputs are not dust";
+    EXPECT_EQ(CoinManager::count_pool_ready_coins(*read, unit), 2U)
+        << "the pool went from one coin to two";
+
+    // Every CAT output is positive, so it clears the CAT floor; across a
+    // range of coin sizes and pool sizes, so is every planned output.
+    for (const xop::Mojo amount : {1LL, 2LL, 3LL, 999LL, 1'000LL, 1'499LL, 100'000LL}) {
+        for (const xop::Mojo target : {1LL, 2LL, 1'000LL, 10'000LL}) {
+            const auto p = CoinManager::plan_split_for_coin(amount, 12, target, 0);
+            if (p.batch < 1) continue;
+            EXPECT_GE(p.split_amount, CoinManager::dust_threshold_for(2));
+            const xop::Mojo left = amount - p.split_amount * p.batch;
+            EXPECT_TRUE(left == 0 || left >= CoinManager::dust_threshold_for(2))
+                << amount << " split to " << p.batch << " x " << p.split_amount;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -316,10 +316,14 @@ public:
     /// in a wallet's spendable read.  One threshold for every wallet used to
     /// be 1,000,000 mojos, which is 0.000001 XCH but 1,000 units of a CAT
     /// (1,000 mojos per unit), so every CAT coin under 1,000 units was
-    /// invisible to the CAT coin pool and could never be split.  A CAT coin
-    /// is dust below one unit.
+    /// invisible to the CAT coin pool and could never be split.  No CAT coin
+    /// is dust: any floor above one mojo is one a split can cut under (the
+    /// half-split fallback turns a 1-unit coin into two 0.5-unit coins for a
+    /// pool of 1-unit coins), and a coin the pool cannot see is one it cannot
+    /// count or split again.  The pool-ready band, not this floor, decides
+    /// which CAT coins count toward a pool.
     static constexpr Mojo kXchDustThresholdMojos = 1'000'000;  // 0.000001 XCH
-    static constexpr Mojo kCatDustThresholdMojos = 1'000;      // 1 CAT unit
+    static constexpr Mojo kCatDustThresholdMojos = 1;          // any CAT coin
     [[nodiscard]] static constexpr Mojo dust_threshold_for(std::int64_t wallet_id) noexcept
     {
         return wallet_id == 1 ? kXchDustThresholdMojos : kCatDustThresholdMojos;

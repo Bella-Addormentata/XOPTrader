@@ -5278,6 +5278,30 @@ TEST(WaitToGrow, NothingIsReclaimedWhileTheLockCapPostsNothing) {
         << "uncapped, the 15 given back fund 1 + 10";
 }
 
+// [WAITGROW-MIN 2026-11-01] A tier with no resting offer starts at its
+// minimum: on 2026-11-01 the XCH/DBX 10 XCH tight ask kept growing (to 12.1
+// XCH) out of coin other offers held while the lock cap refused it.  A
+// refresh replacement whose cancel just landed keeps its offer's size, inside
+// the plan and the minimum, so deferred refreshes still let tiers grow.
+TEST(WaitToGrow, AMissingTierStartsAtItsMinimumUnlessItsOwnOfferJustLeft) {
+    using xop::strategy::tiermin::start_size_without_offer;
+    const xop::Mojo xch = 1'000'000'000'000LL;
+    EXPECT_EQ(start_size_without_offer(12 * xch, 10 * xch, std::nullopt), 10 * xch)
+        << "never posted: its minimum";
+    EXPECT_EQ(start_size_without_offer(12 * xch, 10 * xch, 11 * xch), 11 * xch)
+        << "a deferred replacement keeps the size it had";
+    EXPECT_EQ(start_size_without_offer(12 * xch, 10 * xch, 14 * xch), 12 * xch)
+        << "never above this cycle's plan";
+    EXPECT_EQ(start_size_without_offer(12 * xch, 10 * xch, 3 * xch), 10 * xch)
+        << "never below the minimum";
+    EXPECT_EQ(start_size_without_offer(9 * xch, 10 * xch, std::nullopt), 9 * xch)
+        << "a plan at or under its minimum is left alone";
+    EXPECT_EQ(start_size_without_offer(10 * xch, 10 * xch, 12 * xch), 10 * xch);
+    EXPECT_GE(xop::strategy::tiermin::kReplacementSizeBlocks, 1u);
+    EXPECT_LE(xop::strategy::tiermin::kReplacementSizeBlocks, 5u)
+        << "a tier missing for long starts at its minimum again";
+}
+
 TEST(WaitToGrow, NothingIsReclaimedWithoutAnUnfundedTier) {
     namespace tmin = xop::strategy::tiermin;
     const std::vector<tmin::RestingTier> resting{{30, 10}};
