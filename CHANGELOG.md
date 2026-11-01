@@ -5,6 +5,45 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.42] — 2026-11-01 — missing tiers start small; per-token coin splitting
+
+### Missing tiers start at their minimum (#212)
+
+On 2026-11-01 the XCH/DBX 10 XCH tight ask never posted on v0.10.41. The
+XCH lock cap refused it at 10.5 XCH, and while it waited it kept growing
+(to 12.1 XCH) out of coin that the side's other offers already held. So
+raising `xch_cycle_commit_frac` to 0.6 did not help.
+
+Under wait to grow, a tier with no offer on a pair with tier minimums is
+now first posted at its minimum. It grows later, when the offer is
+refreshed for price or age. A refresh whose replacement has to wait for
+the old offer's cancel to land (up to 3 blocks) is not a first placement
+and keeps its planned size.
+
+### Per-token CAT coin splitting (#212)
+
+New setting `strategy.cat_coin_pool_tokens` (default `{}`, nothing
+changes until a token is listed), for example
+`{wUSDC.b: {count: 12, units: 10.0}}`. When any token is listed, only the
+listed tokens are split, each one to its own count and coin size, and the
+global `cat_coin_pool_target_count` and `cat_coin_pool_target_units` are
+ignored. Listed tokens are checked every block, before offers post, so a
+coin freed by a cancelled offer is split before a new offer locks it
+whole. A pool only splits when a free coin is big enough to make at least
+one coin of its size. The setting applies live, without a restart.
+
+### CAT coin pool fixes (#212)
+
+- **CAT coins were treated as dust.** Every coin under 1,000,000 mojos
+  was ignored in every wallet. For a CAT (1,000 mojos per unit) that
+  meant coins under 1,000 units, so the CAT coin pool could never see,
+  count or split a typical wUSDC.b coin. CAT wallets now have no dust
+  floor; XCH keeps 0.000001 XCH.
+- **Pools count coins of their own size.** A CAT pool counts the free
+  coins between half and twice its coin size, as the split itself does.
+  Before, any free coin counted, so a few large coins could satisfy a pool
+  of small ones.
+
 ## [0.10.41] — 2026-11-01 — tiers grow only from coin the wallet can lock
 
 ### Wait to grow (#210)
