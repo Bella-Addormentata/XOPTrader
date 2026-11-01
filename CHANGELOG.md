@@ -5,6 +5,47 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.41] — 2026-11-01 — tiers grow only from coin the wallet can lock
+
+### Wait to grow (#210)
+
+On the night of 2026-10-31, v0.10.40 sized each pair from its share of
+the confirmed balance. Each offer locks whole coins, so the wide tiers
+grew and locked about 20 XCH more than they needed. That left the tight
+tiers with nothing to post.
+
+`wait_to_grow` (on by default, on new and existing installs) fixes this in
+two ways:
+
+- **Step 7.** Each coin is split between the pair sides that spend it,
+  counting only what those sides could actually lock: what is free less
+  the room the per-cycle lock cap needs, plus what their own offers
+  already hold. Minimum tiers come first. A side keeps its minimum
+  tiers, and its other tiers grow only as far as that split allows.
+- **Step 8.** When planned tiers have no offer and the free coin can't
+  fund them, Step 8 can retire resting offers that grew more than 10% past
+  their plan and are at least 32 blocks old. The widest missing tiers are
+  funded first. It retires the fewest offers that fund them, and only
+  when the missing tiers and the retired offers' replacements can all
+  post within the XCH lock cap. Retired offers are posted again at their
+  planned size. Nothing is retired when the free coin already funds what
+  a reclaim could, or while `xch_cycle_commit_frac` is 0.
+
+The size held back is not treated as a reason to refresh, so the hold on
+its own never cancels an offer. If the wallet locks more than twice what
+our offers on a coin hold, that coin is locked in whole coins: retiring an
+offer would only trade one tier for another, so nothing is retired and
+the log suggests splitting coins. Wait to grow needs `minimum_tiers_first`
+and `coin_budgets_enabled`, and it is off while `batch_offers_enabled` is
+on.
+
+**What to look for in the log:**
+
+- `wait to grow -- N sides can lock ...` for each coin
+- `wait to grow: ...` for each side whose growth is held
+- `retiring N resting tier(s) grown past their plan` and the cancel
+  reason `tier_growth_reclaim` when a reclaim happens
+
 ## [0.10.40] — 2026-10-31 — a pair at its q_max keeps its full ladder on the other side
 
 ### A token floored side no longer cuts the other side (#208)
