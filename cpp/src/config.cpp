@@ -1861,6 +1861,10 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         && !node["minimum_tiers_first"].IsNull()) {
         cfg.minimum_tiers_first = node["minimum_tiers_first"].as<bool>();
     }
+    if (node["wait_to_grow"] && node["wait_to_grow"].IsDefined()
+        && !node["wait_to_grow"].IsNull()) {
+        cfg.wait_to_grow = node["wait_to_grow"].as<bool>();
+    }
 
     // [PACE 2026-09-13] Pace controller keys (default OFF).  Every double goes
     // through read_optional_finite_in_range and every count through
