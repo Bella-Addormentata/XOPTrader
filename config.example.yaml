@@ -860,6 +860,14 @@ strategy:
   # -- CAT coin pool: pre-split BYC, wUSDC.b etc. for concurrent offers --
   cat_coin_pool_target_count: 0          # [OPTIONAL, default: 10]  Target coins per CAT (0=disabled)
   cat_coin_pool_target_units: 10.0       # [OPTIONAL, default: 50.0] Target display units per coin
+  # Per-token CAT pools.  When any token is listed here, ONLY the listed
+  # tokens are split, each to its own count and coin size, and the two
+  # settings above are ignored.  A token is named as in the pair names
+  # (e.g. wUSDC.b) or by its asset id.  Listed pools are also checked every
+  # block, before offers are posted, so a coin a cancelled offer frees is
+  # split before a new offer locks it whole; a pool splits only when a free
+  # coin is big enough to make at least one coin of its size.
+  cat_coin_pool_tokens: {}               # [OPTIONAL, default: {}]  e.g. {wUSDC.b: {count: 12, units: 10.0}}
 
   # -- AMM blend weight --
   # Weight of the TibetSwap AMM implied price in the composite mid-price.

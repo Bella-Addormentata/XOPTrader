@@ -70,13 +70,12 @@ CoinManager::CoinManager(asio::io_context&                    /*ioc*/,
 {
     reconfigure(config);
 
-    // Dust threshold: coins smaller than 1,000,000 mojos (0.000001 XCH)
-    // are ignored to avoid unnecessary UTXO bloat.
-    dust_threshold_ = 1'000'000LL;
-
+    // Dust: coins below dust_threshold_for(wallet_id) are ignored -- 0.000001
+    // XCH in the XCH wallet, one unit in a CAT wallet.
     logger_->info("CoinManager initialised: split_fee={} mojos, "
-                  "dust_threshold={} mojos",
-                  default_split_fee_, dust_threshold_);
+                  "dust_threshold={} mojos (XCH), {} mojos (CAT)",
+                  default_split_fee_, kXchDustThresholdMojos,
+                  kCatDustThresholdMojos);
 }
 
 void CoinManager::reconfigure(const AppConfig& config) noexcept
@@ -133,7 +132,7 @@ CoinManager::get_spendable_coins(std::int64_t wallet_id)
             return wallet->get_spendable_coins(wid);
         },
         wallet_id,
-        dust_threshold_,
+        dust_threshold_for(wallet_id),
         [this](const std::string& coin_name) {
             std::lock_guard<std::mutex> lock(mtx_locked_);
             return locked_coins_.count(coin_name) > 0;

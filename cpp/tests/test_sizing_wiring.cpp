@@ -1060,3 +1060,144 @@ TEST(SizingWiring, WaitToGrowReclaimsGrowthAtTheEndOfStep7AndStep8RetiresIt) {
     ASSERT_NE(retire_at, std::string::npos);
     EXPECT_LT(classify_at, retire_at);
 }
+
+// [WAITGROW-MIN 2026-11-01] A tier with no offer starts at its minimum.  On
+// 2026-11-01 the XCH/DBX 10 XCH tight ask, refused by the XCH lock cap at
+// 10.5 XCH, kept growing (to 12.1 XCH) out of the coin the side's resting
+// offers held while it waited, so raising the cap did not let it post.
+TEST(SizingWiring, WaitToGrowStartsATierWithNoOfferAtItsMinimum) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    // Every resting offer marks its tier, one whose cancel is in flight too:
+    // the tier is not missing until the cancel lands, and for a few blocks
+    // after, a missing tier is a deferred refresh replacement.
+    const std::size_t mark_at = position_of(body,
+        "tiers_with_offer.insert({po.pair_name, po.side, po.tier}); "
+        "wait_grow_recent_offers_.mark({po.pair_name, po.side, po.tier}, block_height); "
+        "if (po.cancel_pending || po.size <= 0) continue;");
+    const std::size_t forget_at = position_of(body,
+        "wait_grow_recent_offers_.expire(block_height);");
+    ASSERT_NE(mark_at, std::string::npos);
+    ASSERT_NE(forget_at, std::string::npos);
+    EXPECT_LT(mark_at, forget_at);
+    EXPECT_NE(position_of(body, "if (!wait_to_grow_on) wait_grow_recent_offers_.clear();"),
+              std::string::npos);
+    const std::size_t hold_at = position_of(body,
+        "if (fits_minimums && lockable.has_value()) {");
+    const std::size_t call_at = position_of(body,
+        "strategy::tiermin::hold_growth_to_lockable( fitted, mins, shares, share_pool, "
+        "*lockable, cost_at, &held_at_minimums);");
+    const std::size_t start_at = position_of(body,
+        "if (tier_minimums_on) { std::size_t k = 0; std::size_t started = 0; "
+        "for (auto& tq : pcs.ladder) { if (tq.side != side) continue; "
+        "const Mojo min_k = mins[k++]; "
+        "const std::tuple<std::string, Side, std::uint8_t> tier_key{pair_name, side, tq.tier_index}; "
+        "if (tq.size <= min_k || tiers_with_offer.count(tier_key) > 0) { continue; } "
+        "const Mojo start = strategy::tiermin::start_size_without_offer( tq.size, min_k, "
+        "wait_grow_recent_offers_.just_left(tier_key)); "
+        "if (start >= tq.size) continue; tq.size = start; ++started; }");
+    const std::size_t reclaim_at = position_of(body,
+        "strategy::tiermin::tiers_to_reclaim( cr.missing, wc.free, wc.commit_frac, "
+        "cr.resting, kGrowthReclaimTolerance);");
+    ASSERT_NE(mark_at, std::string::npos);
+    ASSERT_NE(hold_at, std::string::npos);
+    ASSERT_NE(call_at, std::string::npos);
+    ASSERT_NE(start_at, std::string::npos);
+    ASSERT_NE(reclaim_at, std::string::npos);
+    EXPECT_LT(forget_at, hold_at);
+    EXPECT_LT(mark_at, hold_at);
+    EXPECT_LT(hold_at, call_at);
+    EXPECT_LT(call_at, start_at) << "after the hold, inside the wait-to-grow side";
+    EXPECT_LT(start_at, reclaim_at) << "the reclaim funds the minimum, not the growth";
+}
+
+// [COINPOOL-TOKEN 2026-11-01] Listed tokens get their own coin pools,
+// checked every heartbeat before Step 7 and Step 8 so a coin a refresh just
+// freed is split before a new offer locks it whole again.  The arithmetic
+// (which tokens, what size) is unit-tested in test_config.cpp
+// (CatCoinPoolTarget.*).
+TEST(SizingWiring, ListedTokenCoinPoolsAreCheckedEveryHeartbeatBeforeStep7) {
+    const std::string engine = read_engine_cpp();
+    const std::string heartbeat = function_body(engine, kHeartbeatSignature);
+    ASSERT_FALSE(heartbeat.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t due_at = position_of(heartbeat,
+        "const bool coin_pool_due = (config_.strategy.coin_pool_target_count > 0 "
+        "|| config_.strategy.cat_coin_pool_target_count > 0 "
+        "|| !config_.strategy.cat_coin_pool_tokens.empty())");
+    const std::size_t full_at = position_of(heartbeat,
+        "if (coin_pool_due && wallet_step_may_run(\"coin pool maintenance\")) "
+        "{ try { co_await step_maintain_coin_pool(block_height); }");
+    const std::size_t tokens_at = position_of(heartbeat,
+        "} else if (!coin_pool_due && !config_.strategy.cat_coin_pool_tokens.empty() "
+        "&& !dry_run_ && !wallet_circuit_open_ && wallet_step_may_run(\"token coin pools\")) {");
+    const std::size_t tokens_call_at = position_of(heartbeat,
+        "co_await step_maintain_coin_pool(block_height, /*tokens_only=*/true);");
+    const std::size_t step7_at = position_of(heartbeat, "step_generate_ladder(block_height);");
+    const std::size_t step8_at = position_of(heartbeat, "co_await step_manage_offers(block_height);");
+    ASSERT_NE(due_at, std::string::npos);
+    ASSERT_NE(full_at, std::string::npos);
+    ASSERT_NE(tokens_at, std::string::npos);
+    ASSERT_NE(tokens_call_at, std::string::npos);
+    ASSERT_NE(step7_at, std::string::npos);
+    ASSERT_NE(step8_at, std::string::npos);
+    EXPECT_LT(due_at, full_at);
+    EXPECT_LT(full_at, tokens_at);
+    EXPECT_LT(tokens_at, tokens_call_at);
+    EXPECT_LT(tokens_call_at, step7_at);
+    EXPECT_LT(step7_at, step8_at);
+    // The startup pass runs when only tokens are listed.
+    EXPECT_NE(position_of(squeeze(engine),
+        "|| config_.strategy.cat_coin_pool_target_count > 0 "
+        "|| !config_.strategy.cat_coin_pool_tokens.empty())) { try { "
+        "co_await step_maintain_coin_pool(0);"), std::string::npos);
+
+    const std::string pool = function_body(engine,
+        "asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height,");
+    ASSERT_FALSE(pool.empty()) << XOP_TESTS_ENGINE_CPP;
+    // The heartbeat pass skips XCH, leaves the periodic schedule alone, and
+    // splits each listed token to its own count and size.
+    EXPECT_NE(position_of(pool, "if (xch_target_count > 0 && !tokens_only) {"),
+              std::string::npos);
+    EXPECT_NE(position_of(pool, "if (!tokens_only) coin_pool_last_block_ = block_height;"),
+              std::string::npos);
+    EXPECT_EQ(count_of(pool, "coin_pool_last_block_ ="), 1u);
+    const std::size_t target_at = position_of(pool,
+        "const auto pool = execution::cat_pool_target( per_token, asset_id, info.display_name, "
+        "cat_target_count, cat_target_units); if (!pool.has_value()) continue; "
+        "const int pool_count = pool->count;");
+    // [review] The coin size is converted checked: a finite size can still
+    // scale past the Mojo range.
+    const std::size_t mojos_at = position_of(pool,
+        "const std::optional<Mojo> checked_target = to_mojo_checked( "
+        "pool->units * static_cast<double>(info.mojos_per_unit));");
+    // [review] One coin read per CAT: the pool counts the free coins of its
+    // size, as ensure_split() does, and the same coins decide the split.
+    const std::size_t count_at = position_of(pool,
+        "cat_reading.pool_ready_count = static_cast<int>( "
+        "execution::CoinManager::count_pool_ready_coins( cat_free_coins, target_mojos));");
+    const std::size_t verdict_at = position_of(pool,
+        "execution::decide_coin_pool_action( cat_reading, pool_count, cat_pending);");
+    // Checked every heartbeat, a pool splits only when a free coin can make a
+    // coin of its size: offers holding every coin is the usual state.
+    const std::size_t splittable_at = position_of(pool,
+        "for (const auto& c : cat_free_coins) { if (c.coin_name.empty()) continue; "
+        "if (execution::CoinManager::plan_split_for_coin( c.amount, needed, target_mojos, 0).batch >= 1)");
+    const std::size_t split_at = position_of(pool,
+        "co_await coin_mgr_->ensure_split( info.wallet_id, pool_count, target_mojos, split_fee);");
+    ASSERT_NE(target_at, std::string::npos);
+    ASSERT_NE(mojos_at, std::string::npos);
+    ASSERT_NE(count_at, std::string::npos);
+    ASSERT_NE(verdict_at, std::string::npos);
+    ASSERT_NE(splittable_at, std::string::npos);
+    ASSERT_NE(split_at, std::string::npos);
+    EXPECT_LT(target_at, mojos_at);
+    EXPECT_LT(mojos_at, count_at);
+    EXPECT_LT(count_at, verdict_at);
+    EXPECT_LT(verdict_at, splittable_at);
+    EXPECT_LT(splittable_at, split_at);
+    EXPECT_EQ(count_of(pool, "coin_mgr_->count_free_coins(info.wallet_id)"), 0u)
+        << "a count of every free coin lets big coins satisfy a pool of small ones";
+    EXPECT_EQ(count_of(pool, "coin_mgr_->get_spendable_coins("), 1u);
+    EXPECT_EQ(count_of(pool, "cat_target_count, target_mojos"), 0u)
+        << "no CAT split uses the global count once tokens are listed";
+}

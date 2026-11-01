@@ -79,6 +79,7 @@
 #include "xop/strategy/bbo_sanity.hpp"
 #include "xop/strategy/pace_controller.hpp"
 #include "xop/strategy/revive.hpp"
+#include "xop/strategy/tier_minimums.hpp"
 #include "xop/strategy/synthetic_price.hpp"
 #include "xop/strategy/no_loss_floor.hpp"
 #include "xop/risk/usd_route.hpp"
@@ -132,6 +133,7 @@
 #include <string>
 #include <string_view>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -889,7 +891,11 @@ private:
     /// for concurrent multi-tier offer creation.  Called at startup and
     /// periodically (every coin_pool_interval_blocks).  Uses CoinManager
     /// ensure_split() to self-send if the free coin count is too low.
-    boost::asio::awaitable<void> step_maintain_coin_pool(BlockHeight block_height);
+    /// [COINPOOL-TOKEN 2026-11-01] `tokens_only` runs just the per-token CAT
+    /// pools (strategy.cat_coin_pool_tokens), every heartbeat, without
+    /// touching the XCH pool or the periodic schedule.
+    boost::asio::awaitable<void> step_maintain_coin_pool(BlockHeight block_height,
+                                                         bool tokens_only = false);
 
     // -- Connection management -----------------------------------------------
 
@@ -2528,6 +2534,15 @@ private:
     /// down because whole coins lock them, so the hint is logged at info
     /// once per episode.
     std::set<std::string> wait_grow_whole_coin_warned_;
+    /// [WAITGROW-MIN 2026-11-01] Pair sides ("pair|bid" / "pair|ask") whose
+    /// tiers with no offer were started at their minimum, so the line logs at
+    /// info once per episode.
+    std::set<std::string> wait_grow_started_logged_;
+    /// [WAITGROW-MIN review] The tiers whose own offer was on the book within
+    /// the last few blocks: a missing one is a deferred refresh replacement,
+    /// planned at its plan, not started at its minimum.
+    strategy::tiermin::RecentTierOffers<std::tuple<std::string, Side, std::uint8_t>>
+        wait_grow_recent_offers_;
 
     // -- Ratio-based inventory rebalance mode (per pair) -------------------
     enum class RatioRebalanceMode : std::uint8_t {

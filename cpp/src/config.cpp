@@ -2104,6 +2104,46 @@ StrategyConfig parse_strategy(const YAML::Node& root)
             throw ConfigError(sec + ".cat_coin_pool_target_units must be > 0");
         }
     }
+    // [COINPOOL-TOKEN 2026-11-01] Per-token pools: a map of token -> {count,
+    // units}.  A malformed entry is an error, not a silent skip: a pool the
+    // operator asked for and did not get would look exactly like one that
+    // had nothing to split.
+    if (node["cat_coin_pool_tokens"] && node["cat_coin_pool_tokens"].IsDefined()
+        && !node["cat_coin_pool_tokens"].IsNull()) {
+        const YAML::Node tokens = node["cat_coin_pool_tokens"];
+        if (!tokens.IsMap()) {
+            throw ConfigError(sec + ".cat_coin_pool_tokens must be a map of "
+                              "token -> {count, units}");
+        }
+        cfg.cat_coin_pool_tokens.clear();
+        for (const auto& kv : tokens) {
+            const std::string token = kv.first.as<std::string>();
+            const YAML::Node entry = kv.second;
+            const std::string where = sec + ".cat_coin_pool_tokens." + token;
+            if (token.empty()) {
+                throw ConfigError(sec + ".cat_coin_pool_tokens has an empty token name");
+            }
+            if (!entry.IsMap() || !entry["count"] || !entry["units"]) {
+                throw ConfigError(where + " must be {count: <int>, units: <number>}");
+            }
+            CatCoinPoolTarget t;
+            t.count = entry["count"].as<int>();
+            t.units = entry["units"].as<double>();
+            if (t.count < 0) {
+                throw ConfigError(where + ".count must be >= 0");
+            }
+            if (!std::isfinite(t.units) || t.units <= 0.0) {
+                throw ConfigError(where + ".units must be > 0");
+            }
+            for (const auto& [seen, _] : cfg.cat_coin_pool_tokens) {
+                if (cat_pool_token_key(seen) == cat_pool_token_key(token)) {
+                    throw ConfigError(sec + ".cat_coin_pool_tokens lists " + token
+                                      + " twice");
+                }
+            }
+            cfg.cat_coin_pool_tokens[token] = t;
+        }
+    }
 
     // -- Gap-aware dynamic tier spacing (optional, defaults in StrategyConfig) --
     if (node["gap_aware_spacing"] && node["gap_aware_spacing"].IsDefined()

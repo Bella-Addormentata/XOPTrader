@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -480,6 +481,49 @@ struct RestingTier {
     }
     return {};
 }
+
+/// [WAITGROW-MIN 2026-11-01] How many blocks after a tier's own offer left
+/// the book its replacement is still a replacement.  A price/TTL refresh
+/// whose replacement could not post while the old offer still held its coin
+/// posts it once the cancel lands, a block or two later; a tier missing for
+/// longer than this is placed afresh.
+inline constexpr std::uint32_t kReplacementBlocks = 3;
+
+/// [WAITGROW-MIN 2026-11-01] The size a planned tier with no resting offer
+/// starts at under wait to grow.  A first placement starts at its minimum, so
+/// a missing tier never grows out of the coin the side's resting offers hold:
+/// on 2026-11-01 the XCH/DBX 10 XCH tight ask, refused by the XCH lock cap at
+/// 10.5 XCH, kept growing (to 12.1 XCH) while it waited.  A replacement for
+/// the tier's own offer that left the book within kReplacementBlocks keeps
+/// this cycle's plan, already held to the coin the side can lock: resetting
+/// a deferred refresh to its minimum, or to the old offer's size, would keep
+/// a tier whose refreshes are always deferred from ever growing.
+[[nodiscard]] inline Mojo start_size_without_offer(Mojo planned, Mojo min,
+                                                   bool own_offer_just_left) noexcept
+{
+    return (planned <= min || own_offer_just_left) ? planned : min;
+}
+
+/// [WAITGROW-MIN 2026-11-01] The tiers whose own offer was on the book
+/// within the last kReplacementBlocks blocks.  Step 7 marks every tier with
+/// an offer (its cancel in flight included) each heartbeat, then expires the
+/// rest; a tier with no offer that is still listed is being replaced.
+template <class Key>
+class RecentTierOffers {
+public:
+    void mark(const Key& tier, std::uint32_t block) { seen_at_[tier] = block; }
+    void expire(std::uint32_t block)
+    {
+        std::erase_if(seen_at_, [block](const auto& kv) {
+            return block < kv.second || block - kv.second > kReplacementBlocks;
+        });
+    }
+    void clear() noexcept { seen_at_.clear(); }
+    [[nodiscard]] bool just_left(const Key& tier) const { return seen_at_.count(tier) > 0; }
+
+private:
+    std::map<Key, std::uint32_t> seen_at_;
+};
 
 }  // namespace xop::strategy::tiermin
 

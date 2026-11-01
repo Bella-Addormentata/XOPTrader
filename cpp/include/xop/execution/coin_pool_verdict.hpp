@@ -52,6 +52,13 @@
 // arithmetic, no narrowing, no engine types, no asio, no RPC, no spdlog.
 // ---------------------------------------------------------------------------
 
+#include "xop/config.hpp"
+
+#include <cmath>
+#include <map>
+#include <optional>
+#include <string>
+
 namespace xop::execution {
 
 enum class CoinPoolAction {
@@ -90,6 +97,33 @@ struct CoinPoolReading {
     if (split_pending)                                 return CoinPoolAction::Skip;
     if (reading.pool_ready_count >= target_count)      return CoinPoolAction::Satisfied;
     return CoinPoolAction::Split;
+}
+
+/// [COINPOOL-TOKEN 2026-11-01] The pool a CAT keeps: with no per-token
+/// pools configured, every CAT keeps the global one (cat_coin_pool_target_count
+/// coins of cat_coin_pool_target_units); with any, only a listed token keeps
+/// one -- its own -- matched by its name (as the pair names spell it) or its
+/// asset id.  nullopt when the token keeps no pool: unlisted, a count of 0,
+/// or a size that is not a positive number.
+[[nodiscard]] inline std::optional<CatCoinPoolTarget> cat_pool_target(
+    const std::map<std::string, CatCoinPoolTarget>& per_token,
+    const std::string& asset_id, const std::string& name,
+    int global_count, double global_units)
+{
+    auto usable = [](const CatCoinPoolTarget& t) -> std::optional<CatCoinPoolTarget> {
+        if (t.count <= 0 || !std::isfinite(t.units) || t.units <= 0.0) return std::nullopt;
+        return t;
+    };
+    if (per_token.empty()) return usable({global_count, global_units});
+    const std::string by_id = cat_pool_token_key(asset_id);
+    const std::string by_name = cat_pool_token_key(name);
+    for (const auto& [token, target] : per_token) {
+        const std::string key = cat_pool_token_key(token);
+        if ((!by_id.empty() && key == by_id) || (!by_name.empty() && key == by_name)) {
+            return usable(target);
+        }
+    }
+    return std::nullopt;
 }
 
 }  // namespace xop::execution
