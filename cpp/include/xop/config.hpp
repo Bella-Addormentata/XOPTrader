@@ -1419,6 +1419,22 @@ struct StrategyConfig {
     /// demand.  Applies live.  Default true; false sizes each side from its
     /// own pool and splits a short coin by demand alone, as before.
     bool     minimum_tiers_first{true};
+    /// [WAITGROW 2026-11-01] Wait to grow (operator, 2026-11-01).  With
+    /// minimum_tiers_first and coin_budgets_enabled on, each side's tiers
+    /// grow past their minimums only out of the coin it can actually lock:
+    /// its share of what the coin has free (spendable plus pending change,
+    /// less its reserve) plus what its own resting offers hold, split the
+    /// way a short coin is (every side's minimum tiers first), less the room
+    /// the XCH lock cap (xch_cycle_commit_frac) needs to post the largest
+    /// XCH offer again.  Short of that, every tier stays at its minimum.
+    /// When a planned tier has no offer and the free coin cannot fund it,
+    /// Step 8 retires the resting tiers grown furthest past their plan to
+    /// give the coin back.  Overnight on 2026-10-31 the wide tiers grew out
+    /// of a share of the confirmed balance, which counts coin locked in our
+    /// own offers, and the tight tiers could not post.  Not with batched
+    /// offers.  Applies live.  Default true; false grows the tiers out of
+    /// the confirmed balance as before.
+    bool     wait_to_grow{true};
 
     // -- [PACE 2026-09-13] Pace controller (default OFF) -------------------
     // Sells an overweight CAT QUOTE asset toward its asset_target_allocations

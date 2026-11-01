@@ -709,6 +709,14 @@ strategy:
                                        #   of funds its tight tiers are skipped first. A short coin funds every side's minimum
                                        #   tiers, widest first, before splitting the rest by demand. Applies live; false = each
                                        #   side sizes from its own pool and a short coin is split by demand alone, as before.
+  wait_to_grow: true                   # [OPTIONAL, default: true] With minimum_tiers_first and coin_budgets_enabled on, tiers
+                                       #   grow past their minimums only out of the coin the side can actually lock: its share
+                                       #   of the coin's free balance (spendable + pending change - reserve) plus what its own
+                                       #   offers hold, every side's minimum tiers first, keeping room for the XCH lock cap
+                                       #   (xch_cycle_commit_frac) to post the largest XCH offer again. Short of that, every
+                                       #   tier stays at its minimum, and when a planned tier cannot be funded the resting
+                                       #   tiers grown furthest past their plan are replaced to give the coin back. Not with
+                                       #   batched offers. Applies live; false = tiers grow out of the confirmed balance.
   xch_ask_throttle_enabled: true       # [OPTIONAL, default: true] Enable smooth XCH ask throttling
   xch_ask_throttle_caution_xch: 2.0    # [OPTIONAL, default: 2.0] Start mild ask throttling below this
   xch_ask_throttle_low_xch: 1.0        # [OPTIONAL, default: 1.0] Stronger ask throttling below this

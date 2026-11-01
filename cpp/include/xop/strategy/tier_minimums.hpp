@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -232,6 +233,186 @@ template <class CostFn>
                                              bool ask_guard_floored) noexcept
 {
     return !(tier_minimums_on && bid_guard_floored != ask_guard_floored);
+}
+
+// ---------------------------------------------------------------------------
+// [WAITGROW 2026-11-01] Wait to grow.
+//
+// Overnight on 2026-10-31/11-01 the tiers on the XCH/DBX asks and the
+// XCH/wUSDC.b bids grew past their minimums out of each side's share of the
+// coin's CONFIRMED balance.  That balance counts the coin locked in our own
+// resting offers, and the change locked with them (an offer locks whole
+// coins).  The wider tiers posted first and took the coin, and the tight
+// tiers -- the ones most likely to fill -- then found too little free coin
+// to post at all: the XCH/DBX asks' tiers 2-5 held 33.8 XCH, 19 of it
+// growth, while tier 1 at 17.6 XCH was refused.  The operator approved
+// (2026-11-01): every tier stays at its minimum until the side's whole
+// minimum ladder fits the coin it can actually lock, and only what is left
+// grows them; and a resting tier grown past its plan gives its coin back
+// when a planned tier cannot be funded.
+// ---------------------------------------------------------------------------
+
+/// [WAITGROW] The coin a posting cycle must leave free beyond an XCH-funded
+/// offer of `largest` mojos for the offer to post at all.  The coin-lock
+/// ledger lets one cycle lock at most `commit_frac` of the free XCH above
+/// the fee reserve (strategy.xch_cycle_commit_frac), so the offer needs
+/// largest / commit_frac free: largest * (1 / commit_frac - 1) beyond
+/// itself, rounded up.  0 when the fraction does not cap (1 or more), when
+/// it stops spend-side posting outright (0 or less), or with no offer.
+[[nodiscard]] inline Mojo cycle_cap_headroom(Mojo largest, double commit_frac) noexcept
+{
+    if (largest <= 0 || !std::isfinite(commit_frac) || commit_frac <= 0.0
+        || commit_frac >= 1.0) {
+        return 0;
+    }
+    const long double h = static_cast<long double>(largest)
+                        * (1.0L / static_cast<long double>(commit_frac) - 1.0L);
+    const long double top = static_cast<long double>(std::numeric_limits<Mojo>::max());
+    if (!(h < top)) return std::numeric_limits<Mojo>::max();
+    return static_cast<Mojo>(std::ceil(h));
+}
+
+/// [WAITGROW] One side's tier sizes held to `lockable`, the coin (in the
+/// funding asset's mojos) the side can lock for its ladder, minimums first.
+/// `sizes` are the tiers after fit_tier_sizes_to_pool_and_budget, `mins`,
+/// `weights` and `pool` as there, and `cost(i, size)` what tier i would lock
+/// at `size`, nondecreasing in size.  The tiers the pool keeps (the most of
+/// the side's widest whose minimums fit it) are held to `lockable`:
+///   * when their costs fit, the sizes are returned unchanged;
+///   * when their minimums fit but their sizes do not, their growth shrinks,
+///     shared out by weight as in fit_tier_sizes_to_pool, to the most whose
+///     costs fit;
+///   * when even their minimums do not fit, every one of them is held at its
+///     minimum, so no tier grows before the whole minimum ladder fits.
+/// The tighter tiers in front of them are left as they are, for the funding
+/// fit to skip.  `held_at_minimums`, when given, says whether the last case
+/// applied.
+template <class CostFn>
+[[nodiscard]] std::vector<Mojo> hold_growth_to_lockable(
+    const std::vector<Mojo>& sizes, const std::vector<Mojo>& mins,
+    const std::vector<Mojo>& weights, Mojo pool, Mojo lockable, CostFn cost,
+    bool* held_at_minimums = nullptr)
+{
+    if (held_at_minimums != nullptr) *held_at_minimums = false;
+    const std::size_t n = sizes.size();
+    if (mins.size() != n || weights.size() != n || pool <= 0 || lockable < 0) return sizes;
+    const std::vector<Mojo> wide_mins(mins.rbegin(), mins.rend());
+    const std::size_t keep = tiers_within_budget(wide_mins, pool);
+    if (keep == 0) return sizes;
+    const std::size_t first = n - keep;  // the kept tiers are [first, n)
+    for (std::size_t i = first; i < n; ++i) {
+        if (mins[i] < 0 || sizes[i] < mins[i] || weights[i] < 0) return sizes;
+    }
+    auto kept_cost_fits = [&](const std::vector<Mojo>& v) {
+        Mojo sum = 0;
+        for (std::size_t i = first; i < n; ++i) {
+            const Mojo c = cost(i, v[i]);
+            if (c < 0 || sum > lockable - c) return false;
+            sum += c;
+        }
+        return true;
+    };
+    if (kept_cost_fits(sizes)) return sizes;
+
+    std::vector<Mojo> at_mins = sizes;
+    for (std::size_t i = first; i < n; ++i) at_mins[i] = mins[i];
+    if (!kept_cost_fits(at_mins)) {
+        if (held_at_minimums != nullptr) *held_at_minimums = true;
+        return at_mins;
+    }
+
+    // The kept tiers' total, saturating.  At their minimums they fit and at
+    // their sizes they do not, so the most that fits lies between.  Any pool
+    // in that range keeps the same tiers in fit_tier_sizes_to_pool (it holds
+    // their minimums, and the sizes already fit the side's pool), whose
+    // sizes rise with the pool, and so do their costs.
+    auto kept_total = [&](const std::vector<Mojo>& v) {
+        Mojo sum = 0;
+        for (std::size_t i = first; i < n; ++i) {
+            sum = (sum > std::numeric_limits<Mojo>::max() - v[i])
+                ? std::numeric_limits<Mojo>::max() : sum + v[i];
+        }
+        return sum;
+    };
+    Mojo lo = kept_total(at_mins);  // fits
+    Mojo hi = kept_total(sizes);    // does not
+    while (hi - lo > 1) {
+        const Mojo mid = lo + (hi - lo) / 2;
+        if (kept_cost_fits(fit_tier_sizes_to_pool(sizes, mins, weights, mid))) lo = mid;
+        else hi = mid;
+    }
+    std::vector<Mojo> out = fit_tier_sizes_to_pool(sizes, mins, weights, lo);
+    return kept_cost_fits(out) ? out : at_mins;
+}
+
+/// [WAITGROW] Whether the wallet locks more than twice what our offers on a
+/// coin hold (`offers`, their amounts; `locked`, confirmed less spendable
+/// less pending change): the coin is in a few large coins, each offer locks
+/// one whole, and a smaller repost would lock the same coin again, so a
+/// reclaim would only trade which tiers rest.  Never with nothing locked.
+[[nodiscard]] constexpr bool whole_coins_lock_the_coin(Mojo offers, Mojo locked) noexcept
+{
+    if (locked <= 0) return false;
+    if (offers <= 0) return true;
+    return locked - offers > offers;
+}
+
+/// [WAITGROW] One resting offer a reclaim may retire, in the mojos of the
+/// coin it spends: what it locks now, and what its tier would lock at this
+/// cycle's planned size (0 when the tier is not planned).
+struct RestingTier {
+    Mojo locked{0};
+    Mojo planned{0};
+};
+
+/// [WAITGROW] Which resting offers to retire so that a coin's planned tiers
+/// with no offer can be funded.  `missing` holds what each of those tiers
+/// would lock at its planned size, and `free_coin` what the coin has free.
+/// For XCH, `commit_frac` is strategy.xch_cycle_commit_frac and the largest
+/// missing tier also needs its cycle_cap_headroom free; pass 1 for a CAT.
+/// When the free coin covers them, nothing is retired.  Otherwise the
+/// resting offers that lock more than `tolerance` (a fraction) past their
+/// planned size -- their growth -- are retired, largest excess first, until
+/// what they give back covers the shortfall, or all of them when even that
+/// does not.  An offer on a tier with no plan is left to the caller.
+/// Returns indices into `resting`, largest excess first.
+[[nodiscard]] inline std::vector<std::size_t> tiers_to_reclaim(
+    const std::vector<Mojo>& missing, Mojo free_coin, double commit_frac,
+    const std::vector<RestingTier>& resting, double tolerance)
+{
+    long double need = 0.0L;
+    Mojo largest = 0;
+    for (const Mojo m : missing) {
+        if (m <= 0) continue;
+        need += static_cast<long double>(m);
+        largest = std::max(largest, m);
+    }
+    if (largest <= 0) return {};
+    need += static_cast<long double>(cycle_cap_headroom(largest, commit_frac));
+    const long double shortfall = need - static_cast<long double>(std::max<Mojo>(free_coin, 0));
+    if (!(shortfall > 0.0L)) return {};
+
+    const long double tol = (std::isfinite(tolerance) && tolerance > 0.0)
+        ? static_cast<long double>(tolerance) : 0.0L;
+    std::vector<std::size_t> grown;
+    for (std::size_t i = 0; i < resting.size(); ++i) {
+        const auto& r = resting[i];
+        if (r.planned <= 0 || r.locked <= r.planned) continue;
+        const long double excess = static_cast<long double>(r.locked - r.planned);
+        if (excess > tol * static_cast<long double>(r.planned)) grown.push_back(i);
+    }
+    std::stable_sort(grown.begin(), grown.end(), [&](std::size_t a, std::size_t b) {
+        return resting[a].locked - resting[a].planned
+             > resting[b].locked - resting[b].planned;
+    });
+    std::vector<std::size_t> out;
+    long double freed = 0.0L;
+    for (const std::size_t i : grown) {
+        if (freed >= shortfall) break;
+        out.push_back(i);
+        freed += static_cast<long double>(resting[i].locked - resting[i].planned);
+    }
+    return out;
 }
 
 }  // namespace xop::strategy::tiermin

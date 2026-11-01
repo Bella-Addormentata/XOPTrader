@@ -2442,6 +2442,25 @@ private:
         // set at the start of Step 7; nullopt while the coin's claims fit.
         std::optional<Mojo> coin_share_bid;
         std::optional<Mojo> coin_share_ask;
+        // [WAITGROW 2026-11-01] The coin (in the mojos of the coin it spends)
+        // each side can lock for its ladder this cycle: its share of what the
+        // coin has free plus what its own resting offers hold, set at the
+        // start of Step 7; nullopt while wait-to-grow is off or the coin's
+        // balance is unknown.  Its tiers grow past their minimums only out of
+        // this (tiermin::hold_growth_to_lockable).
+        std::optional<Mojo> lockable_bid;
+        std::optional<Mojo> lockable_ask;
+        // [WAITGROW] Each tier's size before the wait-to-grow hold shrank it,
+        // for the tiers it shrank: Step 8's size-staleness rule still judges
+        // a resting offer against these, so a hold alone never cancels one.
+        std::map<std::pair<Side, std::uint8_t>, Mojo> pre_hold_sizes;
+        // [WAITGROW] Whether each side's growth was held to its lockable coin
+        // this cycle, which makes its tiers count in the end-of-Step-7
+        // reclaim; and the resting offers that reclaim picked, which Step 8
+        // retires to give their growth back to planned tiers with no offer.
+        bool          wait_to_grow_bid{false};
+        bool          wait_to_grow_ask{false};
+        std::set<std::string> growth_reclaim_ids;
         // [SYNTH 2026-10-22] The error bar (bps) of the synthetic quoting
         // price published for this pair in Step 1; 0 when none was.
         double        revive_synth_sigma_bps{0.0};
@@ -2505,6 +2524,10 @@ private:
         CoinClaim ask{};
     };
     std::unordered_map<std::string, PairCoinClaims> coin_claims_;
+    /// [WAITGROW 2026-11-01] Coins whose wait-to-grow reclaim is standing
+    /// down because whole coins lock them, so the hint is logged at info
+    /// once per episode.
+    std::set<std::string> wait_grow_whole_coin_warned_;
 
     // -- Ratio-based inventory rebalance mode (per pair) -------------------
     enum class RatioRebalanceMode : std::uint8_t {

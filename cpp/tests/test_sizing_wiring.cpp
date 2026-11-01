@@ -720,8 +720,11 @@ TEST(SizingWiring, ASideIsRaisedToItsMinimumTiersBeforeTheCaps) {
         "share_pool = std::min<Mojo>(saturating_add_mojo(share_pool, "
         "static_cast<Mojo>(cur_sizes.size())), "
         "is_ask ? pcs.ladder_pools.ask : pcs.ladder_pools.bid);");
+    EXPECT_NE(position_of(body,
+        "const bool fits_minimums = tier_minimums_on || mins_total <= share_pool;"),
+        std::string::npos);
     const std::size_t fitted_at = position_of(body,
-        "(tier_minimums_on || mins_total <= share_pool) "
+        "const std::vector<Mojo> fitted = fits_minimums "
         "? strategy::tiermin::fit_tier_sizes_to_pool_and_budget(cur_sizes, mins, shares, "
         "share_pool, min_budget, cost_at) : cur_sizes;");
     const std::size_t cost_at_at = position_of(body,
@@ -770,7 +773,8 @@ TEST(SizingWiring, Step8RetiresRestingOffersThePlanMovedPast) {
     ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
     const std::size_t classify_at = position_of(body, "auto tier_classes = offer_mgr_->classify_tier_staleness(");
     const std::size_t guard_at = position_of(body,
-        "if (!config_.strategy.batch_offers_enabled && !pcs.tier_min_mojos.empty()) {");
+        "if (!config_.strategy.batch_offers_enabled "
+        "&& (!pcs.tier_min_mojos.empty() || !pcs.growth_reclaim_ids.empty())) {");
     const std::size_t count_at = position_of(body, "bool has_pending = !tier_classes.empty();");
     ASSERT_NE(classify_at, std::string::npos);
     ASSERT_NE(guard_at, std::string::npos);
@@ -895,4 +899,134 @@ TEST(SizingWiring, Step8KeepsTheWidestTiersTheExposureAllowsAndPostsThemFirst) {
     EXPECT_NE(position_of(body,
         "return side_has_minimums(a.side) ? a.tier_index > b.tier_index : a.tier_index < b.tier_index;"),
         std::string::npos);
+}
+
+// [WAITGROW 2026-11-01] Wait to grow.  The arithmetic is unit-tested in
+// test_config.cpp (WaitToGrow.*); these scans pin where engine.cpp uses it.
+// Overnight on 2026-10-31 the wide tiers grew out of a share of the
+// confirmed balance, which counts coin locked in our own offers, and the
+// tight tiers could not post.  Each scan fails against the engine.cpp this
+// change replaced.
+TEST(SizingWiring, WaitToGrowSplitsTheCoinEachSideCanLock) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t on_at = position_of(body,
+        "const bool wait_to_grow_on = config_.strategy.wait_to_grow "
+        "&& config_.strategy.minimum_tiers_first "
+        "&& config_.strategy.coin_budgets_enabled "
+        "&& !config_.strategy.batch_offers_enabled;");
+    const std::size_t coin_split_at = position_of(body,
+        "const auto shares = strategy::coin_budget::split(*coin_balance, claims);");
+    const std::size_t clear_at = position_of(body, "coin_claims_.clear();");
+    ASSERT_NE(on_at, std::string::npos);
+    ASSERT_NE(coin_split_at, std::string::npos);
+    ASSERT_NE(clear_at, std::string::npos);
+    EXPECT_LT(coin_split_at, on_at) << "after the confirmed-balance shares";
+    EXPECT_LT(on_at, clear_at) << "it reads last heartbeat's claims";
+    // What the sides' own offers hold, an offer whose cancel is in flight
+    // left to the pending change; the free balance is spendable plus pending
+    // change less the reserve.
+    const std::size_t held_at = position_of(body,
+        "if (po.cancel_pending || po.size <= 0) continue;");
+    const std::size_t free_at = position_of(body,
+        "const Mojo have = saturating_add_mojo( std::max<Mojo>(0, bit->second.spendable), "
+        "std::max<Mojo>(0, bit->second.pending_change)); return std::max<Mojo>(0, have - reserve);");
+    // The XCH lock cap's room comes off before the minimums-first split.
+    const std::size_t split_at = position_of(body,
+        "const Mojo room = strategy::tiermin::cycle_cap_headroom(largest, frac); "
+        "const Mojo budget = std::max<Mojo>(0, lockable_total - room); "
+        "const auto shares = strategy::coin_budget::split(budget, claims);");
+    ASSERT_NE(held_at, std::string::npos);
+    ASSERT_NE(free_at, std::string::npos);
+    ASSERT_NE(split_at, std::string::npos);
+    EXPECT_LT(on_at, held_at);
+    EXPECT_LT(held_at, split_at);
+    EXPECT_LT(free_at, split_at);
+    EXPECT_LT(split_at, clear_at);
+    EXPECT_NE(position_of(body,
+        "const double frac = (coin == \"xch\") ? config_.strategy.xch_cycle_commit_frac : 1.0;"),
+        std::string::npos) << "only XCH has the lock cap";
+}
+
+TEST(SizingWiring, WaitToGrowHoldsTheGrowthAfterTheMinimumsFirstFit) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t fitted_at = position_of(body,
+        "const std::vector<Mojo> fitted = fits_minimums "
+        "? strategy::tiermin::fit_tier_sizes_to_pool_and_budget(");
+    const std::size_t hold_at = position_of(body,
+        "if (fits_minimums && lockable.has_value()) {");
+    const std::size_t call_at = position_of(body,
+        "strategy::tiermin::hold_growth_to_lockable( fitted, mins, shares, share_pool, "
+        "*lockable, cost_at, &held_at_minimums);");
+    const std::size_t pre_at = position_of(body,
+        "pcs.pre_hold_sizes[{side, tq.tier_index}] = fitted[k];");
+    const std::size_t fit_at = position_of(body,
+        "const std::size_t fit = strategy::tiermin::widest_tiers_within_pool(");
+    ASSERT_NE(fitted_at, std::string::npos);
+    ASSERT_NE(hold_at, std::string::npos);
+    ASSERT_NE(call_at, std::string::npos);
+    ASSERT_NE(pre_at, std::string::npos);
+    ASSERT_NE(fit_at, std::string::npos);
+    EXPECT_LT(fitted_at, hold_at);
+    EXPECT_LT(hold_at, call_at);
+    EXPECT_LT(call_at, pre_at);
+    EXPECT_LT(pre_at, fit_at) << "the funding fit skips what the held sizes cannot fund";
+    EXPECT_NE(position_of(body,
+        "const std::optional<Mojo> lockable = is_ask ? pcs.lockable_ask : pcs.lockable_bid;"),
+        std::string::npos);
+}
+
+TEST(SizingWiring, WaitToGrowReclaimsGrowthAtTheEndOfStep7AndStep8RetiresIt) {
+    const std::string engine = read_engine_cpp();
+    const std::string body = function_body(engine, kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t loop_end_at = position_of(body,
+        "\"[Engine] Step 7: {} generated {} tier quotes\"");
+    const std::size_t reclaim_at = position_of(body,
+        "strategy::tiermin::tiers_to_reclaim( cr.missing, wc.free, wc.commit_frac, "
+        "cr.resting, kGrowthReclaimTolerance);");
+    ASSERT_NE(loop_end_at, std::string::npos);
+    ASSERT_NE(reclaim_at, std::string::npos);
+    EXPECT_LT(loop_end_at, reclaim_at) << "after every pair's ladder is planned";
+    // A tier with an offer in flight is not missing, and that offer is not
+    // retired again.
+    EXPECT_NE(position_of(body,
+        "has_offer = true; if (po.cancel_pending) continue;"), std::string::npos);
+    EXPECT_NE(position_of(body,
+        "|| block_height - po.created_at_block < kGrowthReclaimMinAgeBlocks) { continue; }"),
+        std::string::npos) << "a fresh repost is not reclaimed again";
+    EXPECT_NE(position_of(body,
+        "if (!has_offer) cr.missing.push_back(planned);"), std::string::npos);
+    const std::size_t whole_at = position_of(body,
+        "if (strategy::tiermin::whole_coins_lock_the_coin(wc.offers, wc.locked)) {");
+    const std::size_t pick_at = position_of(body,
+        "cr.picks[i].pcs->growth_reclaim_ids.insert(cr.picks[i].offer_id);");
+    ASSERT_NE(whole_at, std::string::npos);
+    ASSERT_NE(pick_at, std::string::npos);
+    EXPECT_LT(reclaim_at, whole_at);
+    EXPECT_LT(whole_at, pick_at) << "a coin locked in whole coins retires nothing";
+    EXPECT_NE(position_of(body,
+        "locked_on_coin = std::max<Mojo>(0, bit->second.confirmed "
+        "- std::max<Mojo>(0, bit->second.spendable) "
+        "- std::max<Mojo>(0, bit->second.pending_change));"), std::string::npos);
+
+    const std::string step8 = function_body(
+        engine, "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)");
+    ASSERT_FALSE(step8.empty()) << XOP_TESTS_ENGINE_CPP;
+    // The size-staleness rule sees the sizes before the hold.
+    const std::size_t copy_at = position_of(step8,
+        "if (pre != pcs.pre_hold_sizes.end()) tq.size = pre->second;");
+    const std::size_t classify_at = position_of(step8,
+        "auto tier_classes = offer_mgr_->classify_tier_staleness( pair_name, "
+        "pcs.pre_hold_sizes.empty() ? pcs.ladder : classify_ladder,");
+    ASSERT_NE(copy_at, std::string::npos);
+    ASSERT_NE(classify_at, std::string::npos);
+    EXPECT_LT(copy_at, classify_at);
+    // A picked offer still Fresh is retired under its own reason.
+    const std::size_t retire_at = position_of(step8,
+        "if (why == nullptr && pcs.growth_reclaim_ids.count(size_tc.offer_id) > 0) "
+        "{ why = \"tier_growth_reclaim\"; }");
+    ASSERT_NE(retire_at, std::string::npos);
+    EXPECT_LT(classify_at, retire_at);
 }

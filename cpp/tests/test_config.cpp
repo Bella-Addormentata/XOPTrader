@@ -4542,6 +4542,28 @@ TEST(ConfigParserTest, MinimumTiersFirst_DefaultsOnAndParsesFalse) {
     }
 }
 
+// [WAITGROW 2026-11-01] Wait to grow ships on, so an existing install that
+// never wrote the key gets it; false and null parse as for the other switches.
+TEST(ConfigParserTest, WaitToGrow_DefaultsOnAndParsesFalse) {
+    {
+        TempYaml tmp(kMinimalValidYaml);
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_TRUE(cfg.strategy.wait_to_grow);
+    }
+    EXPECT_TRUE(xop::StrategyConfig{}.wait_to_grow)
+        << "a default-constructed StrategyConfig agrees with the parser";
+    {
+        TempYaml tmp(pace_with_strategy("  wait_to_grow: false\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_FALSE(cfg.strategy.wait_to_grow);
+    }
+    {
+        TempYaml tmp(pace_with_strategy("  wait_to_grow: ~\n"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_TRUE(cfg.strategy.wait_to_grow) << "null keeps the default";
+    }
+}
+
 // [STALECAP 2026-10-31] The staleness ceiling ships at 500 bps, parses any
 // non-negative value (0 = no ceiling), and refuses a negative one.
 TEST(ConfigParserTest, StaleSigmaMax_DefaultsTo500AndParses) {
@@ -4933,3 +4955,219 @@ TEST(TierMinimumMojos, XchLimiterKeepsTheWidestTiersFirst) {
     EXPECT_EQ(tmin::lowest_affordable_tier_widest_first(resting, 0, 5, 200), 1);
 }
 
+
+// ---------------------------------------------------------------------------
+// [WAITGROW 2026-11-01] Wait to grow.
+// ---------------------------------------------------------------------------
+
+// The XCH lock ledger lets a cycle lock at most commit_frac of the free XCH,
+// so an offer needs size / commit_frac free: at the shipped 0.5, as much
+// again as the offer itself.
+TEST(WaitToGrow, CycleCapHeadroomIsWhatTheLockCapNeedsFree) {
+    namespace tmin = xop::strategy::tiermin;
+    constexpr xop::Mojo xch = 1'000'000'000'000;
+    EXPECT_EQ(tmin::cycle_cap_headroom(10 * xch, 0.5), 10 * xch)
+        << "a 10 XCH tier needs 20 XCH free at the shipped 0.5";
+    EXPECT_EQ(tmin::cycle_cap_headroom(10 * xch, 0.25), 30 * xch);
+    EXPECT_EQ(tmin::cycle_cap_headroom(3, 0.5), 3);
+    EXPECT_EQ(tmin::cycle_cap_headroom(10 * xch, 1.0), 0) << "no cap";
+    EXPECT_EQ(tmin::cycle_cap_headroom(10 * xch, 1.5), 0);
+    EXPECT_EQ(tmin::cycle_cap_headroom(10 * xch, 0.0), 0)
+        << "0 stops spend-side posting; no room makes it post";
+    EXPECT_EQ(tmin::cycle_cap_headroom(10 * xch, -0.1), 0);
+    EXPECT_EQ(tmin::cycle_cap_headroom(10 * xch, std::numeric_limits<double>::quiet_NaN()), 0);
+    EXPECT_EQ(tmin::cycle_cap_headroom(0, 0.5), 0);
+    EXPECT_EQ(tmin::cycle_cap_headroom(-5, 0.5), 0);
+    EXPECT_EQ(tmin::cycle_cap_headroom(std::numeric_limits<xop::Mojo>::max(), 0.1),
+              std::numeric_limits<xop::Mojo>::max())
+        << "saturates";
+}
+
+namespace {
+// The XCH/DBX ask ladder's tier minimums (10 XCH tight to 1 XCH wide over six
+// tiers), and an ask's cost: its own base mojos.
+constexpr xop::Mojo kWgXch = 1'000'000'000'000;
+std::vector<xop::Mojo> wg_dbx_mins()
+{
+    return {10 * kWgXch, 82 * kWgXch / 10, 64 * kWgXch / 10,
+            46 * kWgXch / 10, 28 * kWgXch / 10, 1 * kWgXch};
+}
+xop::Mojo wg_sum(const std::vector<xop::Mojo>& v, std::size_t from = 0)
+{
+    xop::Mojo s = 0;
+    for (std::size_t i = from; i < v.size(); ++i) s += v[i];
+    return s;
+}
+}  // namespace
+
+// Lockable coin that holds the sizes leaves them alone.
+TEST(WaitToGrow, SizesTheSideCanLockAreKept) {
+    namespace tmin = xop::strategy::tiermin;
+    const auto mins = wg_dbx_mins();
+    const std::vector<xop::Mojo> sizes{14 * kWgXch, 12 * kWgXch, 9 * kWgXch,
+                                       7 * kWgXch, 5 * kWgXch, 2 * kWgXch};
+    const std::vector<xop::Mojo> weights{30, 25, 20, 15, 10, 5};
+    auto cost = [](std::size_t, xop::Mojo size) { return size; };
+    bool held = true;
+    EXPECT_EQ(tmin::hold_growth_to_lockable(sizes, mins, weights, 80 * kWgXch,
+                                            wg_sum(sizes), cost, &held),
+              sizes);
+    EXPECT_FALSE(held);
+}
+
+// The live case: the asks' pool held 73.4 XCH of growth, but the side could
+// lock far less.  The growth shrinks, by weight, to what the lockable coin
+// holds past the minimums, and every tier keeps its minimum.
+TEST(WaitToGrow, GrowthShrinksToWhatIsLeftAfterTheMinimumLadder) {
+    namespace tmin = xop::strategy::tiermin;
+    const auto mins = wg_dbx_mins();  // 33 XCH
+    const std::vector<xop::Mojo> sizes{20 * kWgXch, 16 * kWgXch, 13 * kWgXch,
+                                       9 * kWgXch, 7 * kWgXch, 5 * kWgXch};  // 70 XCH
+    const std::vector<xop::Mojo> weights{20 * kWgXch, 16 * kWgXch, 13 * kWgXch,
+                                         9 * kWgXch, 7 * kWgXch, 5 * kWgXch};
+    auto cost = [](std::size_t, xop::Mojo size) { return size; };
+    const xop::Mojo lockable = 43 * kWgXch;  // 10 XCH past the minimums
+    bool held = true;
+    const auto out = tmin::hold_growth_to_lockable(sizes, mins, weights, 734 * kWgXch / 10,
+                                                   lockable, cost, &held);
+    EXPECT_FALSE(held);
+    ASSERT_EQ(out.size(), sizes.size());
+    EXPECT_LE(wg_sum(out), lockable);
+    EXPECT_GT(wg_sum(out), lockable - 6) << "the growth uses what fits, to a mojo a tier";
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        EXPECT_GE(out[i], mins[i]) << "tier " << i;
+        EXPECT_LE(out[i], sizes[i]) << "tier " << i;
+    }
+    EXPECT_GT(out[0], mins[0]) << "the tight tier grows too";
+}
+
+// Short of the whole minimum ladder, no tier grows: every kept tier sits at
+// its minimum and the funding fit and Step 8 skip what they cannot fund.
+TEST(WaitToGrow, EveryTierStaysAtItsMinimumUntilTheMinimumLadderFits) {
+    namespace tmin = xop::strategy::tiermin;
+    const auto mins = wg_dbx_mins();
+    const std::vector<xop::Mojo> sizes{17 * kWgXch, 176 * kWgXch / 10, 132 * kWgXch / 10,
+                                       88 * kWgXch / 10, 66 * kWgXch / 10, 51 * kWgXch / 10};
+    const std::vector<xop::Mojo> weights{17, 17, 13, 9, 7, 5};
+    auto cost = [](std::size_t, xop::Mojo size) { return size; };
+    bool held = false;
+    const auto out = tmin::hold_growth_to_lockable(sizes, mins, weights, 734 * kWgXch / 10,
+                                                   30 * kWgXch, cost, &held);
+    EXPECT_TRUE(held);
+    EXPECT_EQ(out, mins);
+}
+
+// Tiers in front of the ones the pool keeps are left for the funding fit to
+// skip; only the kept ones are held, and only their cost counts.
+TEST(WaitToGrow, OnlyTheTiersThePoolKeepsAreHeld) {
+    namespace tmin = xop::strategy::tiermin;
+    const auto mins = wg_dbx_mins();
+    // A pool of 16 XCH keeps the four widest minimums (6.4 + 4.6 + 2.8 + 1 =
+    // 14.8; tier 1's 8.2 more would pass 16).
+    const xop::Mojo pool = 16 * kWgXch;
+    const std::vector<xop::Mojo> sizes{10 * kWgXch, 82 * kWgXch / 10, 7 * kWgXch,
+                                       5 * kWgXch, 3 * kWgXch, 1 * kWgXch};
+    const std::vector<xop::Mojo> weights{1, 1, 1, 1, 1, 1};
+    auto cost = [](std::size_t, xop::Mojo size) { return size; };
+    bool held = false;
+    const auto out = tmin::hold_growth_to_lockable(sizes, mins, weights, pool,
+                                                   10 * kWgXch, cost, &held);
+    EXPECT_TRUE(held) << "the four kept minimums need 14.8 XCH";
+    EXPECT_EQ(out[0], sizes[0]);
+    EXPECT_EQ(out[1], sizes[1]);
+    for (std::size_t i = 2; i < out.size(); ++i) EXPECT_EQ(out[i], mins[i]) << "tier " << i;
+}
+
+// A bid's cost is its quote at its own price; the hold works in that coin.
+TEST(WaitToGrow, ABidIsHeldInTheQuoteItSpends) {
+    namespace tmin = xop::strategy::tiermin;
+    const std::vector<xop::Mojo> mins{4, 2};
+    const std::vector<xop::Mojo> sizes{10, 6};
+    const std::vector<xop::Mojo> weights{10, 6};
+    // Two quote mojos per base mojo, rounded up.
+    auto cost = [](std::size_t, xop::Mojo size) { return 2 * size; };
+    const auto out = tmin::hold_growth_to_lockable(sizes, mins, weights, 16, 20, cost);
+    EXPECT_LE(2 * wg_sum(out), 20);
+    EXPECT_GE(out[0], 4);
+    EXPECT_GE(out[1], 2);
+    EXPECT_EQ(tmin::hold_growth_to_lockable(sizes, mins, weights, 16, 11, cost),
+              mins)
+        << "12 quote mojos of minimums do not fit 11";
+}
+
+// Malformed inputs change nothing.
+TEST(WaitToGrow, MalformedInputsKeepTheSizes) {
+    namespace tmin = xop::strategy::tiermin;
+    const std::vector<xop::Mojo> sizes{10, 6};
+    auto cost = [](std::size_t, xop::Mojo size) { return size; };
+    EXPECT_EQ(tmin::hold_growth_to_lockable(sizes, {4}, {1, 1}, 16, 5, cost), sizes);
+    EXPECT_EQ(tmin::hold_growth_to_lockable(sizes, {4, 2}, {1, 1}, 0, 5, cost), sizes);
+    EXPECT_EQ(tmin::hold_growth_to_lockable(sizes, {4, 2}, {1, 1}, 16, -1, cost), sizes);
+    EXPECT_EQ(tmin::hold_growth_to_lockable(sizes, {4, 2}, {1, 1}, 1, 5, cost), sizes)
+        << "the pool holds not even the widest minimum";
+    EXPECT_EQ(tmin::hold_growth_to_lockable(std::vector<xop::Mojo>{3, 6}, {4, 2}, {1, 1}, 16, 5, cost),
+              (std::vector<xop::Mojo>{3, 6}))
+        << "a kept tier below its minimum";
+}
+
+// The 2026-11-01 XCH/DBX book: tiers 0 and 1 had no offer, 19.8 XCH was free,
+// and tiers 2-5 rested at 13.2, 8.8, 6.6 and 5.14 XCH against minimums of
+// 6.4, 4.6, 2.8 and 1.  Posting both minimums under the 0.5 lock cap needs
+// 18.2 XCH plus 10 XCH of room: 8.4 short.  The two tiers grown furthest
+// (tiers 2 and 3) give back 6.8 + 4.2 XCH, which covers it; tiers 4 and 5
+// keep their offers.
+TEST(WaitToGrow, ReclaimRetiresTheMostGrownTiersUntilTheShortfallIsCovered) {
+    namespace tmin = xop::strategy::tiermin;
+    const std::vector<xop::Mojo> missing{10 * kWgXch, 82 * kWgXch / 10};
+    const std::vector<tmin::RestingTier> resting{
+        {132 * kWgXch / 10, 64 * kWgXch / 10},
+        {88 * kWgXch / 10, 46 * kWgXch / 10},
+        {66 * kWgXch / 10, 28 * kWgXch / 10},
+        {514 * kWgXch / 100, 1 * kWgXch},
+    };
+    const auto picks = tmin::tiers_to_reclaim(missing, 198 * kWgXch / 10, 0.5, resting, 0.10);
+    EXPECT_EQ(picks, (std::vector<std::size_t>{0, 1}));
+    EXPECT_TRUE(tmin::tiers_to_reclaim(missing, 283 * kWgXch / 10, 0.5, resting, 0.10).empty())
+        << "28.3 XCH free funds both";
+    EXPECT_EQ(tmin::tiers_to_reclaim(missing, 283 * kWgXch / 10, 1.0, resting, 0.10).size(), 0u);
+    EXPECT_EQ(tmin::tiers_to_reclaim(missing, 17 * kWgXch, 1.0, resting, 0.10),
+              (std::vector<std::size_t>{0}))
+        << "a CAT needs no lock-cap room: 1.2 short, the most grown tier covers it";
+}
+
+TEST(WaitToGrow, ReclaimTakesEveryGrownTierWhenEvenThatFallsShort) {
+    namespace tmin = xop::strategy::tiermin;
+    const std::vector<xop::Mojo> missing{100};
+    const std::vector<tmin::RestingTier> resting{{30, 20}, {50, 20}, {21, 20}, {40, 0}};
+    // 10 + 30 of growth; the third is within 10% of its plan and the fourth
+    // has no plan (the caller retires unplanned tiers on its own).
+    EXPECT_EQ(tmin::tiers_to_reclaim(missing, 0, 1.0, resting, 0.10),
+              (std::vector<std::size_t>{1, 0}));
+}
+
+TEST(WaitToGrow, NothingIsReclaimedWithoutAnUnfundedTier) {
+    namespace tmin = xop::strategy::tiermin;
+    const std::vector<tmin::RestingTier> resting{{30, 10}};
+    EXPECT_TRUE(tmin::tiers_to_reclaim({}, 0, 0.5, resting, 0.10).empty());
+    EXPECT_TRUE(tmin::tiers_to_reclaim({0, -5}, 0, 0.5, resting, 0.10).empty());
+    EXPECT_TRUE(tmin::tiers_to_reclaim({5}, 10, 0.5, resting, 0.10).empty())
+        << "5 + 5 of room fits 10 free";
+    EXPECT_EQ(tmin::tiers_to_reclaim({5}, 9, 0.5, resting, 0.10).size(), 1u);
+    EXPECT_EQ(tmin::tiers_to_reclaim({5}, -50, 1.0, resting, 0.10).size(), 1u)
+        << "a negative free reads as none";
+}
+
+// 2026-11-01: XCH had 67.7 XCH in our offers and 88 XCH locked -- some
+// overshoot, and a reclaim still frees coin.  wUSDC.b had ~4.3 spendable of
+// ~420 under four bids holding ~73: a reclaim would only trade tiers.
+TEST(WaitToGrow, WholeCoinsLockTheCoinWhenTheWalletLocksTwiceWhatOffersHold) {
+    namespace tmin = xop::strategy::tiermin;
+    constexpr xop::Mojo xch = 1'000'000'000'000;
+    EXPECT_FALSE(tmin::whole_coins_lock_the_coin(677 * xch / 10, 88 * xch));
+    EXPECT_TRUE(tmin::whole_coins_lock_the_coin(73'000, 415'000));
+    EXPECT_FALSE(tmin::whole_coins_lock_the_coin(100, 200)) << "exactly twice";
+    EXPECT_TRUE(tmin::whole_coins_lock_the_coin(100, 201));
+    EXPECT_FALSE(tmin::whole_coins_lock_the_coin(100, 0));
+    EXPECT_FALSE(tmin::whole_coins_lock_the_coin(0, 0));
+    EXPECT_TRUE(tmin::whole_coins_lock_the_coin(0, 5)) << "locked with no offer of ours";
+}

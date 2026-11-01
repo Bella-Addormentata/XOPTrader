@@ -141,6 +141,29 @@ namespace {
     return (add > headroom) ? std::numeric_limits<Mojo>::max() : acc + add;
 }
 
+// [WAITGROW 2026-11-01] What an offer of `size` base mojos at `price` locks
+// of the coin its side spends: an ask its base mojos, a bid its quote,
+// rounded up as the offer is built (Step 7's funding fit prices a bid tier
+// the same way).
+[[nodiscard]] Mojo wait_grow_lock(Side side, Mojo size, Mojo price,
+                                  const PairConfig& pc) noexcept
+{
+    if (size <= 0) return 0;
+    if (side == Side::Ask) return size;
+    return execution::quote_cost_for_ask(
+        BaseMojos{size}, price, BaseMpu{pc.base_mojos_per_unit},
+        QuoteMpu{pc.quote_mojos_per_unit}).v;
+}
+
+// [WAITGROW] How far past its planned size a resting tier must lock before
+// the reclaim retires it for its growth: a few percent of drift is not
+// worth an offer's cancel and repost.
+constexpr double kGrowthReclaimTolerance = 0.10;
+// [WAITGROW] And how old it must be: an offer posted within this many blocks
+// keeps its coin, so a tier is reclaimed at most once in that time even if
+// whole-coin locking leaves the coin short again after the repost.
+constexpr BlockHeight kGrowthReclaimMinAgeBlocks = 32;
+
 int score_offer_competitiveness(Side side,
                                 Mojo price,
                                 Mojo best_bid,
@@ -9493,6 +9516,185 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                          100.0 * static_cast<double>(*coin_balance) / wanted);
         }
     }
+    // -- [WAITGROW 2026-11-01] The coin each side can actually lock ---------
+    // The shares above split each coin's CONFIRMED balance, which counts the
+    // coin locked in our own resting offers and the change locked with them
+    // (an offer locks whole coins).  Grown out of that, the wide tiers posted
+    // first and took the coin, and the tight tiers could not post at all
+    // (2026-10-31/11-01).  Here each coin's lockable amount -- what it has
+    // free (spendable plus pending change, less its reserve) plus what the
+    // claiming sides' own resting offers hold -- is split the way a short
+    // coin is, every side's minimum tiers first, and Step 7 grows each side's
+    // tiers only out of its part (tiermin::hold_growth_to_lockable).  For XCH
+    // the room the coin-lock ledger needs to post the largest XCH offer again
+    // (its per-cycle cap, strategy.xch_cycle_commit_frac) is kept back first,
+    // so a tier that goes stale can be reposted.  A side that claimed nothing
+    // last heartbeat keeps what its offers hold.  An offer whose cancel is in
+    // flight counts as the coin's pending change, not as an offer.  Each
+    // coin's free amount is kept for the reclaim at the end of Step 7.
+    struct WaitGrowCoin {
+        Mojo   free{0};
+        double commit_frac{1.0};
+        Mojo   offers{0};  // what our live offers on the coin hold
+        Mojo   locked{0};  // what the wallet has locked for them (whole coins)
+    };
+    std::map<std::string, WaitGrowCoin> wait_grow_coins;
+    const bool wait_to_grow_on = config_.strategy.wait_to_grow
+        && config_.strategy.minimum_tiers_first
+        && config_.strategy.coin_budgets_enabled
+        && !config_.strategy.batch_offers_enabled;
+    if (wait_to_grow_on) {
+        std::map<std::pair<std::string, bool>, Mojo> held;  // (pair, is_bid)
+        std::map<std::string, Mojo> largest_offer;          // per coin
+        for (const auto& po : state_->get_all_offers()) {
+            if (po.cancel_pending || po.size <= 0) continue;
+            const PairConfig* pc = find_pair_config(po.pair_name);
+            if (!pc) continue;
+            const bool is_bid = (po.side == Side::Bid);
+            const Mojo locked = wait_grow_lock(po.side, po.size, po.price, *pc);
+            auto& slot = held[{po.pair_name, is_bid}];
+            slot = saturating_add_mojo(slot, locked);
+            auto& top = largest_offer[strategy::coin_budget::coin_key(
+                is_bid ? pc->quote_asset_id : pc->base_asset_id)];
+            top = std::max(top, locked);
+        }
+        struct GrowSide {
+            PairCycleState*  pcs;
+            bool             is_bid;
+            Mojo             held;
+            const CoinClaim* claim;
+        };
+        std::map<std::string, std::pair<Mojo, std::vector<GrowSide>>> grow_sides;
+        for (auto& [pair_name, pcs] : cycle_) {
+            const PairConfig* pc = find_pair_config(pair_name);
+            if (!pc) continue;
+            const auto cit = coin_claims_.find(pair_name);
+            for (const bool is_bid : {true, false}) {
+                const std::string coin = strategy::coin_budget::coin_key(
+                    is_bid ? pc->quote_asset_id : pc->base_asset_id);
+                const auto hit = held.find({pair_name, is_bid});
+                const CoinClaim* claim = nullptr;
+                if (cit != coin_claims_.end()) {
+                    const CoinClaim& c = is_bid ? cit->second.bid : cit->second.ask;
+                    if (!c.coin.empty() && c.demand > 0.0) claim = &c;
+                }
+                auto& entry = grow_sides[coin];
+                entry.first = is_bid ? pc->quote_mojos_per_unit : pc->base_mojos_per_unit;
+                entry.second.push_back(
+                    {&pcs, is_bid, hit != held.end() ? hit->second : Mojo{0}, claim});
+            }
+        }
+        // What the coin has free, or nullopt when unknown: never read, an
+        // incomplete wallet reply, or a CAT whose caps are opted out (no
+        // reserve, as the funding budget treats it).
+        auto coin_free_now = [&](const std::string& coin, Mojo mpu)
+            -> std::optional<Mojo> {
+            const auto bit = cached_wallet_balances_.find(coin);
+            if (bit == cached_wallet_balances_.end() || !bit->second.fields_validated) {
+                return std::nullopt;
+            }
+            Mojo reserve = 0;
+            if (coin == "xch") {
+                reserve = (config_.strategy.fee_reserve_xch > 0.0)
+                    ? static_cast<Mojo>(std::llround(
+                          config_.strategy.fee_reserve_xch
+                          * static_cast<double>(kMojosPerXch)))
+                    : Mojo{0};
+            } else {
+                const auto reserve_units = execution::sizing_reserve_units(
+                    config_.strategy.asset_reserve_units,
+                    config_.strategy.min_reserve_units,
+                    config_.strategy.wallet_balance_caps_enabled, coin);
+                if (!reserve_units.has_value()) return std::nullopt;
+                reserve = execution::reserve_units_to_mojos(*reserve_units, mpu);
+            }
+            const Mojo have = saturating_add_mojo(
+                std::max<Mojo>(0, bit->second.spendable),
+                std::max<Mojo>(0, bit->second.pending_change));
+            return std::max<Mojo>(0, have - reserve);
+        };
+        for (auto& [coin, entry] : grow_sides) {
+            const auto free_now = coin_free_now(coin, entry.first);
+            if (!free_now.has_value()) continue;
+            const double frac = (coin == "xch") ? config_.strategy.xch_cycle_commit_frac : 1.0;
+            // What our offers on the coin hold, and what the wallet has
+            // locked for them: confirmed less spendable less the pending
+            // change (the coins a pending cancel or send is spending).
+            Mojo offers_on_coin = 0;
+            for (const auto& [key, amount] : held) {
+                const PairConfig* hpc = find_pair_config(key.first);
+                if (hpc == nullptr) continue;
+                if (strategy::coin_budget::coin_key(key.second ? hpc->quote_asset_id
+                                                               : hpc->base_asset_id) == coin) {
+                    offers_on_coin = saturating_add_mojo(offers_on_coin, amount);
+                }
+            }
+            Mojo locked_on_coin = 0;
+            if (const auto bit = cached_wallet_balances_.find(coin);
+                bit != cached_wallet_balances_.end()) {
+                locked_on_coin = std::max<Mojo>(0, bit->second.confirmed
+                    - std::max<Mojo>(0, bit->second.spendable)
+                    - std::max<Mojo>(0, bit->second.pending_change));
+            }
+            wait_grow_coins[coin] = WaitGrowCoin{*free_now, frac, offers_on_coin, locked_on_coin};
+            Mojo lockable_total = *free_now;
+            Mojo held_total = 0;
+            Mojo largest = 0;
+            if (const auto lit = largest_offer.find(coin); lit != largest_offer.end()) {
+                largest = lit->second;
+            }
+            std::vector<strategy::coin_budget::Claim> claims;
+            std::vector<std::size_t> claimed;
+            double demand_total = 0.0;
+            for (std::size_t i = 0; i < entry.second.size(); ++i) {
+                const auto& gs = entry.second[i];
+                if (gs.claim == nullptr) {
+                    (gs.is_bid ? gs.pcs->lockable_bid : gs.pcs->lockable_ask) = gs.held;
+                    continue;
+                }
+                lockable_total = saturating_add_mojo(lockable_total, gs.held);
+                held_total = saturating_add_mojo(held_total, gs.held);
+                claims.push_back({gs.claim->demand, gs.claim->demand, gs.claim->tiers});
+                claimed.push_back(i);
+                demand_total += gs.claim->demand;
+                for (const double t : gs.claim->tiers) {
+                    if (std::isfinite(t) && t > static_cast<double>(largest)
+                        && t < 9.0e18) {
+                        largest = static_cast<Mojo>(t);
+                    }
+                }
+            }
+            if (claims.empty()) continue;
+            const Mojo room = strategy::tiermin::cycle_cap_headroom(largest, frac);
+            const Mojo budget = std::max<Mojo>(0, lockable_total - room);
+            const auto shares = strategy::coin_budget::split(budget, claims);
+            for (std::size_t k = 0; k < claimed.size(); ++k) {
+                const auto& gs = entry.second[claimed[k]];
+                Mojo lock = 0;
+                if (shares.has_value()) {
+                    lock = (*shares)[k];
+                } else {
+                    // The claims fit: a side may lock all but what the
+                    // others claim.
+                    const double others = demand_total - gs.claim->demand;
+                    const double left = static_cast<double>(budget) - std::max(0.0, others);
+                    lock = (left >= static_cast<double>(budget)) ? budget
+                         : (left > 0.0) ? static_cast<Mojo>(left) : Mojo{0};
+                }
+                (gs.is_bid ? gs.pcs->lockable_bid : gs.pcs->lockable_ask) = lock;
+            }
+            spdlog::log(shares.has_value() ? spdlog::level::info : spdlog::level::debug,
+                        "[Engine] Step 7: coin {} wait to grow -- {} sides can "
+                        "lock {} mojos: {} free + {} in their offers, less {} "
+                        "kept free for the lock cap; {}",
+                        coin.substr(0, 12), claims.size(), budget, *free_now,
+                        held_total, room,
+                        shares.has_value()
+                            ? "split minimum tiers first"
+                            : "their claims fit");
+        }
+    }
+
     // This heartbeat's claims are recorded below as each side is sized; a
     // pair that is not sized this heartbeat claims nothing next time.
     coin_claims_.clear();
@@ -12858,12 +13060,13 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                             at.size = size;
                             return tier_cost(at);
                         };
-                        const std::vector<Mojo> fitted =
-                            (tier_minimums_on || mins_total <= share_pool)
-                                ? strategy::tiermin::fit_tier_sizes_to_pool_and_budget(
-                                      cur_sizes, mins, shares, share_pool, min_budget,
-                                      cost_at)
-                                : cur_sizes;
+                        const bool fits_minimums =
+                            tier_minimums_on || mins_total <= share_pool;
+                        const std::vector<Mojo> fitted = fits_minimums
+                            ? strategy::tiermin::fit_tier_sizes_to_pool_and_budget(
+                                  cur_sizes, mins, shares, share_pool, min_budget,
+                                  cost_at)
+                            : cur_sizes;
                         if (fitted != cur_sizes) {
                             std::size_t k = 0;
                             for (auto& tq : pcs.ladder) {
@@ -12873,6 +13076,44 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                                          "growth shrunk so the tiers whose minimums "
                                          "fit the pool of {} base mojos keep them",
                                          pair_name, is_ask ? "ASK" : "BID", share_pool);
+                        }
+                        // [WAITGROW 2026-11-01] Then the growth is held to the
+                        // coin the side can actually lock (set at the top of
+                        // Step 7): out of a share of the confirmed balance,
+                        // the wide tiers posted first took the coin locked
+                        // whole in our own offers, and the tight tiers could
+                        // not post.  Short of the whole minimum ladder, every
+                        // tier stays at its minimum.  The size each tier had
+                        // before is kept for Step 8's size-staleness rule, so
+                        // the hold alone never cancels a resting offer.
+                        const std::optional<Mojo> lockable =
+                            is_ask ? pcs.lockable_ask : pcs.lockable_bid;
+                        if (fits_minimums && lockable.has_value()) {
+                            (is_ask ? pcs.wait_to_grow_ask : pcs.wait_to_grow_bid) = true;
+                            bool held_at_minimums = false;
+                            const std::vector<Mojo> held =
+                                strategy::tiermin::hold_growth_to_lockable(
+                                    fitted, mins, shares, share_pool, *lockable,
+                                    cost_at, &held_at_minimums);
+                            if (held != fitted) {
+                                std::size_t k = 0;
+                                for (auto& tq : pcs.ladder) {
+                                    if (tq.side != side) continue;
+                                    if (held[k] != fitted[k]) {
+                                        pcs.pre_hold_sizes[{side, tq.tier_index}] = fitted[k];
+                                    }
+                                    tq.size = held[k++];
+                                }
+                                spdlog::info("[Engine] Step 7: {} {} wait to grow: {} "
+                                             "(the side can lock {} mojos of {})",
+                                             pair_name, is_ask ? "ASK" : "BID",
+                                             held_at_minimums
+                                                 ? "every tier held at its minimum "
+                                                   "until the whole minimum ladder fits"
+                                                 : "growth shrunk to what is left "
+                                                   "after the minimum ladder",
+                                             *lockable, funding_asset);
+                            }
                         }
                     }
                     if (tier_minimums_on) {
@@ -13032,6 +13273,108 @@ void Engine::step_generate_ladder(BlockHeight block_height)
 
         spdlog::debug("[Engine] Step 7: {} generated {} tier quotes",
                       pair_name, pcs.ladder.size());
+    }
+
+    // -- [WAITGROW 2026-11-01] Give grown tiers' coin back to unfunded ones -
+    // A resting offer sized before the hold above keeps the coin it locked,
+    // and Step 8 only refreshes a tier past twice its planned size, so on
+    // 2026-11-01 the XCH/DBX asks' tiers 2-5 kept 19 XCH of growth while
+    // tiers 0 and 1 had no offer.  For each coin whose sides' growth was
+    // held: when its planned tiers with no offer need more than it has free
+    // (the largest XCH one with room for the lock cap), the resting tiers
+    // grown furthest past their plan, on any side spending that coin, are
+    // picked for Step 8 to retire until what they give back covers it
+    // (tiermin::tiers_to_reclaim).  A tier whose cancel is in flight has an
+    // offer, and its coin is the coin's pending change.  Nothing is picked
+    // while the planned tiers can be funded, so a hold alone moves nothing,
+    // and an offer younger than kGrowthReclaimMinAgeBlocks is never picked.
+    if (wait_to_grow_on && !wait_grow_coins.empty()) {
+        struct Pick {
+            PairCycleState* pcs;
+            std::string     offer_id;
+        };
+        struct CoinReclaim {
+            std::vector<Mojo>                         missing;
+            std::vector<strategy::tiermin::RestingTier> resting;
+            std::vector<Pick>                         picks;
+        };
+        std::map<std::string, CoinReclaim> reclaim_by_coin;
+        const auto offers = state_->get_all_offers();
+        for (auto& [pair_name, pcs] : cycle_) {
+            const PairConfig* pc = find_pair_config(pair_name);
+            if (!pc) continue;
+            for (const Side side : {Side::Bid, Side::Ask}) {
+                const bool is_bid = (side == Side::Bid);
+                if (!(is_bid ? pcs.wait_to_grow_bid : pcs.wait_to_grow_ask)) continue;
+                const std::string coin = strategy::coin_budget::coin_key(
+                    is_bid ? pc->quote_asset_id : pc->base_asset_id);
+                if (wait_grow_coins.find(coin) == wait_grow_coins.end()) continue;
+                auto& cr = reclaim_by_coin[coin];
+                for (const auto& tq : pcs.ladder) {
+                    if (tq.side != side) continue;
+                    const Mojo planned = wait_grow_lock(side, tq.size, tq.price, *pc);
+                    bool has_offer = false;
+                    for (const auto& po : offers) {
+                        if (po.pair_name != pair_name || po.side != side
+                            || po.tier != tq.tier_index) {
+                            continue;
+                        }
+                        has_offer = true;
+                        if (po.cancel_pending) continue;
+                        if (block_height < po.created_at_block
+                            || block_height - po.created_at_block < kGrowthReclaimMinAgeBlocks) {
+                            continue;
+                        }
+                        cr.resting.push_back(
+                            {wait_grow_lock(side, po.size, po.price, *pc), planned});
+                        cr.picks.push_back({&pcs, po.offer_id});
+                    }
+                    if (!has_offer) cr.missing.push_back(planned);
+                }
+            }
+        }
+        for (auto& [coin, cr] : reclaim_by_coin) {
+            const WaitGrowCoin& wc = wait_grow_coins[coin];
+            const auto chosen = strategy::tiermin::tiers_to_reclaim(
+                cr.missing, wc.free, wc.commit_frac, cr.resting,
+                kGrowthReclaimTolerance);
+            if (chosen.empty()) {
+                wait_grow_whole_coin_warned_.erase(coin);
+                continue;
+            }
+            // When the wallet locks more than twice what our offers hold, the
+            // coin sits in a few large coins and each offer locks one whole:
+            // a smaller repost locks the same coin again, so retiring tiers
+            // would only trade which ones rest (2026-11-01: wUSDC.b had 4.3
+            // spendable of ~420 under four bids).  Splitting the coin (the
+            // coin pool) is what funds more tiers; nothing is retired.
+            if (strategy::tiermin::whole_coins_lock_the_coin(wc.offers, wc.locked)) {
+                const bool first = wait_grow_whole_coin_warned_.insert(coin).second;
+                spdlog::log(first ? spdlog::level::info : spdlog::level::debug,
+                            "[Engine] Step 7: coin {} wait to grow -- {} planned "
+                            "tier(s) have no offer, but our offers hold {} mojos "
+                            "and lock {} (whole coins): retiring tiers would not "
+                            "free it; splitting the coin into smaller coins would",
+                            coin.substr(0, 12), cr.missing.size(), wc.offers,
+                            wc.locked);
+                continue;
+            }
+            wait_grow_whole_coin_warned_.erase(coin);
+            Mojo need = 0;
+            for (const Mojo m : cr.missing) need = saturating_add_mojo(need, m);
+            Mojo given_back = 0;
+            for (const std::size_t i : chosen) {
+                cr.picks[i].pcs->growth_reclaim_ids.insert(cr.picks[i].offer_id);
+                given_back = saturating_add_mojo(
+                    given_back, cr.resting[i].locked - cr.resting[i].planned);
+            }
+            spdlog::info("[Engine] Step 7: coin {} wait to grow -- {} planned "
+                         "tier(s) with no offer need {} mojos and {} are free; "
+                         "retiring {} resting tier(s) grown past their plan to "
+                         "give back {} mojos",
+                         coin.substr(0, 12), cr.missing.size(), need, wc.free,
+                         chosen.size(), given_back);
+        }
     }
 }
 
@@ -14092,8 +14435,21 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             ? cur_pc->competitive_anchor_enabled_override.value_or(config_.strategy.competitive_anchor_enabled)
             : config_.strategy.competitive_anchor_enabled;
 
+        // [WAITGROW 2026-11-01] The size-staleness rule judges a resting
+        // offer against each tier's size before the wait-to-grow hold: a
+        // hold alone must not cancel offers (the end-of-Step-7 reclaim
+        // decides which grown tiers give their coin back).
+        std::vector<TierQuote> classify_ladder;
+        if (!pcs.pre_hold_sizes.empty()) {
+            classify_ladder = pcs.ladder;
+            for (auto& tq : classify_ladder) {
+                const auto pre = pcs.pre_hold_sizes.find({tq.side, tq.tier_index});
+                if (pre != pcs.pre_hold_sizes.end()) tq.size = pre->second;
+            }
+        }
         auto tier_classes = offer_mgr_->classify_tier_staleness(
-            pair_name, pcs.ladder, block_height,
+            pair_name, pcs.pre_hold_sizes.empty() ? pcs.ladder : classify_ladder,
+            block_height,
             config_.strategy.offer_ttl_blocks,
             static_cast<Mojo>(std::llround(
                 market_data_->get_mid_price(pair_name)
@@ -14187,12 +14543,19 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             return nullptr;
         };
         std::unordered_map<std::string, std::string> tier_min_retire_reasons;
-        if (!config_.strategy.batch_offers_enabled && !pcs.tier_min_mojos.empty()) {
+        // [WAITGROW 2026-11-01] And a Fresh offer the end-of-Step-7 reclaim
+        // picked: a tier grown past its plan whose coin a planned tier with
+        // no offer needs.
+        if (!config_.strategy.batch_offers_enabled
+            && (!pcs.tier_min_mojos.empty() || !pcs.growth_reclaim_ids.empty())) {
             for (auto& size_tc : tier_classes) {
                 if (size_tc.staleness != execution::TierStaleness::Fresh) continue;
                 const PendingOffer size_po = state_->get_offer(size_tc.offer_id);
                 const char* why = tier_min_retire_reason(
                     size_tc.side, size_tc.tier_index, size_po.size);
+                if (why == nullptr && pcs.growth_reclaim_ids.count(size_tc.offer_id) > 0) {
+                    why = "tier_growth_reclaim";
+                }
                 if (why != nullptr) {
                     size_tc.staleness = execution::TierStaleness::Stale;
                     tier_min_retire_reasons[size_tc.offer_id] = why;
