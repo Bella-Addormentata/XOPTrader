@@ -1069,21 +1069,18 @@ TEST(SizingWiring, WaitToGrowStartsATierWithNoOfferAtItsMinimum) {
     const std::string body = function_body(read_engine_cpp(), kLadderSignature);
     ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
     // Every resting offer marks its tier, one whose cancel is in flight too:
-    // the tier is not missing until the cancel lands.  Its size is kept for
-    // a few blocks after, for a replacement deferred until then.
+    // the tier is not missing until the cancel lands, and for a few blocks
+    // after, a missing tier is a deferred refresh replacement.
     const std::size_t mark_at = position_of(body,
         "tiers_with_offer.insert({po.pair_name, po.side, po.tier}); "
-        "if (po.size > 0) { Mojo& rs = resting_sizes[{po.pair_name, po.side, po.tier}]; "
-        "rs = std::max(rs, po.size); } "
+        "wait_grow_recent_offers_.mark({po.pair_name, po.side, po.tier}, block_height); "
         "if (po.cancel_pending || po.size <= 0) continue;");
-    const std::size_t remember_at = position_of(body,
-        "wait_grow_last_offer_[tier_key] = WaitGrowLastOffer{size, block_height};");
     const std::size_t forget_at = position_of(body,
-        "> strategy::tiermin::kReplacementSizeBlocks;");
-    ASSERT_NE(remember_at, std::string::npos);
+        "wait_grow_recent_offers_.expire(block_height);");
+    ASSERT_NE(mark_at, std::string::npos);
     ASSERT_NE(forget_at, std::string::npos);
-    EXPECT_LT(remember_at, forget_at);
-    EXPECT_NE(position_of(body, "if (!wait_to_grow_on) wait_grow_last_offer_.clear();"),
+    EXPECT_LT(mark_at, forget_at);
+    EXPECT_NE(position_of(body, "if (!wait_to_grow_on) wait_grow_recent_offers_.clear();"),
               std::string::npos);
     const std::size_t hold_at = position_of(body,
         "if (fits_minimums && lockable.has_value()) {");
@@ -1096,10 +1093,9 @@ TEST(SizingWiring, WaitToGrowStartsATierWithNoOfferAtItsMinimum) {
         "const Mojo min_k = mins[k++]; "
         "const std::tuple<std::string, Side, std::uint8_t> tier_key{pair_name, side, tq.tier_index}; "
         "if (tq.size <= min_k || tiers_with_offer.count(tier_key) > 0) { continue; } "
-        "const auto last = wait_grow_last_offer_.find(tier_key); "
         "const Mojo start = strategy::tiermin::start_size_without_offer( tq.size, min_k, "
-        "last != wait_grow_last_offer_.end() ? std::optional<Mojo>(last->second.size) "
-        ": std::nullopt); if (start >= tq.size) continue; tq.size = start; ++started; }");
+        "wait_grow_recent_offers_.just_left(tier_key)); "
+        "if (start >= tq.size) continue; tq.size = start; ++started; }");
     const std::size_t reclaim_at = position_of(body,
         "strategy::tiermin::tiers_to_reclaim( cr.missing, wc.free, wc.commit_frac, "
         "cr.resting, kGrowthReclaimTolerance);");
@@ -1108,7 +1104,6 @@ TEST(SizingWiring, WaitToGrowStartsATierWithNoOfferAtItsMinimum) {
     ASSERT_NE(call_at, std::string::npos);
     ASSERT_NE(start_at, std::string::npos);
     ASSERT_NE(reclaim_at, std::string::npos);
-    EXPECT_LT(mark_at, remember_at);
     EXPECT_LT(forget_at, hold_at);
     EXPECT_LT(mark_at, hold_at);
     EXPECT_LT(hold_at, call_at);

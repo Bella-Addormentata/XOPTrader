@@ -79,6 +79,7 @@
 #include "xop/strategy/bbo_sanity.hpp"
 #include "xop/strategy/pace_controller.hpp"
 #include "xop/strategy/revive.hpp"
+#include "xop/strategy/tier_minimums.hpp"
 #include "xop/strategy/synthetic_price.hpp"
 #include "xop/strategy/no_loss_floor.hpp"
 #include "xop/risk/usd_route.hpp"
@@ -2537,15 +2538,11 @@ private:
     /// tiers with no offer were started at their minimum, so the line logs at
     /// info once per episode.
     std::set<std::string> wait_grow_started_logged_;
-    /// [WAITGROW-MIN review] Each tier's last resting offer: its size and the
-    /// block Step 7 last saw it, so a refresh replacement posted after its
-    /// cancel lands keeps the tier's size (tiermin::start_size_without_offer).
-    struct WaitGrowLastOffer {
-        Mojo        size{0};
-        BlockHeight seen_at{0};
-    };
-    std::map<std::tuple<std::string, Side, std::uint8_t>, WaitGrowLastOffer>
-        wait_grow_last_offer_;
+    /// [WAITGROW-MIN review] The tiers whose own offer was on the book within
+    /// the last few blocks: a missing one is a deferred refresh replacement,
+    /// planned at its plan, not started at its minimum.
+    strategy::tiermin::RecentTierOffers<std::tuple<std::string, Side, std::uint8_t>>
+        wait_grow_recent_offers_;
 
     // -- Ratio-based inventory rebalance mode (per pair) -------------------
     enum class RatioRebalanceMode : std::uint8_t {

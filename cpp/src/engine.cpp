@@ -9561,20 +9561,16 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         && !config_.strategy.batch_offers_enabled;
     // [WAITGROW-MIN 2026-11-01] The tiers that have an offer resting (its
     // cancel in flight included), for the funding fit: a tier with none
-    // starts at its minimum, or at the size of its own offer that left the
-    // book within the last few blocks (a deferred refresh replacement).
+    // starts at its minimum, unless its own offer left the book within the
+    // last few blocks (a deferred refresh replacement keeps its plan).
     std::set<std::tuple<std::string, Side, std::uint8_t>> tiers_with_offer;
-    if (!wait_to_grow_on) wait_grow_last_offer_.clear();
+    if (!wait_to_grow_on) wait_grow_recent_offers_.clear();
     if (wait_to_grow_on) {
         std::map<std::pair<std::string, bool>, Mojo> held;  // (pair, is_bid)
         std::map<std::string, Mojo> largest_offer;          // per coin
-        std::map<std::tuple<std::string, Side, std::uint8_t>, Mojo> resting_sizes;
         for (const auto& po : state_->get_all_offers()) {
             tiers_with_offer.insert({po.pair_name, po.side, po.tier});
-            if (po.size > 0) {
-                Mojo& rs = resting_sizes[{po.pair_name, po.side, po.tier}];
-                rs = std::max(rs, po.size);
-            }
+            wait_grow_recent_offers_.mark({po.pair_name, po.side, po.tier}, block_height);
             if (po.cancel_pending || po.size <= 0) continue;
             const PairConfig* pc = find_pair_config(po.pair_name);
             if (!pc) continue;
@@ -9596,14 +9592,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             auto& slot = held[{po.pair_name, is_bid}];
             slot = saturating_add_mojo(slot, locked);
         }
-        for (const auto& [tier_key, size] : resting_sizes) {
-            wait_grow_last_offer_[tier_key] = WaitGrowLastOffer{size, block_height};
-        }
-        std::erase_if(wait_grow_last_offer_, [&](const auto& kv) {
-            return block_height < kv.second.seen_at
-                || block_height - kv.second.seen_at
-                       > strategy::tiermin::kReplacementSizeBlocks;
-        });
+        wait_grow_recent_offers_.expire(block_height);
         struct GrowSide {
             PairCycleState*  pcs;
             bool             is_bid;
@@ -13176,7 +13165,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                             // the lock cap at 10.5 XCH, kept growing (to 12.1
                             // XCH) while it waited, so raising the cap did not
                             // let it post.  A refresh replacement deferred
-                            // until its cancel lands keeps the tier's size
+                            // until its cancel lands keeps its plan
                             // (tiermin::start_size_without_offer).  Pairs
                             // with tier minimums only.
                             if (tier_minimums_on) {
@@ -13191,13 +13180,10 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                                         || tiers_with_offer.count(tier_key) > 0) {
                                         continue;
                                     }
-                                    const auto last = wait_grow_last_offer_.find(tier_key);
                                     const Mojo start =
                                         strategy::tiermin::start_size_without_offer(
                                             tq.size, min_k,
-                                            last != wait_grow_last_offer_.end()
-                                                ? std::optional<Mojo>(last->second.size)
-                                                : std::nullopt);
+                                            wait_grow_recent_offers_.just_left(tier_key));
                                     if (start >= tq.size) continue;
                                     tq.size = start;
                                     ++started;
@@ -13211,8 +13197,8 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                                                       : spdlog::level::debug,
                                                 "[Engine] Step 7: {} {} wait to grow: "
                                                 "{} tier(s) with no offer start at "
-                                                "their minimum (or their last offer's "
-                                                "size) and grow on a later refresh",
+                                                "their minimum and grow on a later "
+                                                "refresh",
                                                 pair_name, is_ask ? "ASK" : "BID",
                                                 started);
                                 } else {

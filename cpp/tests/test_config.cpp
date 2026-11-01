@@ -5281,25 +5281,61 @@ TEST(WaitToGrow, NothingIsReclaimedWhileTheLockCapPostsNothing) {
 // [WAITGROW-MIN 2026-11-01] A tier with no resting offer starts at its
 // minimum: on 2026-11-01 the XCH/DBX 10 XCH tight ask kept growing (to 12.1
 // XCH) out of coin other offers held while the lock cap refused it.  A
-// refresh replacement whose cancel just landed keeps its offer's size, inside
-// the plan and the minimum, so deferred refreshes still let tiers grow.
-TEST(WaitToGrow, AMissingTierStartsAtItsMinimumUnlessItsOwnOfferJustLeft) {
+// refresh replacement deferred until its cancel lands keeps this cycle's
+// plan, so tiers whose refreshes are always deferred can still grow.
+TEST(WaitToGrow, AMissingTierStartsAtItsMinimumUnlessItIsAReplacement) {
     using xop::strategy::tiermin::start_size_without_offer;
     const xop::Mojo xch = 1'000'000'000'000LL;
-    EXPECT_EQ(start_size_without_offer(12 * xch, 10 * xch, std::nullopt), 10 * xch)
-        << "never posted: its minimum";
-    EXPECT_EQ(start_size_without_offer(12 * xch, 10 * xch, 11 * xch), 11 * xch)
-        << "a deferred replacement keeps the size it had";
-    EXPECT_EQ(start_size_without_offer(12 * xch, 10 * xch, 14 * xch), 12 * xch)
-        << "never above this cycle's plan";
-    EXPECT_EQ(start_size_without_offer(12 * xch, 10 * xch, 3 * xch), 10 * xch)
-        << "never below the minimum";
-    EXPECT_EQ(start_size_without_offer(9 * xch, 10 * xch, std::nullopt), 9 * xch)
+    EXPECT_EQ(start_size_without_offer(12 * xch, 10 * xch, false), 10 * xch)
+        << "a first placement: its minimum";
+    EXPECT_EQ(start_size_without_offer(12 * xch, 10 * xch, true), 12 * xch)
+        << "a replacement: this cycle's plan";
+    EXPECT_EQ(start_size_without_offer(9 * xch, 10 * xch, false), 9 * xch)
         << "a plan at or under its minimum is left alone";
-    EXPECT_EQ(start_size_without_offer(10 * xch, 10 * xch, 12 * xch), 10 * xch);
-    EXPECT_GE(xop::strategy::tiermin::kReplacementSizeBlocks, 1u);
-    EXPECT_LE(xop::strategy::tiermin::kReplacementSizeBlocks, 5u)
-        << "a tier missing for long starts at its minimum again";
+    EXPECT_EQ(start_size_without_offer(10 * xch, 10 * xch, false), 10 * xch);
+}
+
+// The cancel / defer / repost sequence, heartbeat by heartbeat.  A tier rests
+// at 10 XCH with a funded plan of 12; a price refresh cancels it, the
+// replacement cannot post while the old offer holds its coin, and the cancel
+// lands two blocks later.  The replacement is planned at 12, not reset to 10;
+// a tier that stays missing past the window, or never posted, starts at 10.
+TEST(WaitToGrow, ADeferredRefreshReplacementKeepsItsPlanAndAFirstPlacementStartsAtItsMinimum) {
+    namespace tmin = xop::strategy::tiermin;
+    using Key = std::pair<std::string, int>;
+    const xop::Mojo xch = 1'000'000'000'000LL;
+    const xop::Mojo plan = 12 * xch;
+    const xop::Mojo min = 10 * xch;
+    const Key dbx_t0{"XCH/DBX ask", 0};
+    const Key dbx_t1{"XCH/DBX ask", 1};
+    tmin::RecentTierOffers<Key> recent;
+
+    // Block 100: t0 rests at 10 XCH; t1 has never posted.
+    recent.mark(dbx_t0, 100);
+    recent.expire(100);
+    EXPECT_EQ(tmin::start_size_without_offer(plan, min, recent.just_left(dbx_t1)), min)
+        << "never posted: its minimum";
+    // Block 101: the refresh cancel is in flight -- the offer is still on the
+    // book (cancel_pending), so it is marked again.
+    recent.mark(dbx_t0, 101);
+    recent.expire(101);
+    // Block 103: the cancel landed in block 102; t0 has no offer.
+    recent.expire(103);
+    EXPECT_TRUE(recent.just_left(dbx_t0));
+    EXPECT_EQ(tmin::start_size_without_offer(plan, min, recent.just_left(dbx_t0)), plan)
+        << "the deferred replacement keeps the funded plan, not the old 10";
+    // Still missing at block 104 (three blocks after it was last seen).
+    recent.expire(104);
+    EXPECT_EQ(tmin::start_size_without_offer(plan, min, recent.just_left(dbx_t0)), plan);
+    // Block 105: four blocks without an offer -- placed afresh, at its minimum.
+    recent.expire(105);
+    EXPECT_FALSE(recent.just_left(dbx_t0));
+    EXPECT_EQ(tmin::start_size_without_offer(plan, min, recent.just_left(dbx_t0)), min);
+    // A block height that goes backwards (a restart onto a lower tip) forgets.
+    recent.mark(dbx_t1, 200);
+    recent.expire(150);
+    EXPECT_FALSE(recent.just_left(dbx_t1));
+    EXPECT_EQ(tmin::kReplacementBlocks, 3u);
 }
 
 TEST(WaitToGrow, NothingIsReclaimedWithoutAnUnfundedTier) {

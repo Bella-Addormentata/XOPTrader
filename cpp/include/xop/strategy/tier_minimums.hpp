@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -481,29 +482,48 @@ struct RestingTier {
     return {};
 }
 
-/// [WAITGROW-MIN 2026-11-01] How many blocks a tier's last resting offer
-/// still sizes its replacement after that offer left the book.  A refresh
+/// [WAITGROW-MIN 2026-11-01] How many blocks after a tier's own offer left
+/// the book its replacement is still a replacement.  A price/TTL refresh
 /// whose replacement could not post while the old offer still held its coin
-/// posts it once the cancel lands, a block or two later, at the size the
-/// tier had; a tier missing for longer than this starts at its minimum.
-inline constexpr std::uint32_t kReplacementSizeBlocks = 3;
+/// posts it once the cancel lands, a block or two later; a tier missing for
+/// longer than this is placed afresh.
+inline constexpr std::uint32_t kReplacementBlocks = 3;
 
 /// [WAITGROW-MIN 2026-11-01] The size a planned tier with no resting offer
-/// starts at under wait to grow: its minimum, so a missing tier never grows
-/// out of the coin the side's resting offers hold.  On 2026-11-01 the
-/// XCH/DBX 10 XCH tight ask, refused by the XCH lock cap at 10.5 XCH, kept
-/// growing (to 12.1 XCH) while it waited.  A tier whose own offer left the
-/// book within kReplacementSizeBlocks keeps that offer's size instead (never
-/// above the plan, never below the minimum): a refresh replacement deferred
-/// until its cancel lands is not a first placement, and resetting it to the
-/// minimum would keep every deferred refresh from ever growing.
+/// starts at under wait to grow.  A first placement starts at its minimum, so
+/// a missing tier never grows out of the coin the side's resting offers hold:
+/// on 2026-11-01 the XCH/DBX 10 XCH tight ask, refused by the XCH lock cap at
+/// 10.5 XCH, kept growing (to 12.1 XCH) while it waited.  A replacement for
+/// the tier's own offer that left the book within kReplacementBlocks keeps
+/// this cycle's plan, already held to the coin the side can lock: resetting
+/// a deferred refresh to its minimum, or to the old offer's size, would keep
+/// a tier whose refreshes are always deferred from ever growing.
 [[nodiscard]] inline Mojo start_size_without_offer(Mojo planned, Mojo min,
-                                                   std::optional<Mojo> recent_offer)
+                                                   bool own_offer_just_left) noexcept
 {
-    if (planned <= min) return planned;
-    if (!recent_offer.has_value()) return min;
-    return std::clamp(*recent_offer, min, planned);
+    return (planned <= min || own_offer_just_left) ? planned : min;
 }
+
+/// [WAITGROW-MIN 2026-11-01] The tiers whose own offer was on the book
+/// within the last kReplacementBlocks blocks.  Step 7 marks every tier with
+/// an offer (its cancel in flight included) each heartbeat, then expires the
+/// rest; a tier with no offer that is still listed is being replaced.
+template <class Key>
+class RecentTierOffers {
+public:
+    void mark(const Key& tier, std::uint32_t block) { seen_at_[tier] = block; }
+    void expire(std::uint32_t block)
+    {
+        std::erase_if(seen_at_, [block](const auto& kv) {
+            return block < kv.second || block - kv.second > kReplacementBlocks;
+        });
+    }
+    void clear() noexcept { seen_at_.clear(); }
+    [[nodiscard]] bool just_left(const Key& tier) const { return seen_at_.count(tier) > 0; }
+
+private:
+    std::map<Key, std::uint32_t> seen_at_;
+};
 
 }  // namespace xop::strategy::tiermin
 
