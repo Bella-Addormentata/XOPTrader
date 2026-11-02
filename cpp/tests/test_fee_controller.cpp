@@ -2680,3 +2680,28 @@ TEST(FeeTrackerController, ConfigMapsEveryTuningKey)
 }
 
 }  // namespace
+
+// [SPLIT-FEE review #214] Why a coin pool split asks the budget itself: with
+// the controller on, a cancel class is priced in full when the daily budget is
+// spent (a cancel must still go out), so the price alone never says "stop".
+// A split is optional, and the engine checks is_within_budget before it.
+TEST(FeeBudget, ACancelClassIsPricedInFullWhenTheBudgetIsSpentSoASplitMustAskTheBudget)
+{
+    constexpr std::uint32_t kHeight = 9'515'300U;
+    xop::FeeConfig cfg;
+    cfg.enabled            = true;
+    cfg.controller_enabled = true;
+    cfg.min_fee_mojos      = kMinFee;
+    cfg.max_fee_mojos      = kMaxFee;
+    cfg.daily_budget_mojos = 10U * kMinFee;
+    xop::FeeTracker tracker{cfg};
+    for (int i = 0; i < 10; ++i) tracker.record_fee(kMinFee, kHeight);
+    ASSERT_FALSE(tracker.is_within_budget(kHeight, 1U));
+
+    const std::uint64_t xch = tracker.get_recommended_fee(kMinFee, kHeight, ActionClass::CancelXch);
+    const std::uint64_t cat = tracker.get_recommended_fee(kMinFee, kHeight, ActionClass::CancelCat);
+    EXPECT_GT(xch, 0U);
+    EXPECT_GT(cat, 0U);
+    EXPECT_FALSE(tracker.is_within_budget(kHeight, xch));
+    EXPECT_FALSE(tracker.is_within_budget(kHeight, cat));
+}

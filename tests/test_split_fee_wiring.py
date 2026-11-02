@@ -82,9 +82,46 @@ def test_coin_pool_splits_pay_the_cancel_fee_of_their_asset():
     # A split that was sent is charged to the daily fee budget, once per site.
     assert pool.count("fee_tracker_->record_fee(") == 2
     # The tracker's "budget exhausted" skips the split rather than sending it
-    # for nothing.
-    assert "if (fee == 0 && fee_tracker_->enabled()) return std::nullopt;" in pool
+    # for nothing.  [review #214] The budget is asked directly too: with the
+    # fee controller on, a cancel class returns its full fee when it is spent.
+    assert ("if (fee_tracker_->enabled()\n"
+            "            && (fee == 0 || !fee_tracker_->is_within_budget(block_height, fee))) {\n"
+            "            return std::nullopt;") in pool
     assert pool.count("split skipped -- the fee") == 2
+
+
+def test_startup_splits_book_their_fee_at_a_real_height():
+    """[review #214] A fee booked at height 0 is pruned from the daily budget at
+    the first real query: startup asks for the height, and skips without one."""
+    engine = _code(_read(ENGINE))
+    assert "step_maintain_coin_pool(0)" not in engine
+    boot = engine.index("BlockHeight boot_height = 0;")
+    call = engine.index("co_await step_maintain_coin_pool(boot_height);", boot)
+    between = engine[boot:call]
+    assert "co_await full_node_->get_block_height()" in between
+    assert "if (boot_height > 0) {" in between
+
+
+def test_a_fired_force_delete_reaches_every_pending_wallet_of_the_step():
+    """[review #214] Counted once per Step 8 the escalation fires at the first
+    pending pair; it stays on for the rest of the step so later pairs' wallets
+    are wiped too, each once, and the counter resets once."""
+    body = _manage_offers()
+    pending = body.index("std::set<std::int64_t> pending_wallets_this_block;")
+    loop = body.index("for (auto& [pair_name, pcs] : cycle_)", pending)
+    assert pending < body.index("bool force_delete_this_step = false;") < loop
+    assert pending < body.index("std::set<std::int64_t> force_deleted_wallets;") < loop
+    fire = body.index("&& (force_delete_this_step\n")
+    wipe = body.index("delete_unconfirmed_transactions(pw)", fire)
+    between = body[fire:wipe]
+    assert "if (force_deleted_wallets.count(pw) > 0) continue;" in between
+    assert "force_deleted_wallets.insert(pw);" in between
+    # The transport guard still returns before the reset can run.
+    assert between.index("co_return;") < between.index("force_deleted_wallets.insert(pw);")
+    reset = body.index("consecutive_pending_blocks_ = 0;", wipe)
+    tail = body[wipe:reset + 120]
+    assert "if (!force_delete_this_step) {" in tail
+    assert "force_delete_this_step = true;" in tail
 
 
 def test_a_cat_coin_carries_none_of_its_split_fee():

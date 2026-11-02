@@ -3164,11 +3164,28 @@ asio::awaitable<void> Engine::poll_loop_coro()
     }
 
     // -- Coin pool maintenance at startup ------------------------------------
+    // [SPLIT-FEE review #214] A split pays a fee booked against the daily
+    // budget at its block height: booked at height 0 it would be pruned at the
+    // first real query. With no height the first heartbeat runs the pool
+    // instead (it is due at once).
     if (!wallet_circuit_open_ && (config_.strategy.coin_pool_target_count > 0
             || config_.strategy.cat_coin_pool_target_count > 0
             || !config_.strategy.cat_coin_pool_tokens.empty())) {
         try {
-            co_await step_maintain_coin_pool(0);
+            BlockHeight boot_height = 0;
+            if (full_node_) {
+                boot_height = static_cast<BlockHeight>(
+                    co_await full_node_->get_block_height());
+            } else if (wallet_) {
+                boot_height = static_cast<BlockHeight>(
+                    co_await wallet_->get_height_info());
+            }
+            if (boot_height > 0) {
+                co_await step_maintain_coin_pool(boot_height);
+            } else {
+                spdlog::info("[Engine] Startup coin pool maintenance skipped: "
+                             "no block height yet; the first heartbeat runs it");
+            }
         } catch (const std::exception& ex) {
             spdlog::warn("[Engine] Startup coin pool maintenance failed: {}; "
                          "continuing without splitting", ex.what());
@@ -14432,6 +14449,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // every split (and any other spend) before it could confirm: on
     // 2026-11-01 it fired 51 times in nine hours and no coin split landed.
     bool saw_pending_change = false;
+    // [review #214] Set when the force-delete fires; it then stays on for the
+    // rest of this Step 8, wiping each pending wallet once (see below).
+    bool force_delete_this_step = false;
+    std::set<std::int64_t> force_deleted_wallets;
     for (auto& [pair_name, pcs] : cycle_) {
         if (!pcs.quote_valid || pcs.ladder.empty()) continue;
         if (step8_pair_filter_ && step8_pair_filter_->count(pair_name) == 0) {
@@ -15207,17 +15228,32 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             // global counter can fire while examining any
                             // wallet; clearing only that wallet leaves the
                             // others stuck indefinitely.
+                            //
+                            // [review #214] Counted once per Step 8, the
+                            // counter fires at the FIRST pair with pending
+                            // change, before later pairs add their wallets.
+                            // So once it fires the escalation stays on for
+                            // the rest of this Step 8: each pending wallet is
+                            // wiped once, when its pair is reached.  Reset
+                            // at the first firing alone, a wallet that kept
+                            // acquiring pending spends would starve the
+                            // others of every escalation.
                             if (!step8_pair_filter_
-                                && consecutive_pending_blocks_ >=
-                                       kForceDeletePendingBlocks) {
-                                spdlog::warn("[Engine] Step 8: pending_change "
-                                             "persisted for {} consecutive "
-                                             "blocks -- force-deleting ALL "
-                                             "unconfirmed transactions for "
-                                             "{} pending wallets",
-                                             consecutive_pending_blocks_,
-                                             pending_wallets_this_block.size());
+                                && (force_delete_this_step
+                                    || consecutive_pending_blocks_ >=
+                                           kForceDeletePendingBlocks)) {
+                                if (!force_delete_this_step) {
+                                    spdlog::warn("[Engine] Step 8: pending_change "
+                                                 "persisted for {} consecutive "
+                                                 "blocks -- force-deleting ALL "
+                                                 "unconfirmed transactions for "
+                                                 "{} pending wallets (and any a "
+                                                 "later pair finds)",
+                                                 consecutive_pending_blocks_,
+                                                 pending_wallets_this_block.size());
+                                }
                                 for (auto pw : pending_wallets_this_block) {
+                                    if (force_deleted_wallets.count(pw) > 0) continue;
                                     // [WALLET-CIRCUIT] The periodic prune
                                     // above, or the previous delete, may
                                     // have failed at the transport level;
@@ -15229,6 +15265,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                     if (!wallet_step_may_run("Step 8 force-delete")) {
                                         co_return;
                                     }
+                                    force_deleted_wallets.insert(pw);
                                     // [WARP-LOST-SEND] Fresh, right before
                                     // the delete (see the prune above).
                                     if (wallet_holds_warp_send(pw, block_height,
@@ -15255,11 +15292,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                                      pw, e.what());
                                     }
                                 }
-                                // [S67] The hardest "too low" there is: spends
-                                // sat unconfirmed until the wallet was wiped.
-                                fee_feedback_signal(strategy::fee::Signal::ForceDelete,
-                                                    block_height);
-                                consecutive_pending_blocks_ = 0;
+                                if (!force_delete_this_step) {
+                                    // [S67] The hardest "too low" there is: spends
+                                    // sat unconfirmed until the wallet was wiped.
+                                    fee_feedback_signal(strategy::fee::Signal::ForceDelete,
+                                                        block_height);
+                                    consecutive_pending_blocks_ = 0;
+                                    force_delete_this_step = true;
+                                }
                             }
                             // Fall through to Gates 2 and 3: they evaluate
                             // the spendable balance, which is the quantity
@@ -28772,8 +28812,15 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height,
     // the same coins were split six to thirteen times each and wiped
     // unconfirmed every time. nullopt is the tracker's "budget exhausted"
     // (0 with fee tracking on, as Step 8 reads it): no split this time.
+    //
+    // [review #214] The budget is also asked directly: with the fee controller
+    // on, the cancel classes return their full fee even when the daily budget
+    // is spent (a cancel must still go out), and a split is optional.
     const auto split_fee_or_skip = [&](std::uint64_t fee) -> std::optional<Mojo> {
-        if (fee == 0 && fee_tracker_->enabled()) return std::nullopt;
+        if (fee_tracker_->enabled()
+            && (fee == 0 || !fee_tracker_->is_within_budget(block_height, fee))) {
+            return std::nullopt;
+        }
         return static_cast<Mojo>(std::min<std::uint64_t>(
             fee, static_cast<std::uint64_t>(std::numeric_limits<Mojo>::max())));
     };
