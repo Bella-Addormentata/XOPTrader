@@ -5,6 +5,36 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.43] — 2026-11-02 — coin splits confirm
+
+### Coin splits were wiped before they could confirm (#214)
+
+From 2026-11-01 22:26Z no coin split confirmed for nine hours. The coin
+pool split the same coins 6 to 13 times each, and each time Step 8's
+stuck-transaction escalation deleted the split about a minute later (51
+times). So the XCH coin pool never filled, and the wUSDC.b pool kept a
+freed coin pending, which held XCH/wUSDC.b to 2 of its 6 bids.
+
+- **The escalation counts per wallet, once per block.** It was one
+  counter for every wallet, bumped once per pair, so with four pairs on
+  the XCH wallet its ~10 minute limit was reached in about a minute. Each
+  wallet now has its own count, a wallet seen with nothing pending starts
+  over, and only that wallet is cleared.
+- **Only a transaction that is really stuck is cleared.** The escalation
+  now also needs a transaction that has been unconfirmed for 10 minutes;
+  a run of fresh spends that each confirm is not cleared.
+- **Splits pay a fee.** They paid none. They now pay the same fee as a
+  cancel of their asset, count against the daily fee budget, and are
+  skipped when the budget is spent. A CAT coin no longer has the (XCH) fee
+  taken out of its own amount. The startup pass books its fees at the real
+  block height.
+- **A split is never sent twice.** One CAT split timed out three times and
+  went out four times in 94 seconds; `split_coins` is no longer resent.
+
+After installing: look for `created N new coins (fee … mojos)` in the log,
+and a split pending that clears on its own. `force-deleting ALL its
+unconfirmed transactions` should be rare.
+
 ## [0.10.42] — 2026-11-01 — missing tiers start small; per-token coin splitting
 
 ### Missing tiers start at their minimum (#212)
