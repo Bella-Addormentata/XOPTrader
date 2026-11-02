@@ -3018,7 +3018,8 @@ private:
     // Number of consecutive heartbeat blocks where pending_change > 0 was
     // seen for any wallet.  After kForceDeletePendingBlocks consecutive
     // blocks, unconditionally call delete_unconfirmed_transactions rather
-    // than relying on the transaction-scanning heuristic.
+    // than relying on the transaction-scanning heuristic.  Counted ONCE per
+    // Step 8 however many pairs see the pending change ([STUCK-TX-COUNT]).
     uint32_t consecutive_pending_blocks_{0};
     static constexpr uint32_t kForceDeletePendingBlocks{12};  // ~10 min
 

@@ -14424,6 +14424,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     }
 
     std::set<std::int64_t> pending_wallets_this_block;
+    // [STUCK-TX-COUNT 2026-11-02] Once per Step 8, like the reset below the
+    // loop: consecutive_pending_blocks_ counts HEARTBEATS with pending
+    // change. Declared inside the pair loop it counted once per PAIR, so
+    // with four pairs on the XCH wallet kForceDeletePendingBlocks (~10 min)
+    // was reached in three heartbeats (~1 min), and the force-delete wiped
+    // every split (and any other spend) before it could confirm: on
+    // 2026-11-01 it fired 51 times in nine hours and no coin split landed.
+    bool saw_pending_change = false;
     for (auto& [pair_name, pcs] : cycle_) {
         if (!pcs.quote_valid || pcs.ladder.empty()) continue;
         if (step8_pair_filter_ && step8_pair_filter_->count(pair_name) == 0) {
@@ -14955,7 +14963,6 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         }
 
         {
-            bool saw_pending_change = false;
             const PairConfig* gate_pc = find_pair_config(pair_name);
             if (gate_pc) {
                 auto bwid = offer_mgr_->resolve_wallet_id(gate_pc->base_asset_id);
@@ -28758,6 +28765,19 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height,
         co_return;
     }
 
+    // [SPLIT-FEE 2026-11-02] A split pays the fee a secure cancel of the
+    // same asset pays: a split is the same shape of spend (one coin of ours,
+    // back to ourselves), and the cancel classes already carry its cost. It
+    // used to pay nothing. On 2026-11-01 no split confirmed for nine hours:
+    // the same coins were split six to thirteen times each and wiped
+    // unconfirmed every time. nullopt is the tracker's "budget exhausted"
+    // (0 with fee tracking on, as Step 8 reads it): no split this time.
+    const auto split_fee_or_skip = [&](std::uint64_t fee) -> std::optional<Mojo> {
+        if (fee == 0 && fee_tracker_->enabled()) return std::nullopt;
+        return static_cast<Mojo>(std::min<std::uint64_t>(
+            fee, static_cast<std::uint64_t>(std::numeric_limits<Mojo>::max())));
+    };
+
     // -----------------------------------------------------------------------
     // Phase 1: XCH coin pool (wallet_id 1)
     // -----------------------------------------------------------------------
@@ -28853,14 +28873,26 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height,
                          xch_target_count - xch_reading.pool_ready_count,
                          target_xch);
 
-            constexpr Mojo split_fee = 0;
+            const std::optional<Mojo> xch_fee = split_fee_or_skip(
+                fee_tracker_->get_recommended_fee(
+                    config_.strategy.offer_fee_mojos, block_height,
+                    strategy::fee::ActionClass::CancelXch));
+            if (!xch_fee.has_value()) {
+                spdlog::warn("[Engine] Coin pool: XCH split skipped -- the fee "
+                             "budget is exhausted");
+                break;
+            }
+            const Mojo split_fee = *xch_fee;
             try {
                 auto result = co_await coin_mgr_->ensure_split(
                     1, xch_target_count, target_mojos, split_fee);
 
                 if (result.success && result.coins_created > 0) {
-                    spdlog::info("[Engine] Coin pool: XCH created {} new coins",
-                                 result.coins_created);
+                    fee_tracker_->record_fee(static_cast<std::uint64_t>(split_fee),
+                                             block_height);
+                    spdlog::info("[Engine] Coin pool: XCH created {} new coins "
+                                 "(fee {} mojos)",
+                                 result.coins_created, split_fee);
                 } else if (result.read_failed) {
                     spdlog::warn("[Engine] Coin pool: XCH split abandoned -- "
                                  "coin enumeration failed, pool state unknown "
@@ -29055,17 +29087,29 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height,
                          pool_count - cat_reading.pool_ready_count,
                          pool->units, target_mojos);
 
-            // Execute the split.
-            constexpr Mojo split_fee = 0;
+            // Execute the split. The fee is XCH, paid from the XCH wallet: the
+            // CAT coin itself carries none (CoinManager::fee_carried_by_coin).
+            const std::optional<Mojo> cat_fee = split_fee_or_skip(
+                fee_tracker_->get_recommended_fee(
+                    config_.strategy.offer_fee_mojos, block_height,
+                    strategy::fee::ActionClass::CancelCat));
+            if (!cat_fee.has_value()) {
+                spdlog::warn("[Engine] Coin pool: {} split skipped -- the fee "
+                             "budget is exhausted", info.display_name);
+                continue;
+            }
+            const Mojo split_fee = *cat_fee;
             try {
                 auto result = co_await coin_mgr_->ensure_split(
                     info.wallet_id, pool_count, target_mojos, split_fee);
 
                 if (result.success && result.coins_created > 0) {
+                    fee_tracker_->record_fee(static_cast<std::uint64_t>(split_fee),
+                                             block_height);
                     spdlog::info("[Engine] Coin pool: {} created {} new coins "
-                                 "of {} mojos each (wid={})",
+                                 "of {} mojos each (wid={}, fee {} mojos)",
                                  info.display_name, result.coins_created,
-                                 target_mojos, info.wallet_id);
+                                 target_mojos, info.wallet_id, split_fee);
                 } else if (result.read_failed) {
                     spdlog::warn("[Engine] Coin pool: {} split abandoned -- "
                                  "coin enumeration failed, pool state unknown "

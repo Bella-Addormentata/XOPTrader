@@ -33,14 +33,15 @@ ACTION_CLASS = re.compile(
 # Every get_recommended_fee call site in engine.cpp, by the class it must name.
 # Step 8 asks three times (the offer-attached fee, then the two cancel classes
 # it hands to OfferManager), five take sites ask for Take, and the #157 cancel
-# escalation asks for CancelCat.
+# escalation asks for CancelCat.  [SPLIT-FEE 2026-11-02] The coin pool's two
+# splits pay the cancel class of their asset (CancelXch, CancelCat).
 EXPECTED_CLASSES = {
     "OfferAttached": 1,
-    "CancelXch": 1,
-    "CancelCat": 2,
+    "CancelXch": 2,
+    "CancelCat": 3,
     "Take": 5,
 }
-CALL_SITE_COUNT = 9
+CALL_SITE_COUNT = 11
 
 
 def _read(path: Path) -> str:

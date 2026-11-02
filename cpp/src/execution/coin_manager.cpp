@@ -330,6 +330,11 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
 
     int needed = target_count - current_count;
 
+    // [SPLIT-FEE] What the source coin itself pays: the whole fee for XCH,
+    // none for a CAT (its fee comes from the XCH wallet). The planner and the
+    // balance checks work in the coin's own mojos; the RPC gets the fee.
+    const Mojo coin_fee = fee_carried_by_coin(wallet_id, fee);
+
     // Step 2: Calculate total mojos required for the split.
     // Each new coin will be target_amount_mojos, plus the fee.
     //
@@ -340,11 +345,11 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
     // ISO/IEC 27001:2022 -- deterministic error reporting on arithmetic fault.
     if (needed > 0 && target_amount_mojos > 0 &&
         static_cast<Mojo>(needed) >
-            (std::numeric_limits<std::int64_t>::max() - fee)
+            (std::numeric_limits<std::int64_t>::max() - coin_fee)
             / target_amount_mojos) {
         logger_->error("coin_manager: split total_needed overflows int64_t "
                        "(needed={}, target={}, fee={})",
-                       needed, target_amount_mojos, fee);
+                       needed, target_amount_mojos, coin_fee);
         co_return SplitResult{.success = false, .tx_id = "overflow in total_needed calculation"};
     }
     // Step 3: Verify we have sufficient balance.
@@ -362,10 +367,10 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
         total_available += c.amount;
     }
 
-    if (total_available < target_amount_mojos + fee) {
+    if (total_available < target_amount_mojos + coin_fee) {
         logger_->error("ensure_split: insufficient balance to create even 1 "
                        "coin of {} mojos (+ {} fee). Have {} mojos total",
-                       target_amount_mojos, fee, total_available);
+                       target_amount_mojos, coin_fee, total_available);
         result.success = false;
         co_return result;
     }
@@ -395,7 +400,7 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
         if (c.coin_name.empty()) {
             continue;
         }
-        plan = plan_split_for_coin(c.amount, needed, target_amount_mojos, fee);
+        plan = plan_split_for_coin(c.amount, needed, target_amount_mojos, coin_fee);
         if (plan.batch < 1) {
             continue;
         }
@@ -407,7 +412,7 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
         logger_->error("ensure_split: no coin can improve the pool-ready "
                        "count for target {} mojos (+ {} fee). "
                        "Largest free coin: {} mojos",
-                       target_amount_mojos, fee,
+                       target_amount_mojos, coin_fee,
                        free_coins.empty() ? 0 : free_coins[0].amount);
         result.success = false;
         co_return result;

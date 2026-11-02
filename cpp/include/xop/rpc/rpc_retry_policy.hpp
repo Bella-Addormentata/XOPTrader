@@ -104,7 +104,8 @@ enum class RpcRetryPolicy {
 
 /// The policy for an rpc_post endpoint name (e.g. "cancel_offers").
 ///
-/// The two cancel endpoints and create_offer_for_ids are NeverResend.
+/// The two cancel endpoints, create_offer_for_ids and split_coins are
+/// NeverResend.
 /// take_offer is not idempotent either; it is still out of scope and keeps
 /// the transient retry.
 ///
@@ -122,11 +123,16 @@ enum class RpcRetryPolicy {
 /// for this endpoint is the answer to the only request the wallet ever saw.
 /// The cost: a create that times out fails after one attempt (30 s) where it
 /// used to be re-sent three more times (~124 s).
+///
+/// [SPLIT-FEE 2026-11-02] split_coins joined them: a second copy is a second
+/// spend of the coin.  On 2026-11-01 a CAT split timed out three times and
+/// was sent four times in 94 s, the wallet answering the last copy "needs to
+/// be fully synced" while it was still building the first.
 [[nodiscard]] constexpr RpcRetryPolicy retry_policy_for_endpoint(
     std::string_view endpoint) noexcept
 {
     if (endpoint == "cancel_offers" || endpoint == "cancel_offer"
-        || endpoint == "create_offer_for_ids") {
+        || endpoint == "create_offer_for_ids" || endpoint == "split_coins") {
         return RpcRetryPolicy::NeverResend;
     }
     return RpcRetryPolicy::RetryTransient;
