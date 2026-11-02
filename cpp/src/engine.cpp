@@ -14441,18 +14441,20 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     }
 
     std::set<std::int64_t> pending_wallets_this_block;
-    // [STUCK-TX-COUNT 2026-11-02] Once per Step 8, like the reset below the
-    // loop: consecutive_pending_blocks_ counts HEARTBEATS with pending
-    // change. Declared inside the pair loop it counted once per PAIR, so
-    // with four pairs on the XCH wallet kForceDeletePendingBlocks (~10 min)
-    // was reached in three heartbeats (~1 min), and the force-delete wiped
-    // every split (and any other spend) before it could confirm: on
-    // 2026-11-01 it fired 51 times in nine hours and no coin split landed.
-    bool saw_pending_change = false;
-    // [review #214] Set when the force-delete fires; it then stays on for the
-    // rest of this Step 8, wiping each pending wallet once (see below).
-    bool force_delete_this_step = false;
-    std::set<std::int64_t> force_deleted_wallets;
+    // [STUCK-TX-COUNT 2026-11-02] The force-delete escalation counts PER
+    // WALLET: pending_streak_by_wallet_ is the number of consecutive Step 8s
+    // in which that wallet showed pending change, counted at its first
+    // sighting in each.  It used to be one counter for every wallet, bumped
+    // once per PAIR: with four pairs on the XCH wallet it reached
+    // kForceDeletePendingBlocks (~10 min) in three heartbeats (~1 min), and
+    // the force-delete wiped every split before it could confirm (51 times on
+    // 2026-11-01, and no coin split landed in nine hours).  Per wallet, a
+    // wallet seen with NO pending change starts over at once -- by a pair's
+    // gate or by the coin pool's own read -- so a spend submitted on a clean
+    // wallet earlier in this heartbeat (a coin split, an earlier pair's
+    // secure cancel) is never mistaken for a stuck one, and one busy wallet
+    // cannot hold back another's escalation.
+    bool force_delete_signalled = false;
     for (auto& [pair_name, pcs] : cycle_) {
         if (!pcs.quote_valid || pcs.ladder.empty()) continue;
         if (step8_pair_filter_ && step8_pair_filter_->count(pair_name) == 0) {
@@ -14460,7 +14462,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         }
 
         // [WALLET-CIRCUIT] C2, at every pair boundary.  co_return, NOT break:
-        // a break falls through to the consecutive_pending_blocks_ reset below
+        // a break falls through to the pending-streak reset below
         // the loop, so one transport failure before any pair reached Gate 1
         // would restart the force-delete escalation.  Inside the iteration,
         // every wallet call that can follow a failure has its own checkpoint
@@ -15156,27 +15158,25 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                              "transactions are left alone",
                                              pair_name, sb.label);
                             }
-                            // Track consecutive blocks with pending_change.
-                            if (!warp_send_here) {
-                                pending_wallets_this_block.insert(sb.wid);
-                            }
+                            // [STUCK-TX-COUNT] Once per wallet per Step 8,
+                            // at its first sighting.
+                            const bool first_sighting = !warp_send_here
+                                && pending_wallets_this_block.insert(sb.wid).second;
                             // [REVIVE2 2026-10-22] Not in a revive-only run:
                             // it skips the clean-heartbeat reset below the
                             // loop, so counting here would turn alternating
                             // pending/clear heartbeats into a false streak.
-                            if (!saw_pending_change && !step8_pair_filter_
-                                && !warp_send_here) {
-                                ++consecutive_pending_blocks_;
-                                saw_pending_change = true;
+                            std::uint32_t pending_streak = 0;
+                            if (first_sighting && !step8_pair_filter_) {
+                                pending_streak = ++pending_streak_by_wallet_[sb.wid];
                                 // [S67] Half way to the force-delete: our own
                                 // spends are not confirming.  An edge, so one
                                 // run of pending_change speaks once.
-                                if (consecutive_pending_blocks_ == kForceDeletePendingBlocks / 2) {
+                                if (pending_streak == kForceDeletePendingBlocks / 2) {
                                     fee_feedback_signal(
                                         strategy::fee::Signal::PendingChangeStuck, block_height);
                                 }
                             }
-
                             // Periodic stuck-tx pruning.
                             // [REVIVE2 2026-10-22] Not in a revive-only run:
                             // the pruner can delete EVERY unconfirmed
@@ -15223,61 +15223,39 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             }
 
                             // Escalation: force-delete if stuck too long.
-                            // Iterate ALL wallets with pending_change this
-                            // block, not just the current one.  A single
-                            // global counter can fire while examining any
-                            // wallet; clearing only that wallet leaves the
-                            // others stuck indefinitely.
-                            //
-                            // [review #214] Counted once per Step 8, the
-                            // counter fires at the FIRST pair with pending
-                            // change, before later pairs add their wallets.
-                            // So once it fires the escalation stays on for
-                            // the rest of this Step 8: each pending wallet is
-                            // wiped once, when its pair is reached.  Reset
-                            // at the first firing alone, a wallet that kept
-                            // acquiring pending spends would starve the
-                            // others of every escalation.
+                            // [STUCK-TX-COUNT] Per wallet: this wallet has
+                            // shown pending change in every one of the last
+                            // kForceDeletePendingBlocks Step 8s, and nothing
+                            // has seen it clear since.
                             if (!step8_pair_filter_
-                                && (force_delete_this_step
-                                    || consecutive_pending_blocks_ >=
-                                           kForceDeletePendingBlocks)) {
-                                if (!force_delete_this_step) {
-                                    spdlog::warn("[Engine] Step 8: pending_change "
-                                                 "persisted for {} consecutive "
-                                                 "blocks -- force-deleting ALL "
-                                                 "unconfirmed transactions for "
-                                                 "{} pending wallets (and any a "
-                                                 "later pair finds)",
-                                                 consecutive_pending_blocks_,
-                                                 pending_wallets_this_block.size());
+                                && pending_streak >= kForceDeletePendingBlocks) {
+                                const std::int64_t pw = sb.wid;
+                                spdlog::warn("[Engine] Step 8: wallet {} pending_change "
+                                             "persisted for {} consecutive "
+                                             "blocks -- force-deleting ALL "
+                                             "its unconfirmed transactions",
+                                             pw, pending_streak);
+                                // [WALLET-CIRCUIT] The periodic prune above,
+                                // or a previous delete, may have failed at the
+                                // transport level; both swallow it.  co_return,
+                                // NOT break: the streak reset below must not
+                                // run, so the escalation stays armed for the
+                                // next heartbeat instead of restarting its
+                                // kForceDeletePendingBlocks count.
+                                if (!wallet_step_may_run("Step 8 force-delete")) {
+                                    co_return;
                                 }
-                                for (auto pw : pending_wallets_this_block) {
-                                    if (force_deleted_wallets.count(pw) > 0) continue;
-                                    // [WALLET-CIRCUIT] The periodic prune
-                                    // above, or the previous delete, may
-                                    // have failed at the transport level;
-                                    // both swallow it.  co_return, NOT
-                                    // break: the reset below must not run,
-                                    // so the escalation stays armed for the
-                                    // next heartbeat instead of restarting
-                                    // its kForceDeletePendingBlocks count.
-                                    if (!wallet_step_may_run("Step 8 force-delete")) {
-                                        co_return;
-                                    }
-                                    force_deleted_wallets.insert(pw);
-                                    // [WARP-LOST-SEND] Fresh, right before
-                                    // the delete (see the prune above).
-                                    if (wallet_holds_warp_send(pw, block_height,
-                                                               /*fresh=*/true)) {
-                                        spdlog::info("[Engine] Step 8: force-"
-                                                     "delete of wallet {} "
-                                                     "skipped -- a warp send "
-                                                     "was reserved on it since "
-                                                     "this heartbeat's read",
-                                                     pw);
-                                        continue;
-                                    }
+                                // [WARP-LOST-SEND] Fresh, right before the
+                                // delete (see the prune above).
+                                if (wallet_holds_warp_send(pw, block_height,
+                                                           /*fresh=*/true)) {
+                                    spdlog::info("[Engine] Step 8: force-"
+                                                 "delete of wallet {} "
+                                                 "skipped -- a warp send "
+                                                 "was reserved on it since "
+                                                 "this heartbeat's read",
+                                                 pw);
+                                } else {
                                     try {
                                         co_await wallet_->
                                             delete_unconfirmed_transactions(pw);
@@ -15292,18 +15270,23 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                                      pw, e.what());
                                     }
                                 }
-                                if (!force_delete_this_step) {
-                                    // [S67] The hardest "too low" there is: spends
-                                    // sat unconfirmed until the wallet was wiped.
+                                // [S67] The hardest "too low" there is: spends
+                                // sat unconfirmed until the wallet was wiped.
+                                // Once per Step 8, however many wallets.
+                                if (!force_delete_signalled) {
                                     fee_feedback_signal(strategy::fee::Signal::ForceDelete,
                                                         block_height);
-                                    consecutive_pending_blocks_ = 0;
-                                    force_delete_this_step = true;
+                                    force_delete_signalled = true;
                                 }
+                                pending_streak_by_wallet_.erase(pw);
                             }
                             // Fall through to Gates 2 and 3: they evaluate
                             // the spendable balance, which is the quantity
                             // that actually constrains posting.
+                        } else {
+                            // [STUCK-TX-COUNT] Seen clear: whatever is pending
+                            // on it later in this heartbeat is a fresh spend.
+                            pending_streak_by_wallet_.erase(sb.wid);
                         }
 
                         // Gate 2: spendable reserve too low (fractional).
@@ -17603,9 +17586,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // Reset consecutive pending counter only when NO pair hit Gate 1
     // (pending_change > 0) on this entire block.  Resetting per-pair
     // would incorrectly clear the counter whenever a clean pair processes.
-    if (pending_wallets_this_block.empty()) {
-        consecutive_pending_blocks_ = 0;
-    }
+    // [STUCK-TX-COUNT] Per wallet: a wallet not pending in this Step 8 starts
+    // over.
+    std::erase_if(pending_streak_by_wallet_, [&](const auto& kv) {
+        return pending_wallets_this_block.count(kv.first) == 0;
+    });
 
     // Report the aggregate stuck-offer count across all pairs for this cycle.
     metrics_->update_stuck_offers(total_stuck_offers);
@@ -28846,6 +28831,10 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height,
                               "waiting for prior split to confirm",
                               pending_change);
                 xch_pending = true;
+            } else {
+                // [STUCK-TX-COUNT] Seen clear: the split this pass may send is
+                // a fresh spend, not the stuck one Step 8 was counting.
+                pending_streak_by_wallet_.erase(1);
             }
         } catch (const std::exception& e) {
             spdlog::warn("[Engine] Coin pool: XCH balance check failed: {}",
@@ -29043,6 +29032,9 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height,
                                   info.display_name, info.wallet_id,
                                   pending_change);
                     cat_pending = true;
+                } else {
+                    // [STUCK-TX-COUNT] Seen clear (see the XCH read above).
+                    pending_streak_by_wallet_.erase(info.wallet_id);
                 }
             } catch (const std::exception& e) {
                 spdlog::warn("[Engine] Coin pool: {} balance check failed: {}",

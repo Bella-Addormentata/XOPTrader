@@ -350,11 +350,12 @@ def test_cancel_verdict_site_feeds_the_controller():
 
 def test_pending_change_site_feeds_the_controller_on_an_edge():
     body = _function_body(_engine(), "asio::awaitable<void> Engine::step_manage_offers(")
-    bump = body.index("++consecutive_pending_blocks_;")
+    # [STUCK-TX-COUNT 2026-11-02] The streak is per wallet.
+    bump = body.index("pending_streak = ++pending_streak_by_wallet_[sb.wid];")
     hook = body.index("strategy::fee::Signal::PendingChangeStuck", bump)
     assert hook - bump < 600, hook - bump
     between = body[bump:hook]
-    assert "consecutive_pending_blocks_ == kForceDeletePendingBlocks / 2" in between, (
+    assert "pending_streak == kForceDeletePendingBlocks / 2" in between, (
         "the pending_change signal must fire on the half-way EDGE, once per run")
 
 
@@ -362,7 +363,7 @@ def test_force_delete_site_feeds_the_controller_before_the_counter_resets():
     body = _function_body(_engine(), "asio::awaitable<void> Engine::step_manage_offers(")
     wipe = body.index("delete_unconfirmed_transactions(pw)")
     hook = body.index("strategy::fee::Signal::ForceDelete", wipe)
-    reset = body.index("consecutive_pending_blocks_ = 0;", wipe)
+    reset = body.index("pending_streak_by_wallet_.erase(pw);", wipe)
     assert wipe < hook < reset
 
 

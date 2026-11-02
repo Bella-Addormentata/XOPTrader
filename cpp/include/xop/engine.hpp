@@ -3015,12 +3015,14 @@ private:
     BlockHeight last_stuck_tx_prune_block_{0};
     static constexpr uint32_t kStuckTxPruneInterval{20};  // ~17 min
 
-    // Number of consecutive heartbeat blocks where pending_change > 0 was
-    // seen for any wallet.  After kForceDeletePendingBlocks consecutive
-    // blocks, unconditionally call delete_unconfirmed_transactions rather
-    // than relying on the transaction-scanning heuristic.  Counted ONCE per
-    // Step 8 however many pairs see the pending change ([STUCK-TX-COUNT]).
-    uint32_t consecutive_pending_blocks_{0};
+    // Per wallet id, the number of consecutive heartbeat blocks (Step 8s) in
+    // which that wallet showed pending_change > 0.  After
+    // kForceDeletePendingBlocks of them, unconditionally call
+    // delete_unconfirmed_transactions on THAT wallet rather than relying on
+    // the transaction-scanning heuristic.  [STUCK-TX-COUNT 2026-11-02]
+    // Counted once per Step 8 per wallet, and a wallet seen clear (by a
+    // pair's gate or the coin pool) starts over.
+    std::map<std::int64_t, std::uint32_t> pending_streak_by_wallet_;
     static constexpr uint32_t kForceDeletePendingBlocks{12};  // ~10 min
 
     // [WARP-LOST-SEND 2026-10-25] Which wallets the GUI's warp jobs have a

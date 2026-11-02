@@ -38,20 +38,24 @@ def test_the_pending_change_block_consults_the_guard_once_per_wallet():
     start = text.index("wallet_holds_warp_send(sb.wid, block_height)")
     block = text[start:start + 6000]
     # Not counted toward the escalation, not pruned, not force-deleted.
-    assert "if (!warp_send_here) {\n" in block
-    assert "pending_wallets_this_block.insert(sb.wid);" in block
-    assert "&& !warp_send_here) {" in block                # the increment
+    # [STUCK-TX-COUNT 2026-11-02] The streak is per wallet; a guarded wallet
+    # never has its first sighting counted, so it never builds one.
+    assert "const bool first_sighting = !warp_send_here\n" in block
+    assert "&& pending_wallets_this_block.insert(sb.wid).second;" in block
+    assert "if (first_sighting && !step8_pair_filter_) {" in block  # the increment
     assert "!step8_pair_filter_ && !warp_send_here" in block  # the periodic prune
-    assert text.count("!warp_send_here") == 3
+    assert text.count("!warp_send_here") == 2
 
 
 def test_the_force_delete_iterates_only_unprotected_wallets():
+    # [STUCK-TX-COUNT 2026-11-02] The force-delete fires on a wallet's own
+    # streak, which only an unguarded first sighting can build.
     text = _engine()
-    insert = text.index("pending_wallets_this_block.insert(sb.wid);")
-    guard = text.rindex("if (!warp_send_here) {", 0, insert)
-    assert insert - guard < 120, "the insert is inside the guard"
-    loop = text.index("for (auto pw : pending_wallets_this_block)")
-    assert loop > insert
+    first = text.index("const bool first_sighting = !warp_send_here")
+    bump = text.index("pending_streak = ++pending_streak_by_wallet_[sb.wid];", first)
+    assert "if (first_sighting && !step8_pair_filter_) {" in text[first:bump]
+    fire = text.index("&& pending_streak >= kForceDeletePendingBlocks) {")
+    assert fire > bump
 
 
 def test_every_destructive_rpc_re_reads_the_guard_first():
@@ -66,7 +70,7 @@ def test_every_destructive_rpc_re_reads_the_guard_first():
     delete = text.index("delete_unconfirmed_transactions(pw);")
     fresh = text.rindex("wallet_holds_warp_send(pw, block_height,", 0, delete)
     assert delete - fresh < 900
-    assert "continue;" in text[fresh:delete]
+    assert "} else {" in text[fresh:delete], "a guarded wallet is not deleted"
     assert "void Engine::refresh_warp_send_guard(BlockHeight block_height, bool fresh)" in text
     # [review] A headless engine (warp enabled, no database ever) regains its
     # cleanup after a bounded grace instead of failing closed for good.

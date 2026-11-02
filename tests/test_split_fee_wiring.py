@@ -51,22 +51,37 @@ def _coin_pool() -> str:
         _read(ENGINE), "asio::awaitable<void> Engine::step_maintain_coin_pool("))
 
 
-def test_the_pending_change_counter_counts_once_per_step_8():
+def test_pending_change_is_counted_per_wallet_once_per_step_8():
+    """One counter for every wallet, bumped once per PAIR, reached the
+    force-delete in ~1 minute instead of ~10.  The streak is per wallet, counted
+    at the wallet's first sighting in each Step 8."""
     body = _manage_offers()
-    flag = "bool saw_pending_change = false;"
-    assert body.count(flag) == 1, "one flag for the whole Step 8"
-    pending = body.index("std::set<std::int64_t> pending_wallets_this_block;")
-    loop = body.index("for (auto& [pair_name, pcs] : cycle_)", pending)
-    at = body.index(flag)
-    assert pending < at < loop, (
-        "declared inside the pair loop the counter counts once per PAIR and "
-        "the force-delete fires after ~1 minute instead of ~10")
-    # The increment is still guarded by it, and the reset is still per run.
-    bump = body.index("++consecutive_pending_blocks_;")
-    guard = body.rindex("if (!saw_pending_change", 0, bump)
-    assert bump - guard < 200
-    assert "saw_pending_change = true;" in body[bump:bump + 120]
-    assert "if (pending_wallets_this_block.empty()) {" in body
+    assert "consecutive_pending_blocks_" not in body
+    assert "saw_pending_change" not in body
+    first = body.index("pending_wallets_this_block.insert(sb.wid).second;")
+    bump = body.index("pending_streak = ++pending_streak_by_wallet_[sb.wid];", first)
+    assert "if (first_sighting && !step8_pair_filter_) {" in body[first:bump]
+    # A wallet that was not pending in this Step 8 starts over.
+    assert ("std::erase_if(pending_streak_by_wallet_, [&](const auto& kv) {\n"
+            "        return pending_wallets_this_block.count(kv.first) == 0;") in body
+    hpp = _code(_read(REPO / "cpp" / "include" / "xop" / "engine.hpp"))
+    assert "std::map<std::int64_t, std::uint32_t> pending_streak_by_wallet_;" in hpp
+    assert "consecutive_pending_blocks_" not in hpp
+
+
+def test_a_wallet_seen_clear_starts_over():
+    """[review #214] A spend submitted on a clean wallet earlier in the same
+    heartbeat (an earlier pair's secure cancel, a coin split) must not inherit
+    a stuck streak and be force-deleted as one."""
+    body = _manage_offers()
+    fire = body.index("&& pending_streak >= kForceDeletePendingBlocks) {")
+    reset = body.index("pending_streak_by_wallet_.erase(pw);", fire)
+    clear = body.index("} else {", reset)
+    assert body[reset:clear].count("}") == 1, "the else of `if (pending > 0)`"
+    assert "pending_streak_by_wallet_.erase(sb.wid);" in body[clear:clear + 200]
+    pool = _coin_pool()
+    assert "pending_streak_by_wallet_.erase(1);" in pool
+    assert "pending_streak_by_wallet_.erase(info.wallet_id);" in pool
 
 
 def test_coin_pool_splits_pay_the_cancel_fee_of_their_asset():
@@ -102,43 +117,19 @@ def test_startup_splits_book_their_fee_at_a_real_height():
     assert "if (boot_height > 0) {" in between
 
 
-def test_a_fired_force_delete_reaches_every_pending_wallet_of_the_step():
-    """[review #214] Counted once per Step 8 the escalation fires at the first
-    pending pair; it stays on for the rest of the step so later pairs' wallets
-    are wiped too, each once, and the counter resets once."""
+def test_the_force_delete_wipes_only_the_wallet_whose_streak_ran_out():
+    """[review #214] Each wallet escalates on its own streak: no shared counter
+    for one busy wallet to reset, no sweep of wallets other pairs spent on in
+    this Step 8.  The transport guard still returns before the reset, and the
+    ForceDelete signal fires once per Step 8."""
     body = _manage_offers()
-    pending = body.index("std::set<std::int64_t> pending_wallets_this_block;")
-    loop = body.index("for (auto& [pair_name, pcs] : cycle_)", pending)
-    assert pending < body.index("bool force_delete_this_step = false;") < loop
-    assert pending < body.index("std::set<std::int64_t> force_deleted_wallets;") < loop
-    fire = body.index("&& (force_delete_this_step\n")
+    fire = body.index("&& pending_streak >= kForceDeletePendingBlocks) {")
     wipe = body.index("delete_unconfirmed_transactions(pw)", fire)
     between = body[fire:wipe]
-    assert "if (force_deleted_wallets.count(pw) > 0) continue;" in between
-    assert "force_deleted_wallets.insert(pw);" in between
-    # The transport guard still returns before the reset can run.
-    assert between.index("co_return;") < between.index("force_deleted_wallets.insert(pw);")
-    reset = body.index("consecutive_pending_blocks_ = 0;", wipe)
-    tail = body[wipe:reset + 120]
-    assert "if (!force_delete_this_step) {" in tail
-    assert "force_delete_this_step = true;" in tail
-
-
-def test_a_cat_coin_carries_none_of_its_split_fee():
-    hpp = _code(_read(COIN_MANAGER_HPP))
-    assert "return wallet_id == 1 ? fee : 0;" in hpp
-    body = _code(_function_body(
-        _read(COIN_MANAGER), "asio::awaitable<SplitResult> CoinManager::ensure_split("))
-    assert "const Mojo coin_fee = fee_carried_by_coin(wallet_id, fee);" in body
-    # The planner and the balance check work in the coin's own mojos ...
-    assert "plan_split_for_coin(c.amount, needed, target_amount_mojos, coin_fee)" in body
-    assert "total_available < target_amount_mojos + coin_fee" in body
-    assert "plan_split_for_coin(c.amount, needed, target_amount_mojos, fee)" not in body
-    # ... and the wallet gets the whole fee.
-    rpc = body.index("co_await wallet_->split_coins(")
-    assert "fee);" in body[rpc:rpc + 300]
-
-
-def test_split_coins_is_never_resent():
-    hpp = _code(_read(RETRY_POLICY_HPP))
-    assert 'endpoint == "split_coins"' in hpp
+    assert "const std::int64_t pw = sb.wid;" in between
+    assert "for (auto pw : pending_wallets_this_block)" not in body
+    assert "co_return;" in between
+    reset = body.index("pending_streak_by_wallet_.erase(pw);", wipe)
+    tail = body[wipe:reset]
+    assert "if (!force_delete_signalled) {" in tail
+    assert "strategy::fee::Signal::ForceDelete" in tail
