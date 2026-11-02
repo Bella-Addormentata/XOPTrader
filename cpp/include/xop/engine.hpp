@@ -3017,13 +3017,20 @@ private:
 
     // Per wallet id, the number of consecutive heartbeat blocks (Step 8s) in
     // which that wallet showed pending_change > 0.  After
-    // kForceDeletePendingBlocks of them, unconditionally call
-    // delete_unconfirmed_transactions on THAT wallet rather than relying on
+    // kForceDeletePendingBlocks of them, call delete_unconfirmed_transactions
+    // on THAT wallet -- fresh rows or not, once one of its rows has been
+    // unconfirmed for kForceDeleteMinRowAgeSeconds -- rather than relying on
     // the transaction-scanning heuristic.  [STUCK-TX-COUNT 2026-11-02]
     // Counted once per Step 8 per wallet, and a wallet seen clear (by a
-    // pair's gate or the coin pool) starts over.
+    // pair's gate, the empty-ladder liveness refresh or the coin pool)
+    // starts over.
     std::map<std::int64_t, std::uint32_t> pending_streak_by_wallet_;
     static constexpr uint32_t kForceDeletePendingBlocks{12};  // ~10 min
+    // [review #214 r3] ...and a row unconfirmed this long (stuck_tx_verdict.hpp).
+    static constexpr std::int64_t kForceDeleteMinRowAgeSeconds{600};
+    /// Such rows on @p wallet_id; nullopt when unread.
+    asio::awaitable<std::optional<int>>
+        count_rows_past_force_delete_window(std::int64_t wallet_id);
 
     // [WARP-LOST-SEND 2026-10-25] Which wallets the GUI's warp jobs have a
     // Chia send in flight on, read from warp_jobs.db once per heartbeat

@@ -35,6 +35,7 @@
 #include "xop/execution/coin_pool_verdict.hpp"
 #include "xop/execution/stuck_prune_scope.hpp"
 #include "xop/execution/warp_send_guard.hpp"
+#include "xop/execution/stuck_tx_verdict.hpp"
 #include "xop/execution/wallet_circuit.hpp"
 #include "xop/strategy/tier_gain.hpp"
 #include "xop/strategy/competitiveness_gate.hpp"
@@ -14403,6 +14404,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     cached_wallet_balances_[asset] =
                         {spendable, confirmed, pending, block_height,
                          std::chrono::system_clock::now(), fields_validated};
+                    // [review #214 r3] Seen clear here too: what a pace or
+                    // stuck-offer cancel puts on it later in this Step 8 is
+                    // a fresh spend, not the tail of an old streak.
+                    if (fields_validated && pending == 0) {
+                        pending_streak_by_wallet_.erase(wid);
+                    }
                     // [SEED-FAIL-CLOSED 2026-09-22] The main loop never reads
                     // the assets of a pair with an empty ladder -- a suspended
                     // pair's, for one -- yet they count in every other pair's
@@ -15230,11 +15237,6 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             if (!step8_pair_filter_
                                 && pending_streak >= kForceDeletePendingBlocks) {
                                 const std::int64_t pw = sb.wid;
-                                spdlog::warn("[Engine] Step 8: wallet {} pending_change "
-                                             "persisted for {} consecutive "
-                                             "blocks -- force-deleting ALL "
-                                             "its unconfirmed transactions",
-                                             pw, pending_streak);
                                 // [WALLET-CIRCUIT] The periodic prune above,
                                 // or a previous delete, may have failed at the
                                 // transport level; both swallow it.  co_return,
@@ -15245,40 +15247,76 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                 if (!wallet_step_may_run("Step 8 force-delete")) {
                                     co_return;
                                 }
-                                // [WARP-LOST-SEND] Fresh, right before the
-                                // delete (see the prune above).
-                                if (wallet_holds_warp_send(pw, block_height,
-                                                           /*fresh=*/true)) {
-                                    spdlog::info("[Engine] Step 8: force-"
-                                                 "delete of wallet {} "
-                                                 "skipped -- a warp send "
-                                                 "was reserved on it since "
-                                                 "this heartbeat's read",
+                                // [review #214 r3] The streak counts Step 8s
+                                // that SAW pending change, and a chain of
+                                // spends that each confirmed between two
+                                // reads makes the same run: a cancel sent on
+                                // a wallet that cleared unseen at streak 11
+                                // would be wiped seconds old.  The wipe needs
+                                // a row unconfirmed for the window itself.
+                                const std::optional<int> outlived =
+                                    co_await count_rows_past_force_delete_window(pw);
+                                if (!outlived) {
+                                    // Unread: stays armed for the next Step 8.
+                                    spdlog::warn("[Engine] Step 8: force-delete "
+                                                 "of wallet {} held -- its "
+                                                 "transactions could not be read",
                                                  pw);
+                                } else if (*outlived == 0) {
+                                    spdlog::info("[Engine] Step 8: wallet {} "
+                                                 "pending_change seen for {} "
+                                                 "consecutive blocks, but no "
+                                                 "transaction on it is {}s "
+                                                 "unconfirmed -- a run of fresh "
+                                                 "spends, not a stuck one; the "
+                                                 "count starts over",
+                                                 pw, pending_streak,
+                                                 kForceDeleteMinRowAgeSeconds);
+                                    pending_streak_by_wallet_.erase(pw);
                                 } else {
-                                    try {
-                                        co_await wallet_->
-                                            delete_unconfirmed_transactions(pw);
-                                        spdlog::info("[Engine] Step 8: "
-                                                     "force-deleted unconfirmed "
-                                                     "transactions for wallet "
-                                                     "id {}", pw);
-                                    } catch (const std::exception& e) {
-                                        spdlog::warn("[Engine] Step 8: "
-                                                     "force-delete failed for "
-                                                     "wallet id {}: {}",
-                                                     pw, e.what());
+                                    spdlog::warn("[Engine] Step 8: wallet {} pending_change "
+                                                 "persisted for {} consecutive "
+                                                 "blocks ({} transaction(s) "
+                                                 "unconfirmed for {}s or more) -- "
+                                                 "force-deleting ALL its "
+                                                 "unconfirmed transactions",
+                                                 pw, pending_streak, *outlived,
+                                                 kForceDeleteMinRowAgeSeconds);
+                                    // [WARP-LOST-SEND] Fresh, right before the
+                                    // delete (see the prune above).
+                                    if (wallet_holds_warp_send(pw, block_height,
+                                                               /*fresh=*/true)) {
+                                        spdlog::info("[Engine] Step 8: force-"
+                                                     "delete of wallet {} "
+                                                     "skipped -- a warp send "
+                                                     "was reserved on it since "
+                                                     "this heartbeat's read",
+                                                     pw);
+                                    } else {
+                                        try {
+                                            co_await wallet_->
+                                                delete_unconfirmed_transactions(pw);
+                                            spdlog::info("[Engine] Step 8: "
+                                                         "force-deleted unconfirmed "
+                                                         "transactions for wallet "
+                                                         "id {}", pw);
+                                        } catch (const std::exception& e) {
+                                            spdlog::warn("[Engine] Step 8: "
+                                                         "force-delete failed for "
+                                                         "wallet id {}: {}",
+                                                         pw, e.what());
+                                        }
                                     }
+                                    // [S67] The hardest "too low" there is: spends
+                                    // sat unconfirmed until the wallet was wiped.
+                                    // Once per Step 8, however many wallets.
+                                    if (!force_delete_signalled) {
+                                        fee_feedback_signal(strategy::fee::Signal::ForceDelete,
+                                                            block_height);
+                                        force_delete_signalled = true;
+                                    }
+                                    pending_streak_by_wallet_.erase(pw);
                                 }
-                                // [S67] The hardest "too low" there is: spends
-                                // sat unconfirmed until the wallet was wiped.
-                                // Once per Step 8, however many wallets.
-                                if (!force_delete_signalled) {
-                                    fee_feedback_signal(strategy::fee::Signal::ForceDelete,
-                                                        block_height);
-                                    force_delete_signalled = true;
-                                }
-                                pending_streak_by_wallet_.erase(pw);
                             }
                             // Fall through to Gates 2 and 3: they evaluate
                             // the spendable balance, which is the quantity
@@ -22574,6 +22612,38 @@ bool Engine::wallet_holds_warp_send(std::int64_t wallet_id,
         if (wallet_id == offer_mgr_->resolve_wallet_id(asset)) return true;
     }
     return false;
+}
+
+// [review #214 r3] The force-delete's second condition (engine.hpp,
+// kForceDeleteMinRowAgeSeconds).  The same 200-row RELEVANCE window the
+// pruner reads: unconfirmed rows come first.
+asio::awaitable<std::optional<int>>
+Engine::count_rows_past_force_delete_window(std::int64_t wallet_id)
+{
+    try {
+        const auto txs = co_await wallet_->get_transactions(wallet_id, 0, 200);
+        const std::int64_t now_epoch =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        int outlived = 0;
+        for (const auto& tx : txs) {
+            const bool confirmed = tx.contains("confirmed")
+                && tx["confirmed"].is_boolean() && tx["confirmed"].get<bool>();
+            const bool age_known = tx.contains("created_at_time")
+                && tx["created_at_time"].is_number_integer();
+            const std::int64_t age = age_known
+                ? now_epoch - tx["created_at_time"].get<std::int64_t>() : 0;
+            if (execution::row_outlived_force_delete_window(
+                    confirmed, age_known, age, kForceDeleteMinRowAgeSeconds)) {
+                ++outlived;
+            }
+        }
+        co_return outlived;
+    } catch (const std::exception& e) {
+        spdlog::warn("[Engine] Step 8: reading wallet {}'s transactions for "
+                     "the force-delete failed: {}", wallet_id, e.what());
+    }
+    co_return std::nullopt;
 }
 
 // The bridge scans' on-demand wallet read (contract in engine.hpp).

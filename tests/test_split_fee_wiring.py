@@ -75,13 +75,50 @@ def test_a_wallet_seen_clear_starts_over():
     a stuck streak and be force-deleted as one."""
     body = _manage_offers()
     fire = body.index("&& pending_streak >= kForceDeletePendingBlocks) {")
-    reset = body.index("pending_streak_by_wallet_.erase(pw);", fire)
+    wipe = body.index("delete_unconfirmed_transactions(pw)", fire)
+    reset = body.index("pending_streak_by_wallet_.erase(pw);", wipe)
     clear = body.index("} else {", reset)
-    assert body[reset:clear].count("}") == 1, "the else of `if (pending > 0)`"
+    assert body[reset:clear].count("}") == 2, "the else of `if (pending > 0)`"
     assert "pending_streak_by_wallet_.erase(sb.wid);" in body[clear:clear + 200]
     pool = _coin_pool()
     assert "pending_streak_by_wallet_.erase(1);" in pool
     assert "pending_streak_by_wallet_.erase(info.wallet_id);" in pool
+    # [review #214 r3] The empty-ladder liveness refresh reads wallets before
+    # any pace or stuck-offer cancel of this Step 8; a clear read there resets
+    # too.
+    refresh = body.index("cached_wallet_balances_[asset] =")
+    loop = body.index("pending_wallets_this_block.insert(sb.wid).second;")
+    seen = body.index("if (fields_validated && pending == 0) {\n"
+                      "                        pending_streak_by_wallet_.erase(wid);", refresh)
+    assert seen < loop
+
+
+def test_a_stale_streak_cannot_wipe_a_fresh_spend():
+    """[review #214 r3] A streak counts Step 8s that SAW pending change, which
+    a chain of spends that each confirmed between reads also builds.  The wipe
+    needs a row that has itself been unconfirmed for the window; without one
+    the count starts over, and an unread wallet stays armed."""
+    body = _manage_offers()
+    fire = body.index("&& pending_streak >= kForceDeletePendingBlocks) {")
+    ask = body.index("co_await count_rows_past_force_delete_window(pw);", fire)
+    wipe = body.index("delete_unconfirmed_transactions(pw)", fire)
+    assert ask < wipe
+    between = body[ask:wipe]
+    unread = between.index("if (!outlived) {")
+    fresh_run = between.index("} else if (*outlived == 0) {", unread)
+    stuck = between.index("} else {", fresh_run)
+    assert "pending_streak_by_wallet_" not in between[unread:fresh_run], (
+        "an unread wallet keeps its streak")
+    assert "pending_streak_by_wallet_.erase(pw);" in between[fresh_run:stuck]
+    assert "Signal::ForceDelete" not in between[:stuck], "nothing was wiped"
+    helper = _code(_function_body(
+        _read(ENGINE),
+        "asio::awaitable<std::optional<int>>\nEngine::count_rows_past_force_delete_window("))
+    assert "execution::row_outlived_force_delete_window(" in helper
+    assert "kForceDeleteMinRowAgeSeconds" in helper
+    assert "co_return std::nullopt;" in helper
+    hpp = _code(_read(REPO / "cpp" / "include" / "xop" / "engine.hpp"))
+    assert "static constexpr std::int64_t kForceDeleteMinRowAgeSeconds{600};" in hpp
 
 
 def test_coin_pool_splits_pay_the_cancel_fee_of_their_asset():
