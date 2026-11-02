@@ -20,10 +20,14 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <initializer_list>
+
 #include "xop/execution/stuck_tx_verdict.hpp"
 
 using xop::execution::authorises_wallet_wide_delete;
 using xop::execution::classify_stuck_row;
+using xop::execution::row_outlived_force_delete_window;
 using xop::execution::StuckRowClass;
 
 namespace {
@@ -134,6 +138,42 @@ TEST(StuckTxVerdict, TheTwoCountsAreNotInterchangeable)
 {
     EXPECT_NE(authorises_wallet_wide_delete(1, 0),
               authorises_wallet_wide_delete(0, 1));
+}
+
+// [review #214 r3] The force-delete's own row rule.
+TEST(ForceDeleteWindow, OnlyARowUnconfirmedForTheWholeWindowArmsTheWipe)
+{
+    EXPECT_FALSE(row_outlived_force_delete_window(false, true, 599, 600))
+        << "a cancel sent under a stale streak is seconds old: never wiped";
+    EXPECT_TRUE(row_outlived_force_delete_window(false, true, 600, 600))
+        << "the boundary is inclusive, like classify_stuck_row's";
+    EXPECT_FALSE(row_outlived_force_delete_window(true, true, 5000, 600))
+        << "a confirmed row is history, not a stuck spend";
+    EXPECT_FALSE(row_outlived_force_delete_window(false, false, 5000, 600))
+        << "an undatable row is not old: unknown authorises nothing";
+}
+
+// The escalation is the pruner's backstop: it is NOT gated like the prune.
+TEST(ForceDeleteWindow, FreshRowsBesideAStuckOneDoNotHoldTheEscalation)
+{
+    // One stuck row and one fresh one: the pruner holds...
+    int past = 0, fresh = 0;
+    for (const auto c : {classify_stuck_row(false, true, 5000, false, 600),
+                         classify_stuck_row(false, true, 10, false, 600)}) {
+        if (c == StuckRowClass::FreshOrUnknown) ++fresh;
+        else if (c == StuckRowClass::PastThreshold) ++past;
+    }
+    EXPECT_FALSE(authorises_wallet_wide_delete(past, fresh));
+    // ...and the escalation still has its old row.
+    int outlived = 0;
+    for (const std::int64_t age : {5000, 10}) {
+        if (row_outlived_force_delete_window(false, true, age, 600)) ++outlived;
+    }
+    EXPECT_EQ(outlived, 1);
+    // A broadcast row gets no 3x here: 600 s is enough.
+    EXPECT_EQ(classify_stuck_row(false, true, 600, /*has_spend_bundle=*/true, 600),
+              StuckRowClass::FreshOrUnknown);
+    EXPECT_TRUE(row_outlived_force_delete_window(false, true, 600, 600));
 }
 
 }  // namespace

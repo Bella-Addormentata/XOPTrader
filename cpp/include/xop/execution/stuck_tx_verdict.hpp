@@ -28,8 +28,10 @@
 // KNOWN AND DELIBERATE: on a wallet that churns fresh spends faster than the
 // threshold this returns false and the prune does not fire. That is the safe
 // direction and it is BOUNDED -- engine.hpp's kForceDeletePendingBlocks
-// escalation still clears the wallet unconditionally. Do not "fix" the
-// starvation by weakening this gate; the backstop already exists.
+// escalation still clears the wallet once one of its rows has been
+// unconfirmed for the escalation's window, fresh rows beside it or not (see
+// row_outlived_force_delete_window below). Do not "fix" the starvation by
+// weakening this gate; the backstop already exists.
 //
 // Pure header: ints and an enum, no I/O, no engine types, no asio, no RPC,
 // no spdlog, no JSON.
@@ -93,6 +95,29 @@ enum class StuckRowClass {
         has_spend_bundle ? max_age_seconds * 3 : max_age_seconds;
     return (age_seconds < threshold) ? StuckRowClass::FreshOrUnknown
                                      : StuckRowClass::PastThreshold;
+}
+
+/// May this row arm the Step 8 force-delete?  [review #214 r3]
+///
+/// The escalation counts Step 8s in which the wallet SHOWED pending change.
+/// A chain of spends that each confirmed between two reads makes the same
+/// run as one spend stuck for all of it, so on its own the count would wipe
+/// a cancel submitted seconds earlier on a wallet that cleared unseen.  The
+/// wipe therefore needs a row that has ITSELF been unconfirmed for the
+/// window.  Fresh rows beside such a row do NOT veto it: that is the
+/// backstop authorises_wallet_wide_delete's gate relies on.
+///
+/// Unlike classify_stuck_row there is no 3x for a broadcast row: the
+/// escalation exists to clear what the pruner's longer windows have not.
+/// A row whose age cannot be read is not old (coin_pool_verdict.hpp's rule:
+/// unknown authorises nothing).
+[[nodiscard]] constexpr bool row_outlived_force_delete_window(
+    bool         confirmed,
+    bool         age_known,
+    std::int64_t age_seconds,
+    std::int64_t window_seconds) noexcept
+{
+    return !confirmed && age_known && age_seconds >= window_seconds;
 }
 
 }  // namespace xop::execution

@@ -167,6 +167,23 @@ TEST(RpcRetryPolicy, ACreateIsNeverResentOnceItMayHaveReachedTheWallet) {
               RpcRetryPolicy::RetryTransient);
 }
 
+// [SPLIT-FEE 2026-11-02] split_coins: a second copy is a second spend of the
+// coin. On 2026-11-01 one CAT split was sent four times in 94 s.
+TEST(RpcRetryPolicy, ASplitIsNeverResentOnceItMayHaveReachedTheWallet) {
+    // Spelled exactly as ChiaWalletRPC::split_coins passes it.
+    const RpcRetryPolicy split = retry_policy_for_endpoint("split_coins");
+    ASSERT_EQ(split, RpcRetryPolicy::NeverResend);
+
+    EXPECT_FALSE(may_resend(split, CURLE_OPERATION_TIMEDOUT, /*transient=*/true));
+    EXPECT_FALSE(may_resend(split, CURLE_RECV_ERROR, true));
+    EXPECT_FALSE(may_resend(split, CURLE_GOT_NOTHING, true));
+    EXPECT_FALSE(may_resend(split, CURLE_OK, true));  // an HTTP 5xx
+
+    // A wallet that is down was never asked.
+    EXPECT_TRUE(may_resend(split, CURLE_COULDNT_CONNECT, true));
+    EXPECT_TRUE(may_resend(split, CURLE_SSL_CONNECT_ERROR, true));
+}
+
 TEST(RpcRetryPolicy, AnUnansweredCreateMayHaveBuiltTheOffer) {
     // What post_merged_side asks before it answers a failed merged create
     // with one create per tier.

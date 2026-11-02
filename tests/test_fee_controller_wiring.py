@@ -33,14 +33,15 @@ ACTION_CLASS = re.compile(
 # Every get_recommended_fee call site in engine.cpp, by the class it must name.
 # Step 8 asks three times (the offer-attached fee, then the two cancel classes
 # it hands to OfferManager), five take sites ask for Take, and the #157 cancel
-# escalation asks for CancelCat.
+# escalation asks for CancelCat.  [SPLIT-FEE 2026-11-02] The coin pool's two
+# splits pay the cancel class of their asset (CancelXch, CancelCat).
 EXPECTED_CLASSES = {
     "OfferAttached": 1,
-    "CancelXch": 1,
-    "CancelCat": 2,
+    "CancelXch": 2,
+    "CancelCat": 3,
     "Take": 5,
 }
-CALL_SITE_COUNT = 9
+CALL_SITE_COUNT = 11
 
 
 def _read(path: Path) -> str:
@@ -349,11 +350,12 @@ def test_cancel_verdict_site_feeds_the_controller():
 
 def test_pending_change_site_feeds_the_controller_on_an_edge():
     body = _function_body(_engine(), "asio::awaitable<void> Engine::step_manage_offers(")
-    bump = body.index("++consecutive_pending_blocks_;")
+    # [STUCK-TX-COUNT 2026-11-02] The streak is per wallet.
+    bump = body.index("pending_streak = ++pending_streak_by_wallet_[sb.wid];")
     hook = body.index("strategy::fee::Signal::PendingChangeStuck", bump)
     assert hook - bump < 600, hook - bump
     between = body[bump:hook]
-    assert "consecutive_pending_blocks_ == kForceDeletePendingBlocks / 2" in between, (
+    assert "pending_streak == kForceDeletePendingBlocks / 2" in between, (
         "the pending_change signal must fire on the half-way EDGE, once per run")
 
 
@@ -361,7 +363,7 @@ def test_force_delete_site_feeds_the_controller_before_the_counter_resets():
     body = _function_body(_engine(), "asio::awaitable<void> Engine::step_manage_offers(")
     wipe = body.index("delete_unconfirmed_transactions(pw)")
     hook = body.index("strategy::fee::Signal::ForceDelete", wipe)
-    reset = body.index("consecutive_pending_blocks_ = 0;", wipe)
+    reset = body.index("pending_streak_by_wallet_.erase(pw);", wipe)
     assert wipe < hook < reset
 
 

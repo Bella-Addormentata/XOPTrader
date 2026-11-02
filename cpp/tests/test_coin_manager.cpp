@@ -149,3 +149,23 @@ TEST(CoinManagerTest, SplitImprovesPoolReadyCountRejectsDustChange) {
 }
 
 }  // namespace
+
+// [SPLIT-FEE 2026-11-02] A split's fee is XCH. An XCH split pays it out of the
+// coin being split; a CAT split pays it from the XCH wallet, so the CAT coin
+// carries none of it and the planner keeps every CAT mojo.
+TEST(CoinManagerTest, OnlyAnXchCoinCarriesItsSplitFee) {
+    constexpr Mojo fee = 15'000'000;
+    static_assert(CoinManager::fee_carried_by_coin(1, fee) == fee);
+    static_assert(CoinManager::fee_carried_by_coin(2, fee) == 0);
+    EXPECT_EQ(CoinManager::fee_carried_by_coin(7, fee), 0);
+    EXPECT_EQ(CoinManager::fee_carried_by_coin(1, 0), 0);
+
+    // The 2026-11-01 wUSDC.b coin: 199.4 units (1,000 mojos each) into twelve
+    // 10-unit coins. Charged the XCH fee in CAT mojos it could not be planned.
+    constexpr Mojo cat_coin = 199'400;
+    constexpr Mojo ten_units = 10'000;
+    EXPECT_EQ(CoinManager::plan_split_for_coin(
+                  cat_coin, 12, ten_units, CoinManager::fee_carried_by_coin(2, fee)).batch,
+              12);
+    EXPECT_EQ(CoinManager::plan_split_for_coin(cat_coin, 12, ten_units, fee).batch, 0);
+}

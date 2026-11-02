@@ -329,6 +329,16 @@ public:
         return wallet_id == 1 ? kXchDustThresholdMojos : kCatDustThresholdMojos;
     }
 
+    /// [SPLIT-FEE 2026-11-02] The part of a split's fee that the coin being
+    /// split pays.  A fee is XCH: an XCH split pays it out of the coin, a CAT
+    /// split out of the XCH wallet, so a CAT coin carries none of it --
+    /// taking it from the CAT amount would count XCH mojos as CAT mojos.
+    [[nodiscard]] static constexpr Mojo fee_carried_by_coin(std::int64_t wallet_id,
+                                                            Mojo fee) noexcept
+    {
+        return wallet_id == 1 ? fee : 0;
+    }
+
     /**
      * @brief Check whether a coin is already close to the target pool size.
      *

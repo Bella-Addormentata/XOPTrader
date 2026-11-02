@@ -1149,7 +1149,12 @@ TEST(SizingWiring, ListedTokenCoinPoolsAreCheckedEveryHeartbeatBeforeStep7) {
     EXPECT_NE(position_of(squeeze(engine),
         "|| config_.strategy.cat_coin_pool_target_count > 0 "
         "|| !config_.strategy.cat_coin_pool_tokens.empty())) { try { "
-        "co_await step_maintain_coin_pool(0);"), std::string::npos);
+        "BlockHeight boot_height = 0;"), std::string::npos);
+    // [review #214] ... at a real height, so its split fees stay in the budget.
+    EXPECT_NE(position_of(squeeze(engine),
+        "if (boot_height > 0) { co_await step_maintain_coin_pool(boot_height);"),
+              std::string::npos);
+    EXPECT_EQ(position_of(engine, "step_maintain_coin_pool(0)"), std::string::npos);
 
     const std::string pool = function_body(engine,
         "asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height,");
