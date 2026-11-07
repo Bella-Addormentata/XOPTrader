@@ -481,10 +481,9 @@ TEST(SizingWiring, AFlooredDriftTaperedSideDoesNotShrinkTheOtherSide) {
     // The ladder config carries the verdict into compute_ladder, and the
     // recorded pools use the same verdict.
     const std::size_t verdict_at = position_of(body,
-        "const bool ladder_pairs_pools = strategy::tiermin::pair_side_pools( "
-        "ladder_tier_minimums_on, bid_guard_floored, ask_guard_floored);");
+        "const auto ladder_pairing = pairing_now();");
     const std::size_t carried_at = position_of(body,
-        "ladder_cfg.pair_side_pools = ladder_pairs_pools;");
+        "ladder_cfg.pair_side_pools = ladder_pairing.pair;");
     const std::size_t ladder_at = position_of(body, "pcs.ladder = liq.compute_ladder(");
     const std::size_t pools_at = position_of(body,
         "pcs.ladder_pools = LiquidityEngine::side_pools( "
@@ -499,6 +498,115 @@ TEST(SizingWiring, AFlooredDriftTaperedSideDoesNotShrinkTheOtherSide) {
     EXPECT_LT(ladder_at, pools_at);
     // Twice: here, and the coin-budget claim, which pairs the same way.
     EXPECT_EQ(count_of(body, "LiquidityEngine::side_pools("), 2u);
+}
+
+// [TIERMIN-TAPER 2026-11-07] A side tapered on purpose -- drift guard, or
+// ratio rebalancing on the overweight side -- that is the smaller pool stops
+// pairing the other side down to it, floored or not.  On 2026-11-07 the
+// XCH/wUSDC.b bids (33 XCH) posted 2 of 6 tiers from the asks' 3.95 XCH,
+// and the XCH/DBX bids six 1 XCH offers from the asks' 0.14 XCH.
+TEST(SizingWiring, ATaperedSmallerSideDoesNotShrinkTheOtherSide) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    // The ratio taper is recorded for the side it shrinks, in each mode.
+    const std::size_t base_at = position_of(body,
+        "static_cast<double>(avail_inventory) * overweight_scale)); "
+        "ratio_ask_scale = overweight_scale;");
+    const std::size_t quote_at = position_of(body,
+        "static_cast<double>(avail_capital) * overweight_scale)); "
+        "avail_inventory = static_cast<Mojo>(std::llround( "
+        "static_cast<double>(avail_inventory) * underweight_scale)); "
+        "ratio_bid_scale = overweight_scale;");
+    ASSERT_NE(base_at, std::string::npos);
+    ASSERT_NE(quote_at, std::string::npos);
+    // Each side passes its own floor flag, scales and pool, read when the
+    // verdict is made (the lambda captures by reference).
+    const std::size_t sides_at = position_of(body,
+        "const auto pairing_now = [&]() { return strategy::tiermin::ladder_pairing( "
+        "ladder_tier_minimums_on, "
+        "strategy::tiermin::LadderSide{bid_guard_floored, drift_bid_applied, "
+        "ratio_bid_scale, avail_capital}, "
+        "strategy::tiermin::LadderSide{ask_guard_floored, drift_ask_applied, "
+        "ratio_ask_scale, avail_inventory}); };");
+    ASSERT_NE(sides_at, std::string::npos);
+    // The pairing reads the drift scales the guard APPLIED: it skips scaling
+    // when both raw scales are >= 0.999, and then neither side was tapered.
+    const std::size_t applied_at = position_of(body,
+        "if (bid_scale < 0.999 || ask_scale < 0.999) { "
+        "const Mojo old_bid = avail_capital; const Mojo old_ask = avail_inventory; "
+        "avail_capital = static_cast<Mojo>(std::llround( "
+        "static_cast<double>(avail_capital) * bid_scale)); "
+        "avail_inventory = static_cast<Mojo>(std::llround( "
+        "static_cast<double>(avail_inventory) * ask_scale)); "
+        "drift_bid_applied = bid_scale; drift_ask_applied = ask_scale;");
+    ASSERT_NE(applied_at, std::string::npos);
+    EXPECT_LT(applied_at, sides_at);
+    // Declared 1.0, and set only where the guard scales the pools.
+    EXPECT_EQ(count_of(body, "drift_bid_applied ="), 2u);
+    EXPECT_EQ(count_of(body, "drift_ask_applied ="), 2u);
+    // Made after the taper and the floors, once for the coin-budget claims
+    // and again after the coin shares cap the pools, for the ladder.
+    const std::size_t ask_mark_at = position_of(body,
+        "ask_guard_floored = strategy::tiermin::floored_side_unpairs(");
+    const std::size_t claim_at = position_of(body,
+        "const auto claim_pairing = pairing_now();");
+    const std::size_t claim_use_at = position_of(body,
+        "const SidePools wanted = LiquidityEngine::side_pools( "
+        "avail_capital, avail_inventory, claim_pairing.pair);");
+    const std::size_t bid_share_at = position_of(body, "avail_capital = *share_cap;");
+    const std::size_t ladder_verdict_at = position_of(body,
+        "const auto ladder_pairing = pairing_now();");
+    const std::size_t carried_at = position_of(body,
+        "ladder_cfg.pair_side_pools = ladder_pairing.pair;");
+    ASSERT_NE(claim_at, std::string::npos);
+    ASSERT_NE(claim_use_at, std::string::npos);
+    ASSERT_NE(bid_share_at, std::string::npos);
+    ASSERT_NE(ladder_verdict_at, std::string::npos);
+    ASSERT_NE(carried_at, std::string::npos);
+    EXPECT_LT(base_at, sides_at);
+    EXPECT_LT(ask_mark_at, sides_at);
+    EXPECT_LT(sides_at, claim_at);
+    EXPECT_LT(claim_at, claim_use_at);
+    EXPECT_LT(claim_use_at, bid_share_at);
+    EXPECT_LT(bid_share_at, ladder_verdict_at);
+    EXPECT_LT(ladder_verdict_at, carried_at);
+    EXPECT_EQ(count_of(body, "pairing_now()"), 2u);
+}
+
+// [SKEW-TARGET 2026-11-07] The ladder's inventory skew pivots on the pair's
+// target ratio (the same ratio_target_by_pair entry the reservation offset
+// and the ratio mode read), measured on inv_ratio after the cross-pair
+// adjustment, and the target reaches compute_ladder through ladder_cfg.
+TEST(SizingWiring, TheLadderSkewIsMeasuredAgainstThePairsTarget) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t cross_at = position_of(body,
+        "inv_ratio = std::clamp(inv_ratio + cross_adj, 0.0, 1.0);");
+    const std::size_t cfg_at = position_of(body,
+        "LiquidityConfig ladder_cfg = liq.config();");
+    const std::size_t lookup_at = position_of(body,
+        "double skew_target = config_.strategy.ratio_target; "
+        "if (auto it_skew = config_.strategy.ratio_target_by_pair.find(pair_name); "
+        "it_skew != config_.strategy.ratio_target_by_pair.end()) { "
+        "skew_target = it_skew->second; } "
+        "ladder_cfg.inventory_skew_target = skew_target;");
+    const std::size_t log_at = position_of(body,
+        "const auto skew = inventory_skew_multipliers( "
+        "inv_ratio, skew_target, ladder_cfg.phi);");
+    const std::size_t ladder_at = position_of(body,
+        "pcs.ladder = liq.compute_ladder( mid_mojos, sigma, inv_ratio,");
+    ASSERT_NE(cross_at, std::string::npos);
+    ASSERT_NE(cfg_at, std::string::npos);
+    ASSERT_NE(lookup_at, std::string::npos);
+    ASSERT_NE(log_at, std::string::npos);
+    ASSERT_NE(ladder_at, std::string::npos);
+    EXPECT_LT(cross_at, cfg_at);
+    EXPECT_LT(cfg_at, lookup_at);
+    EXPECT_LT(lookup_at, log_at);
+    EXPECT_LT(log_at, ladder_at);
+    EXPECT_EQ(count_of(body, "ladder_cfg.inventory_skew_target ="), 1u);
+    EXPECT_EQ(count_of(body, "liq.compute_ladder("), 2u)
+        << "both overloads read the same ladder_cfg";
 }
 
 // [COINBUDGET 2026-10-30] A coin several pair sides spend is split between
@@ -555,7 +663,7 @@ TEST(SizingWiring, ACoinSeveralSidesSpendIsSplitBetweenThem) {
         "[GAS-RESERVE 2026-10-24] FINAL per-asset reserve caps");
     const std::size_t claim_at = position_of(body,
         "const SidePools wanted = LiquidityEngine::side_pools( "
-        "avail_capital, avail_inventory, ladder_pairs_pools);");
+        "avail_capital, avail_inventory, claim_pairing.pair);");
     const std::size_t record_at = position_of(body, "auto& claims = coin_claims_[pair_name];");
     const std::size_t ask_share_at = position_of(body,
         "avail_inventory = *pcs.coin_share_ask;");

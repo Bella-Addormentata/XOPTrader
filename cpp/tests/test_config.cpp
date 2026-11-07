@@ -4977,19 +4977,23 @@ TEST(TierMinimumMojos, TheGrowthAlsoShrinksToTheFundingBudget) {
                   sizes, mins, weights, 9 * xch, xop::Mojo{5}, cost), sizes);
 }
 
-// [TIERMIN 2026-10-29] Only a tier-minimum pair with exactly one side both
-// drift-tapered and floored sizes its sides from their own pools.
-TEST(TierMinimumMojos, PairSidePoolsUnlessOneSideIsAFlooredTaper) {
+// [TIERMIN 2026-10-29] Only a tier-minimum pair with a side kept small on
+// purpose sizes its sides from their own pools.  [TIERMIN-TAPER 2026-11-07]
+// Either side is enough: with both kept small the pools are equal (and size
+// identically either way) unless one is floored and the other a smaller
+// taper, where pairing would undo the floor.
+TEST(TierMinimumMojos, PairSidePoolsUnlessASideIsKeptSmall) {
     namespace tmin = xop::strategy::tiermin;
     EXPECT_TRUE(tmin::pair_side_pools(false, false, false));
     EXPECT_TRUE(tmin::pair_side_pools(false, true, false))
         << "no tier minimums: pairing as before";
+    EXPECT_TRUE(tmin::pair_side_pools(false, true, true));
     EXPECT_TRUE(tmin::pair_side_pools(true, false, false))
-        << "no floored taper";
-    EXPECT_TRUE(tmin::pair_side_pools(true, true, true))
-        << "both sides floored: they are equal anyway";
+        << "neither side kept small";
     EXPECT_FALSE(tmin::pair_side_pools(true, true, false));
     EXPECT_FALSE(tmin::pair_side_pools(true, false, true));
+    EXPECT_FALSE(tmin::pair_side_pools(true, true, true))
+        << "both kept small: each from its own pool";
 }
 
 // [TIERMIN 2026-10-31] A floored side unpairs when the drift guard tapered it
@@ -5012,6 +5016,93 @@ TEST(TierMinimumMojos, AFlooredSideThatWasOffOrTaperedUnpairs) {
     // The XCH/DBX case: the floored bid unpairs the pair (the ask was not
     // floored), so side_pools sizes the asks from their own pool.
     EXPECT_FALSE(tmin::pair_side_pools(true, tmin::floored_side_unpairs(0, 1.0), false));
+}
+
+// [TIERMIN-TAPER 2026-11-07] A side the drift guard or ratio rebalancing
+// tapered unpairs when it is the smaller pool, floored or not.  On 2026-11-07
+// the XCH/wUSDC.b ask (ratio x0.58, 3.95 XCH) cut the 33 XCH bids to 2
+// tiers, and the XCH/DBX ask (drift x0.03, 0.14 XCH) the 59.5 XCH bids to
+// six 1 XCH offers.  The XCH/BYC ask, tapered but still 66 XCH against the
+// bids' 33, keeps the pairing.
+TEST(TierMinimumMojos, ATaperedSmallerSideUnpairsALargerOneKeepsThePairing) {
+    namespace tmin = xop::strategy::tiermin;
+    constexpr xop::Mojo xch = 1'000'000'000'000;
+    const xop::Mojo usdc_ask = 3'954'836'165'368, dbx_ask = 137'666'255'551;
+    EXPECT_TRUE(tmin::tapered_side_unpairs(1.0, 0.58, usdc_ask, 33 * xch))
+        << "XCH/wUSDC.b ask: ratio-tapered and smaller";
+    EXPECT_TRUE(tmin::tapered_side_unpairs(0.03, 0.49, dbx_ask, 59 * xch))
+        << "XCH/DBX ask: drift- and ratio-tapered, smaller";
+    EXPECT_FALSE(tmin::tapered_side_unpairs(0.81, 0.47, 66 * xch, 33 * xch))
+        << "XCH/BYC ask: tapered but still the larger pool";
+    EXPECT_FALSE(tmin::tapered_side_unpairs(1.0, 1.0, usdc_ask, 33 * xch))
+        << "small but not tapered: the strategy sized it, pairing stands";
+    EXPECT_TRUE(tmin::tapered_side_unpairs(0.0, 1.0, 0, 33 * xch))
+        << "a hard stop is a taper";
+    // The verdict the engine makes from the flags.
+    const bool bid_small = tmin::tapered_side_unpairs(1.0, 1.0, 33 * xch, usdc_ask);
+    const bool ask_small = tmin::tapered_side_unpairs(1.0, 0.58, usdc_ask, 33 * xch);
+    EXPECT_FALSE(bid_small);
+    EXPECT_FALSE(tmin::pair_side_pools(true, bid_small, ask_small))
+        << "XCH/wUSDC.b sizes each side from its own pool";
+    EXPECT_TRUE(tmin::pair_side_pools(false, bid_small, ask_small))
+        << "not a tier-minimum pair: pairing as before";
+    EXPECT_TRUE(tmin::pair_side_pools(
+        true, tmin::tapered_side_unpairs(1.0, 1.0, 33 * xch, 66 * xch),
+        tmin::tapered_side_unpairs(0.81, 0.47, 66 * xch, 33 * xch)))
+        << "XCH/BYC keeps pairing its asks to the bids";
+}
+
+// [TIERMIN-TAPER 2026-11-07] ladder_pairing makes the verdict from the pools
+// it is given, so Step 7 makes it again after the coin shares cap them.
+TEST(TierMinimumMojos, LadderPairingFollowsThePoolsItIsGiven) {
+    namespace tmin = xop::strategy::tiermin;
+    constexpr xop::Mojo xch = 1'000'000'000'000;
+    const tmin::LadderSide untapered_bid{false, 1.0, 1.0, 33 * xch};
+
+    // XCH/BYC: the tapered ask is the larger pool, so the pair pairs...
+    const auto byc = tmin::ladder_pairing(
+        true, untapered_bid, tmin::LadderSide{false, 0.81, 0.47, 66 * xch});
+    EXPECT_TRUE(byc.pair);
+    EXPECT_FALSE(byc.ask_kept_small);
+    // ...until an XCH share of 22 makes it the smaller one: then the asks
+    // must not cut the 33 XCH bids to 22.
+    const auto byc_shared = tmin::ladder_pairing(
+        true, untapered_bid, tmin::LadderSide{false, 0.81, 0.47, 22 * xch});
+    EXPECT_FALSE(byc_shared.pair);
+    EXPECT_TRUE(byc_shared.ask_kept_small);
+
+    // The reverse: XCH/wUSDC.b's tapered 3.95 XCH ask unpairs against 33...
+    const tmin::LadderSide usdc_ask{false, 1.0, 0.58, 3'954'836'165'368};
+    EXPECT_FALSE(tmin::ladder_pairing(true, untapered_bid, usdc_ask).pair);
+    // ...but against a bid a wUSDC.b share cut to 2 XCH it is the larger
+    // pool again, and pairing only trims it toward its taper.
+    const auto usdc_shared = tmin::ladder_pairing(
+        true, tmin::LadderSide{false, 1.0, 1.0, 2 * xch}, usdc_ask);
+    EXPECT_TRUE(usdc_shared.pair);
+    EXPECT_FALSE(usdc_shared.ask_kept_small);
+
+    // A floored bid against a smaller tapered ask: both kept small, and the
+    // pair unpairs, so the bid keeps the 1 XCH it was floored to instead of
+    // being cut back to the ask's 0.14 XCH.
+    const auto mixed = tmin::ladder_pairing(
+        true, tmin::LadderSide{true, 1.0, 1.0, xch},
+        tmin::LadderSide{false, 0.03, 0.49, 137'666'255'551});
+    EXPECT_TRUE(mixed.bid_kept_small);
+    EXPECT_TRUE(mixed.ask_kept_small);
+    EXPECT_FALSE(mixed.pair);
+
+    // Not a tier-minimum pair: pairing as before, whatever the flags.
+    EXPECT_TRUE(tmin::ladder_pairing(false, untapered_bid, usdc_ask).pair);
+
+    // The drift guard leaves the pools alone when both raw scales are
+    // >= 0.999; a raw 0.9995 would still read as a taper, so Step 7 passes
+    // the scale it applied (1.0 there) and the untouched pair stays paired.
+    const xop::Mojo small_ask = 3'954'836'165'368;
+    EXPECT_TRUE(tmin::tapered_side_unpairs(0.9995, 1.0, small_ask, 33 * xch))
+        << "the raw scale alone reads as a taper";
+    EXPECT_TRUE(tmin::ladder_pairing(
+        true, untapered_bid, tmin::LadderSide{false, 1.0, 1.0, small_ask}).pair)
+        << "the applied scale, 1.0: no taper, pairing stands";
 }
 
 TEST(TierMinimumMojos, XchLimiterKeepsTheWidestTiersFirst) {
