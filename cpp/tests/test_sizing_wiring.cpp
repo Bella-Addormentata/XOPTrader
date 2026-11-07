@@ -482,7 +482,7 @@ TEST(SizingWiring, AFlooredDriftTaperedSideDoesNotShrinkTheOtherSide) {
     // recorded pools use the same verdict.
     const std::size_t verdict_at = position_of(body,
         "const bool ladder_pairs_pools = strategy::tiermin::pair_side_pools( "
-        "ladder_tier_minimums_on, bid_guard_floored, ask_guard_floored);");
+        "ladder_tier_minimums_on, bid_kept_small, ask_kept_small);");
     const std::size_t carried_at = position_of(body,
         "ladder_cfg.pair_side_pools = ladder_pairs_pools;");
     const std::size_t ladder_at = position_of(body, "pcs.ladder = liq.compute_ladder(");
@@ -499,6 +499,85 @@ TEST(SizingWiring, AFlooredDriftTaperedSideDoesNotShrinkTheOtherSide) {
     EXPECT_LT(ladder_at, pools_at);
     // Twice: here, and the coin-budget claim, which pairs the same way.
     EXPECT_EQ(count_of(body, "LiquidityEngine::side_pools("), 2u);
+}
+
+// [TIERMIN-TAPER 2026-11-07] A side tapered on purpose -- drift guard, or
+// ratio rebalancing on the overweight side -- that is the smaller pool stops
+// pairing the other side down to it, floored or not.  On 2026-11-07 the
+// XCH/wUSDC.b bids (33 XCH) posted 2 of 6 tiers from the asks' 3.95 XCH,
+// and the XCH/DBX bids six 1 XCH offers from the asks' 0.14 XCH.
+TEST(SizingWiring, ATaperedSmallerSideDoesNotShrinkTheOtherSide) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    // The ratio taper is recorded for the side it shrinks, in each mode.
+    const std::size_t base_at = position_of(body,
+        "static_cast<double>(avail_inventory) * overweight_scale)); "
+        "ratio_ask_scale = overweight_scale;");
+    const std::size_t quote_at = position_of(body,
+        "static_cast<double>(avail_capital) * overweight_scale)); "
+        "avail_inventory = static_cast<Mojo>(std::llround( "
+        "static_cast<double>(avail_inventory) * underweight_scale)); "
+        "ratio_bid_scale = overweight_scale;");
+    ASSERT_NE(base_at, std::string::npos);
+    ASSERT_NE(quote_at, std::string::npos);
+    // Each side passes its own scales and its own pool first.
+    const std::size_t bid_at = position_of(body,
+        "const bool bid_kept_small = bid_guard_floored "
+        "|| strategy::tiermin::tapered_side_unpairs( "
+        "drift_bid_scale, ratio_bid_scale, avail_capital, avail_inventory);");
+    const std::size_t ask_at = position_of(body,
+        "const bool ask_kept_small = ask_guard_floored "
+        "|| strategy::tiermin::tapered_side_unpairs( "
+        "drift_ask_scale, ratio_ask_scale, avail_inventory, avail_capital);");
+    const std::size_t verdict_at = position_of(body,
+        "const bool ladder_pairs_pools = strategy::tiermin::pair_side_pools(");
+    ASSERT_NE(bid_at, std::string::npos);
+    ASSERT_NE(ask_at, std::string::npos);
+    ASSERT_NE(verdict_at, std::string::npos);
+    // After the taper and the floors (the pools are final by then), before
+    // the verdict.
+    const std::size_t ask_mark_at = position_of(body,
+        "ask_guard_floored = strategy::tiermin::floored_side_unpairs(");
+    EXPECT_LT(base_at, bid_at);
+    EXPECT_LT(ask_mark_at, bid_at);
+    EXPECT_LT(bid_at, ask_at);
+    EXPECT_LT(ask_at, verdict_at);
+}
+
+// [SKEW-TARGET 2026-11-07] The ladder's inventory skew pivots on the pair's
+// target ratio (the same ratio_target_by_pair entry the reservation offset
+// and the ratio mode read), measured on inv_ratio after the cross-pair
+// adjustment, and the target reaches compute_ladder through ladder_cfg.
+TEST(SizingWiring, TheLadderSkewIsMeasuredAgainstThePairsTarget) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t cross_at = position_of(body,
+        "inv_ratio = std::clamp(inv_ratio + cross_adj, 0.0, 1.0);");
+    const std::size_t cfg_at = position_of(body,
+        "LiquidityConfig ladder_cfg = liq.config();");
+    const std::size_t lookup_at = position_of(body,
+        "double skew_target = config_.strategy.ratio_target; "
+        "if (auto it_skew = config_.strategy.ratio_target_by_pair.find(pair_name); "
+        "it_skew != config_.strategy.ratio_target_by_pair.end()) { "
+        "skew_target = it_skew->second; } "
+        "ladder_cfg.inventory_skew_target = skew_target;");
+    const std::size_t log_at = position_of(body,
+        "const auto skew = inventory_skew_multipliers( "
+        "inv_ratio, skew_target, ladder_cfg.phi);");
+    const std::size_t ladder_at = position_of(body,
+        "pcs.ladder = liq.compute_ladder( mid_mojos, sigma, inv_ratio,");
+    ASSERT_NE(cross_at, std::string::npos);
+    ASSERT_NE(cfg_at, std::string::npos);
+    ASSERT_NE(lookup_at, std::string::npos);
+    ASSERT_NE(log_at, std::string::npos);
+    ASSERT_NE(ladder_at, std::string::npos);
+    EXPECT_LT(cross_at, cfg_at);
+    EXPECT_LT(cfg_at, lookup_at);
+    EXPECT_LT(lookup_at, log_at);
+    EXPECT_LT(log_at, ladder_at);
+    EXPECT_EQ(count_of(body, "ladder_cfg.inventory_skew_target ="), 1u);
+    EXPECT_EQ(count_of(body, "liq.compute_ladder("), 2u)
+        << "both overloads read the same ladder_cfg";
 }
 
 // [COINBUDGET 2026-10-30] A coin several pair sides spend is split between

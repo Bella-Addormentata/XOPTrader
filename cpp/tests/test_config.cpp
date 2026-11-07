@@ -5014,6 +5014,40 @@ TEST(TierMinimumMojos, AFlooredSideThatWasOffOrTaperedUnpairs) {
     EXPECT_FALSE(tmin::pair_side_pools(true, tmin::floored_side_unpairs(0, 1.0), false));
 }
 
+// [TIERMIN-TAPER 2026-11-07] A side the drift guard or ratio rebalancing
+// tapered unpairs when it is the smaller pool, floored or not.  On 2026-11-07
+// the XCH/wUSDC.b ask (ratio x0.58, 3.95 XCH) cut the 33 XCH bids to 2
+// tiers, and the XCH/DBX ask (drift x0.03, 0.14 XCH) the 59.5 XCH bids to
+// six 1 XCH offers.  The XCH/BYC ask, tapered but still 66 XCH against the
+// bids' 33, keeps the pairing.
+TEST(TierMinimumMojos, ATaperedSmallerSideUnpairsALargerOneKeepsThePairing) {
+    namespace tmin = xop::strategy::tiermin;
+    constexpr xop::Mojo xch = 1'000'000'000'000;
+    const xop::Mojo usdc_ask = 3'954'836'165'368, dbx_ask = 137'666'255'551;
+    EXPECT_TRUE(tmin::tapered_side_unpairs(1.0, 0.58, usdc_ask, 33 * xch))
+        << "XCH/wUSDC.b ask: ratio-tapered and smaller";
+    EXPECT_TRUE(tmin::tapered_side_unpairs(0.03, 0.49, dbx_ask, 59 * xch))
+        << "XCH/DBX ask: drift- and ratio-tapered, smaller";
+    EXPECT_FALSE(tmin::tapered_side_unpairs(0.81, 0.47, 66 * xch, 33 * xch))
+        << "XCH/BYC ask: tapered but still the larger pool";
+    EXPECT_FALSE(tmin::tapered_side_unpairs(1.0, 1.0, usdc_ask, 33 * xch))
+        << "small but not tapered: the strategy sized it, pairing stands";
+    EXPECT_TRUE(tmin::tapered_side_unpairs(0.0, 1.0, 0, 33 * xch))
+        << "a hard stop is a taper";
+    // The verdict the engine makes from the flags.
+    const bool bid_small = tmin::tapered_side_unpairs(1.0, 1.0, 33 * xch, usdc_ask);
+    const bool ask_small = tmin::tapered_side_unpairs(1.0, 0.58, usdc_ask, 33 * xch);
+    EXPECT_FALSE(bid_small);
+    EXPECT_FALSE(tmin::pair_side_pools(true, bid_small, ask_small))
+        << "XCH/wUSDC.b sizes each side from its own pool";
+    EXPECT_TRUE(tmin::pair_side_pools(false, bid_small, ask_small))
+        << "not a tier-minimum pair: pairing as before";
+    EXPECT_TRUE(tmin::pair_side_pools(
+        true, tmin::tapered_side_unpairs(1.0, 1.0, 33 * xch, 66 * xch),
+        tmin::tapered_side_unpairs(0.81, 0.47, 66 * xch, 33 * xch)))
+        << "XCH/BYC keeps pairing its asks to the bids";
+}
+
 TEST(TierMinimumMojos, XchLimiterKeepsTheWidestTiersFirst) {
     namespace tmin = xop::strategy::tiermin;
     // New XCH each tier locks, tier 0 first.

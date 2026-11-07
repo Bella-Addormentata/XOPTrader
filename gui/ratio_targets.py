@@ -2,9 +2,10 @@
 
 [RATIO-SOT 2026-09-13] ``strategy.ratio_target_by_pair`` is the only per-pair
 ratio target the engine reads.  ``cpp/src/config.cpp`` parses it with a (0, 1)
-range check, and ``cpp/src/engine.cpp`` consumes it in four places: the
-reservation offset, the cross-pair skew (as every OTHER pair's target), and
-both ratio-rebalance hysteresis sites.
+range check, and ``cpp/src/engine.cpp`` consumes it in five places: the
+reservation offset, the cross-pair skew (as every OTHER pair's target), both
+ratio-rebalance hysteresis sites, and (since SKEW-TARGET, 2026-11-07) the
+ladder's inventory skew, which used to pivot on 50/50.
 
 ``pairs[].ratio_target_override`` is a retired GUI-only mirror.  No engine code
 has ever read it, and the Wallet tab's Apply rewrites the map without touching

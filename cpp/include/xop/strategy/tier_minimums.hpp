@@ -223,17 +223,40 @@ template <class CostFn>
     return drift_scale < 1.0 || pool_before_floor <= 0;
 }
 
+/// [TIERMIN-TAPER 2026-11-07] Whether a side the deploy-idle floor did not
+/// touch was kept small on purpose -- tapered by the drift guard
+/// (`drift_scale` < 1) or by ratio rebalancing on the overweight side
+/// (`ratio_scale` < 1) -- AND is the smaller pool, so pairing would cut the
+/// OTHER side to it.  In AcquireBase only the bid can be floored, so a
+/// tapered ask never reached `floored_side_unpairs`, and pairing cut the bids
+/// to it: on 2026-11-07 the XCH/wUSDC.b bids (33 XCH) posted 2 of 6 tiers
+/// from the asks' 3.95 XCH, and the XCH/DBX bids (59.5 XCH) six 1 XCH offers
+/// from the asks' 0.14 XCH, with XCH at 31% of its 50% target.
+///
+/// A tapered side that is still the LARGER pool keeps the pairing: pairing
+/// only cuts it further, in the direction its taper already points (the
+/// XCH/BYC asks the same day: 66 XCH after the taper, paired to the bids'
+/// 33).  Unpairing there would sell more of the coin the taper is saving.
+[[nodiscard]] constexpr bool tapered_side_unpairs(double drift_scale,
+                                                  double ratio_scale,
+                                                  Mojo   own_pool,
+                                                  Mojo   other_pool) noexcept
+{
+    return (drift_scale < 1.0 || ratio_scale < 1.0) && own_pool <= other_pool;
+}
+
 /// Whether Step 7 sizes a pair's two ladder sides from the smaller pool
 /// (`LiquidityEngine::side_pools` pairing) or each from its own.  Pairing
 /// stays the rule, except on a pair posting tier minimums where exactly one
-/// side was lifted to the pair minimum by the deploy-idle floor and
-/// `floored_side_unpairs` holds for it: that 1-unit side would otherwise cut
-/// the other side to one unit too, so it could post only its widest tier.
+/// side is kept small on purpose: lifted to the pair minimum by the
+/// deploy-idle floor with `floored_side_unpairs` holding for it, or tapered
+/// (`tapered_side_unpairs`).  That side would otherwise cut the other side
+/// to its size, so the other side could post only its widest tiers.
 [[nodiscard]] constexpr bool pair_side_pools(bool tier_minimums_on,
-                                             bool bid_guard_floored,
-                                             bool ask_guard_floored) noexcept
+                                             bool bid_kept_small,
+                                             bool ask_kept_small) noexcept
 {
-    return !(tier_minimums_on && bid_guard_floored != ask_guard_floored);
+    return !(tier_minimums_on && bid_kept_small != ask_kept_small);
 }
 
 // ---------------------------------------------------------------------------

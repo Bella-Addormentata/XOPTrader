@@ -10337,6 +10337,10 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         // -- Ratio rebalance sizing (hysteresis-aware) ---------------------
         // Scale bid/ask pools based on target-ratio mode so the underweight
         // side receives more capital while the overweight side is tapered.
+        // [TIERMIN-TAPER 2026-11-07] The overweight side's scale, kept for
+        // the ladder pairing below (1.0 = not tapered).
+        double ratio_bid_scale = 1.0;
+        double ratio_ask_scale = 1.0;
         if (pair_cfg && config_.strategy.ratio_rebalance_enabled) {
             auto it_mode = ratio_rebalance_modes_.find(pair_name);
             if (it_mode == ratio_rebalance_modes_.end()) {
@@ -10417,12 +10421,14 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         static_cast<double>(avail_capital) * underweight_scale));
                     avail_inventory = static_cast<Mojo>(std::llround(
                         static_cast<double>(avail_inventory) * overweight_scale));
+                    ratio_ask_scale = overweight_scale;
                 } else {
                     // Boost asks (acquire quote), taper bids.
                     avail_capital = static_cast<Mojo>(std::llround(
                         static_cast<double>(avail_capital) * overweight_scale));
                     avail_inventory = static_cast<Mojo>(std::llround(
                         static_cast<double>(avail_inventory) * underweight_scale));
+                    ratio_bid_scale = overweight_scale;
                 }
 
                 spdlog::info("[Engine] Step 7: {} ratio size scaling mode={} "
@@ -10955,8 +10961,24 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         // one bid, its widest tier, instead of five.  On 2026-10-31 the
         // XCH/DBX bid was 0 at q_max and floored to 1 XCH, and pairing cut
         // the 104 XCH ask pool to 1 XCH the same way.
+        // [TIERMIN-TAPER 2026-11-07] And so does a side kept small on purpose
+        // that the floor never touched -- the drift guard's taper, or ratio
+        // rebalancing's on the overweight side -- when it is the smaller pool.
+        // In AcquireBase the ask is never floored (only the acquire side is),
+        // so a tapered ask kept the pairing and cut the bids to its size: on
+        // 2026-11-07, with XCH at 31% of a 50% target, the XCH/wUSDC.b bids
+        // (pool 33 XCH) posted 2 tiers from the asks' 3.95 XCH, and the
+        // XCH/DBX bids (59.5 XCH) six 1 XCH offers from the asks' 0.14 XCH.
+        // A tapered side that is still the larger pool keeps the pairing,
+        // which only cuts it further (the XCH/BYC asks, 66 -> 33 XCH).
+        const bool bid_kept_small = bid_guard_floored
+            || strategy::tiermin::tapered_side_unpairs(
+                   drift_bid_scale, ratio_bid_scale, avail_capital, avail_inventory);
+        const bool ask_kept_small = ask_guard_floored
+            || strategy::tiermin::tapered_side_unpairs(
+                   drift_ask_scale, ratio_ask_scale, avail_inventory, avail_capital);
         const bool ladder_pairs_pools = strategy::tiermin::pair_side_pools(
-            ladder_tier_minimums_on, bid_guard_floored, ask_guard_floored);
+            ladder_tier_minimums_on, bid_kept_small, ask_kept_small);
 
         // -- [COINBUDGET 2026-10-30] This side's claim on its coin, and its share
         // The claim is what each side would use of the coin it spends, paired
@@ -11115,6 +11137,33 @@ void Engine::step_generate_ladder(BlockHeight block_height)
 
         // Query per-tier fill rates from the offer log for adaptive sizing.
         LiquidityConfig ladder_cfg = liq.config();
+
+        // [SKEW-TARGET 2026-11-07] The ladder's inventory skew measures
+        // inv_ratio (after the cross-pair adjustment above) against this
+        // pair's TARGET ratio -- the same strategy.ratio_target_by_pair entry,
+        // else strategy.ratio_target, that the reservation offset and the
+        // ratio-rebalance mode read.  It used to pivot on 50/50, which on
+        // 2026-11-07 leaned XCH/BYC (ratio 0.597, target 0.909) toward
+        // SELLING the XCH it was short of, and BYC/wUSDC.b (0.306, target
+        // 0.2) toward BUYING the BYC it was long of.
+        {
+            double skew_target = config_.strategy.ratio_target;
+            if (auto it_skew = config_.strategy.ratio_target_by_pair.find(pair_name);
+                it_skew != config_.strategy.ratio_target_by_pair.end()) {
+                skew_target = it_skew->second;
+            }
+            ladder_cfg.inventory_skew_target = skew_target;
+            const auto skew = inventory_skew_multipliers(
+                inv_ratio, skew_target, ladder_cfg.phi);
+            if (std::abs(skew.bid - 1.0) >= 0.01
+                || std::abs(skew.ask - 1.0) >= 0.01) {
+                spdlog::info("[Engine] Step 7: {} inventory skew: ratio {:.3f} "
+                             "vs target {:.3f} -> bid spread x{:.2f}, ask "
+                             "spread x{:.2f} (phi {:.2f}; below 1 = tighter)",
+                             pair_name, inv_ratio, skew_target,
+                             skew.bid, skew.ask, ladder_cfg.phi);
+            }
+        }
 
         // 24-hour activity-adaptive margin and spacing scaling
         const bool activity_adaptive = pair_cfg
@@ -11379,10 +11428,11 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         if (!ladder_cfg.pair_side_pools) {
             spdlog::info("[Engine] Step 7: {} ladder sides sized from their "
                          "own pools (bid {} / ask {} base mojos): the {} "
-                         "pool is a drift-tapered or switched-off side "
-                         "floored to the pair minimum",
+                         "pool is kept small on purpose (drift guard or "
+                         "ratio taper, or a switched-off side floored to "
+                         "the pair minimum)",
                          pair_name, avail_capital, avail_inventory,
-                         bid_guard_floored ? "bid" : "ask");
+                         bid_kept_small ? "bid" : "ask");
         }
 
         // Generate the tier ladder.

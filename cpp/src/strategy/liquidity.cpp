@@ -271,22 +271,22 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
 std::vector<TierQuote> LiquidityEngine::apply_inventory_skew(
     const std::vector<TierQuote>& ladder,
     double inventory_ratio,
-    double phi)
+    double phi,
+    double ratio_target)
 {
-    // Clamp inventory_ratio to [0, 1] for safety.
-    const double ratio = std::clamp(inventory_ratio, 0.0, 1.0);
-
-    // Deviation from the balanced midpoint (0.5).
-    // Positive when long-biased, negative when short-biased.
-    const double deviation = (ratio - 0.5) / 0.5;  // normalised to [-1, +1]
-
+    // [SKEW-TARGET 2026-11-07] Deviation from the pair's TARGET ratio, not
+    // from 50/50 (inventory_skew_deviation, liquidity.hpp): positive when
+    // long of target, negative when short, normalised to [-1, +1].  With
+    // ratio_target 0.5 this is the old (ratio - 0.5) / 0.5 exactly, so the
+    // worked examples below (all at the 0.5 target) still hold.
+    //
     // Bid multiplier: > 1 when long (widen bids to discourage buying),
     //                 < 1 when short (tighten bids to encourage buying).
     //
     // Ask multiplier: < 1 when long (tighten asks to encourage selling),
     //                 > 1 when short (widen asks to discourage selling).
     //
-    // The skew direction is verified:
+    // The skew direction is verified (target 0.5):
     //   Long (ratio=0.8): deviation = +0.6
     //     bid_mult = 1 + 1.5*0.6 = 1.9  (wider bids -- discourage buying)
     //     ask_mult = 1 - 1.5*0.6 = 0.1  (tighter asks -- encourage selling)
@@ -297,9 +297,13 @@ std::vector<TierQuote> LiquidityEngine::apply_inventory_skew(
     //     bid_mult = 1.0, ask_mult = 1.0  (no shift)
     //
     // Multipliers are clamped to [0.1, 3.0] to prevent degenerate pricing
-    // (zero or negative spreads, or excessively wide spreads).
-    const double bid_mult = std::clamp(1.0 + phi * deviation, 0.1, 3.0);
-    const double ask_mult = std::clamp(1.0 - phi * deviation, 0.1, 3.0);
+    // (zero or negative spreads, or excessively wide spreads).  The formula
+    // lives in inventory_skew_multipliers (liquidity.hpp) so the engine's
+    // Step 7 log line reports exactly these numbers.
+    const auto mults = inventory_skew_multipliers(inventory_ratio,
+                                                  ratio_target, phi);
+    const double bid_mult = mults.bid;
+    const double ask_mult = mults.ask;
 
     std::vector<TierQuote> adjusted;
     adjusted.reserve(ladder.size());
@@ -408,8 +412,9 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
         return ladder;
     }
 
-    // Apply inventory-aware skew adjustment.
-    ladder = apply_inventory_skew(ladder, inventory_ratio, cfg.phi);
+    // Apply inventory-aware skew adjustment, centred on the pair's target.
+    ladder = apply_inventory_skew(ladder, inventory_ratio, cfg.phi,
+                                  cfg.inventory_skew_target);
 
     return ladder;
 }
