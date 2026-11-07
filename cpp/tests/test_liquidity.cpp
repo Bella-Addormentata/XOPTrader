@@ -1653,6 +1653,23 @@ TEST(SidePoolsTest, ATokenFlooredBidDoesNotCutTheAsksPool) {
     EXPECT_EQ(pools.ask, 104 * xch);
 }
 
+// [TIERMIN-TAPER 2026-11-07] An AcquireBase bid floored from 0 to 1 XCH and
+// an ask tapered to 0.14 XCH are both kept small; the pair unpairs, so the
+// bid keeps its floor instead of being cut back to the ask's size.
+TEST(SidePoolsTest, AFlooredBidKeepsItsFloorAgainstASmallerTaperedAsk) {
+    namespace tmin = xop::strategy::tiermin;
+    const std::int64_t xch = 1'000'000'000'000LL;
+    const std::int64_t ask = 137'666'255'551;
+    EXPECT_EQ(LiquidityEngine::side_pools(xch, ask, true).bid, ask)
+        << "paired, the tapered ask cuts the floored bid below its floor";
+    const auto verdict = tmin::ladder_pairing(
+        true, tmin::LadderSide{true, 1.0, 1.0, xch},
+        tmin::LadderSide{false, 0.03, 0.49, ask});
+    const auto pools = LiquidityEngine::side_pools(xch, ask, verdict.pair);
+    EXPECT_EQ(pools.bid, xch);
+    EXPECT_EQ(pools.ask, ask);
+}
+
 TEST(SidePoolsTest, TiersPastTierZeroStayWithinThePool) {
     LiquidityConfig cfg;
     cfg.num_tiers = 3;
@@ -1667,6 +1684,128 @@ TEST(SidePoolsTest, TiersPastTierZeroStayWithinThePool) {
         if (tq.side == Side::Bid) bid_sum += tq.size;
     }
     EXPECT_LE(bid_sum, LiquidityEngine::side_pools(pool, pool).bid);
+}
+
+// ============================================================================
+// [SKEW-TARGET 2026-11-07] The ladder's inventory skew is measured against
+// the pair's target ratio, not 50/50.
+// ============================================================================
+
+// At the 0.5 target the deviation is the old (ratio - 0.5) / 0.5 exactly, so
+// a 50/50 pair skews as before.
+TEST(InventorySkewTarget, AHalfTargetMatchesTheOldFiftyFiftyPivot) {
+    for (double r : {0.0, 0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9, 1.0}) {
+        EXPECT_NEAR(inventory_skew_deviation(r, 0.5), (r - 0.5) / 0.5, 1e-12)
+            << "ratio " << r;
+    }
+}
+
+// Each half is scaled by its own room: 0 at target, -1 at an all-quote book,
+// +1 at an all-base book, whatever the target.
+TEST(InventorySkewTarget, ZeroAtTargetAndPlusMinusOneAtTheEnds) {
+    for (double t : {0.1667, 0.2, 0.5, 0.7143, 0.769, 0.909}) {
+        EXPECT_NEAR(inventory_skew_deviation(t, t), 0.0, 1e-12) << t;
+        EXPECT_NEAR(inventory_skew_deviation(0.0, t), -1.0, 1e-12) << t;
+        EXPECT_NEAR(inventory_skew_deviation(1.0, t), 1.0, 1e-12) << t;
+    }
+}
+
+// The 2026-11-07 ratios (after the cross-pair adjustment) and targets.  Under
+// the 50/50 pivot XCH/BYC and BYC/wUSDC.b leaned the wrong way; measured
+// against their targets every pair leans toward its target.
+TEST(InventorySkewTarget, TheNov7PairsAllLeanTowardTheirTargets) {
+    struct Case { const char* pair; double ratio; double target; };
+    const Case cases[] = {
+        {"XCH/wUSDC.b",     0.396, 0.7142857},
+        {"XCH/DBX",         0.390, 0.7692308},
+        {"XCH/BYC",         0.597, 0.9090909},
+        {"BYC/wUSDC.b",     0.306, 0.2},
+        {"wmilliETH.b/XCH", 0.125, 0.1666667},
+    };
+    for (const auto& c : cases) {
+        const double d = inventory_skew_deviation(c.ratio, c.target);
+        if (c.ratio < c.target) {
+            EXPECT_LT(d, 0.0) << c.pair << ": short base, so buy base";
+        } else {
+            EXPECT_GT(d, 0.0) << c.pair << ": long base, so sell base";
+        }
+    }
+    // The two that used to lean the wrong way.
+    EXPECT_GT(inventory_skew_deviation(0.597, 0.5), 0.0)
+        << "XCH/BYC under the old pivot read as long XCH";
+    EXPECT_LT(inventory_skew_deviation(0.597, 0.9090909), 0.0)
+        << "XCH/BYC is short XCH against its target";
+    EXPECT_LT(inventory_skew_deviation(0.306, 0.5), 0.0)
+        << "BYC/wUSDC.b under the old pivot read as short BYC";
+    EXPECT_GT(inventory_skew_deviation(0.306, 0.2), 0.0)
+        << "BYC/wUSDC.b is long BYC against its target";
+
+    // The multipliers the Step 7 log reports at phi 0.5.
+    const auto byc = inventory_skew_multipliers(0.597, 0.9090909, 0.5);
+    EXPECT_NEAR(byc.bid, 0.828, 0.001) << "XCH/BYC bids about 17% tighter";
+    EXPECT_NEAR(byc.ask, 1.172, 0.001) << "XCH/BYC asks about 17% wider";
+    const auto usdc = inventory_skew_multipliers(0.396, 0.7142857, 0.5);
+    EXPECT_NEAR(usdc.bid, 0.777, 0.001) << "XCH/wUSDC.b bids about 22% tighter";
+}
+
+TEST(InventorySkewTarget, DegenerateInputsFallBackSafely) {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_EQ(inventory_skew_deviation(nan, 0.7), 0.0) << "NaN ratio: no skew";
+    EXPECT_NEAR(inventory_skew_deviation(0.25, nan), -0.5, 1e-12)
+        << "NaN target reads as 0.5";
+    EXPECT_NEAR(inventory_skew_deviation(0.25, 0.0), -0.5, 1e-12);
+    EXPECT_NEAR(inventory_skew_deviation(0.25, 1.0), -0.5, 1e-12);
+    EXPECT_NEAR(inventory_skew_deviation(-0.3, 0.7), -1.0, 1e-12) << "clamped";
+    EXPECT_NEAR(inventory_skew_deviation(1.7, 0.7), 1.0, 1e-12) << "clamped";
+    const auto m = inventory_skew_multipliers(nan, 0.7, 0.5);
+    EXPECT_EQ(m.bid, 1.0);
+    EXPECT_EQ(m.ask, 1.0);
+    const auto big = inventory_skew_multipliers(0.0, 0.7, 5.0);
+    EXPECT_EQ(big.bid, 0.1) << "clamped to the 0.1 floor";
+    EXPECT_EQ(big.ask, 3.0) << "clamped to the 3.0 ceiling";
+}
+
+// compute_ladder reads LiquidityConfig::inventory_skew_target: at ratio 0.597
+// the default 0.5 pivot widens the bids and tightens the asks (sell base);
+// the 0.909 target does the opposite (buy base).
+TEST(InventorySkewTarget, TheLadderLeansTowardTheConfiguredTarget) {
+    LiquidityConfig cfg;
+    cfg.num_tiers = 2;
+    cfg.tier_spacing_bps = {100.0, 200.0};
+    cfg.tier_size_pct = {0.6, 0.4};
+    cfg.phi = 0.5;
+    LiquidityEngine engine("XCH/TEST", cfg);
+    const std::int64_t mid = 1'000'000'000'000LL;
+    const std::int64_t pool = 10'000'000'000'000LL;
+    auto tier0 = [](const std::vector<TierQuote>& ladder, Side side) {
+        for (const auto& tq : ladder) {
+            if (tq.side == side && tq.tier_index == 0) return tq;
+        }
+        ADD_FAILURE() << "no tier 0 on that side";
+        return TierQuote{};
+    };
+
+    const auto flat = engine.compute_ladder(mid, 0.0, 0.5, pool, pool, cfg);
+    ASSERT_FALSE(flat.empty());
+    const double flat_bid_bps = tier0(flat, Side::Bid).spread_bps;
+    const double flat_ask_bps = tier0(flat, Side::Ask).spread_bps;
+    EXPECT_NEAR(flat_bid_bps, flat_ask_bps, 1e-9) << "at 0.5 vs 0.5 no lean";
+
+    const auto old_pivot = engine.compute_ladder(mid, 0.0, 0.597, pool, pool, cfg);
+    EXPECT_GT(tier0(old_pivot, Side::Bid).spread_bps, flat_bid_bps)
+        << "0.5 pivot: bids wider";
+    EXPECT_LT(tier0(old_pivot, Side::Ask).spread_bps, flat_ask_bps)
+        << "0.5 pivot: asks tighter (the wrong way for a 0.909 target)";
+
+    cfg.inventory_skew_target = 0.9090909;
+    const auto at_target = engine.compute_ladder(mid, 0.0, 0.597, pool, pool, cfg);
+    EXPECT_LT(tier0(at_target, Side::Bid).spread_bps, flat_bid_bps)
+        << "target pivot: bids tighter, to buy the XCH the pair is short of";
+    EXPECT_GT(tier0(at_target, Side::Ask).spread_bps, flat_ask_bps)
+        << "target pivot: asks wider";
+    EXPECT_NEAR(tier0(at_target, Side::Bid).spread_bps,
+                flat_bid_bps * inventory_skew_multipliers(0.597, 0.9090909, 0.5).bid,
+                1e-6);
 }
 
 }  // namespace

@@ -223,17 +223,81 @@ template <class CostFn>
     return drift_scale < 1.0 || pool_before_floor <= 0;
 }
 
+/// [TIERMIN-TAPER 2026-11-07] Whether a side the deploy-idle floor did not
+/// touch was kept small on purpose -- tapered by the drift guard
+/// (`drift_scale` < 1) or by ratio rebalancing on the overweight side
+/// (`ratio_scale` < 1) -- AND is the smaller pool, so pairing would cut the
+/// OTHER side to it.  In AcquireBase only the bid can be floored, so a
+/// tapered ask never reached `floored_side_unpairs`, and pairing cut the bids
+/// to it: on 2026-11-07 the XCH/wUSDC.b bids (33 XCH) posted 2 of 6 tiers
+/// from the asks' 3.95 XCH, and the XCH/DBX bids (59.5 XCH) six 1 XCH offers
+/// from the asks' 0.14 XCH, with XCH at 31% of its 50% target.
+///
+/// A tapered side that is still the LARGER pool keeps the pairing: pairing
+/// only cuts it further, in the direction its taper already points (the
+/// XCH/BYC asks the same day: 66 XCH after the taper, paired to the bids'
+/// 33).  Unpairing there would sell more of the coin the taper is saving.
+[[nodiscard]] constexpr bool tapered_side_unpairs(double drift_scale,
+                                                  double ratio_scale,
+                                                  Mojo   own_pool,
+                                                  Mojo   other_pool) noexcept
+{
+    return (drift_scale < 1.0 || ratio_scale < 1.0) && own_pool <= other_pool;
+}
+
 /// Whether Step 7 sizes a pair's two ladder sides from the smaller pool
 /// (`LiquidityEngine::side_pools` pairing) or each from its own.  Pairing
-/// stays the rule, except on a pair posting tier minimums where exactly one
-/// side was lifted to the pair minimum by the deploy-idle floor and
-/// `floored_side_unpairs` holds for it: that 1-unit side would otherwise cut
-/// the other side to one unit too, so it could post only its widest tier.
+/// stays the rule, except on a pair posting tier minimums where a side is
+/// kept small on purpose: lifted to the pair minimum by the deploy-idle
+/// floor with `floored_side_unpairs` holding for it, or tapered
+/// (`tapered_side_unpairs`).  That side would otherwise cut the other side
+/// to its size, so the other side could post only its widest tiers.
+///
+/// Either side is enough.  When both are kept small, their pools are equal
+/// (both floored to the same minimum, or both tapered and each no larger
+/// than the other) and unpairing sizes them identically -- except a floored
+/// side against a smaller tapered one (an AcquireBase bid floored from 0 to
+/// 1 XCH, the ask tapered to 0.14 XCH), where pairing would cut the floored
+/// side back below the floor it was just lifted to.
 [[nodiscard]] constexpr bool pair_side_pools(bool tier_minimums_on,
-                                             bool bid_guard_floored,
-                                             bool ask_guard_floored) noexcept
+                                             bool bid_kept_small,
+                                             bool ask_kept_small) noexcept
 {
-    return !(tier_minimums_on && bid_guard_floored != ask_guard_floored);
+    return !(tier_minimums_on && (bid_kept_small || ask_kept_small));
+}
+
+/// [TIERMIN-TAPER 2026-11-07] One side's inputs to the pairing verdict.
+struct LadderSide {
+    bool   floored{false};      ///< `floored_side_unpairs` held at the floor.
+    double drift_scale{1.0};    ///< The drift guard's scale for this side.
+    double ratio_scale{1.0};    ///< Ratio rebalancing's taper (1 = none).
+    Mojo   pool{0};             ///< The side's pool in base mojos.
+};
+
+/// The pairing verdict and the flags it came from.
+struct LadderPairing {
+    bool bid_kept_small{false};
+    bool ask_kept_small{false};
+    bool pair{true};             ///< `pair_side_pools` of the two flags.
+};
+
+/// The verdict Step 7 makes from both sides' current pools.  Pure, so it is
+/// made twice: once for the coin-budget claims, and again after the coin
+/// shares cap the pools, because a share can reorder them -- the XCH/BYC
+/// asks, tapered to 66 XCH and paired to the bids' 33, become the smaller
+/// side if their XCH share is 22 -- and the tapered-side rule reads which
+/// pool is smaller.
+[[nodiscard]] constexpr LadderPairing ladder_pairing(bool       tier_minimums_on,
+                                                     LadderSide bid,
+                                                     LadderSide ask) noexcept
+{
+    LadderPairing v;
+    v.bid_kept_small = bid.floored
+        || tapered_side_unpairs(bid.drift_scale, bid.ratio_scale, bid.pool, ask.pool);
+    v.ask_kept_small = ask.floored
+        || tapered_side_unpairs(ask.drift_scale, ask.ratio_scale, ask.pool, bid.pool);
+    v.pair = pair_side_pools(tier_minimums_on, v.bid_kept_small, v.ask_kept_small);
+    return v;
 }
 
 // ---------------------------------------------------------------------------

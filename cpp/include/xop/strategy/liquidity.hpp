@@ -216,6 +216,57 @@ inline const char* to_string(RebalanceReason r) noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// [SKEW-TARGET 2026-11-07] inventory_skew_deviation -- how far a pair's
+// inventory ratio sits from its target, normalized to [-1, +1]:
+//
+//     ratio <  target:  (ratio - target) / target         0 -> -1
+//     ratio >= target:  (ratio - target) / (1 - target)   1 -> +1
+//
+// With target 0.5 this is exactly the old (ratio - 0.5) / 0.5, so a pair
+// whose target is 50/50 skews as before.  Every other pair used to be
+// measured against 50/50 too, which on 2026-11-07 leaned two pairs the
+// WRONG way: XCH/BYC (ratio 0.597, target 0.909, short XCH) tightened its
+// asks and widened its bids, and BYC/wUSDC.b (0.306, target 0.2, long BYC)
+// tightened its bids.  Each half is scaled by its own room so the result
+// reaches +/-1 only at an all-base or all-quote book, whatever the target.
+//
+// Defensive rails: a NaN ratio reads as on target (0); the ratio is clamped
+// to [0, 1]; a target outside (0, 1) or NaN falls back to 0.5.
+// ---------------------------------------------------------------------------
+[[nodiscard]] constexpr double inventory_skew_deviation(double ratio,
+                                                        double target) noexcept
+{
+    if (!(target > 0.0 && target < 1.0)) target = 0.5;
+    if (!(ratio == ratio)) return 0.0;
+    if (ratio < 0.0) ratio = 0.0;
+    if (ratio > 1.0) ratio = 1.0;
+    return ratio < target ? (ratio - target) / target
+                          : (ratio - target) / (1.0 - target);
+}
+
+/// The spread multipliers apply_inventory_skew uses for each side, so the
+/// engine's log line reports exactly what the ladder applied:
+///     bid = clamp(1 + phi * d, 0.1, 3.0),  ask = clamp(1 - phi * d, 0.1, 3.0)
+/// with d = inventory_skew_deviation(ratio, target).  Below 1 tightens that
+/// side toward mid, above 1 widens it.
+struct InventorySkewMults {
+    double bid{1.0};
+    double ask{1.0};
+};
+
+[[nodiscard]] constexpr InventorySkewMults inventory_skew_multipliers(
+    double ratio, double target, double phi) noexcept
+{
+    const double d = inventory_skew_deviation(ratio, target);
+    auto clamp_mult = [](double m) constexpr {
+        if (!(m == m)) return 1.0;
+        return m < 0.1 ? 0.1 : (m > 3.0 ? 3.0 : m);
+    };
+    return InventorySkewMults{clamp_mult(1.0 + phi * d),
+                              clamp_mult(1.0 - phi * d)};
+}
+
+// ---------------------------------------------------------------------------
 // LiquidityConfig -- tuning knobs for the multi-tier liquidity engine.
 //
 // Defaults are drawn from the strategy document examples:
@@ -257,9 +308,17 @@ struct LiquidityConfig {
 
     /// Skew strength coefficient (phi).  Controls how aggressively the engine
     /// shifts tier spreads to rebalance inventory.
-    ///   skew_multiplier = 1.0 +/- phi * (inventory_ratio - 0.5) / 0.5
+    ///   skew_multiplier = 1.0 +/- phi * inventory_skew_deviation(
+    ///                         inventory_ratio, inventory_skew_target)
     /// Higher phi => more aggressive shifting.  Typical range [0.1, 2.0].
     double phi{1.5};
+
+    /// [SKEW-TARGET 2026-11-07] The inventory ratio the skew treats as
+    /// balanced (runtime data, not YAML config).  The engine sets it per
+    /// pair from strategy.ratio_target_by_pair (else strategy.ratio_target)
+    /// before calling compute_ladder.  0.5 is the old fixed pivot, kept as
+    /// the default for callers that do not set it (backtests).
+    double inventory_skew_target{0.5};
 
     /// Inventory ratio above which the engine considers the portfolio
     /// long-biased.  Below (1 - threshold) is short-biased.
@@ -607,31 +666,32 @@ public:
 
     /// Apply inventory-aware spread skewing to an existing tier ladder.
     ///
-    /// When inventory_ratio > 0.6 (long-biased):
+    /// When inventory_ratio is above ratio_target (long base):
     ///   - Ask tiers tighten (reduced spread) to encourage selling.
     ///   - Bid tiers widen   (increased spread) to discourage buying.
     ///
-    /// When inventory_ratio < 0.4 (short-biased):
+    /// When inventory_ratio is below ratio_target (short base):
     ///   - Bid tiers tighten to encourage buying.
     ///   - Ask tiers widen   to discourage selling.
     ///
-    /// Skew multiplier for each side:
-    ///   bid_mult = 1.0 + phi * (inventory_ratio - 0.5) / 0.5
-    ///   ask_mult = 1.0 - phi * (inventory_ratio - 0.5) / 0.5
-    ///
-    /// When balanced (ratio near 0.5): both multipliers are ~1.0 (no shift).
-    /// When long (ratio = 0.8): bid_mult > 1 (widen), ask_mult < 1 (tighten).
-    /// When short (ratio = 0.2): bid_mult < 1 (tighten), ask_mult > 1 (widen).
+    /// Skew multiplier for each side, with d = inventory_skew_deviation(
+    /// inventory_ratio, ratio_target) in [-1, +1]:
+    ///   bid_mult = 1.0 + phi * d
+    ///   ask_mult = 1.0 - phi * d
+    /// both clamped to [0.1, 3.0].  At target both are 1.0 (no shift).
     ///
     /// @param ladder          The unadjusted tier ladder to modify.
     /// @param inventory_ratio Fraction of capital in base asset [0, 1].
     /// @param phi             Skew strength coefficient.
+    /// @param ratio_target    The ratio treated as balanced (0, 1); 0.5 by
+    ///                        default, the pivot before SKEW-TARGET.
     ///
     /// @return A new vector with skew-adjusted prices.  Sizes unchanged.
     static std::vector<TierQuote> apply_inventory_skew(
         const std::vector<TierQuote>& ladder,
         double inventory_ratio,
-        double phi);
+        double phi,
+        double ratio_target = 0.5);
 
     /// [TIERMIN 2026-10-29] The pool each side's tiers are sized from, as
     /// build_raw_ladder sizes them: the smaller of the two when both sides
