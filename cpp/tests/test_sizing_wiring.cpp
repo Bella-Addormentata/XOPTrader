@@ -481,10 +481,9 @@ TEST(SizingWiring, AFlooredDriftTaperedSideDoesNotShrinkTheOtherSide) {
     // The ladder config carries the verdict into compute_ladder, and the
     // recorded pools use the same verdict.
     const std::size_t verdict_at = position_of(body,
-        "const bool ladder_pairs_pools = strategy::tiermin::pair_side_pools( "
-        "ladder_tier_minimums_on, bid_kept_small, ask_kept_small);");
+        "const auto ladder_pairing = pairing_now();");
     const std::size_t carried_at = position_of(body,
-        "ladder_cfg.pair_side_pools = ladder_pairs_pools;");
+        "ladder_cfg.pair_side_pools = ladder_pairing.pair;");
     const std::size_t ladder_at = position_of(body, "pcs.ladder = liq.compute_ladder(");
     const std::size_t pools_at = position_of(body,
         "pcs.ladder_pools = LiquidityEngine::side_pools( "
@@ -520,28 +519,43 @@ TEST(SizingWiring, ATaperedSmallerSideDoesNotShrinkTheOtherSide) {
         "ratio_bid_scale = overweight_scale;");
     ASSERT_NE(base_at, std::string::npos);
     ASSERT_NE(quote_at, std::string::npos);
-    // Each side passes its own scales and its own pool first.
-    const std::size_t bid_at = position_of(body,
-        "const bool bid_kept_small = bid_guard_floored "
-        "|| strategy::tiermin::tapered_side_unpairs( "
-        "drift_bid_scale, ratio_bid_scale, avail_capital, avail_inventory);");
-    const std::size_t ask_at = position_of(body,
-        "const bool ask_kept_small = ask_guard_floored "
-        "|| strategy::tiermin::tapered_side_unpairs( "
-        "drift_ask_scale, ratio_ask_scale, avail_inventory, avail_capital);");
-    const std::size_t verdict_at = position_of(body,
-        "const bool ladder_pairs_pools = strategy::tiermin::pair_side_pools(");
-    ASSERT_NE(bid_at, std::string::npos);
-    ASSERT_NE(ask_at, std::string::npos);
-    ASSERT_NE(verdict_at, std::string::npos);
-    // After the taper and the floors (the pools are final by then), before
-    // the verdict.
+    // Each side passes its own floor flag, scales and pool, read when the
+    // verdict is made (the lambda captures by reference).
+    const std::size_t sides_at = position_of(body,
+        "const auto pairing_now = [&]() { return strategy::tiermin::ladder_pairing( "
+        "ladder_tier_minimums_on, "
+        "strategy::tiermin::LadderSide{bid_guard_floored, drift_bid_scale, "
+        "ratio_bid_scale, avail_capital}, "
+        "strategy::tiermin::LadderSide{ask_guard_floored, drift_ask_scale, "
+        "ratio_ask_scale, avail_inventory}); };");
+    ASSERT_NE(sides_at, std::string::npos);
+    // Made after the taper and the floors, once for the coin-budget claims
+    // and again after the coin shares cap the pools, for the ladder.
     const std::size_t ask_mark_at = position_of(body,
         "ask_guard_floored = strategy::tiermin::floored_side_unpairs(");
-    EXPECT_LT(base_at, bid_at);
-    EXPECT_LT(ask_mark_at, bid_at);
-    EXPECT_LT(bid_at, ask_at);
-    EXPECT_LT(ask_at, verdict_at);
+    const std::size_t claim_at = position_of(body,
+        "const auto claim_pairing = pairing_now();");
+    const std::size_t claim_use_at = position_of(body,
+        "const SidePools wanted = LiquidityEngine::side_pools( "
+        "avail_capital, avail_inventory, claim_pairing.pair);");
+    const std::size_t bid_share_at = position_of(body, "avail_capital = *share_cap;");
+    const std::size_t ladder_verdict_at = position_of(body,
+        "const auto ladder_pairing = pairing_now();");
+    const std::size_t carried_at = position_of(body,
+        "ladder_cfg.pair_side_pools = ladder_pairing.pair;");
+    ASSERT_NE(claim_at, std::string::npos);
+    ASSERT_NE(claim_use_at, std::string::npos);
+    ASSERT_NE(bid_share_at, std::string::npos);
+    ASSERT_NE(ladder_verdict_at, std::string::npos);
+    ASSERT_NE(carried_at, std::string::npos);
+    EXPECT_LT(base_at, sides_at);
+    EXPECT_LT(ask_mark_at, sides_at);
+    EXPECT_LT(sides_at, claim_at);
+    EXPECT_LT(claim_at, claim_use_at);
+    EXPECT_LT(claim_use_at, bid_share_at);
+    EXPECT_LT(bid_share_at, ladder_verdict_at);
+    EXPECT_LT(ladder_verdict_at, carried_at);
+    EXPECT_EQ(count_of(body, "pairing_now()"), 2u);
 }
 
 // [SKEW-TARGET 2026-11-07] The ladder's inventory skew pivots on the pair's
@@ -634,7 +648,7 @@ TEST(SizingWiring, ACoinSeveralSidesSpendIsSplitBetweenThem) {
         "[GAS-RESERVE 2026-10-24] FINAL per-asset reserve caps");
     const std::size_t claim_at = position_of(body,
         "const SidePools wanted = LiquidityEngine::side_pools( "
-        "avail_capital, avail_inventory, ladder_pairs_pools);");
+        "avail_capital, avail_inventory, claim_pairing.pair);");
     const std::size_t record_at = position_of(body, "auto& claims = coin_claims_[pair_name];");
     const std::size_t ask_share_at = position_of(body,
         "avail_inventory = *pcs.coin_share_ask;");

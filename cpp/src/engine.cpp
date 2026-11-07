@@ -10971,14 +10971,18 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         // XCH/DBX bids (59.5 XCH) six 1 XCH offers from the asks' 0.14 XCH.
         // A tapered side that is still the larger pool keeps the pairing,
         // which only cuts it further (the XCH/BYC asks, 66 -> 33 XCH).
-        const bool bid_kept_small = bid_guard_floored
-            || strategy::tiermin::tapered_side_unpairs(
-                   drift_bid_scale, ratio_bid_scale, avail_capital, avail_inventory);
-        const bool ask_kept_small = ask_guard_floored
-            || strategy::tiermin::tapered_side_unpairs(
-                   drift_ask_scale, ratio_ask_scale, avail_inventory, avail_capital);
-        const bool ladder_pairs_pools = strategy::tiermin::pair_side_pools(
-            ladder_tier_minimums_on, bid_kept_small, ask_kept_small);
+        // The verdict reads which pool is smaller, so it is made from the
+        // pools as they stand: here for the coin-budget claims, and again
+        // after the coin shares below, which can reorder them.
+        const auto pairing_now = [&]() {
+            return strategy::tiermin::ladder_pairing(
+                ladder_tier_minimums_on,
+                strategy::tiermin::LadderSide{bid_guard_floored, drift_bid_scale,
+                                              ratio_bid_scale, avail_capital},
+                strategy::tiermin::LadderSide{ask_guard_floored, drift_ask_scale,
+                                              ratio_ask_scale, avail_inventory});
+        };
+        const auto claim_pairing = pairing_now();
 
         // -- [COINBUDGET 2026-10-30] This side's claim on its coin, and its share
         // The claim is what each side would use of the coin it spends, paired
@@ -10996,7 +11000,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 ? kMojosPerXch
                 : pair_cfg->quote_mojos_per_unit;
             const SidePools wanted = LiquidityEngine::side_pools(
-                avail_capital, avail_inventory, ladder_pairs_pools);
+                avail_capital, avail_inventory, claim_pairing.pair);
             const double bid_claim = (market_mid > 0.0 && base_mpu > 0 && quote_mpu > 0)
                 ? static_cast<double>(wanted.bid) / static_cast<double>(base_mpu)
                       * market_mid * static_cast<double>(quote_mpu)
@@ -11071,6 +11075,12 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 }
             }
         }
+
+        // [TIERMIN-TAPER 2026-11-07] The ladder's pairing verdict, from the
+        // final pools: a coin share can make a tapered side that was the
+        // larger pool the smaller one (or the reverse), and pairing must
+        // not then cut the other side to it.
+        const auto ladder_pairing = pairing_now();
 
         // -- Minimum ladder half-spread (uncertainty-scaled) ----------------
         // The ladder's minimum half-spread is
@@ -11423,8 +11433,8 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         ladder_cfg.book_ask_side_anchor_ok = comp_book.ask_side_anchor_ok;
 
         // [TIERMIN 2026-10-29] Size each side from its own pool when the
-        // verdict above (ladder_pairs_pools) says so.
-        ladder_cfg.pair_side_pools = ladder_pairs_pools;
+        // verdict above (ladder_pairing, from the final pools) says so.
+        ladder_cfg.pair_side_pools = ladder_pairing.pair;
         if (!ladder_cfg.pair_side_pools) {
             spdlog::info("[Engine] Step 7: {} ladder sides sized from their "
                          "own pools (bid {} / ask {} base mojos): the {} "
@@ -11432,7 +11442,7 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                          "ratio taper, or a switched-off side floored to "
                          "the pair minimum)",
                          pair_name, avail_capital, avail_inventory,
-                         bid_kept_small ? "bid" : "ask");
+                         ladder_pairing.bid_kept_small ? "bid" : "ask");
         }
 
         // Generate the tier ladder.

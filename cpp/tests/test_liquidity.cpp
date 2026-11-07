@@ -1653,6 +1653,23 @@ TEST(SidePoolsTest, ATokenFlooredBidDoesNotCutTheAsksPool) {
     EXPECT_EQ(pools.ask, 104 * xch);
 }
 
+// [TIERMIN-TAPER 2026-11-07] An AcquireBase bid floored from 0 to 1 XCH and
+// an ask tapered to 0.14 XCH are both kept small; the pair unpairs, so the
+// bid keeps its floor instead of being cut back to the ask's size.
+TEST(SidePoolsTest, AFlooredBidKeepsItsFloorAgainstASmallerTaperedAsk) {
+    namespace tmin = xop::strategy::tiermin;
+    const std::int64_t xch = 1'000'000'000'000LL;
+    const std::int64_t ask = 137'666'255'551;
+    EXPECT_EQ(LiquidityEngine::side_pools(xch, ask, true).bid, ask)
+        << "paired, the tapered ask cuts the floored bid below its floor";
+    const auto verdict = tmin::ladder_pairing(
+        true, tmin::LadderSide{true, 1.0, 1.0, xch},
+        tmin::LadderSide{false, 0.03, 0.49, ask});
+    const auto pools = LiquidityEngine::side_pools(xch, ask, verdict.pair);
+    EXPECT_EQ(pools.bid, xch);
+    EXPECT_EQ(pools.ask, ask);
+}
+
 TEST(SidePoolsTest, TiersPastTierZeroStayWithinThePool) {
     LiquidityConfig cfg;
     cfg.num_tiers = 3;
