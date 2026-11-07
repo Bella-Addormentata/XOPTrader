@@ -5093,6 +5093,16 @@ TEST(TierMinimumMojos, LadderPairingFollowsThePoolsItIsGiven) {
 
     // Not a tier-minimum pair: pairing as before, whatever the flags.
     EXPECT_TRUE(tmin::ladder_pairing(false, untapered_bid, usdc_ask).pair);
+
+    // The drift guard leaves the pools alone when both raw scales are
+    // >= 0.999; a raw 0.9995 would still read as a taper, so Step 7 passes
+    // the scale it applied (1.0 there) and the untouched pair stays paired.
+    const xop::Mojo small_ask = 3'954'836'165'368;
+    EXPECT_TRUE(tmin::tapered_side_unpairs(0.9995, 1.0, small_ask, 33 * xch))
+        << "the raw scale alone reads as a taper";
+    EXPECT_TRUE(tmin::ladder_pairing(
+        true, untapered_bid, tmin::LadderSide{false, 1.0, 1.0, small_ask}).pair)
+        << "the applied scale, 1.0: no taper, pairing stands";
 }
 
 TEST(TierMinimumMojos, XchLimiterKeepsTheWidestTiersFirst) {

@@ -524,11 +524,26 @@ TEST(SizingWiring, ATaperedSmallerSideDoesNotShrinkTheOtherSide) {
     const std::size_t sides_at = position_of(body,
         "const auto pairing_now = [&]() { return strategy::tiermin::ladder_pairing( "
         "ladder_tier_minimums_on, "
-        "strategy::tiermin::LadderSide{bid_guard_floored, drift_bid_scale, "
+        "strategy::tiermin::LadderSide{bid_guard_floored, drift_bid_applied, "
         "ratio_bid_scale, avail_capital}, "
-        "strategy::tiermin::LadderSide{ask_guard_floored, drift_ask_scale, "
+        "strategy::tiermin::LadderSide{ask_guard_floored, drift_ask_applied, "
         "ratio_ask_scale, avail_inventory}); };");
     ASSERT_NE(sides_at, std::string::npos);
+    // The pairing reads the drift scales the guard APPLIED: it skips scaling
+    // when both raw scales are >= 0.999, and then neither side was tapered.
+    const std::size_t applied_at = position_of(body,
+        "if (bid_scale < 0.999 || ask_scale < 0.999) { "
+        "const Mojo old_bid = avail_capital; const Mojo old_ask = avail_inventory; "
+        "avail_capital = static_cast<Mojo>(std::llround( "
+        "static_cast<double>(avail_capital) * bid_scale)); "
+        "avail_inventory = static_cast<Mojo>(std::llround( "
+        "static_cast<double>(avail_inventory) * ask_scale)); "
+        "drift_bid_applied = bid_scale; drift_ask_applied = ask_scale;");
+    ASSERT_NE(applied_at, std::string::npos);
+    EXPECT_LT(applied_at, sides_at);
+    // Declared 1.0, and set only where the guard scales the pools.
+    EXPECT_EQ(count_of(body, "drift_bid_applied ="), 2u);
+    EXPECT_EQ(count_of(body, "drift_ask_applied ="), 2u);
     // Made after the taper and the floors, once for the coin-budget claims
     // and again after the coin shares cap the pools, for the ladder.
     const std::size_t ask_mark_at = position_of(body,

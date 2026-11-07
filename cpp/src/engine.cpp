@@ -10455,6 +10455,12 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         // taper (still acquiring; may be floored).
         double drift_bid_scale = 1.0;
         double drift_ask_scale = 1.0;
+        // [TIERMIN-TAPER 2026-11-07] The scales the drift guard actually
+        // applied to the pools: it skips scaling when both are >= 0.999, so a
+        // raw 0.9995 left the pool untouched and must not read as a taper in
+        // the ladder pairing.  The floor keeps reading the raw scales above.
+        double drift_bid_applied = 1.0;
+        double drift_ask_applied = 1.0;
         // [TIERMIN 2026-10-29] Set by the deploy-idle floor when it lifted a
         // side the drift guard had tapered (0 < scale < 1); read when the
         // ladder decides whether to pair the two sides' pools.
@@ -10552,6 +10558,8 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                     static_cast<double>(avail_capital) * bid_scale));
                 avail_inventory = static_cast<Mojo>(std::llround(
                     static_cast<double>(avail_inventory) * ask_scale));
+                drift_bid_applied = bid_scale;
+                drift_ask_applied = ask_scale;
                 auto pct_or = [&](const std::string& k) {
                     auto it = portfolio_pct_by_asset.find(k);
                     return it != portfolio_pct_by_asset.end() ? it->second : 0.0;
@@ -10977,9 +10985,9 @@ void Engine::step_generate_ladder(BlockHeight block_height)
         const auto pairing_now = [&]() {
             return strategy::tiermin::ladder_pairing(
                 ladder_tier_minimums_on,
-                strategy::tiermin::LadderSide{bid_guard_floored, drift_bid_scale,
+                strategy::tiermin::LadderSide{bid_guard_floored, drift_bid_applied,
                                               ratio_bid_scale, avail_capital},
-                strategy::tiermin::LadderSide{ask_guard_floored, drift_ask_scale,
+                strategy::tiermin::LadderSide{ask_guard_floored, drift_ask_applied,
                                               ratio_ask_scale, avail_inventory});
         };
         const auto claim_pairing = pairing_now();
