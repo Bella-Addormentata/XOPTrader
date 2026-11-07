@@ -5,6 +5,51 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.44] — 2026-11-07 — full bid ladders; prices lean toward your targets
+
+### A small ask no longer shrinks the bids (#216)
+
+On 2026-11-07, with XCH at 31% of its 50% target, two pairs posted far
+fewer bids than planned. Pairs with tier minimums size both sides from
+the smaller pool. Their asks were kept small on purpose (ratio
+rebalancing and the drift guard sell less of the XCH the portfolio is
+short of), so the bids were cut down to the same size:
+
+- XCH/wUSDC.b posted 2 of its 6 bid tiers (from the asks' 3.95 XCH).
+- XCH/DBX posted six 1 XCH bids instead of its tier ladder (from 0.14 XCH).
+
+Now a side that is tapered on purpose and is the smaller pool, or one
+the deploy-idle floor lifted, no longer cuts the other side. Each side is
+sized from its own pool. A tapered side that is still the larger pool
+keeps the pairing (XCH/BYC is unchanged). The decision is made from the
+final pools, after each pair's share of a shared coin is applied.
+
+### Prices lean toward each pair's target, not 50/50 (#216)
+
+The ladder's inventory skew (`strategy.phi`) tightens the side that moves
+a pair toward balance and widens the other. It measured balance against
+50/50 instead of `ratio_target_by_pair`, so two pairs leaned the wrong
+way:
+
+- XCH/BYC tightened its asks, selling the XCH it was short of.
+- BYC/wUSDC.b tightened its bids, buying the BYC it was long of.
+
+It now measures against each pair's target. Pairs at a 0.5 target skew
+exactly as before. With phi 0.5 on 2026-11-07 the bids would be about:
+
+- 22% tighter on XCH/wUSDC.b (was 10%)
+- 25% tighter on XCH/DBX (was 11%)
+- 17% tighter on XCH/BYC (was 10% wider)
+
+The width floors and order-book guards still apply after the skew.
+
+After installing: look for `inventory skew: ratio … vs target … -> bid
+spread x…, ask spread x…` for each pair, and on XCH/wUSDC.b and XCH/DBX
+`ladder sides sized from their own pools ... the ask pool is kept small
+on purpose`. Expect larger bids on those two pairs: about 33 XCH on
+XCH/wUSDC.b (about 40 wUSDC.b) and about 59 XCH on XCH/DBX (about
+4,600 DBX).
+
 ## [0.10.43] — 2026-11-02 — coin splits confirm
 
 ### Coin splits were wiped before they could confirm (#214)
