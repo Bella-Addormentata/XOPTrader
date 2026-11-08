@@ -1331,15 +1331,36 @@ TEST(SizingWiring, RatioModesAreSavedOnEveryTransitionAndRestoredAtStartup) {
     ASSERT_FALSE(ladder.empty()) << XOP_TESTS_ENGINE_CPP;
     ASSERT_FALSE(offers.empty()) << XOP_TESTS_ENGINE_CPP;
     EXPECT_NE(position_of(ladder,
-        "strategy::ratiomode::next_mode(prev_mode, inv_ratio, bands);"), std::string::npos);
-    EXPECT_NE(position_of(ladder,
-        "set_ratio_mode(pair_name, prev_mode, next_mode, inv_ratio, bands, \"Step 7\");"),
+        "strategy::ratiomode::next_mode(prev_mode, inv_ratio_holdings, bands); "
+        "if (next_mode != prev_mode && !ratio_mode_held(pair_name, *pair_cfg, block_height)) { "
+        "set_ratio_mode(pair_name, prev_mode, next_mode, inv_ratio_holdings, bands, \"Step 7\");"),
               std::string::npos);
     EXPECT_NE(position_of(offers,
-        "strategy::ratiomode::next_mode(prev_mode, inv_ratio_rb, bands);"), std::string::npos);
-    EXPECT_NE(position_of(offers,
+        "strategy::ratiomode::next_mode(prev_mode, inv_ratio_rb, bands); "
+        "if (next_mode != prev_mode && !ratio_mode_held(pair_name, *pair_cfg, block_height)) { "
         "set_ratio_mode(pair_name, prev_mode, next_mode, inv_ratio_rb, bands, \"Step 8\");"),
               std::string::npos);
+    EXPECT_EQ(count_of(flat, "set_ratio_mode(pair_name, prev_mode, next_mode,"), 2u);
+
+    // [review] Both sites transition on the pair's own holdings.  Step 7
+    // takes its ratio BEFORE the cross-pair adjustment, which used to feed
+    // its transitions: raw 0.39 adjusted to 0.63 flipped the mode back and
+    // forth against Step 8 every heartbeat once overshoot exits existed.
+    const std::size_t own_at = position_of(ladder,
+        "inv_ratio = inventory_->inventory_ratio( AssetId{pair_cfg->base_asset_id}, "
+        "AssetId{pair_cfg->quote_asset_id}, mid_mojos); }");
+    const std::size_t raw_at = position_of(ladder, "const double inv_ratio_holdings = inv_ratio;");
+    const std::size_t cross_at = position_of(ladder,
+        "inv_ratio = std::clamp(inv_ratio + cross_adj, 0.0, 1.0);");
+    ASSERT_NE(own_at, std::string::npos);
+    ASSERT_NE(raw_at, std::string::npos);
+    ASSERT_NE(cross_at, std::string::npos);
+    EXPECT_LT(own_at, raw_at);
+    EXPECT_LT(raw_at, cross_at);
+    EXPECT_EQ(count_of(ladder, "inv_ratio_holdings ="), 1u);
+    EXPECT_NE(position_of(offers,
+        "const double inv_ratio_rb = inventory_->inventory_ratio( AssetId{pair_cfg->base_asset_id}, "
+        "AssetId{pair_cfg->quote_asset_id}, rb_mid_mojos);"), std::string::npos);
     EXPECT_EQ(count_of(flat, "strategy::ratiomode::bands_for("), 2u);
     // No site keeps its own copy of the old in-band exit test.
     EXPECT_EQ(position_of(flat, "inv_ratio>=lower_exit&&inv_ratio<=upper_exit"), std::string::npos);
@@ -1379,4 +1400,30 @@ TEST(SizingWiring, RatioModesAreSavedOnEveryTransitionAndRestoredAtStartup) {
     EXPECT_NE(position_of(boot,
         "const PairConfig* pc = find_pair_config(row.pair_name); if (!pc || !pc->enabled) continue;"),
               std::string::npos);
+    EXPECT_NE(position_of(boot,
+        "ratio_rebalance_modes_[row.pair_name] = *mode; ratio_mode_held_pairs_.insert(row.pair_name);"),
+              std::string::npos);
+
+    // [review] A restored mode is held until the pair's restored quantities
+    // have been checked against the wallet (or the hold times out): the
+    // quantities predate any deposit or withdrawal made while the engine
+    // was down, and an exit on them would be saved.
+    const std::string held = function_body(engine,
+        "bool Engine::ratio_mode_held(const std::string& pair_name,");
+    ASSERT_FALSE(held.empty()) << XOP_TESTS_ENGINE_CPP;
+    EXPECT_NE(position_of(held,
+        "if (inventory_reconciled_assets_.count(asset_id) > 0) return true; "
+        "return asset_id == config_.accounting.bridge_asset_id && bridge_accounting_operational();"),
+              std::string::npos);
+    EXPECT_NE(position_of(held,
+        "const bool reconciled = checked(pc.base_asset_id) && checked(pc.quote_asset_id);"),
+              std::string::npos);
+    EXPECT_NE(position_of(held,
+        "const bool timed_out = pnl_first_block_ > 0 "
+        "&& block_height >= pnl_first_block_ + kRatioModeHoldMaxBlocks; "
+        "if (!reconciled && !timed_out) return true; ratio_mode_held_pairs_.erase(it);"),
+              std::string::npos);
+    // Only startup adds to the hold; only the release removes from it.
+    EXPECT_EQ(count_of(flat, "ratio_mode_held_pairs_.insert("), 1u);
+    EXPECT_EQ(count_of(flat, "ratio_mode_held_pairs_.erase("), 1u);
 }

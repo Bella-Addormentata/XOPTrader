@@ -11,7 +11,11 @@
 // XCH/wUSDC.b ask pool went from ~4 XCH (tapered x0.56) to 33 XCH, selling
 // the asset the pair was short of.  The engine now saves every transition
 // (Database::save_ratio_mode) and restores the saved modes at startup, so a
-// restart resumes the hysteresis where it left off.
+// restart resumes the hysteresis where it left off.  A restored mode makes
+// no transition until the pair's holdings have been checked against the
+// wallet (Engine::ratio_mode_held), and both Step 7 and Step 8 decide on the
+// pair's own holdings ratio, never the cross-pair-adjusted one, so the two
+// sites cannot pull one mode in opposite directions.
 //
 // A restored mode is only as current as the moment it was saved: the target
 // may have been edited, or the balances moved, while the engine was off.  So

@@ -3300,7 +3300,12 @@ asio::awaitable<void> Engine::poll_loop_coro()
     // that had been tapering its overweight side for days from tapering
     // again (2026-11-07: XCH/wUSDC.b asks 4 -> 33 XCH).  A restored mode is
     // checked against the current ratio and bands on the first heartbeat
-    // and exits as usual if the pair is already back near its target.
+    // and exits as usual if the pair is already back near its target --
+    // but only once the pair's restored quantities have been checked against
+    // the wallet (ratio_mode_held): until Step 11's one-shot reconcile runs,
+    // the ratio is computed from the quantities the last process saved, and
+    // a deposit or withdrawal while the engine was down could make it exit
+    // (and save Neutral) on a ratio that is no longer true.
     if (db_) {
         for (const auto& row : db_->load_ratio_modes()) {
             const auto mode = strategy::ratiomode::parse_mode(row.mode);
@@ -3314,7 +3319,9 @@ asio::awaitable<void> Engine::poll_loop_coro()
             const PairConfig* pc = find_pair_config(row.pair_name);
             if (!pc || !pc->enabled) continue;
             ratio_rebalance_modes_[row.pair_name] = *mode;
-            spdlog::info("[Engine] Restored ratio mode {} for {} (saved {} UTC)",
+            ratio_mode_held_pairs_.insert(row.pair_name);
+            spdlog::info("[Engine] Restored ratio mode {} for {} (saved {} UTC); "
+                         "held until its holdings are checked against the wallet",
                          row.mode, row.pair_name, row.updated_at);
         }
     }
@@ -10069,6 +10076,14 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 AssetId{pair_cfg->quote_asset_id},
                 mid_mojos);
         }
+        // [RATIO-MODE-PERSIST review] The pair's own holdings, before the
+        // cross-pair adjustment below.  The ratio rebalance mode transitions
+        // on this, as Step 8 does: Step 7 used to transition on the adjusted
+        // ratio and Step 8 on the raw one, and with the overshoot exit the
+        // two could flip the mode back and forth every heartbeat (raw 0.39
+        // adjusted to 0.63 around a 0.5 target).  The skew stays a pricing
+        // and sizing input.
+        const double inv_ratio_holdings = inv_ratio;
 
         // -- Cross-pair correlated inventory skewing (Gueant 2019) --
         // When enabled, adjusts inv_ratio based on inventory pressure
@@ -10388,10 +10403,11 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             const double enter_band = bands.enter;
 
             const RatioRebalanceMode next_mode =
-                strategy::ratiomode::next_mode(prev_mode, inv_ratio, bands);
-            if (next_mode != prev_mode) {
-                set_ratio_mode(pair_name, prev_mode, next_mode, inv_ratio,
-                               bands, "Step 7");
+                strategy::ratiomode::next_mode(prev_mode, inv_ratio_holdings, bands);
+            if (next_mode != prev_mode
+                && !ratio_mode_held(pair_name, *pair_cfg, block_height)) {
+                set_ratio_mode(pair_name, prev_mode, next_mode,
+                               inv_ratio_holdings, bands, "Step 7");
             }
 
             const RatioRebalanceMode active_mode = it_mode->second;
@@ -15995,7 +16011,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     config_.strategy.ratio_band_enter_by_pair);
                 const RatioRebalanceMode next_mode =
                     strategy::ratiomode::next_mode(prev_mode, inv_ratio_rb, bands);
-                if (next_mode != prev_mode) {
+                if (next_mode != prev_mode
+                    && !ratio_mode_held(pair_name, *pair_cfg, block_height)) {
                     set_ratio_mode(pair_name, prev_mode, next_mode,
                                    inv_ratio_rb, bands, "Step 8");
                 }
@@ -21479,6 +21496,36 @@ void Engine::set_ratio_mode(const std::string& pair_name,
         db_->save_ratio_mode(pair_name,
                              strategy::ratiomode::mode_name(next_mode));
     }
+}
+
+bool Engine::ratio_mode_held(const std::string& pair_name,
+                             const PairConfig& pc,
+                             BlockHeight block_height)
+{
+    const auto it = ratio_mode_held_pairs_.find(pair_name);
+    if (it == ratio_mode_held_pairs_.end()) return false;
+
+    // An asset's restored quantity is trusted once Step 11 has reconciled
+    // it to the wallet this process.  The bridge asset is skipped by that
+    // reconcile while step_ingest_bridge_flows keeps it current, so it
+    // counts as checked whenever that scan is operational.
+    auto checked = [&](const std::string& asset_id) {
+        if (inventory_reconciled_assets_.count(asset_id) > 0) return true;
+        return asset_id == config_.accounting.bridge_asset_id
+            && bridge_accounting_operational();
+    };
+    const bool reconciled = checked(pc.base_asset_id) && checked(pc.quote_asset_id);
+    // Backstop: the reconcile can wait on coins in flight for a long time;
+    // past this the mode follows the tracked ratio as it always did.
+    const bool timed_out = pnl_first_block_ > 0
+        && block_height >= pnl_first_block_ + kRatioModeHoldMaxBlocks;
+    if (!reconciled && !timed_out) return true;
+
+    ratio_mode_held_pairs_.erase(it);
+    spdlog::info("[Engine] {} restored ratio mode released: {}", pair_name,
+                 reconciled ? "holdings checked against the wallet"
+                            : "no wallet check within the hold limit");
+    return false;
 }
 
 void Engine::persist_inventory_state() noexcept

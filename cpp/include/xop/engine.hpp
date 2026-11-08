@@ -2553,6 +2553,22 @@ private:
     using RatioRebalanceMode = strategy::ratiomode::Mode;
     std::unordered_map<std::string, RatioRebalanceMode> ratio_rebalance_modes_;
 
+    /// [RATIO-MODE-PERSIST review] Pairs whose mode was restored at startup.
+    /// A restored mode makes no transition until both of the pair's assets
+    /// have been checked against the wallet this process (Step 11's one-shot
+    /// reconcile, or the bridge scan for the bridge asset), or until
+    /// kRatioModeHoldMaxBlocks after Step 11's first block: before that the
+    /// ratio comes from quantities the last process saved, which a deposit
+    /// or withdrawal while the engine was down makes untrue.
+    std::unordered_set<std::string> ratio_mode_held_pairs_;
+    static constexpr BlockHeight kRatioModeHoldMaxBlocks = 192;  // ~1 hour
+
+    /// True while @p pair_name's restored mode is held (see above); the
+    /// first call that finds it checked or timed out releases it.
+    [[nodiscard]] bool ratio_mode_held(const std::string& pair_name,
+                                       const PairConfig& pc,
+                                       BlockHeight block_height);
+
     /// Apply a mode transition: store it, log it, and save it so a restart
     /// resumes from it.  @p step names the caller in the log ("Step 7").
     void set_ratio_mode(const std::string& pair_name,
