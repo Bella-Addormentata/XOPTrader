@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gui.ratio_targets import pair_band_enter
 from gui.theme import scaled_px, COLORS as _C
 from gui.theme import MONO_FONT_FAMILY
 
@@ -1518,11 +1519,12 @@ class WalletBalancesWidget(QWidget):
     def _pair_band_enter_from_tolerances(self) -> dict[str, float]:
         """Map asset-level "Target % +/-" inputs to a per-pair ratio band.
 
-        For each pair, project the asset tolerances into ratio space by
-        evaluating the pair's target ratio at (base+tol)/(quote-tol) and
-        (base-tol)/(quote+tol), then taking the widest deviation from
-        the nominal target.  The resulting fraction is clamped to (0, 0.49)
-        so the C++ side accepts it as a valid enter band.
+        For each enabled pair, project the asset tolerances into ratio space
+        (:func:`gui.ratio_targets.pair_band_enter`).  [RATIO-BAND-CAP
+        2026-11-08] The band is capped at ``RATIO_BAND_ENTER_MAX`` (0.10, the
+        engine's default): XCH's +/-40 tolerance used to write 0.49 bands that
+        kept the XCH pairs out of AcquireBase however far below target they
+        were.
         """
         bands: dict[str, float] = {}
         enabled_pairs = self._enabled_pair_names()
@@ -1536,27 +1538,13 @@ class WalletBalancesWidget(QWidget):
             quote_pct = self._target_allocations.get(quote_key)
             if base_pct is None or quote_pct is None:
                 continue
-            denom = base_pct + quote_pct
-            if denom <= 0.0:
-                continue
-            base_tol = self._target_tolerances.get(base_key, 0.0)
-            quote_tol = self._target_tolerances.get(quote_key, 0.0)
-            if base_tol <= 0.0 and quote_tol <= 0.0:
-                continue
-            target_ratio = base_pct / denom
-
-            def _ratio(b: float, q: float) -> float:
-                b = max(0.0, b)
-                q = max(0.0, q)
-                d = b + q
-                return (b / d) if d > 0.0 else target_ratio
-
-            upper_r = _ratio(base_pct + base_tol, quote_pct - quote_tol)
-            lower_r = _ratio(base_pct - base_tol, quote_pct + quote_tol)
-            band = max(abs(upper_r - target_ratio),
-                       abs(target_ratio - lower_r))
-            band = max(0.0, min(0.49, band))
-            if band > 0.0:
+            band = pair_band_enter(
+                base_pct,
+                quote_pct,
+                self._target_tolerances.get(base_key, 0.0),
+                self._target_tolerances.get(quote_key, 0.0),
+            )
+            if band is not None:
                 bands[pair_name] = band
         return bands
 
