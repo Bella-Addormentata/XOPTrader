@@ -5,6 +5,39 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.46] — 2026-11-08 — bid ladders stay up through a restart
+
+### The first heartbeat after a restart keeps the bid ladders (#220)
+
+The target-gap bid floor values every asset against its target from the
+engine's cached wallet balances. That cache is filled pair by pair later
+in the same heartbeat, so on the first heartbeat after a restart the last
+pair's coin had no balance yet. On 2026-11-08 at 05:09 UTC that coin was
+DBX: the floor switched off, XCH/wUSDC.b, XCH/BYC and XCH/DBX each planned
+a single bid, and the engine started cancelling their resting bid ladders
+(7 cancels went through) until the next heartbeat planned them again.
+
+Now:
+
+- The wallet balances read at startup, after the wallet has synced, are
+  kept for the first heartbeat's target valuation. A coin the cache has no
+  balance for yet is valued from that startup read, which ages out like
+  the cache does.
+- The startup reads never enter the cache itself, so reconciliation and
+  the ledger checks still compare the books only against reads taken
+  while trading.
+
+No config change is needed.
+
+After installing, look for:
+
+- `Startup: kept the wallet balances of … of … assets (block …) for the
+  first heartbeat's target-gap valuation` at startup.
+- `Step 4: target-gap bid floor on (… targeted coins, … XCH)` on the first
+  heartbeat, not `target-gap bid floor off until every targeted coin is
+  valued -- DBX: no validated wallet balance`, and no burst of bid cancels
+  on XCH/wUSDC.b, XCH/BYC or XCH/DBX right after the restart.
+
 ## [0.10.45] — 2026-11-08 — ratio modes survive restarts; DBX back on the Wallet Balances tab
 
 ### Ratio rebalance modes are kept across restarts (#218)
