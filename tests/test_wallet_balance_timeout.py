@@ -123,3 +123,79 @@ def test_a_failing_wallet_is_logged_once_and_its_recovery_once(tmp_path, monkeyp
     assert "CAT db1a9020" in worker._fetch_impl()
     recovered = [r for r in caplog.records if "works again" in r.getMessage()]
     assert len(recovered) == 1
+
+
+# [review] Shutdown.  quit() cannot interrupt a blocking RPC, and a QThread
+# destroyed while still running aborts the process (pinned in
+# test_worker_thread_shutdown.py).  With 15 s balance reads, stop()'s old
+# 5 s wait could return with a read still in flight, so a GUI close during
+# the slow DBX read could crash.  stop() now asks the worker to abandon the
+# pass between RPCs and waits out the one RPC in flight.
+
+
+def test_a_stop_during_a_balance_read_ends_the_pass_after_that_read(tmp_path, monkeypatch):
+    worker = _worker(tmp_path)
+    stub, calls = _stub_requests(slow_wallet_seconds=0.1)
+    inner_post = stub.post
+    stop_once = [True]
+
+    def post(url, **kw):
+        resp = inner_post(url, **kw)
+        if (stop_once and url.endswith("/get_wallet_balance")
+                and kw["json"]["wallet_id"] == 1):
+            stop_once.clear()
+            worker.request_abort()  # stop() arrives while wallet 1 is read
+        return resp
+
+    stub.post = post
+    monkeypatch.setitem(sys.modules, "requests", stub)
+    assert worker._fetch_impl() == {}
+    reads = [j["wallet_id"] for e, j, _ in calls if e == "get_wallet_balance"]
+    assert reads == [1], "the pass kept reading wallets after stop()"
+
+    # A pass that starts after stop() makes no RPC at all.
+    calls.clear()
+    assert worker._fetch_impl() == {}
+    assert calls == []
+
+    # start() clears the request, so a restarted service reads again.
+    worker.clear_abort()
+    assert "CAT db1a9020" in worker._fetch_impl()
+
+
+def test_stop_joins_a_worker_that_is_mid_read(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    from PySide6.QtCore import QCoreApplication
+
+    app = QCoreApplication.instance() or QCoreApplication([])  # noqa: F841
+    assert ws._STOP_WAIT_MS >= ws._BALANCE_TIMEOUT_S * 1000
+
+    stub, calls = _stub_requests(slow_wallet_seconds=0.1)
+    inner_post = stub.post
+    reading = threading.Event()
+
+    def post(url, **kw):
+        if url.endswith("/get_wallet_balance") and kw["json"]["wallet_id"] == 1:
+            reading.set()
+            time.sleep(1.0)  # a slow read the GUI closes in the middle of
+        return inner_post(url, **kw)
+
+    stub.post = post
+    monkeypatch.setitem(sys.modules, "requests", stub)
+
+    cert = tmp_path / "c.crt"
+    key = tmp_path / "c.key"
+    cert.write_text("x")
+    key.write_text("x")
+    svc = ws.WalletService({"chia": {"wallet_fingerprint": 1,
+                                     "wallet_cert_path": str(cert),
+                                     "wallet_key_path": str(key)}})
+    svc.start()
+    svc.fetch_balances()
+    assert reading.wait(10.0), "the worker never started its pass"
+    svc.stop()
+    assert not svc._thread.isRunning(), "stop() returned with the read in flight"
+    reads = [j["wallet_id"] for e, j, _ in calls if e == "get_wallet_balance"]
+    assert reads == [1]

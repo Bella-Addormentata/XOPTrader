@@ -1360,9 +1360,17 @@ TEST(SizingWiring, RatioModesAreSavedOnEveryTransitionAndRestoredAtStartup) {
     EXPECT_NE(position_of(observe,
         "const double mid = market_data_->get_mid_price(pair_name); "
         "if (!(mid > 0.0)) return std::nullopt;"), std::string::npos);
+    // [review] The mid is converted checked, and a price that rounds to 0
+    // mojos (or overflows) is no observation: inventory_ratio() reads 0 as
+    // "no price" and returns 0.5, which would exit AcquireBase on nothing.
+    EXPECT_NE(position_of(observe,
+        "const std::optional<Mojo> mid_mojos = "
+        "to_mojo_checked(mid * static_cast<double>(kMojosPerXch)); "
+        "if (!mid_mojos || *mid_mojos <= 0) return std::nullopt;"), std::string::npos);
     EXPECT_NE(position_of(observe,
         "return inventory_->inventory_ratio(AssetId{pc.base_asset_id}, "
-        "AssetId{pc.quote_asset_id}, mid_mojos);"), std::string::npos);
+        "AssetId{pc.quote_asset_id}, *mid_mojos);"), std::string::npos);
+    EXPECT_EQ(position_of(observe, "std::llround("), std::string::npos);
     EXPECT_EQ(position_of(ladder, "next_mode(prev_mode, inv_ratio,"), std::string::npos);
     EXPECT_EQ(count_of(flat, "strategy::ratiomode::bands_for("), 2u);
     // No site keeps its own copy of the old in-band exit test.

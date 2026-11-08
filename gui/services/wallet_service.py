@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Any, Final, Optional
 
@@ -49,6 +50,14 @@ _RPC_TIMEOUT_S: Final[float] = 5.0
 # wait never blocks the UI, and an overlapping refresh is skipped while it
 # runs.
 _BALANCE_TIMEOUT_S: Final[float] = 15.0
+
+# How long WalletService.stop() waits for the worker thread.  quit() cannot
+# interrupt a blocking RPC, so stop() first asks the worker to abandon its
+# pass (checked between RPCs) and then waits out the one RPC that may be in
+# flight: at most one balance read, plus a margin.  Destroying a QThread
+# that is still running aborts the whole process, so a wait shorter than
+# the slowest RPC could crash the GUI on close.
+_STOP_WAIT_MS: Final[int] = int((_BALANCE_TIMEOUT_S + 5.0) * 1000)
 
 # Mojo conversion factor (1 XCH = 1e12 mojos).
 _MOJOS_PER_XCH: Final[float] = 1_000_000_000_000.0
@@ -104,6 +113,28 @@ class _WalletWorker(QObject):
         # Wallet ids whose last balance read failed, so the failure is
         # logged at INFO once (and the recovery once), not every refresh.
         self._failed_wallets: set[Any] = set()
+        # Set from the GUI thread by WalletService.stop(); read here between
+        # RPCs, so a pass in progress ends after its current call instead
+        # of running every remaining balance read during shutdown.
+        self._abort: threading.Event = threading.Event()
+
+    def request_abort(self) -> None:
+        """Ask a pass in progress to stop after its current RPC.
+
+        Called directly from the GUI thread (``threading.Event`` is
+        thread-safe); a queued slot would only run after the pass ends.
+        """
+        self._abort.set()
+
+    def clear_abort(self) -> None:
+        """Allow passes again (the service is being started)."""
+        self._abort.clear()
+
+    def _aborted(self) -> bool:
+        if self._abort.is_set():
+            _log.debug("Wallet balance pass abandoned: service stopping")
+            return True
+        return False
 
     @Slot(dict)
     def set_params(self, params: dict) -> None:
@@ -154,8 +185,11 @@ class _WalletWorker(QObject):
         dict[str, dict[str, float]]
             Mapping of wallet name to ``{spendable, confirmed,
             pending_change, unconfirmed}`` in display units (XCH or
-            token units).  Empty on failure.
+            token units).  Empty on failure, and when the service is
+            stopping (checked before each RPC).
         """
+        if self._aborted():
+            return {}
         try:
             import requests  # type: ignore[import-untyped]
             import urllib3
@@ -185,6 +219,8 @@ class _WalletWorker(QObject):
                 pass  # Login may already be active.
 
         # Step 1.5: Query wallet sync status.
+        if self._aborted():
+            return {}
         try:
             sync_resp = requests.post(
                 f"{base_url}/get_sync_status",
@@ -210,6 +246,8 @@ class _WalletWorker(QObject):
             self._last_sync_status = {"connected": False, "synced": False, "syncing": False}
 
         # Step 2: Get list of wallets.
+        if self._aborted():
+            return {}
         try:
             resp = requests.post(
                 f"{base_url}/get_wallets",
@@ -233,6 +271,8 @@ class _WalletWorker(QObject):
 
         # Step 3: Query balance for each wallet.
         for wallet in wallets:
+            if self._aborted():
+                return {}
             wallet_id = wallet.get("id")
             wallet_name = wallet.get("name", f"Wallet {wallet_id}")
             wallet_type = wallet.get("type", _WALLET_TYPE_STANDARD)
@@ -283,6 +323,8 @@ class _WalletWorker(QObject):
                     m = _ASSET_ID_RE.search(wallet_name)
                     if m:
                         asset_id = m.group(0).lower()
+                if not asset_id and self._aborted():
+                    return {}
                 if not asset_id:
                     try:
                         aid_resp = requests.post(
@@ -427,17 +469,22 @@ class WalletService(QObject):
             _log.warning("WalletService.start() called but thread already running.")
             return
         _log.info("Starting WalletService worker thread.")
+        self._worker.clear_abort()
         self._thread.start()
 
     def stop(self) -> None:
         """Cleanly shut down the worker thread.
 
-        Safe to call even if the service was never started.
+        Safe to call even if the service was never started.  A balance
+        pass in progress is abandoned after its current RPC, and the wait
+        covers that one RPC (``_STOP_WAIT_MS``), so the thread has ended
+        before the service, and with it the QThread, is destroyed.
         """
         _log.info("Stopping WalletService.")
+        self._worker.request_abort()
         if self._thread.isRunning():
             self._thread.quit()
-            if not self._thread.wait(5_000):
+            if not self._thread.wait(_STOP_WAIT_MS):
                 _log.warning("WalletService worker thread did not exit in time.")
 
     # ===================================================================

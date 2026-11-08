@@ -21498,11 +21498,16 @@ std::optional<double> Engine::ratio_mode_ratio(const PairConfig& pc,
 {
     const double mid = market_data_->get_mid_price(pair_name);
     if (!(mid > 0.0)) return std::nullopt;
-    const Mojo mid_mojos = static_cast<Mojo>(std::llround(
-        mid * static_cast<double>(kMojosPerXch)));
+    // [review] Checked, not cast: a tiny positive mid rounds to 0 mojos, and
+    // inventory_ratio() reads a zero price as "no price" and returns 0.5,
+    // which would walk a pair out of its mode on no observation at all.  A
+    // huge one overflows llround.  Either way there is nothing to decide on.
+    const std::optional<Mojo> mid_mojos =
+        to_mojo_checked(mid * static_cast<double>(kMojosPerXch));
+    if (!mid_mojos || *mid_mojos <= 0) return std::nullopt;
     return inventory_->inventory_ratio(AssetId{pc.base_asset_id},
                                        AssetId{pc.quote_asset_id},
-                                       mid_mojos);
+                                       *mid_mojos);
 }
 
 bool Engine::ratio_mode_held(const std::string& pair_name,
