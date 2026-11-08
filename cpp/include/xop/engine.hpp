@@ -3160,20 +3160,19 @@ private:
     };
     std::unordered_map<std::string, WalletBalanceEntry> cached_wallet_balances_;
 
-    // [STARTUP-BALANCES 2026-11-08] The startup seed's wallet reads, taken
-    // from a wallet the sync wait saw synced and only from replies carrying
-    // confirmed_wallet_balance and pending_change.  Read by Step 4's
-    // target-gap valuation alone, for a coin cached_wallet_balances_ has no
-    // validated entry for yet, and subject to the same age limit.  The cache
-    // is filled by Step 8, which runs after Step 4 and pair by pair, so the
-    // first heartbeat after a restart valued the portfolio with the last
-    // pair's coin missing (2026-11-08: XCH/DBX is last, "DBX: no validated
-    // wallet balance"), switched the floor off, planned one bid on each
-    // XCH-quoted pair and began cancelling their resting bid ladders.  Kept
-    // out of the cache on purpose: the cache's other readers (Step 11's
-    // one-shot reconcile, the ledger invariant, the bridge scans) reconcile
-    // the books against it, and a boot read taken before a downtime fill was
-    // processed must never reach them.
+    // [STARTUP-BALANCES 2026-11-08]
+    //   What:   the startup seed's wallet reads, from a wallet the sync wait
+    //           saw synced and only from replies carrying
+    //           confirmed_wallet_balance and pending_change; written once.
+    //   Reader: Step 4's target-gap valuation alone, for a coin
+    //           cached_wallet_balances_ has no validated entry for yet, with
+    //           the cache's age limit.  Step 8 fills the cache after Step 4,
+    //           so without this the first heartbeat valued its targets with a
+    //           coin missing and switched the bid floor off.
+    //   Never copied into cached_wallet_balances_: Step 11's reconcile, the
+    //           ledger invariant and the bridge scans reconcile the books
+    //           against the cache, and a boot read that predates a downtime
+    //           fill being processed must never reach them.
     std::unordered_map<std::string, WalletBalanceEntry> startup_wallet_balances_;
 
     // [SEED-FAIL-CLOSED 2026-09-22] Assets whose State position the startup

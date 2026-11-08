@@ -1487,10 +1487,14 @@ TEST(SizingWiring, StartupBalancesValueTheFirstHeartbeatsTargetsOnly) {
 
     // Written once, at startup; read by Step 4 alone.  Nothing copies it into
     // the cache Step 11, the ledger invariant and the bridge scans reconcile
-    // against.
-    EXPECT_EQ(count_of(engine, "startup_wallet_balances_["), 1u);
-    EXPECT_EQ(count_of(engine, "startup_wallet_balances_.find("), 1u);
+    // against.  (Scanned squeezed, like the needles: a needle with a space in
+    // it never matches the raw source.)
+    const std::string flat = squeeze(engine);
+    EXPECT_EQ(count_of(flat, "startup_wallet_balances_["), 1u);
+    EXPECT_EQ(count_of(flat, "startup_wallet_balances_.find("), 1u);
     EXPECT_EQ(count_of(step4, "startup_wallet_balances_.find("), 1u);
-    EXPECT_EQ(position_of(engine, "cached_wallet_balances_[aid] ="), std::string::npos);
-    EXPECT_EQ(position_of(engine, "cached_wallet_balances_ = startup_wallet_balances_"), std::string::npos);
+    EXPECT_EQ(position_of(boot, "cached_wallet_balances_"), std::string::npos);
+    EXPECT_EQ(position_of(flat, "cached_wallet_balances_ = startup_wallet_balances_"), std::string::npos);
+    EXPECT_EQ(position_of(flat, "cached_wallet_balances_.insert(startup_wallet_balances_"),
+              std::string::npos);
 }
