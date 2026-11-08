@@ -146,10 +146,10 @@ TEST(SizingWiring, TargetGapValuationIsGatedValidatedAndFresh) {
               std::string::npos);
     EXPECT_NE(position_of(body, "gap_cached != cached_wallet_balances_.end() && gap_cached->second.fields_validated"),
               std::string::npos);
-    EXPECT_NE(position_of(body, "const Mojo gap_confirmed = gap_cached->second.confirmed;"), std::string::npos);
+    EXPECT_NE(position_of(body, "const Mojo gap_confirmed = gap_entry->confirmed;"), std::string::npos);
     EXPECT_NE(position_of(body, "gap_holding.balance_known = true;"), std::string::npos);
-    EXPECT_NE(position_of(body, "gap_holding.balance_age_blocks = block_height > gap_cached->second.as_of_block "
-                                "? block_height - gap_cached->second.as_of_block : 0u;"),
+    EXPECT_NE(position_of(body, "gap_holding.balance_age_blocks = block_height > gap_entry->as_of_block "
+                                "? block_height - gap_entry->as_of_block : 0u;"),
               std::string::npos);
     EXPECT_NE(position_of(body, "gap_holding.priced = gap_confirmed == 0 || gap_rate > 0.0;"), std::string::npos);
     EXPECT_EQ(count_of(body, "value_targeted("), 1u);
@@ -1437,4 +1437,79 @@ TEST(SizingWiring, RatioModesAreSavedOnEveryTransitionAndRestoredAtStartup) {
     // Only startup adds to the hold; only the release removes from it.
     EXPECT_EQ(count_of(flat, "ratio_mode_held_pairs_.insert("), 1u);
     EXPECT_EQ(count_of(flat, "ratio_mode_held_pairs_.erase("), 1u);
+}
+
+// [STARTUP-BALANCES 2026-11-08] The first heartbeat after a restart valued the
+// targets before Step 8 had cached the last pair's coin ("DBX: no validated
+// wallet balance"), switched the target-gap bid floor off, planned one bid on
+// each XCH-quoted pair and began cancelling their resting bid ladders.  The
+// startup seed's synced reads now stand in for Step 4 alone, aged like the
+// cache, and never reach the cache the books are reconciled against.
+TEST(SizingWiring, StartupBalancesValueTheFirstHeartbeatsTargetsOnly) {
+    const std::string engine = read_engine_cpp();
+    const std::string boot = function_body(engine, "asio::awaitable<void> Engine::poll_loop_coro()");
+    ASSERT_FALSE(boot.empty()) << XOP_TESTS_ENGINE_CPP;
+    // Stamped with a height read after the sync wait, from a synced wallet only.
+    const std::size_t wait_at = position_of(boot, "bool startup_wallet_synced = false;");
+    const std::size_t height_at = position_of(boot,
+        "BlockHeight startup_balance_height = 0; if (startup_wallet_synced) {");
+    const std::size_t read_at = position_of(boot, "auto bal_json = co_await wallet_->get_wallet_balance(wid);");
+    const std::size_t keep_at = position_of(boot,
+        "if (startup_balance_height > 0 && bal_json.contains(\"confirmed_wallet_balance\") "
+        "&& bal_json.contains(\"pending_change\")) { startup_wallet_balances_[aid] = "
+        "{spendable, confirmed, bal_json.value(\"pending_change\", static_cast<Mojo>(0)), "
+        "startup_balance_height, std::chrono::system_clock::now(), true}; }");
+    ASSERT_NE(wait_at, std::string::npos);
+    ASSERT_NE(height_at, std::string::npos);
+    ASSERT_NE(read_at, std::string::npos);
+    ASSERT_NE(keep_at, std::string::npos);
+    EXPECT_LT(wait_at, height_at);
+    EXPECT_LT(height_at, read_at);
+    EXPECT_LT(read_at, keep_at);
+    // The node only while trusted (an auto-mode fallback closes it but keeps
+    // the pointer), and the reply range-checked before the narrowing cast.
+    const std::size_t source_at = position_of(boot,
+        "std::int64_t height = 0; if (full_node_ && !wallet_only_mode_) { "
+        "height = co_await full_node_->get_block_height(); } else { "
+        "height = co_await wallet_->get_height_info(); }");
+    const std::size_t range_at = position_of(boot,
+        "if (risk::height_in_range(height)) { "
+        "startup_balance_height = static_cast<BlockHeight>(height); }");
+    ASSERT_NE(source_at, std::string::npos);
+    ASSERT_NE(range_at, std::string::npos);
+    EXPECT_LT(height_at, source_at);
+    EXPECT_LT(source_at, range_at);
+    EXPECT_LT(range_at, read_at);
+    EXPECT_EQ(count_of(boot, "startup_balance_height = static_cast<BlockHeight>("), 1u);
+
+    // Step 4 falls back to it only for a coin the cache has no validated
+    // entry for, before valuing, and ages it like the cache.
+    const std::string step4 = function_body(engine, kComputeQuotesSignature);
+    ASSERT_FALSE(step4.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t cache_at = position_of(step4,
+        "const WalletBalanceEntry* gap_entry = (gap_cached != cached_wallet_balances_.end() "
+        "&& gap_cached->second.fields_validated) ? &gap_cached->second : nullptr;");
+    const std::size_t boot_at = position_of(step4,
+        "if (gap_entry == nullptr && gap_id) { const auto gap_boot = startup_wallet_balances_.find(*gap_id);");
+    const std::size_t value_at = position_of(step4, kValuationCall);
+    ASSERT_NE(cache_at, std::string::npos);
+    ASSERT_NE(boot_at, std::string::npos);
+    ASSERT_NE(value_at, std::string::npos);
+    EXPECT_LT(cache_at, boot_at);
+    EXPECT_LT(boot_at, value_at);
+    EXPECT_NE(position_of(step4, "gap_boot->second.fields_validated) { gap_entry = &gap_boot->second; }"),
+              std::string::npos);
+
+    // Written once, at startup; read by Step 4 alone.  Nothing copies it into
+    // the cache Step 11, the ledger invariant and the bridge scans reconcile
+    // against.  (Scanned squeezed, like the needles: a needle with a space in
+    // it never matches the raw source.)
+    const std::string flat = squeeze(engine);
+    EXPECT_EQ(count_of(flat, "startup_wallet_balances_["), 1u);
+    EXPECT_EQ(count_of(flat, "startup_wallet_balances_.find("), 1u);
+    EXPECT_EQ(count_of(step4, "startup_wallet_balances_.find("), 1u);
+    EXPECT_EQ(position_of(boot, "cached_wallet_balances_"), std::string::npos);
+    EXPECT_EQ(position_of(flat, "cached_wallet_balances_ = startup_wallet_balances_"), std::string::npos);
+    EXPECT_EQ(position_of(flat, "cached_wallet_balances_.insert(startup_wallet_balances_"),
+              std::string::npos);
 }

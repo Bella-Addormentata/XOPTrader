@@ -3369,6 +3369,40 @@ asio::awaitable<void> Engine::poll_loop_coro()
             // returns, biasing the irreducible in-flight race toward
             // skip (degrades to an adjust) over double-book.
             std::unordered_map<AssetId, std::string> genesis_observed_at;
+            // [STARTUP-BALANCES 2026-11-08] The height the reads below are
+            // stamped with for Step 4's first valuation (engine.hpp).  Read
+            // now, not reused from startup_block_: the sync wait can take
+            // minutes.  Unread, nothing is kept, and the first heartbeat
+            // values the portfolio as before.
+            // [review] The node only while the engine trusts it: an auto-mode
+            // start that fell back to wallet-only closed full_node_ but left
+            // the pointer set.  And the reply is range-checked before the
+            // narrowing cast: a -1 would wrap to a stamp no later real height
+            // reaches, and the boot read would never age out.
+            BlockHeight startup_balance_height = 0;
+            if (startup_wallet_synced) {
+                try {
+                    std::int64_t height = 0;
+                    if (full_node_ && !wallet_only_mode_) {
+                        height = co_await full_node_->get_block_height();
+                    } else {
+                        height = co_await wallet_->get_height_info();
+                    }
+                    if (risk::height_in_range(height)) {
+                        startup_balance_height = static_cast<BlockHeight>(height);
+                    } else {
+                        spdlog::debug("[Engine] Startup: block height {} out of "
+                                      "range -- the first heartbeat values the "
+                                      "targets without the startup balances",
+                                      height);
+                    }
+                } catch (const std::exception& e) {
+                    spdlog::debug("[Engine] Startup: no block height for the "
+                                  "startup balances ({}) -- the first "
+                                  "heartbeat values the targets without them",
+                                  e.what());
+                }
+            }
             for (const auto& aid : seed_asset_ids) {
                 auto wid = offer_mgr_->resolve_wallet_id(aid);
                 if (wid <= 0) {
@@ -3411,6 +3445,17 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     // falls to the unverified path below.
                     if (startup_wallet_synced && bal_json.contains("confirmed_wallet_balance")) {
                         state_seed_confirmed[aid] = confirmed;
+                    }
+                    // [STARTUP-BALANCES 2026-11-08] For Step 4's first
+                    // valuation only (engine.hpp), in the cache's write shape.
+                    if (startup_balance_height > 0
+                        && bal_json.contains("confirmed_wallet_balance")
+                        && bal_json.contains("pending_change")) {
+                        startup_wallet_balances_[aid] =
+                            {spendable, confirmed,
+                             bal_json.value("pending_change", static_cast<Mojo>(0)),
+                             startup_balance_height,
+                             std::chrono::system_clock::now(), true};
                     }
                     // [S19 review round 6] The bridge asset records
                     // its opening even at ZERO balance: the zero-opening
@@ -3488,6 +3533,13 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 spdlog::info("[Engine] Inventory seeded from wallet: "
                              "total {} mojos across {} assets",
                              total_seeded, seed_asset_ids.size());
+            }
+            if (!startup_wallet_balances_.empty()) {
+                spdlog::info("[Engine] Startup: kept the wallet balances of {} "
+                             "of {} assets (block {}) for the first heartbeat's "
+                             "target-gap valuation",
+                             startup_wallet_balances_.size(),
+                             seed_asset_ids.size(), startup_balance_height);
             }
 
             // [PNL-BASIS-PERSIST] Persist the post-restore/post-seed state
@@ -7535,13 +7587,25 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         const auto gap_id = pace_asset_id_for_key(gap_key);
         const auto gap_cached = gap_id ? cached_wallet_balances_.find(*gap_id)
                                        : cached_wallet_balances_.end();
-        if (gap_cached != cached_wallet_balances_.end() && gap_cached->second.fields_validated) {
-            const Mojo gap_confirmed = gap_cached->second.confirmed;
+        // [STARTUP-BALANCES 2026-11-08] Until Step 8 or the pace refresh
+        // caches a coin, its synced startup read stands in, aged like any
+        // cached balance (engine.hpp).
+        const WalletBalanceEntry* gap_entry =
+            (gap_cached != cached_wallet_balances_.end() && gap_cached->second.fields_validated)
+                ? &gap_cached->second : nullptr;
+        if (gap_entry == nullptr && gap_id) {
+            const auto gap_boot = startup_wallet_balances_.find(*gap_id);
+            if (gap_boot != startup_wallet_balances_.end() && gap_boot->second.fields_validated) {
+                gap_entry = &gap_boot->second;
+            }
+        }
+        if (gap_entry != nullptr) {
+            const Mojo gap_confirmed = gap_entry->confirmed;
             const double gap_rate = (*gap_id == "xch")
                 ? 1.0 : state_->get_asset_xch_rate(AssetId{*gap_id});
             gap_holding.balance_known = true;
-            gap_holding.balance_age_blocks = block_height > gap_cached->second.as_of_block
-                ? block_height - gap_cached->second.as_of_block : 0u;
+            gap_holding.balance_age_blocks = block_height > gap_entry->as_of_block
+                ? block_height - gap_entry->as_of_block : 0u;
             gap_holding.priced = gap_confirmed == 0 || gap_rate > 0.0;
             gap_holding.xch_value = gap_holding.priced
                 ? static_cast<double>(gap_confirmed) * gap_rate / static_cast<double>(kMojosPerXch)
