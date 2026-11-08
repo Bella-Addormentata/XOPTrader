@@ -5,6 +5,50 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.47] — 2026-11-08 — ratio modes switch on when a pair drifts 10 points
+
+### Apply on the Wallet tab caps each pair's ratio entry band at 0.10 (#223)
+
+Apply on the Wallet Balances tab turns each asset's "Target % ±"
+tolerance into a per-pair entry band, `strategy.ratio_band_enter_by_pair`.
+A wide tolerance used to make a wide band: XCH's ±40 points wrote bands
+of 0.38 to 0.49. On 2026-11-08, XCH/wUSDC.b and XCH/DBX sat 21 and 26
+points under their target ratios and still could not enter AcquireBase,
+so XCH/wUSDC.b kept offering about 33 XCH in asks.
+
+Now:
+
+- The band Apply writes is capped at 0.10, the engine's own default. A
+  narrow tolerance can still make it stricter.
+- The tolerances themselves are unchanged. The drift guard and the drift
+  corrector still read them.
+
+An existing install picks up the cap at its next Apply. New installs
+already use 0.10.
+
+### A side that ratio mode keeps small posts one offer, not a full minimum ladder (#223)
+
+In AcquireBase the ask side is tapered, and in AcquireQuote the bid side
+is. On a pair with tier minimums, a tapered side that could not fund even
+its widest tier used to fall back to the plain ladder: every tier at the
+pair minimum. On 2026-11-08 the XCH/DBX ask, tapered to 0.017 XCH, posted
+six 1 XCH asks where Neutral had posted one.
+
+That side now posts one offer, the same single offer it gets in Neutral.
+The offer sits on the widest tier the side planned. It is sized at the
+minimum of the ladder's widest tier, even when a tiny pool planned only
+tighter tiers with larger minimums. If the funding budget cannot pay for
+it, the side posts nothing. Either way, the side's other resting offers
+are retired.
+
+After installing, look for:
+
+- `Step 7: XCH/DBX ASK kept small by ratio mode AcquireBase: … so it posts
+  one offer at that minimum, not the plain ladder`, and no
+  `XCH/DBX ASK tier minimums set aside` warning.
+- One XCH/DBX ask. The five tighter asks it posted at 1 XCH each are
+  retired (`tier_min_unplanned`).
+
 ## [0.10.46] — 2026-11-08 — bid ladders stay up through a restart
 
 ### The first heartbeat after a restart keeps the bid ladders (#220)
