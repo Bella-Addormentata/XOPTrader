@@ -13394,15 +13394,32 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                         // [RATIO-TAPER-MIN 2026-11-08] The side ratio
                         // rebalancing tapers (the ask in AcquireBase, the
                         // bid in AcquireQuote; the deploy-idle floor leaves
-                        // it alone) keeps only its widest tier at its
-                        // minimum, not the plain ladder at the pair minimum:
-                        // on 2026-11-08 the XCH/DBX ask, tapered to 0.017
-                        // XCH in AcquireBase, posted six 1 XCH asks where
-                        // Neutral had posted one.
+                        // it alone) posts one offer, not the plain ladder at
+                        // the pair minimum: on 2026-11-08 the XCH/DBX ask,
+                        // tapered to 0.017 XCH in AcquireBase, posted six
+                        // 1 XCH asks where Neutral had posted one.  That
+                        // offer is the side's widest planned tier at the
+                        // minimum of the ladder's widest tier: a CAT pool
+                        // too small to give every tier a mojo plans only its
+                        // tightest tiers, whose own minimums are the largest.
+                        // Costed at that size, not one a tier grew to.
+                        std::optional<TierQuote> widest_offer;
+                        for (const auto& tq : pcs.ladder) {
+                            if (tq.side == side) widest_offer = tq;
+                        }
+                        if (widest_offer.has_value() && ladder_cfg.num_tiers > 0) {
+                            TierQuote widest_tier = *widest_offer;
+                            widest_tier.tier_index =
+                                static_cast<std::uint8_t>(ladder_cfg.num_tiers - 1);
+                            widest_offer->size = tier_min_mojos(widest_tier);
+                        }
                         const std::optional<std::size_t> tapered_keep =
-                            strategy::tiermin::tapered_side_tiers_when_unfunded(
-                                fit, is_ask ? !floor_ask : !floor_bid,
-                                side_costs(), min_budget);
+                            widest_offer.has_value()
+                                ? strategy::tiermin::tapered_side_tiers_when_unfunded(
+                                      fit, is_ask ? !floor_ask : !floor_bid,
+                                      min_sizes.size(), tier_cost(*widest_offer),
+                                      min_budget)
+                                : std::nullopt;
                         if (tapered_keep.has_value()) {
                             spdlog::info(
                                 "[Engine] Step 7: {} {} kept small by ratio "
@@ -13411,10 +13428,8 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                                 pair_name, is_ask ? "ASK" : "BID",
                                 strategy::ratiomode::mode_name(idle_ratio_mode), side_pool,
                                 *tapered_keep > 0
-                                    ? std::string("only that tier at its minimum, "
-                                                  "not the plain ladder")
-                                    : std::string("no tier: its ") + funding_asset
-                                          + " budget cannot pay that tier either");
+                                    ? "one offer at that minimum, not the plain ladder"
+                                    : "nothing: its budget cannot pay that offer either");
                         }
                         if (fit == 0 && !min_sizes.empty() && !tapered_keep.has_value()) {
                             for (auto& tq : pcs.ladder) {
@@ -13444,17 +13459,31 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                                             return seen++ < skip;
                                         }),
                                     pcs.ladder.end());
-                                spdlog::info(
-                                    "[Engine] Step 7: {} {} skipped the {} "
-                                    "tightest of {} tiers: the side's pool of "
-                                    "{} base mojos and its {} budget fund only "
-                                    "the {} widest at their tier minimums",
-                                    pair_name, is_ask ? "ASK" : "BID", skip,
-                                    min_sizes.size(), side_pool, funding_asset, kept);
+                                if (!tapered_keep.has_value()) {
+                                    spdlog::info(
+                                        "[Engine] Step 7: {} {} skipped the {} "
+                                        "tightest of {} tiers: the side's pool of "
+                                        "{} base mojos and its {} budget fund only "
+                                        "the {} widest at their tier minimums",
+                                        pair_name, is_ask ? "ASK" : "BID", skip,
+                                        min_sizes.size(), side_pool, funding_asset, kept);
+                                }
                             }
-                            for (const auto& tq : pcs.ladder) {
-                                if (tq.side == side) {
-                                    pcs.tier_min_mojos[{side, tq.tier_index}] = tier_min_mojos(tq);
+                            if (tapered_keep.has_value()) {
+                                // The kept offer at that minimum, and the
+                                // minimum on record even when nothing is
+                                // kept, so Step 8 retires the side's other
+                                // resting offers (tier_min_unplanned).
+                                for (auto& tq : pcs.ladder) {
+                                    if (tq.side == side) tq.size = widest_offer->size;
+                                }
+                                pcs.tier_min_mojos[{side, widest_offer->tier_index}] =
+                                    widest_offer->size;
+                            } else {
+                                for (const auto& tq : pcs.ladder) {
+                                    if (tq.side == side) {
+                                        pcs.tier_min_mojos[{side, tq.tier_index}] = tier_min_mojos(tq);
+                                    }
                                 }
                             }
                         }

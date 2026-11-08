@@ -447,9 +447,9 @@ TEST(SizingWiring, TierMinimumsStayWithinThePoolAndTheBudget) {
 
 // [RATIO-TAPER-MIN 2026-11-08] The side ratio rebalancing tapers -- the ask in
 // AcquireBase, the bid in AcquireQuote, the one the deploy-idle floor leaves
-// alone -- keeps only its widest tier at its minimum when it cannot fund that
-// tier, never the plain ladder: on 2026-11-08 the XCH/DBX ask, tapered to
-// 0.017 XCH in AcquireBase, posted six 1 XCH asks where Neutral had posted one.
+// alone -- posts one offer when it cannot fund its widest tier, never the
+// plain ladder: on 2026-11-08 the XCH/DBX ask, tapered to 0.017 XCH in
+// AcquireBase, posted six 1 XCH asks where Neutral had posted one.
 TEST(SizingWiring, ARatioTaperedSideNeverPostsThePlainLadder) {
     const std::string body = function_body(read_engine_cpp(), kLadderSignature);
     ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
@@ -459,10 +459,18 @@ TEST(SizingWiring, ARatioTaperedSideNeverPostsThePlainLadder) {
     const std::size_t fit_at = position_of(body,
         "const std::size_t fit = strategy::tiermin::widest_tiers_within_pool("
         "min_sizes, side_costs(), side_pool, min_budget);");
+    // The one offer is the side's widest planned tier, sized and costed at
+    // the minimum of the ladder's widest configured tier, not the tier's own
+    // minimum or a size it grew to.
+    const std::size_t widest_at = position_of(body,
+        "for (const auto& tq : pcs.ladder) { if (tq.side == side) widest_offer = tq; }");
+    const std::size_t widest_min_at = position_of(body,
+        "widest_tier.tier_index = static_cast<std::uint8_t>(ladder_cfg.num_tiers - 1); "
+        "widest_offer->size = tier_min_mojos(widest_tier);");
     const std::size_t tapered_at = position_of(body,
-        "const std::optional<std::size_t> tapered_keep = "
         "strategy::tiermin::tapered_side_tiers_when_unfunded( "
-        "fit, is_ask ? !floor_ask : !floor_bid, side_costs(), min_budget);");
+        "fit, is_ask ? !floor_ask : !floor_bid, min_sizes.size(), "
+        "tier_cost(*widest_offer), min_budget)");
     // The plain ladder only when the helper does not apply; otherwise its
     // count, or the fit, decides how many of the widest tiers stay.
     const std::size_t plain_gate_at = position_of(body,
@@ -472,21 +480,37 @@ TEST(SizingWiring, ARatioTaperedSideNeverPostsThePlainLadder) {
     const std::size_t kept_at = position_of(body,
         "const std::size_t kept = tapered_keep.value_or(fit); "
         "if (kept < min_sizes.size()) { const std::size_t skip = min_sizes.size() - kept;");
+    // The kept offer at that minimum, and the minimum on record even with
+    // nothing kept, so Step 8 retires the side's other resting offers.
+    const std::size_t resize_at = position_of(body,
+        "for (auto& tq : pcs.ladder) { "
+        "if (tq.side == side) tq.size = widest_offer->size; } "
+        "pcs.tier_min_mojos[{side, widest_offer->tier_index}] = widest_offer->size; }");
     const std::size_t record_at = position_of(body,
         "pcs.tier_min_mojos[{side, tq.tier_index}] = tier_min_mojos(tq);");
+    const std::size_t trim_at = position_of(body,
+        "const std::size_t keep = tiers_within_budget(costs, *budget);");
     ASSERT_NE(floor_ask_at, std::string::npos);
     ASSERT_NE(fit_at, std::string::npos);
+    ASSERT_NE(widest_at, std::string::npos);
+    ASSERT_NE(widest_min_at, std::string::npos);
     ASSERT_NE(tapered_at, std::string::npos);
     ASSERT_NE(plain_gate_at, std::string::npos);
     ASSERT_NE(plain_at, std::string::npos);
     ASSERT_NE(kept_at, std::string::npos);
+    ASSERT_NE(resize_at, std::string::npos);
     ASSERT_NE(record_at, std::string::npos);
+    ASSERT_NE(trim_at, std::string::npos);
     EXPECT_LT(floor_ask_at, fit_at);
-    EXPECT_LT(fit_at, tapered_at);
+    EXPECT_LT(fit_at, widest_at);
+    EXPECT_LT(widest_at, widest_min_at);
+    EXPECT_LT(widest_min_at, tapered_at);
     EXPECT_LT(tapered_at, plain_gate_at);
     EXPECT_LT(plain_gate_at, plain_at);
     EXPECT_LT(plain_at, kept_at);
-    EXPECT_LT(kept_at, record_at);
+    EXPECT_LT(kept_at, resize_at);
+    EXPECT_LT(resize_at, record_at);
+    EXPECT_LT(record_at, trim_at) << "the budget trim sees the kept offer's size";
     EXPECT_EQ(position_of(body, "if (fit == 0 && !min_sizes.empty()) {"), std::string::npos)
         << "a gate without the tapered check would post the plain ladder again";
 }

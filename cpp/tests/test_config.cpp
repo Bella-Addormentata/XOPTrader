@@ -4836,11 +4836,11 @@ TEST(TierMinimumMojos, ShortOfFundsTheTightestTiersGoFirst) {
 }
 
 // [RATIO-TAPER-MIN 2026-11-08] A side ratio rebalancing keeps small that
-// cannot fund even its widest tier at its minimum keeps that one tier, as the
-// deploy-idle floor gives the same side in Neutral, not the plain ladder.  On
-// 2026-11-08 the XCH/DBX ask, tapered to 0.017 XCH in AcquireBase, posted six
-// 1 XCH asks where Neutral had posted one.
-TEST(TierMinimumMojos, ARatioTaperedSideShortOfItsWidestMinimumKeepsOnlyThatTier) {
+// cannot fund even its widest tier at its minimum posts one offer at that
+// minimum, as the deploy-idle floor gives the same side in Neutral, not the
+// plain ladder.  On 2026-11-08 the XCH/DBX ask, tapered to 0.017 XCH in
+// AcquireBase, posted six 1 XCH asks where Neutral had posted one.
+TEST(TierMinimumMojos, ARatioTaperedSideShortOfItsWidestMinimumPostsOneOffer) {
     namespace tmin = xop::strategy::tiermin;
     constexpr xop::Mojo xch = 1'000'000'000'000;
     // The XCH/DBX ask ladder after the up-scale: 10, 8.2 ... 1 XCH, costed
@@ -4850,25 +4850,28 @@ TEST(TierMinimumMojos, ARatioTaperedSideShortOfItsWidestMinimumKeepsOnlyThatTier
     ASSERT_EQ(tmin::widest_tiers_within_pool(costs, costs, 17'130'843'070,
                                              xop::Mojo{164 * xch}), 0u)
         << "the 0.017 XCH pool funds no tier at its minimum";
-    EXPECT_EQ(tmin::tapered_side_tiers_when_unfunded(0, true, costs, xop::Mojo{164 * xch}),
+    EXPECT_EQ(tmin::tapered_side_tiers_when_unfunded(0, true, 6, xch, xop::Mojo{164 * xch}),
               std::optional<std::size_t>{1u})
-        << "the widest tier stays up at its minimum";
-    EXPECT_EQ(tmin::tapered_side_tiers_when_unfunded(0, true, costs, std::nullopt),
+        << "one offer at the widest minimum stays up";
+    EXPECT_EQ(tmin::tapered_side_tiers_when_unfunded(0, true, 6, xch, std::nullopt),
               std::optional<std::size_t>{1u})
         << "an unknown budget leaves the check to Step 8";
-    EXPECT_EQ(tmin::tapered_side_tiers_when_unfunded(0, true, costs, xop::Mojo{xch}),
+    EXPECT_EQ(tmin::tapered_side_tiers_when_unfunded(0, true, 6, xch, xop::Mojo{xch}),
               std::optional<std::size_t>{1u})
-        << "a budget of exactly that tier pays for it";
-    EXPECT_EQ(tmin::tapered_side_tiers_when_unfunded(0, true, costs, xop::Mojo{xch - 1}),
+        << "a budget of exactly that offer pays for it";
+    EXPECT_EQ(tmin::tapered_side_tiers_when_unfunded(0, true, 6, xch, xop::Mojo{xch - 1}),
               std::optional<std::size_t>{0u})
-        << "a budget short of that tier posts nothing on the side";
+        << "a budget short of that offer posts nothing on the side";
+    EXPECT_EQ(tmin::tapered_side_tiers_when_unfunded(0, true, 1, xch, xop::Mojo{xch}),
+              std::optional<std::size_t>{1u})
+        << "a side that planned only its tight tier still gets the one offer";
     // Not a tapered side, a side that fits some tiers, or a side with none:
     // the fit as before (0 sets the minimums aside).
-    EXPECT_FALSE(tmin::tapered_side_tiers_when_unfunded(0, false, costs, std::nullopt).has_value())
+    EXPECT_FALSE(tmin::tapered_side_tiers_when_unfunded(0, false, 6, xch, std::nullopt).has_value())
         << "a side the floor would have lifted keeps the plain ladder";
-    EXPECT_FALSE(tmin::tapered_side_tiers_when_unfunded(3, true, costs, std::nullopt).has_value())
+    EXPECT_FALSE(tmin::tapered_side_tiers_when_unfunded(3, true, 6, xch, std::nullopt).has_value())
         << "a tapered side that funds its three widest keeps them";
-    EXPECT_FALSE(tmin::tapered_side_tiers_when_unfunded(0, true, {}, std::nullopt).has_value());
+    EXPECT_FALSE(tmin::tapered_side_tiers_when_unfunded(0, true, 0, xch, std::nullopt).has_value());
 }
 
 // [TIERFIRST 2026-10-31] A side raised to its ladder of minimum offers posts
