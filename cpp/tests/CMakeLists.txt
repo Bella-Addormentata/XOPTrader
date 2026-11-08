@@ -63,6 +63,7 @@ add_executable(xop_tests
     test_sizing_wiring.cpp
     test_target_gap.cpp
     test_coin_budget.cpp
+    test_ratio_mode.cpp
     test_config.cpp
     test_config_reload.cpp
     test_config_live_apply.cpp

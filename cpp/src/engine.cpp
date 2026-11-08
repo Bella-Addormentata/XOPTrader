@@ -3294,6 +3294,31 @@ asio::awaitable<void> Engine::poll_loop_coro()
         }
     }
 
+    // [RATIO-MODE-PERSIST 2026-11-08] Resume each pair's ratio rebalance
+    // mode where the last process left it.  The modes reset to Neutral on
+    // every restart before this, and the wide enter bands then kept a pair
+    // that had been tapering its overweight side for days from tapering
+    // again (2026-11-07: XCH/wUSDC.b asks 4 -> 33 XCH).  A restored mode is
+    // checked against the current ratio and bands on the first heartbeat
+    // and exits as usual if the pair is already back near its target.
+    if (db_) {
+        for (const auto& row : db_->load_ratio_modes()) {
+            const auto mode = strategy::ratiomode::parse_mode(row.mode);
+            if (!mode) {
+                spdlog::warn("[Engine] Ignoring saved ratio mode '{}' for {} "
+                             "(not a mode this version knows)",
+                             row.mode, row.pair_name);
+                continue;
+            }
+            if (*mode == RatioRebalanceMode::Neutral) continue;
+            const PairConfig* pc = find_pair_config(row.pair_name);
+            if (!pc || !pc->enabled) continue;
+            ratio_rebalance_modes_[row.pair_name] = *mode;
+            spdlog::info("[Engine] Restored ratio mode {} for {} (saved {} UTC)",
+                         row.mode, row.pair_name, row.updated_at);
+        }
+    }
+
     if (inventory_ && offer_mgr_ && wallet_) {
         // Collect unique asset IDs across all enabled pairs.
         std::unordered_set<std::string> seed_asset_ids;
@@ -10349,55 +10374,24 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             }
 
             const RatioRebalanceMode prev_mode = it_mode->second;
-            double target = config_.strategy.ratio_target;
-            if (auto it_target = config_.strategy.ratio_target_by_pair.find(pair_name);
-                it_target != config_.strategy.ratio_target_by_pair.end()) {
-                target = it_target->second;
-            }
-            double enter_band = config_.strategy.ratio_band_enter;
-            double exit_band = config_.strategy.ratio_band_exit;
-            if (auto it_band = config_.strategy.ratio_band_enter_by_pair.find(pair_name);
-                it_band != config_.strategy.ratio_band_enter_by_pair.end()) {
-                enter_band = it_band->second;
-                // Keep exit_band <= enter_band so hysteresis stays consistent.
-                exit_band = std::min(exit_band, enter_band * 0.5);
-                if (exit_band <= 0.0) {
-                    exit_band = enter_band * 0.5;
-                }
-            }
-            const double upper_enter = target + enter_band;
-            const double lower_enter = target - enter_band;
-            const double upper_exit = target + exit_band;
-            const double lower_exit = target - exit_band;
+            // [RATIO-MODE-PERSIST 2026-11-08] Bands and hysteresis shared
+            // with Step 8 (xop/strategy/ratio_mode.hpp); a transition is
+            // saved so a restart resumes it.
+            const strategy::ratiomode::Bands bands = strategy::ratiomode::bands_for(
+                pair_name,
+                config_.strategy.ratio_target,
+                config_.strategy.ratio_band_enter,
+                config_.strategy.ratio_band_exit,
+                config_.strategy.ratio_target_by_pair,
+                config_.strategy.ratio_band_enter_by_pair);
+            const double target = bands.target;
+            const double enter_band = bands.enter;
 
-            RatioRebalanceMode next_mode = prev_mode;
-            if (prev_mode == RatioRebalanceMode::Neutral) {
-                if (inv_ratio >= upper_enter) {
-                    next_mode = RatioRebalanceMode::AcquireQuote;
-                } else if (inv_ratio <= lower_enter) {
-                    next_mode = RatioRebalanceMode::AcquireBase;
-                }
-            } else if (inv_ratio >= lower_exit && inv_ratio <= upper_exit) {
-                next_mode = RatioRebalanceMode::Neutral;
-            }
-
+            const RatioRebalanceMode next_mode =
+                strategy::ratiomode::next_mode(prev_mode, inv_ratio, bands);
             if (next_mode != prev_mode) {
-                it_mode->second = next_mode;
-                auto mode_name = [](RatioRebalanceMode m) {
-                    switch (m) {
-                        case RatioRebalanceMode::Neutral: return "Neutral";
-                        case RatioRebalanceMode::AcquireBase: return "AcquireBase";
-                        case RatioRebalanceMode::AcquireQuote: return "AcquireQuote";
-                    }
-                    return "Unknown";
-                };
-                spdlog::info("[Engine] Step 7: {} ratio mode {} -> {} "
-                             "(ratio={:.3f} target={:.3f})",
-                             pair_name,
-                             mode_name(prev_mode),
-                             mode_name(next_mode),
-                             inv_ratio,
-                             target);
+                set_ratio_mode(pair_name, prev_mode, next_mode, inv_ratio,
+                               bands, "Step 7");
             }
 
             const RatioRebalanceMode active_mode = it_mode->second;
@@ -15990,76 +15984,24 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 }
                 const RatioRebalanceMode prev_mode = it_mode->second;
 
-                double target = config_.strategy.ratio_target;
-                if (auto it_target = config_.strategy.ratio_target_by_pair.find(pair_name);
-                    it_target != config_.strategy.ratio_target_by_pair.end()) {
-                    target = it_target->second;
-                }
-                double enter_band = config_.strategy.ratio_band_enter;
-                double exit_band = config_.strategy.ratio_band_exit;
-                if (auto it_band = config_.strategy.ratio_band_enter_by_pair.find(pair_name);
-                    it_band != config_.strategy.ratio_band_enter_by_pair.end()) {
-                    enter_band = it_band->second;
-                    exit_band = std::min(exit_band, enter_band * 0.5);
-                    if (exit_band <= 0.0) {
-                        exit_band = enter_band * 0.5;
-                    }
-                }
-
-                const double upper_enter = target + enter_band;
-                const double lower_enter = target - enter_band;
-                const double upper_exit = target + exit_band;
-                const double lower_exit = target - exit_band;
-
-                RatioRebalanceMode next_mode = prev_mode;
-                if (prev_mode == RatioRebalanceMode::Neutral) {
-                    if (inv_ratio_rb >= upper_enter) {
-                        next_mode = RatioRebalanceMode::AcquireQuote;
-                    } else if (inv_ratio_rb <= lower_enter) {
-                        next_mode = RatioRebalanceMode::AcquireBase;
-                    }
-                } else if (inv_ratio_rb >= lower_exit && inv_ratio_rb <= upper_exit) {
-                    next_mode = RatioRebalanceMode::Neutral;
-                }
-
+                // [RATIO-MODE-PERSIST 2026-11-08] Same bands and hysteresis
+                // as Step 7 (xop/strategy/ratio_mode.hpp), saved on change.
+                const strategy::ratiomode::Bands bands = strategy::ratiomode::bands_for(
+                    pair_name,
+                    config_.strategy.ratio_target,
+                    config_.strategy.ratio_band_enter,
+                    config_.strategy.ratio_band_exit,
+                    config_.strategy.ratio_target_by_pair,
+                    config_.strategy.ratio_band_enter_by_pair);
+                const RatioRebalanceMode next_mode =
+                    strategy::ratiomode::next_mode(prev_mode, inv_ratio_rb, bands);
                 if (next_mode != prev_mode) {
-                    it_mode->second = next_mode;
-                    auto mode_name = [](RatioRebalanceMode m) {
-                        switch (m) {
-                            case RatioRebalanceMode::Neutral:
-                                return "Neutral";
-                            case RatioRebalanceMode::AcquireBase:
-                                return "AcquireBase";
-                            case RatioRebalanceMode::AcquireQuote:
-                                return "AcquireQuote";
-                        }
-                        return "Unknown";
-                    };
-                    spdlog::info("[Engine] Step 8: {} ratio mode {} -> {} "
-                                 "(ratio={:.3f} target={:.3f} enter=+/-{:.3f} "
-                                 "exit=+/-{:.3f})",
-                                 pair_name,
-                                 mode_name(prev_mode),
-                                 mode_name(next_mode),
-                                 inv_ratio_rb,
-                                 target,
-                                 enter_band,
-                                 exit_band);
+                    set_ratio_mode(pair_name, prev_mode, next_mode,
+                                   inv_ratio_rb, bands, "Step 8");
                 }
 
                 if (config_.strategy.ratio_force_one_sided) {
                     const RatioRebalanceMode active_mode = it_mode->second;
-                    auto mode_name = [](RatioRebalanceMode m) {
-                        switch (m) {
-                            case RatioRebalanceMode::Neutral:
-                                return "Neutral";
-                            case RatioRebalanceMode::AcquireBase:
-                                return "AcquireBase";
-                            case RatioRebalanceMode::AcquireQuote:
-                                return "AcquireQuote";
-                        }
-                        return "Unknown";
-                    };
                     if (active_mode == RatioRebalanceMode::AcquireBase) {
                         can_ask = false;
                     } else if (active_mode == RatioRebalanceMode::AcquireQuote) {
@@ -16069,7 +16011,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         spdlog::info("[Engine] Step 8: {} ratio mode {} "
                                      "enforced (can_bid={}, can_ask={})",
                                      pair_name,
-                                     mode_name(active_mode),
+                                     strategy::ratiomode::mode_name(active_mode),
                                      can_bid,
                                      can_ask);
                     }
@@ -21515,6 +21457,28 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
         valuation_holds_anything_ = (held_count > 0);
     }
     return risk::portfolio_equity_usd(inputs);
+}
+
+void Engine::set_ratio_mode(const std::string& pair_name,
+                            RatioRebalanceMode prev_mode,
+                            RatioRebalanceMode next_mode,
+                            double inv_ratio,
+                            const strategy::ratiomode::Bands& bands,
+                            const char* step)
+{
+    ratio_rebalance_modes_[pair_name] = next_mode;
+    spdlog::info("[Engine] {}: {} ratio mode {} -> {} "
+                 "(ratio={:.3f} target={:.3f} enter=+/-{:.3f} "
+                 "exit=+/-{:.3f})",
+                 step, pair_name,
+                 strategy::ratiomode::mode_name(prev_mode),
+                 strategy::ratiomode::mode_name(next_mode),
+                 inv_ratio, bands.target, bands.enter, bands.exit);
+    // [RATIO-MODE-PERSIST 2026-11-08] Saved so a restart resumes it.
+    if (db_) {
+        db_->save_ratio_mode(pair_name,
+                             strategy::ratiomode::mode_name(next_mode));
+    }
 }
 
 void Engine::persist_inventory_state() noexcept

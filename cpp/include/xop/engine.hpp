@@ -80,6 +80,7 @@
 #include "xop/strategy/pace_controller.hpp"
 #include "xop/strategy/revive.hpp"
 #include "xop/strategy/tier_minimums.hpp"
+#include "xop/strategy/ratio_mode.hpp"
 #include "xop/strategy/synthetic_price.hpp"
 #include "xop/strategy/no_loss_floor.hpp"
 #include "xop/risk/usd_route.hpp"
@@ -2545,12 +2546,21 @@ private:
         wait_grow_recent_offers_;
 
     // -- Ratio-based inventory rebalance mode (per pair) -------------------
-    enum class RatioRebalanceMode : std::uint8_t {
-        Neutral      = 0,
-        AcquireBase  = 1,
-        AcquireQuote = 2
-    };
+    // [RATIO-MODE-PERSIST 2026-11-08] The hysteresis lives in
+    // xop/strategy/ratio_mode.hpp; the modes are saved to the database on
+    // every transition and restored at startup (they used to reset to
+    // Neutral on every restart).
+    using RatioRebalanceMode = strategy::ratiomode::Mode;
     std::unordered_map<std::string, RatioRebalanceMode> ratio_rebalance_modes_;
+
+    /// Apply a mode transition: store it, log it, and save it so a restart
+    /// resumes from it.  @p step names the caller in the log ("Step 7").
+    void set_ratio_mode(const std::string& pair_name,
+                        RatioRebalanceMode prev_mode,
+                        RatioRebalanceMode next_mode,
+                        double inv_ratio,
+                        const strategy::ratiomode::Bands& bands,
+                        const char* step);
 
     // [H6] Portfolio-equity high-water mark for drawdown detection in
     // step 13 alerts.  Monotonically non-decreasing; updated each cycle in

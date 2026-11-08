@@ -1314,3 +1314,69 @@ TEST(SizingWiring, ListedTokenCoinPoolsAreCheckedEveryHeartbeatBeforeStep7) {
     EXPECT_EQ(count_of(pool, "cat_target_count, target_mojos"), 0u)
         << "no CAT split uses the global count once tokens are listed";
 }
+
+// [RATIO-MODE-PERSIST 2026-11-08] The ratio rebalance mode reset to Neutral
+// on every restart, and the wide enter bands then kept XCH/wUSDC.b, XCH/DBX
+// and XCH/BYC out of AcquireBase after the v0.10.44 install (XCH/wUSDC.b
+// asks 4 -> 33 XCH).  Both hysteresis sites now share one rule and save
+// each transition; startup restores the saved modes.
+TEST(SizingWiring, RatioModesAreSavedOnEveryTransitionAndRestoredAtStartup) {
+    const std::string engine = read_engine_cpp();
+    const std::string flat = squeeze(engine);
+
+    // Both sites: the shared bands and rule, then the saving setter.
+    const std::string ladder = function_body(engine, kLadderSignature);
+    const std::string offers = function_body(engine,
+        "asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)");
+    ASSERT_FALSE(ladder.empty()) << XOP_TESTS_ENGINE_CPP;
+    ASSERT_FALSE(offers.empty()) << XOP_TESTS_ENGINE_CPP;
+    EXPECT_NE(position_of(ladder,
+        "strategy::ratiomode::next_mode(prev_mode, inv_ratio, bands);"), std::string::npos);
+    EXPECT_NE(position_of(ladder,
+        "set_ratio_mode(pair_name, prev_mode, next_mode, inv_ratio, bands, \"Step 7\");"),
+              std::string::npos);
+    EXPECT_NE(position_of(offers,
+        "strategy::ratiomode::next_mode(prev_mode, inv_ratio_rb, bands);"), std::string::npos);
+    EXPECT_NE(position_of(offers,
+        "set_ratio_mode(pair_name, prev_mode, next_mode, inv_ratio_rb, bands, \"Step 8\");"),
+              std::string::npos);
+    EXPECT_EQ(count_of(flat, "strategy::ratiomode::bands_for("), 2u);
+    // No site keeps its own copy of the old in-band exit test.
+    EXPECT_EQ(position_of(flat, "inv_ratio>=lower_exit&&inv_ratio<=upper_exit"), std::string::npos);
+    EXPECT_EQ(position_of(flat, "inv_ratio_rb>=lower_exit&&inv_ratio_rb<=upper_exit"),
+              std::string::npos);
+
+    // The setter is the only writer of a mode other than the startup
+    // restore, and it saves what it stores.
+    const std::string setter = function_body(engine,
+        "void Engine::set_ratio_mode(const std::string& pair_name,");
+    ASSERT_FALSE(setter.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t store_at = position_of(setter, "ratio_rebalance_modes_[pair_name] = next_mode;");
+    const std::size_t save_at = position_of(setter,
+        "db_->save_ratio_mode(pair_name, strategy::ratiomode::mode_name(next_mode));");
+    ASSERT_NE(store_at, std::string::npos);
+    ASSERT_NE(save_at, std::string::npos);
+    EXPECT_LT(store_at, save_at);
+    EXPECT_EQ(count_of(flat, "it_mode->second=next_mode;"), 0u);
+
+    // Startup restores the saved non-Neutral modes of enabled pairs, right
+    // after the cost basis and before the first heartbeat can read them.
+    const std::string boot = function_body(engine, "asio::awaitable<void> Engine::poll_loop_coro()");
+    ASSERT_FALSE(boot.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t basis_at = position_of(boot, "const auto persisted = db_->load_inventory_state();");
+    const std::size_t load_at = position_of(boot, "for (const auto& row : db_->load_ratio_modes()) {");
+    const std::size_t restore_at = position_of(boot, "ratio_rebalance_modes_[row.pair_name] = *mode;");
+    ASSERT_NE(basis_at, std::string::npos);
+    ASSERT_NE(load_at, std::string::npos);
+    ASSERT_NE(restore_at, std::string::npos);
+    EXPECT_LT(basis_at, load_at);
+    EXPECT_LT(load_at, restore_at);
+    EXPECT_NE(position_of(boot,
+        "const auto mode = strategy::ratiomode::parse_mode(row.mode); if (!mode) {"),
+              std::string::npos);
+    EXPECT_NE(position_of(boot, "if (*mode == RatioRebalanceMode::Neutral) continue;"),
+              std::string::npos);
+    EXPECT_NE(position_of(boot,
+        "const PairConfig* pc = find_pair_config(row.pair_name); if (!pc || !pc->enabled) continue;"),
+              std::string::npos);
+}

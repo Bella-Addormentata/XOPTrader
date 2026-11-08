@@ -562,6 +562,47 @@ TEST(DatabaseTest, InventoryStateEmptyOnFirstRun) {
 }
 
 // ===========================================================================
+// ratio_rebalance_modes -- RATIO-MODE-PERSIST 2026-11-08
+// ===========================================================================
+
+TEST(DatabaseTest, RatioModesRoundTripAcrossReopen) {
+    TempDbPath temp("ratio_modes_roundtrip");
+    {
+        xop::Database db(temp.path().string());
+        db.save_ratio_mode("XCH/wUSDC.b", "AcquireBase");
+        db.save_ratio_mode("XCH/DBX", "AcquireBase");
+    }  // closes the connection -- simulated restart
+
+    xop::Database db2(temp.path().string());
+    const auto loaded = db2.load_ratio_modes();
+    ASSERT_EQ(loaded.size(), 2u);
+    for (const auto& row : loaded) {
+        EXPECT_TRUE(row.pair_name == "XCH/wUSDC.b" || row.pair_name == "XCH/DBX")
+            << row.pair_name;
+        EXPECT_EQ(row.mode, "AcquireBase");
+        EXPECT_FALSE(row.updated_at.empty());
+    }
+}
+
+TEST(DatabaseTest, RatioModeUpsertKeepsOneRowPerPair) {
+    TempDbPath temp("ratio_modes_upsert");
+    xop::Database db(temp.path().string());
+    db.save_ratio_mode("XCH/wUSDC.b", "AcquireBase");
+    db.save_ratio_mode("XCH/wUSDC.b", "Neutral");
+
+    const auto loaded = db.load_ratio_modes();
+    ASSERT_EQ(loaded.size(), 1u) << "upsert must not duplicate the pair row";
+    EXPECT_EQ(loaded[0].pair_name, "XCH/wUSDC.b");
+    EXPECT_EQ(loaded[0].mode, "Neutral");
+}
+
+TEST(DatabaseTest, RatioModesEmptyOnFirstRun) {
+    TempDbPath temp("ratio_modes_firstrun");
+    xop::Database db(temp.path().string());
+    EXPECT_TRUE(db.load_ratio_modes().empty());
+}
+
+// ===========================================================================
 // ledger_entries -- double-entry accounting (LEDGER 2026-07-30)
 // ===========================================================================
 
