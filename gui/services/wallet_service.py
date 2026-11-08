@@ -7,8 +7,9 @@ each wallet associated with the configured fingerprint.
 All HTTP I/O runs in a dedicated ``QThread`` worker (mirroring
 ``MetricsService``) so the GUI event loop is never blocked -- a full
 balance pass is log_in + get_wallets + one get_wallet_balance per
-wallet, each with a 5 s timeout, which measured 4-11 s when the wallet
-daemon is slow.
+wallet, which measured 4-11 s when the wallet daemon is slow.  Each
+balance read gets ``_BALANCE_TIMEOUT_S`` (see there): one CAT wallet with
+many coins can take longer to answer than the other calls.
 
 Compliant with:
     - ISO/IEC 27001:2022  (SSL certs loaded from disk, not embedded)
@@ -35,6 +36,19 @@ _log: logging.Logger = logging.getLogger(__name__)
 
 # Chia wallet RPC timeout (seconds).
 _RPC_TIMEOUT_S: Final[float] = 5.0
+
+# [DBX-BALANCE 2026-11-08] Timeout for one wallet's get_wallet_balance
+# (and the cat_get_asset_id fallback for the same wallet).  The daemon
+# computes spendable and max-send amounts from the wallet's coins, so a
+# CAT wallet holding many coins answers slowly: on 2026-11-07 one wallet
+# took 6.5-7 s on every call, all day.  At 5 s that read always timed out,
+# the wallet never reached the table, and once a GUI restart cleared the
+# cache DBX vanished from the Wallet Balances tab and from its Current %
+# (which then summed to 100% without DBX).  15 s is about twice the
+# slowest read seen (9.2 s).  The pass runs on the worker thread, so the
+# wait never blocks the UI, and an overlapping refresh is skipped while it
+# runs.
+_BALANCE_TIMEOUT_S: Final[float] = 15.0
 
 # Mojo conversion factor (1 XCH = 1e12 mojos).
 _MOJOS_PER_XCH: Final[float] = 1_000_000_000_000.0
@@ -87,6 +101,9 @@ class _WalletWorker(QObject):
         self._cert_path: Path = Path("")
         self._key_path: Path = Path("")
         self._last_sync_status: dict[str, Any] = {}
+        # Wallet ids whose last balance read failed, so the failure is
+        # logged at INFO once (and the recovery once), not every refresh.
+        self._failed_wallets: set[Any] = set()
 
     @Slot(dict)
     def set_params(self, params: dict) -> None:
@@ -230,16 +247,24 @@ class _WalletWorker(QObject):
                     json={"wallet_id": wallet_id},
                     cert=(str(self._cert_path), str(self._key_path)),
                     verify=False,
-                    timeout=_RPC_TIMEOUT_S,
+                    timeout=_BALANCE_TIMEOUT_S,
                 )
                 bal_resp.raise_for_status()
                 bal_data = bal_resp.json()
             except requests.RequestException as exc:
-                _log.debug("Failed to get balance for wallet %s: %s", wallet_id, exc)
+                self._note_balance_failure(wallet_id, wallet_name, str(exc))
                 continue
 
             if not bal_data.get("success"):
+                self._note_balance_failure(
+                    wallet_id, wallet_name,
+                    str(bal_data.get("error", "success=false")),
+                )
                 continue
+            if wallet_id in self._failed_wallets:
+                self._failed_wallets.discard(wallet_id)
+                _log.info("Balance read for wallet %s (%r) works again",
+                          wallet_id, wallet_name)
 
             balance = bal_data.get("wallet_balance", {})
 
@@ -265,7 +290,7 @@ class _WalletWorker(QObject):
                             json={"wallet_id": wallet_id},
                             cert=(str(self._cert_path), str(self._key_path)),
                             verify=False,
-                            timeout=_RPC_TIMEOUT_S,
+                            timeout=_BALANCE_TIMEOUT_S,
                         )
                         aid_resp.raise_for_status()
                         aid_data = aid_resp.json()
@@ -311,6 +336,20 @@ class _WalletWorker(QObject):
             }
 
         return result
+
+    def _note_balance_failure(self, wallet_id: Any, wallet_name: str,
+                              reason: str) -> None:
+        """Log a wallet whose balance could not be read: INFO the first
+        time (the wallet is missing from the table until a read works),
+        DEBUG while it keeps failing."""
+        if wallet_id in self._failed_wallets:
+            _log.debug("Balance read for wallet %s (%r) still failing: %s",
+                       wallet_id, wallet_name, reason)
+            return
+        self._failed_wallets.add(wallet_id)
+        _log.info("Balance read for wallet %s (%r) failed: %s -- it stays "
+                  "off the Wallet Balances tab until a read succeeds",
+                  wallet_id, wallet_name, reason)
 
 
 # ===================================================================
