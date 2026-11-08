@@ -3374,15 +3374,27 @@ asio::awaitable<void> Engine::poll_loop_coro()
             // now, not reused from startup_block_: the sync wait can take
             // minutes.  Unread, nothing is kept, and the first heartbeat
             // values the portfolio as before.
+            // [review] The node only while the engine trusts it: an auto-mode
+            // start that fell back to wallet-only closed full_node_ but left
+            // the pointer set.  And the reply is range-checked before the
+            // narrowing cast: a -1 would wrap to a stamp no later real height
+            // reaches, and the boot read would never age out.
             BlockHeight startup_balance_height = 0;
             if (startup_wallet_synced) {
                 try {
-                    if (full_node_) {
-                        startup_balance_height = static_cast<BlockHeight>(
-                            co_await full_node_->get_block_height());
+                    std::int64_t height = 0;
+                    if (full_node_ && !wallet_only_mode_) {
+                        height = co_await full_node_->get_block_height();
                     } else {
-                        startup_balance_height = static_cast<BlockHeight>(
-                            co_await wallet_->get_height_info());
+                        height = co_await wallet_->get_height_info();
+                    }
+                    if (risk::height_in_range(height)) {
+                        startup_balance_height = static_cast<BlockHeight>(height);
+                    } else {
+                        spdlog::debug("[Engine] Startup: block height {} out of "
+                                      "range -- the first heartbeat values the "
+                                      "targets without the startup balances",
+                                      height);
                     }
                 } catch (const std::exception& e) {
                     spdlog::debug("[Engine] Startup: no block height for the "

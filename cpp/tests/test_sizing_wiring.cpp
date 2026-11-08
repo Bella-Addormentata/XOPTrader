@@ -1466,6 +1466,21 @@ TEST(SizingWiring, StartupBalancesValueTheFirstHeartbeatsTargetsOnly) {
     EXPECT_LT(wait_at, height_at);
     EXPECT_LT(height_at, read_at);
     EXPECT_LT(read_at, keep_at);
+    // The node only while trusted (an auto-mode fallback closes it but keeps
+    // the pointer), and the reply range-checked before the narrowing cast.
+    const std::size_t source_at = position_of(boot,
+        "std::int64_t height = 0; if (full_node_ && !wallet_only_mode_) { "
+        "height = co_await full_node_->get_block_height(); } else { "
+        "height = co_await wallet_->get_height_info(); }");
+    const std::size_t range_at = position_of(boot,
+        "if (risk::height_in_range(height)) { "
+        "startup_balance_height = static_cast<BlockHeight>(height); }");
+    ASSERT_NE(source_at, std::string::npos);
+    ASSERT_NE(range_at, std::string::npos);
+    EXPECT_LT(height_at, source_at);
+    EXPECT_LT(source_at, range_at);
+    EXPECT_LT(range_at, read_at);
+    EXPECT_EQ(count_of(boot, "startup_balance_height = static_cast<BlockHeight>("), 1u);
 
     // Step 4 falls back to it only for a coin the cache has no validated
     // entry for, before valuing, and ages it like the cache.
