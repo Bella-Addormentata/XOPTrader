@@ -13,9 +13,10 @@
 // (Database::save_ratio_mode) and restores the saved modes at startup, so a
 // restart resumes the hysteresis where it left off.  A restored mode makes
 // no transition until the pair's holdings have been checked against the
-// wallet (Engine::ratio_mode_held), and both Step 7 and Step 8 decide on the
-// pair's own holdings ratio, never the cross-pair-adjusted one, so the two
-// sites cannot pull one mode in opposite directions.
+// wallet (Engine::ratio_mode_held), and both Step 7 and Step 8 decide on one
+// observation (Engine::ratio_mode_ratio): the pair's own holdings valued at
+// the published mid, never Step 7's blended centre or cross-pair-adjusted
+// ratio, so the two sites cannot pull one mode in opposite directions.
 //
 // A restored mode is only as current as the moment it was saved: the target
 // may have been edited, or the balances moved, while the engine was off.  So

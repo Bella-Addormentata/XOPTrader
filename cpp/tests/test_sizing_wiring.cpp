@@ -1331,36 +1331,39 @@ TEST(SizingWiring, RatioModesAreSavedOnEveryTransitionAndRestoredAtStartup) {
     ASSERT_FALSE(ladder.empty()) << XOP_TESTS_ENGINE_CPP;
     ASSERT_FALSE(offers.empty()) << XOP_TESTS_ENGINE_CPP;
     EXPECT_NE(position_of(ladder,
-        "strategy::ratiomode::next_mode(prev_mode, inv_ratio_holdings, bands); "
+        "if (const auto observed = ratio_mode_ratio(*pair_cfg, pair_name)) { "
+        "const RatioRebalanceMode next_mode = "
+        "strategy::ratiomode::next_mode(prev_mode, *observed, bands); "
         "if (next_mode != prev_mode && !ratio_mode_held(pair_name, *pair_cfg, block_height)) { "
-        "set_ratio_mode(pair_name, prev_mode, next_mode, inv_ratio_holdings, bands, \"Step 7\");"),
+        "set_ratio_mode(pair_name, prev_mode, next_mode, *observed, bands, \"Step 7\");"),
               std::string::npos);
+    EXPECT_NE(position_of(offers,
+        "if (const auto observed = ratio_mode_ratio(*pair_cfg, pair_name)) { "
+        "const double inv_ratio_rb = *observed;"), std::string::npos);
     EXPECT_NE(position_of(offers,
         "strategy::ratiomode::next_mode(prev_mode, inv_ratio_rb, bands); "
         "if (next_mode != prev_mode && !ratio_mode_held(pair_name, *pair_cfg, block_height)) { "
         "set_ratio_mode(pair_name, prev_mode, next_mode, inv_ratio_rb, bands, \"Step 8\");"),
               std::string::npos);
     EXPECT_EQ(count_of(flat, "set_ratio_mode(pair_name, prev_mode, next_mode,"), 2u);
+    EXPECT_EQ(count_of(flat, "strategy::ratiomode::next_mode("), 2u);
 
-    // [review] Both sites transition on the pair's own holdings.  Step 7
-    // takes its ratio BEFORE the cross-pair adjustment, which used to feed
-    // its transitions: raw 0.39 adjusted to 0.63 flipped the mode back and
-    // forth against Step 8 every heartbeat once overshoot exits existed.
-    const std::size_t own_at = position_of(ladder,
-        "inv_ratio = inventory_->inventory_ratio( AssetId{pair_cfg->base_asset_id}, "
-        "AssetId{pair_cfg->quote_asset_id}, mid_mojos); }");
-    const std::size_t raw_at = position_of(ladder, "const double inv_ratio_holdings = inv_ratio;");
-    const std::size_t cross_at = position_of(ladder,
-        "inv_ratio = std::clamp(inv_ratio + cross_adj, 0.0, 1.0);");
-    ASSERT_NE(own_at, std::string::npos);
-    ASSERT_NE(raw_at, std::string::npos);
-    ASSERT_NE(cross_at, std::string::npos);
-    EXPECT_LT(own_at, raw_at);
-    EXPECT_LT(raw_at, cross_at);
-    EXPECT_EQ(count_of(ladder, "inv_ratio_holdings ="), 1u);
-    EXPECT_NE(position_of(offers,
-        "const double inv_ratio_rb = inventory_->inventory_ratio( AssetId{pair_cfg->base_asset_id}, "
-        "AssetId{pair_cfg->quote_asset_id}, rb_mid_mojos);"), std::string::npos);
+    // [review] Both sites decide on ONE observation: the pair's own holdings
+    // valued at the published mid.  Step 7's inv_ratio is valued at its
+    // blended / reservation-shifted centre and carries the cross-pair
+    // adjustment; deciding on it let the two sites flip one mode back and
+    // forth every heartbeat once overshoot exits existed.
+    EXPECT_EQ(count_of(flat, "ratio_mode_ratio(*pair_cfg, pair_name)"), 2u);
+    const std::string observe = function_body(engine,
+        "std::optional<double> Engine::ratio_mode_ratio(const PairConfig& pc,");
+    ASSERT_FALSE(observe.empty()) << XOP_TESTS_ENGINE_CPP;
+    EXPECT_NE(position_of(observe,
+        "const double mid = market_data_->get_mid_price(pair_name); "
+        "if (!(mid > 0.0)) return std::nullopt;"), std::string::npos);
+    EXPECT_NE(position_of(observe,
+        "return inventory_->inventory_ratio(AssetId{pc.base_asset_id}, "
+        "AssetId{pc.quote_asset_id}, mid_mojos);"), std::string::npos);
+    EXPECT_EQ(position_of(ladder, "next_mode(prev_mode, inv_ratio,"), std::string::npos);
     EXPECT_EQ(count_of(flat, "strategy::ratiomode::bands_for("), 2u);
     // No site keeps its own copy of the old in-band exit test.
     EXPECT_EQ(position_of(flat, "inv_ratio>=lower_exit&&inv_ratio<=upper_exit"), std::string::npos);

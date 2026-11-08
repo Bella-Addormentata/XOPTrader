@@ -2563,6 +2563,13 @@ private:
     std::unordered_set<std::string> ratio_mode_held_pairs_;
     static constexpr BlockHeight kRatioModeHoldMaxBlocks = 192;  // ~1 hour
 
+    /// [RATIO-MODE-PERSIST review] The one observation both mode sites
+    /// decide on: the pair's own holdings ratio valued at the published mid
+    /// (MarketDataFeed::get_mid_price), without Step 7's blended centre,
+    /// reservation shift or cross-pair adjustment.  nullopt without a mid.
+    [[nodiscard]] std::optional<double> ratio_mode_ratio(
+        const PairConfig& pc, const std::string& pair_name) const;
+
     /// True while @p pair_name's restored mode is held (see above); the
     /// first call that finds it checked or timed out releases it.
     [[nodiscard]] bool ratio_mode_held(const std::string& pair_name,

@@ -10076,14 +10076,6 @@ void Engine::step_generate_ladder(BlockHeight block_height)
                 AssetId{pair_cfg->quote_asset_id},
                 mid_mojos);
         }
-        // [RATIO-MODE-PERSIST review] The pair's own holdings, before the
-        // cross-pair adjustment below.  The ratio rebalance mode transitions
-        // on this, as Step 8 does: Step 7 used to transition on the adjusted
-        // ratio and Step 8 on the raw one, and with the overshoot exit the
-        // two could flip the mode back and forth every heartbeat (raw 0.39
-        // adjusted to 0.63 around a 0.5 target).  The skew stays a pricing
-        // and sizing input.
-        const double inv_ratio_holdings = inv_ratio;
 
         // -- Cross-pair correlated inventory skewing (Gueant 2019) --
         // When enabled, adjusts inv_ratio based on inventory pressure
@@ -10402,12 +10394,21 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             const double target = bands.target;
             const double enter_band = bands.enter;
 
-            const RatioRebalanceMode next_mode =
-                strategy::ratiomode::next_mode(prev_mode, inv_ratio_holdings, bands);
-            if (next_mode != prev_mode
-                && !ratio_mode_held(pair_name, *pair_cfg, block_height)) {
-                set_ratio_mode(pair_name, prev_mode, next_mode,
-                               inv_ratio_holdings, bands, "Step 7");
+            // [RATIO-MODE-PERSIST review] The mode decides on the pair's own
+            // holdings valued at the published mid -- the observation Step 8
+            // uses -- never on inv_ratio above, which is valued at this
+            // step's blended / reservation-shifted centre and carries the
+            // cross-pair adjustment.  With the overshoot exit, two sites
+            // reading different ratios could flip one mode back and forth
+            // every heartbeat.  inv_ratio stays the pricing and sizing input.
+            if (const auto observed = ratio_mode_ratio(*pair_cfg, pair_name)) {
+                const RatioRebalanceMode next_mode =
+                    strategy::ratiomode::next_mode(prev_mode, *observed, bands);
+                if (next_mode != prev_mode
+                    && !ratio_mode_held(pair_name, *pair_cfg, block_height)) {
+                    set_ratio_mode(pair_name, prev_mode, next_mode,
+                                   *observed, bands, "Step 7");
+                }
             }
 
             const RatioRebalanceMode active_mode = it_mode->second;
@@ -15984,14 +15985,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // - AcquireBase  => only post bids (buy base)
         // - AcquireQuote => only post asks (sell base / receive quote)
         if (config_.strategy.ratio_rebalance_enabled) {
-            const double rb_mid = market_data_->get_mid_price(pair_name);
-            if (rb_mid > 0.0) {
-                const Mojo rb_mid_mojos = static_cast<Mojo>(std::llround(
-                    rb_mid * static_cast<double>(kMojosPerXch)));
-                const double inv_ratio_rb = inventory_->inventory_ratio(
-                    AssetId{pair_cfg->base_asset_id},
-                    AssetId{pair_cfg->quote_asset_id},
-                    rb_mid_mojos);
+            if (const auto observed = ratio_mode_ratio(*pair_cfg, pair_name)) {
+                const double inv_ratio_rb = *observed;
 
                 auto it_mode = ratio_rebalance_modes_.find(pair_name);
                 if (it_mode == ratio_rebalance_modes_.end()) {
@@ -21496,6 +21491,18 @@ void Engine::set_ratio_mode(const std::string& pair_name,
         db_->save_ratio_mode(pair_name,
                              strategy::ratiomode::mode_name(next_mode));
     }
+}
+
+std::optional<double> Engine::ratio_mode_ratio(const PairConfig& pc,
+                                               const std::string& pair_name) const
+{
+    const double mid = market_data_->get_mid_price(pair_name);
+    if (!(mid > 0.0)) return std::nullopt;
+    const Mojo mid_mojos = static_cast<Mojo>(std::llround(
+        mid * static_cast<double>(kMojosPerXch)));
+    return inventory_->inventory_ratio(AssetId{pc.base_asset_id},
+                                       AssetId{pc.quote_asset_id},
+                                       mid_mojos);
 }
 
 bool Engine::ratio_mode_held(const std::string& pair_name,
