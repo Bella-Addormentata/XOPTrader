@@ -35,9 +35,11 @@ pair minimum. On 2026-11-08 the XCH/DBX ask, tapered to 0.017 XCH, posted
 six 1 XCH asks where Neutral had posted one.
 
 That side now posts one offer, the same single offer it gets in Neutral.
-The offer sits on its widest tier, sized at that tier's minimum. If the
-funding budget cannot pay for it, the side posts nothing. Either way, the
-side's other resting offers are retired.
+The offer sits on the widest tier the side planned. It is sized at the
+minimum of the ladder's widest tier, even when a tiny pool planned only
+tighter tiers with larger minimums. If the funding budget cannot pay for
+it, the side posts nothing. Either way, the side's other resting offers
+are retired.
 
 After installing, look for:
 
