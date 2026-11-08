@@ -292,3 +292,58 @@ def legacy_ratio_mirrors(pairs: Any) -> list[tuple[str, Any]]:
         for pair in pairs
         if isinstance(pair, Mapping) and LEGACY_PAIR_RATIO_KEY in pair
     ]
+
+
+#: [RATIO-BAND-CAP 2026-11-08] The widest ``strategy.ratio_band_enter_by_pair``
+#: entry the Wallet tab's Apply writes: the engine's own default
+#: ``ratio_band_enter`` (``config.hpp``).
+#:
+#: Apply projects the "Target % +/-" column into ratio space, and a wide asset
+#: tolerance makes a wide pair band.  On 2026-11-08 XCH's +/-40 points gave
+#: XCH/wUSDC.b 0.49 and XCH/DBX 0.48: a pair 21 and 26 points under its target
+#: ratio could not enter AcquireBase, so its asks sold the coin it was short
+#: of at full size.  The tolerances stay as they are -- the drift guard and the
+#: drift corrector read them in portfolio space -- and only the ratio band they
+#: imply is capped, so a narrow tolerance can still make a pair stricter.
+RATIO_BAND_ENTER_MAX: float = 0.10
+
+
+def pair_band_enter(
+    base_pct: float,
+    quote_pct: float,
+    base_tol: float,
+    quote_tol: float,
+) -> Optional[float]:
+    """The ratio_band_enter Apply writes for one pair, or ``None`` for none.
+
+    The four inputs are the Wallet tab's portfolio percentages: the two
+    assets' targets and their "Target % +/-" tolerances, in one unit (points
+    or fractions).  The pair's target ratio is ``base / (base + quote)``; the
+    band is its widest move when each asset sits at the far end of its
+    tolerance, toward the other ((base+tol)/(quote-tol) and
+    (base-tol)/(quote+tol)), capped at :data:`RATIO_BAND_ENTER_MAX`.
+
+    ``None`` -- no override, the engine's global band applies -- when either
+    target is negative or both are zero, when neither asset has a positive
+    tolerance, or when the projection is zero.
+    """
+    if base_pct < 0.0 or quote_pct < 0.0:
+        return None
+    denom = base_pct + quote_pct
+    if denom <= 0.0:
+        return None
+    if base_tol <= 0.0 and quote_tol <= 0.0:
+        return None
+    target_ratio = base_pct / denom
+
+    def _ratio(base: float, quote: float) -> float:
+        base = max(0.0, base)
+        quote = max(0.0, quote)
+        total = base + quote
+        return (base / total) if total > 0.0 else target_ratio
+
+    upper = _ratio(base_pct + base_tol, quote_pct - quote_tol)
+    lower = _ratio(base_pct - base_tol, quote_pct + quote_tol)
+    band = max(abs(upper - target_ratio), abs(target_ratio - lower))
+    band = min(RATIO_BAND_ENTER_MAX, band)
+    return band if band > 0.0 else None
