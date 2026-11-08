@@ -256,6 +256,20 @@ struct DbInventoryState {
 };
 
 // ---------------------------------------------------------------------------
+// DbRatioMode -- maps 1:1 to a row in the ratio_rebalance_modes table.
+//
+// [RATIO-MODE-PERSIST 2026-11-08] The pair's ratio rebalance mode as text
+// ("Neutral", "AcquireBase", "AcquireQuote"; xop/strategy/ratio_mode.hpp),
+// saved on every transition and restored at startup.
+// ---------------------------------------------------------------------------
+
+struct DbRatioMode {
+    std::string pair_name;
+    std::string mode;
+    std::string updated_at;  ///< SQLite CURRENT_TIMESTAMP (UTC), for the log.
+};
+
+// ---------------------------------------------------------------------------
 // DbLedgerEntry -- one leg of a double-entry accounting event.
 //
 // Every event that changes what the bot believes it holds posts a BALANCED
@@ -599,6 +613,16 @@ public:
     /// Load all persisted inventory records.  Returns an empty vector when
     /// the table is empty (first run) or on error.
     [[nodiscard]] std::vector<DbInventoryState> load_inventory_state() const;
+
+    // -- Ratio rebalance modes (RATIO-MODE-PERSIST) --------------------------
+
+    /// Upsert one pair's ratio rebalance mode.  Called by the engine on each
+    /// transition so the mode survives restarts.  Never throws.
+    void save_ratio_mode(const std::string& pair_name,
+                         const std::string& mode) noexcept;
+
+    /// All saved modes.  Empty on first run or on error.
+    [[nodiscard]] std::vector<DbRatioMode> load_ratio_modes() const;
 
     // -- Double-entry ledger -------------------------------------------------
 

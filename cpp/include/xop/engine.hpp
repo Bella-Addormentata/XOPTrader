@@ -80,6 +80,7 @@
 #include "xop/strategy/pace_controller.hpp"
 #include "xop/strategy/revive.hpp"
 #include "xop/strategy/tier_minimums.hpp"
+#include "xop/strategy/ratio_mode.hpp"
 #include "xop/strategy/synthetic_price.hpp"
 #include "xop/strategy/no_loss_floor.hpp"
 #include "xop/risk/usd_route.hpp"
@@ -2545,12 +2546,44 @@ private:
         wait_grow_recent_offers_;
 
     // -- Ratio-based inventory rebalance mode (per pair) -------------------
-    enum class RatioRebalanceMode : std::uint8_t {
-        Neutral      = 0,
-        AcquireBase  = 1,
-        AcquireQuote = 2
-    };
+    // [RATIO-MODE-PERSIST 2026-11-08] The hysteresis lives in
+    // xop/strategy/ratio_mode.hpp; the modes are saved to the database on
+    // every transition and restored at startup (they used to reset to
+    // Neutral on every restart).
+    using RatioRebalanceMode = strategy::ratiomode::Mode;
     std::unordered_map<std::string, RatioRebalanceMode> ratio_rebalance_modes_;
+
+    /// [RATIO-MODE-PERSIST review] Pairs whose mode was restored at startup.
+    /// A restored mode makes no transition until both of the pair's assets
+    /// have been checked against the wallet this process (Step 11's one-shot
+    /// reconcile, or the bridge scan for the bridge asset), or until
+    /// kRatioModeHoldMaxBlocks after Step 11's first block: before that the
+    /// ratio comes from quantities the last process saved, which a deposit
+    /// or withdrawal while the engine was down makes untrue.
+    std::unordered_set<std::string> ratio_mode_held_pairs_;
+    static constexpr BlockHeight kRatioModeHoldMaxBlocks = 192;  // ~1 hour
+
+    /// [RATIO-MODE-PERSIST review] The one observation both mode sites
+    /// decide on: the pair's own holdings ratio valued at the published mid
+    /// (MarketDataFeed::get_mid_price), without Step 7's blended centre,
+    /// reservation shift or cross-pair adjustment.  nullopt without a mid.
+    [[nodiscard]] std::optional<double> ratio_mode_ratio(
+        const PairConfig& pc, const std::string& pair_name) const;
+
+    /// True while @p pair_name's restored mode is held (see above); the
+    /// first call that finds it checked or timed out releases it.
+    [[nodiscard]] bool ratio_mode_held(const std::string& pair_name,
+                                       const PairConfig& pc,
+                                       BlockHeight block_height);
+
+    /// Apply a mode transition: store it, log it, and save it so a restart
+    /// resumes from it.  @p step names the caller in the log ("Step 7").
+    void set_ratio_mode(const std::string& pair_name,
+                        RatioRebalanceMode prev_mode,
+                        RatioRebalanceMode next_mode,
+                        double inv_ratio,
+                        const strategy::ratiomode::Bands& bands,
+                        const char* step);
 
     // [H6] Portfolio-equity high-water mark for drawdown detection in
     // step 13 alerts.  Monotonically non-decreasing; updated each cycle in

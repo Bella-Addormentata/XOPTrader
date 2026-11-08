@@ -171,6 +171,17 @@ CREATE TABLE IF NOT EXISTS inventory_state (
 );
 )SQL";
 
+// [RATIO-MODE-PERSIST 2026-11-08] Each pair's ratio rebalance mode, so a
+// restart resumes the hysteresis instead of starting every pair Neutral (see
+// xop/strategy/ratio_mode.hpp).  One row per pair, written on transitions.
+constexpr const char* kCreateRatioRebalanceModes = R"SQL(
+CREATE TABLE IF NOT EXISTS ratio_rebalance_modes (
+    pair_name   TEXT    PRIMARY KEY,
+    mode        TEXT    NOT NULL,
+    updated_at  TEXT    DEFAULT CURRENT_TIMESTAMP
+);
+)SQL";
+
 constexpr const char* kCreateLedgerEntries = R"SQL(
 CREATE TABLE IF NOT EXISTS ledger_entries (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1446,6 +1457,81 @@ std::vector<DbInventoryState> Database::load_inventory_state() const
 }
 
 // ===========================================================================
+// Ratio rebalance modes (RATIO-MODE-PERSIST 2026-11-08)
+// ===========================================================================
+
+void Database::save_ratio_mode(const std::string& pair_name,
+                               const std::string& mode) noexcept
+{
+    // Written only when a pair changes mode: a few times a week.
+    static constexpr const char* kUpsert = R"SQL(
+        INSERT INTO ratio_rebalance_modes (pair_name, mode, updated_at)
+        VALUES (?1, ?2, CURRENT_TIMESTAMP)
+        ON CONFLICT(pair_name) DO UPDATE SET
+            mode       = excluded.mode,
+            updated_at = CURRENT_TIMESTAMP;
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    try {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, kUpsert, -1, &stmt, nullptr) != SQLITE_OK) {
+            spdlog::error("[Database] save_ratio_mode prepare failed: {}",
+                          sqlite3_errmsg(db_));
+            return;
+        }
+        sqlite3_bind_text(stmt, 1, pair_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, mode.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            spdlog::error("[Database] save_ratio_mode step failed for {}: {}",
+                          pair_name, sqlite3_errmsg(db_));
+        }
+        sqlite3_finalize(stmt);
+    } catch (...) {
+        // noexcept contract: persistence must never disrupt trading.
+        spdlog::error("[Database] save_ratio_mode: unexpected exception");
+    }
+}
+
+std::vector<DbRatioMode> Database::load_ratio_modes() const
+{
+    static constexpr const char* kSelect = R"SQL(
+        SELECT pair_name, mode, COALESCE(updated_at, '')
+        FROM ratio_rebalance_modes;
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    std::vector<DbRatioMode> result;
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, kSelect, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("[Database] load_ratio_modes prepare failed: {}",
+                      sqlite3_errmsg(db_));
+        return result;
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        auto text = [&](int col) {
+            const char* v = reinterpret_cast<const char*>(
+                sqlite3_column_text(stmt, col));
+            return std::string(v ? v : "");
+        };
+        DbRatioMode row;
+        row.pair_name  = text(0);
+        row.mode       = text(1);
+        row.updated_at = text(2);
+        if (!row.pair_name.empty()) {
+            result.push_back(std::move(row));
+        }
+    }
+
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+// ===========================================================================
 // Double-entry ledger (2026-07-30)
 // ===========================================================================
 
@@ -2001,6 +2087,7 @@ void Database::run_migrations()
         kCreateStrategyQuotes,
         kCreateSanityFailures,
         kCreateInventoryState,
+        kCreateRatioRebalanceModes,
         kCreateLedgerEntries,
         kIndexLedgerAsset,
         kCreateArbEdgeLog,

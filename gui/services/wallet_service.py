@@ -7,8 +7,9 @@ each wallet associated with the configured fingerprint.
 All HTTP I/O runs in a dedicated ``QThread`` worker (mirroring
 ``MetricsService``) so the GUI event loop is never blocked -- a full
 balance pass is log_in + get_wallets + one get_wallet_balance per
-wallet, each with a 5 s timeout, which measured 4-11 s when the wallet
-daemon is slow.
+wallet, which measured 4-11 s when the wallet daemon is slow.  Each
+balance read gets ``_BALANCE_TIMEOUT_S`` (see there): one CAT wallet with
+many coins can take longer to answer than the other calls.
 
 Compliant with:
     - ISO/IEC 27001:2022  (SSL certs loaded from disk, not embedded)
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Any, Final, Optional
 
@@ -35,6 +37,32 @@ _log: logging.Logger = logging.getLogger(__name__)
 
 # Chia wallet RPC timeout (seconds).
 _RPC_TIMEOUT_S: Final[float] = 5.0
+
+# [DBX-BALANCE 2026-11-08] Timeout for one wallet's get_wallet_balance
+# (and the cat_get_asset_id fallback for the same wallet).  The daemon
+# computes spendable and max-send amounts from the wallet's coins, so a
+# CAT wallet holding many coins answers slowly: on 2026-11-07 one wallet
+# took 6.5-7 s on every call, all day.  At 5 s that read always timed out,
+# the wallet never reached the table, and once a GUI restart cleared the
+# cache DBX vanished from the Wallet Balances tab and from its Current %
+# (which then summed to 100% without DBX).  15 s is about twice the
+# slowest read seen (9.2 s).  The pass runs on the worker thread, so the
+# wait never blocks the UI, and an overlapping refresh is skipped while it
+# runs.
+_BALANCE_TIMEOUT_S: Final[float] = 15.0
+
+# The ``timeout=`` those reads pass: (connect, read).  A bare number would
+# apply to the connect AND the read, letting one call take twice as long;
+# the daemon is local, so connecting never needs the long budget.
+_BALANCE_TIMEOUTS: Final[tuple[float, float]] = (_RPC_TIMEOUT_S, _BALANCE_TIMEOUT_S)
+
+# How long WalletService.stop() waits for the worker thread.  quit() cannot
+# interrupt a blocking RPC, so stop() first asks the worker to abandon its
+# pass (checked between RPCs) and then waits out the one RPC that may be in
+# flight: the longest is a balance read, connect + read, plus a margin.
+# Destroying a QThread that is still running aborts the whole process, so a
+# wait shorter than the slowest RPC could crash the GUI on close.
+_STOP_WAIT_MS: Final[int] = int((sum(_BALANCE_TIMEOUTS) + 5.0) * 1000)
 
 # Mojo conversion factor (1 XCH = 1e12 mojos).
 _MOJOS_PER_XCH: Final[float] = 1_000_000_000_000.0
@@ -87,6 +115,31 @@ class _WalletWorker(QObject):
         self._cert_path: Path = Path("")
         self._key_path: Path = Path("")
         self._last_sync_status: dict[str, Any] = {}
+        # Wallet ids whose last balance read failed, so the failure is
+        # logged at INFO once (and the recovery once), not every refresh.
+        self._failed_wallets: set[Any] = set()
+        # Set from the GUI thread by WalletService.stop(); read here between
+        # RPCs, so a pass in progress ends after its current call instead
+        # of running every remaining balance read during shutdown.
+        self._abort: threading.Event = threading.Event()
+
+    def request_abort(self) -> None:
+        """Ask a pass in progress to stop after its current RPC.
+
+        Called directly from the GUI thread (``threading.Event`` is
+        thread-safe); a queued slot would only run after the pass ends.
+        """
+        self._abort.set()
+
+    def clear_abort(self) -> None:
+        """Allow passes again (the service is being started)."""
+        self._abort.clear()
+
+    def _aborted(self) -> bool:
+        if self._abort.is_set():
+            _log.debug("Wallet balance pass abandoned: service stopping")
+            return True
+        return False
 
     @Slot(dict)
     def set_params(self, params: dict) -> None:
@@ -137,8 +190,11 @@ class _WalletWorker(QObject):
         dict[str, dict[str, float]]
             Mapping of wallet name to ``{spendable, confirmed,
             pending_change, unconfirmed}`` in display units (XCH or
-            token units).  Empty on failure.
+            token units).  Empty on failure, and when the service is
+            stopping (checked before each RPC).
         """
+        if self._aborted():
+            return {}
         try:
             import requests  # type: ignore[import-untyped]
             import urllib3
@@ -168,6 +224,8 @@ class _WalletWorker(QObject):
                 pass  # Login may already be active.
 
         # Step 1.5: Query wallet sync status.
+        if self._aborted():
+            return {}
         try:
             sync_resp = requests.post(
                 f"{base_url}/get_sync_status",
@@ -193,6 +251,8 @@ class _WalletWorker(QObject):
             self._last_sync_status = {"connected": False, "synced": False, "syncing": False}
 
         # Step 2: Get list of wallets.
+        if self._aborted():
+            return {}
         try:
             resp = requests.post(
                 f"{base_url}/get_wallets",
@@ -216,6 +276,8 @@ class _WalletWorker(QObject):
 
         # Step 3: Query balance for each wallet.
         for wallet in wallets:
+            if self._aborted():
+                return {}
             wallet_id = wallet.get("id")
             wallet_name = wallet.get("name", f"Wallet {wallet_id}")
             wallet_type = wallet.get("type", _WALLET_TYPE_STANDARD)
@@ -230,16 +292,24 @@ class _WalletWorker(QObject):
                     json={"wallet_id": wallet_id},
                     cert=(str(self._cert_path), str(self._key_path)),
                     verify=False,
-                    timeout=_RPC_TIMEOUT_S,
+                    timeout=_BALANCE_TIMEOUTS,
                 )
                 bal_resp.raise_for_status()
                 bal_data = bal_resp.json()
             except requests.RequestException as exc:
-                _log.debug("Failed to get balance for wallet %s: %s", wallet_id, exc)
+                self._note_balance_failure(wallet_id, wallet_name, str(exc))
                 continue
 
             if not bal_data.get("success"):
+                self._note_balance_failure(
+                    wallet_id, wallet_name,
+                    str(bal_data.get("error", "success=false")),
+                )
                 continue
+            if wallet_id in self._failed_wallets:
+                self._failed_wallets.discard(wallet_id)
+                _log.info("Balance read for wallet %s (%r) works again",
+                          wallet_id, wallet_name)
 
             balance = bal_data.get("wallet_balance", {})
 
@@ -258,6 +328,8 @@ class _WalletWorker(QObject):
                     m = _ASSET_ID_RE.search(wallet_name)
                     if m:
                         asset_id = m.group(0).lower()
+                if not asset_id and self._aborted():
+                    return {}
                 if not asset_id:
                     try:
                         aid_resp = requests.post(
@@ -265,7 +337,7 @@ class _WalletWorker(QObject):
                             json={"wallet_id": wallet_id},
                             cert=(str(self._cert_path), str(self._key_path)),
                             verify=False,
-                            timeout=_RPC_TIMEOUT_S,
+                            timeout=_BALANCE_TIMEOUTS,
                         )
                         aid_resp.raise_for_status()
                         aid_data = aid_resp.json()
@@ -311,6 +383,22 @@ class _WalletWorker(QObject):
             }
 
         return result
+
+    def _note_balance_failure(self, wallet_id: Any, wallet_name: str,
+                              reason: str) -> None:
+        """Log a wallet whose balance could not be read: INFO the first
+        time, DEBUG while it keeps failing.  The service merges each pass
+        into its cache, so the tab keeps showing the wallet's last good
+        balance; a wallet never read since the GUI started is missing."""
+        if wallet_id in self._failed_wallets:
+            _log.debug("Balance read for wallet %s (%r) still failing: %s",
+                       wallet_id, wallet_name, reason)
+            return
+        self._failed_wallets.add(wallet_id)
+        _log.info("Balance read for wallet %s (%r) failed: %s -- the Wallet "
+                  "Balances tab keeps its last balance (or leaves the wallet "
+                  "out if it has none) until a read succeeds",
+                  wallet_id, wallet_name, reason)
 
 
 # ===================================================================
@@ -388,17 +476,22 @@ class WalletService(QObject):
             _log.warning("WalletService.start() called but thread already running.")
             return
         _log.info("Starting WalletService worker thread.")
+        self._worker.clear_abort()
         self._thread.start()
 
     def stop(self) -> None:
         """Cleanly shut down the worker thread.
 
-        Safe to call even if the service was never started.
+        Safe to call even if the service was never started.  A balance
+        pass in progress is abandoned after its current RPC, and the wait
+        covers that one RPC (``_STOP_WAIT_MS``), so the thread has ended
+        before the service, and with it the QThread, is destroyed.
         """
         _log.info("Stopping WalletService.")
+        self._worker.request_abort()
         if self._thread.isRunning():
             self._thread.quit()
-            if not self._thread.wait(5_000):
+            if not self._thread.wait(_STOP_WAIT_MS):
                 _log.warning("WalletService worker thread did not exit in time.")
 
     # ===================================================================
