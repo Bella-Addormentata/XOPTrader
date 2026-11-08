@@ -387,15 +387,17 @@ class _WalletWorker(QObject):
     def _note_balance_failure(self, wallet_id: Any, wallet_name: str,
                               reason: str) -> None:
         """Log a wallet whose balance could not be read: INFO the first
-        time (the wallet is missing from the table until a read works),
-        DEBUG while it keeps failing."""
+        time, DEBUG while it keeps failing.  The service merges each pass
+        into its cache, so the tab keeps showing the wallet's last good
+        balance; a wallet never read since the GUI started is missing."""
         if wallet_id in self._failed_wallets:
             _log.debug("Balance read for wallet %s (%r) still failing: %s",
                        wallet_id, wallet_name, reason)
             return
         self._failed_wallets.add(wallet_id)
-        _log.info("Balance read for wallet %s (%r) failed: %s -- it stays "
-                  "off the Wallet Balances tab until a read succeeds",
+        _log.info("Balance read for wallet %s (%r) failed: %s -- the Wallet "
+                  "Balances tab keeps its last balance (or leaves the wallet "
+                  "out if it has none) until a read succeeds",
                   wallet_id, wallet_name, reason)
 
 
