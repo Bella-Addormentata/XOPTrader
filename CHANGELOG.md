@@ -5,6 +5,64 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.45] — 2026-11-08 — ratio modes survive restarts; DBX back on the Wallet Balances tab
+
+### Ratio rebalance modes are kept across restarts (#218)
+
+Each pair's ratio rebalance mode (Neutral, AcquireBase, AcquireQuote) was
+kept only in memory, so every restart started every pair at Neutral. The
+enter bands are wide on purpose and the exit bands narrow. A pair that had
+been tapering its overweight side for days therefore could not get back
+into its mode after a restart. When v0.10.44 was installed on 2026-11-07,
+XCH/wUSDC.b, XCH/DBX and XCH/BYC dropped from AcquireBase to Neutral, and
+the XCH/wUSDC.b ask pool went from about 4 XCH to 33 XCH. That meant
+selling the asset the pair was short of.
+
+Now:
+
+- Every mode change is saved in the database, and saved modes are
+  restored at startup.
+- A restored mode makes no change until the pair's holdings have been
+  checked against the wallet, or for about an hour at most. Until then
+  the engine's tracked quantities predate any deposit or withdrawal made
+  while it was off.
+- Step 7 and Step 8 decide the mode from the same observation: the
+  pair's own holdings valued at the published mid. Before, the two steps
+  could pull one mode in opposite directions.
+- A mode now ends once the ratio is back on the near side of its exit
+  band, not only while it sits inside the band. A large fill or a lowered
+  target no longer leaves a pair boosting the side it already has too
+  much of.
+
+No config change is needed. The first start on 0.10.45 begins from
+Neutral (nothing has been saved yet), and modes are kept from then on.
+
+### DBX shows on the Wallet Balances tab again (#218)
+
+The GUI gave each wallet balance read 5 s. On 2026-11-07 the DBX wallet
+(many coins) took 6.5-7 s on every read, so after a GUI restart DBX never
+appeared. The Target Portfolio Allocation table then showed no Current %
+for DBX and wrong percentages for every other asset. The engine itself
+read DBX correctly the whole time.
+
+- Balance reads now get 15 s. The other wallet calls keep 5 s.
+- A wallet whose read fails is logged once at INFO, and once more when it
+  works again.
+- Closing the GUI during a slow read now waits for that read to finish
+  instead of risking a crash on exit.
+
+After installing, look for:
+
+- `Restored ratio mode AcquireBase for XCH/wUSDC.b (saved … UTC); held
+  until its holdings are checked against the wallet` at startup. This
+  appears from the second start on 0.10.45 onwards.
+- `restored ratio mode released: holdings checked against the wallet`
+  about 20 blocks after startup.
+- `ratio mode Neutral -> AcquireBase (ratio=… target=… …)` whenever a
+  pair changes mode.
+- In the GUI log, `Balance read for wallet … failed` only if a wallet is
+  still too slow.
+
 ## [0.10.44] — 2026-11-07 — full bid ladders; prices lean toward your targets
 
 ### A small ask no longer shrinks the bids (#216)
