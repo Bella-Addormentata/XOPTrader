@@ -433,7 +433,7 @@ TEST(SizingWiring, TierMinimumsStayWithinThePoolAndTheBudget) {
     // of the fit go, and the kept ones are recorded for Step 8.
     const std::size_t plain_at = position_of(body,
         "if (sz != tier_min_sizes.end()) tq.size = sz->second.second;");
-    EXPECT_NE(position_of(body, "const std::size_t skip = min_sizes.size() - fit;"),
+    EXPECT_NE(position_of(body, "const std::size_t skip = min_sizes.size() - kept;"),
               std::string::npos);
     EXPECT_NE(position_of(body, "return seen++ < skip;"), std::string::npos);
     const std::size_t record_at = position_of(body,
@@ -443,6 +443,52 @@ TEST(SizingWiring, TierMinimumsStayWithinThePoolAndTheBudget) {
     EXPECT_LT(fit_at, plain_at);
     EXPECT_LT(plain_at, record_at);
     EXPECT_LT(record_at, skip_at);
+}
+
+// [RATIO-TAPER-MIN 2026-11-08] The side ratio rebalancing tapers -- the ask in
+// AcquireBase, the bid in AcquireQuote, the one the deploy-idle floor leaves
+// alone -- keeps only its widest tier at its minimum when it cannot fund that
+// tier, never the plain ladder: on 2026-11-08 the XCH/DBX ask, tapered to
+// 0.017 XCH in AcquireBase, posted six 1 XCH asks where Neutral had posted one.
+TEST(SizingWiring, ARatioTaperedSideNeverPostsThePlainLadder) {
+    const std::string body = function_body(read_engine_cpp(), kLadderSignature);
+    ASSERT_FALSE(body.empty()) << XOP_TESTS_ENGINE_CPP;
+    // The tapered side is the one the floor leaves alone.
+    const std::size_t floor_ask_at = position_of(body,
+        "const bool floor_ask = (idle_ratio_mode != RatioRebalanceMode::AcquireBase);");
+    const std::size_t fit_at = position_of(body,
+        "const std::size_t fit = strategy::tiermin::widest_tiers_within_pool("
+        "min_sizes, side_costs(), side_pool, min_budget);");
+    const std::size_t tapered_at = position_of(body,
+        "const std::optional<std::size_t> tapered_keep = "
+        "strategy::tiermin::tapered_side_tiers_when_unfunded( "
+        "fit, is_ask ? !floor_ask : !floor_bid, side_costs(), min_budget);");
+    // The plain ladder only when the helper does not apply; otherwise its
+    // count, or the fit, decides how many of the widest tiers stay.
+    const std::size_t plain_gate_at = position_of(body,
+        "if (fit == 0 && !min_sizes.empty() && !tapered_keep.has_value()) {");
+    const std::size_t plain_at = position_of(body,
+        "if (sz != tier_min_sizes.end()) tq.size = sz->second.second;");
+    const std::size_t kept_at = position_of(body,
+        "const std::size_t kept = tapered_keep.value_or(fit); "
+        "if (kept < min_sizes.size()) { const std::size_t skip = min_sizes.size() - kept;");
+    const std::size_t record_at = position_of(body,
+        "pcs.tier_min_mojos[{side, tq.tier_index}] = tier_min_mojos(tq);");
+    ASSERT_NE(floor_ask_at, std::string::npos);
+    ASSERT_NE(fit_at, std::string::npos);
+    ASSERT_NE(tapered_at, std::string::npos);
+    ASSERT_NE(plain_gate_at, std::string::npos);
+    ASSERT_NE(plain_at, std::string::npos);
+    ASSERT_NE(kept_at, std::string::npos);
+    ASSERT_NE(record_at, std::string::npos);
+    EXPECT_LT(floor_ask_at, fit_at);
+    EXPECT_LT(fit_at, tapered_at);
+    EXPECT_LT(tapered_at, plain_gate_at);
+    EXPECT_LT(plain_gate_at, plain_at);
+    EXPECT_LT(plain_at, kept_at);
+    EXPECT_LT(kept_at, record_at);
+    EXPECT_EQ(position_of(body, "if (fit == 0 && !min_sizes.empty()) {"), std::string::npos)
+        << "a gate without the tapered check would post the plain ladder again";
 }
 
 // [TIERMIN 2026-10-29] On a tier-minimum pair a drift-tapered side the

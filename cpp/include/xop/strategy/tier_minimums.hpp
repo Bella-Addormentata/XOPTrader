@@ -67,6 +67,28 @@ namespace xop::strategy::tiermin {
     return n;
 }
 
+/// [RATIO-TAPER-MIN 2026-11-08] How many of its widest tiers a side that
+/// ratio rebalancing keeps small on purpose posts, at their minimums, when
+/// even its widest tier does not fit (`fit`, from widest_tiers_within_pool,
+/// is 0).  That side is the ask in AcquireBase or the bid in AcquireQuote,
+/// the one the deploy-idle floor leaves alone (`ratio_tapered`).  It keeps
+/// its widest tier, the one offer the floor gives the same side in Neutral,
+/// or none when `budget` (known) cannot pay that tier's cost (`costs`, ladder
+/// order, tightest first).  nullopt when it does not apply, and the side
+/// either keeps `fit` tiers or, at 0, sets its minimums aside and posts the
+/// plain ladder: every tier at the pair minimum.  For a tapered side that
+/// ladder sold more than Neutral would: on 2026-11-08 XCH/DBX went into
+/// AcquireBase with its ask pool tapered to 0.017 XCH and posted six 1 XCH
+/// asks where Neutral had posted one.
+[[nodiscard]] inline std::optional<std::size_t> tapered_side_tiers_when_unfunded(
+    std::size_t fit, bool ratio_tapered, const std::vector<Mojo>& costs,
+    std::optional<Mojo> budget)
+{
+    if (fit > 0 || !ratio_tapered || costs.empty()) return std::nullopt;
+    if (budget.has_value() && costs.back() > *budget) return std::size_t{0};
+    return std::size_t{1};
+}
+
 /// [TIERFIRST 2026-10-31] One side's tier sizes fitted to its pool, minimums
 /// first.  `sizes` are the tiers as Step 7 has them after the cap and the
 /// up-scale (each at least its minimum), `mins` each tier's minimum, and
