@@ -62,8 +62,9 @@ def _stub_requests(slow_wallet_seconds: float, fail_wallets: set[int] = frozense
             if wid in fail_wallets:
                 raise RequestException("connection reset")
             needed = slow_wallet_seconds if wid == 8 else 0.1
-            if timeout is not None and needed > timeout:
-                raise RequestException(f"Read timed out. (read timeout={timeout})")
+            read_timeout = timeout[1] if isinstance(timeout, tuple) else timeout
+            if read_timeout is not None and needed > read_timeout:
+                raise RequestException(f"Read timed out. (read timeout={read_timeout})")
             return _Resp({"success": True, "wallet_balance": {
                 "confirmed_wallet_balance": 12_411_968 if wid == 8 else 164_945_722_000_000,
                 "spendable_balance": 12_411_968 if wid == 8 else 34_691_380_000_000,
@@ -95,7 +96,7 @@ def test_a_wallet_slower_than_the_old_5s_limit_still_reaches_the_table(tmp_path,
     assert result["CAT db1a9020"]["confirmed"] == pytest.approx(12_411.968)
     assert result["CAT db1a9020"]["asset_id"].startswith("db1a9020")
     balance_timeouts = {t for e, _, t in calls if e == "get_wallet_balance"}
-    assert balance_timeouts == {ws._BALANCE_TIMEOUT_S}
+    assert balance_timeouts == {(ws._RPC_TIMEOUT_S, ws._BALANCE_TIMEOUT_S)}
     assert ws._BALANCE_TIMEOUT_S >= 2 * 6.9
     # The quick calls keep their short timeout.
     assert {t for e, _, t in calls if e in ("log_in", "get_sync_status", "get_wallets")} == {
@@ -169,8 +170,10 @@ def test_stop_joins_a_worker_that_is_mid_read(tmp_path, monkeypatch):
 
     from PySide6.QtCore import QCoreApplication
 
-    app = QCoreApplication.instance() or QCoreApplication([])  # noqa: F841
-    assert ws._STOP_WAIT_MS >= ws._BALANCE_TIMEOUT_S * 1000
+    app = QCoreApplication.instance() or QCoreApplication([])
+    # stop() outwaits the longest single RPC: a balance read's connect plus
+    # its read.
+    assert ws._STOP_WAIT_MS > (ws._RPC_TIMEOUT_S + ws._BALANCE_TIMEOUT_S) * 1000
 
     stub, calls = _stub_requests(slow_wallet_seconds=0.1)
     inner_post = stub.post
@@ -199,3 +202,7 @@ def test_stop_joins_a_worker_that_is_mid_read(tmp_path, monkeypatch):
     assert not svc._thread.isRunning(), "stop() returned with the read in flight"
     reads = [j["wallet_id"] for e, j, _ in calls if e == "get_wallet_balance"]
     assert reads == [1]
+    # The abandoned pass still reported back, so the in-flight guard is
+    # clear and a restarted service is not stuck skipping every fetch.
+    app.processEvents()
+    assert svc._fetch_in_flight is False

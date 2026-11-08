@@ -51,13 +51,18 @@ _RPC_TIMEOUT_S: Final[float] = 5.0
 # runs.
 _BALANCE_TIMEOUT_S: Final[float] = 15.0
 
+# The ``timeout=`` those reads pass: (connect, read).  A bare number would
+# apply to the connect AND the read, letting one call take twice as long;
+# the daemon is local, so connecting never needs the long budget.
+_BALANCE_TIMEOUTS: Final[tuple[float, float]] = (_RPC_TIMEOUT_S, _BALANCE_TIMEOUT_S)
+
 # How long WalletService.stop() waits for the worker thread.  quit() cannot
 # interrupt a blocking RPC, so stop() first asks the worker to abandon its
 # pass (checked between RPCs) and then waits out the one RPC that may be in
-# flight: at most one balance read, plus a margin.  Destroying a QThread
-# that is still running aborts the whole process, so a wait shorter than
-# the slowest RPC could crash the GUI on close.
-_STOP_WAIT_MS: Final[int] = int((_BALANCE_TIMEOUT_S + 5.0) * 1000)
+# flight: the longest is a balance read, connect + read, plus a margin.
+# Destroying a QThread that is still running aborts the whole process, so a
+# wait shorter than the slowest RPC could crash the GUI on close.
+_STOP_WAIT_MS: Final[int] = int((sum(_BALANCE_TIMEOUTS) + 5.0) * 1000)
 
 # Mojo conversion factor (1 XCH = 1e12 mojos).
 _MOJOS_PER_XCH: Final[float] = 1_000_000_000_000.0
@@ -287,7 +292,7 @@ class _WalletWorker(QObject):
                     json={"wallet_id": wallet_id},
                     cert=(str(self._cert_path), str(self._key_path)),
                     verify=False,
-                    timeout=_BALANCE_TIMEOUT_S,
+                    timeout=_BALANCE_TIMEOUTS,
                 )
                 bal_resp.raise_for_status()
                 bal_data = bal_resp.json()
@@ -332,7 +337,7 @@ class _WalletWorker(QObject):
                             json={"wallet_id": wallet_id},
                             cert=(str(self._cert_path), str(self._key_path)),
                             verify=False,
-                            timeout=_BALANCE_TIMEOUT_S,
+                            timeout=_BALANCE_TIMEOUTS,
                         )
                         aid_resp.raise_for_status()
                         aid_data = aid_resp.json()
