@@ -355,7 +355,8 @@ For issues specific to this project repository, use the GitHub issues section.
 
 ## License
 
-This documentation is provided under the MIT License.
+This documentation is part of XOPTrader and, like the rest of the project, is
+licensed under the WTFPL, Version 2. See [LICENSE](../LICENSE).
 
 ---
 

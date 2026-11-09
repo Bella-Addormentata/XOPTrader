@@ -3,7 +3,7 @@
   "name": "xop-trader",
   "version-semver": "0.1.7",
   "description": "CHIA DEX market-making bot — XOPTrader C++ engine",
-  "license": "UNLICENSED",
+  "license": "WTFPL",
   "supports": "!uwp",
   "dependencies": [
     {

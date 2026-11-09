@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: WTFPL
 //
 // CompetitivenessPid -- adaptive control of the competitiveness gate threshold
 // based on observed fill rate.  Companion to the existing spread PID

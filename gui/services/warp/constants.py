@@ -4,7 +4,8 @@ Values are transcribed verbatim from the warp-ui ``config.tsx`` deployment
 config (validator BLS G1 keys, multisig keys, EVM validator addresses, Nostr
 relays + x-only keys, thresholds, contract addresses, launcher ids) plus the
 watcher/status endpoints. The BLS validator keys are needed regardless of Nostr
-because currying the portal-receiver inner puzzle commits to them.
+because currying the portal-receiver inner puzzle commits to them. warp-ui is
+MIT-licensed; its notice is in THIRD_PARTY_NOTICES.md at the repository root.
 
 **Mainnet only.** A Base Sepolia / testnet11 deployment used to live here too,
 but it could never actually bridge (Base Sepolia has no wired USDC, and the EVM

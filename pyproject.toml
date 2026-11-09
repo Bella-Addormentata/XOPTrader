@@ -1,11 +1,18 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+# 77 is the first setuptools that reads `license` as an SPDX expression and
+# `license-files` under [project] (PEP 639); older ones reject both.
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "xop-trader"
 version = "0.10.47"
 description = "CHIA DEX market maker — Avellaneda-Stoikov / GLFT strategy engine"
+# XOPTrader itself is WTFPL. The package also carries code ported from
+# warp.green (MIT), Pieter Wuille's bech32 (MIT) and Chia (Apache-2.0), which
+# keeps its own license: see THIRD_PARTY_NOTICES.md.
+license = "WTFPL AND MIT AND Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.11,<4"
 dependencies = [
     "aiohttp>=3.9,<4",

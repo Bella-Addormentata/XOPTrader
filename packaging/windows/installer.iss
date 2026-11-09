@@ -86,6 +86,12 @@ Source: "config.example.yaml"; DestDir: "{app}"; Flags: ignoreversion
 ; Application icon (for Add/Remove Programs)
 Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 
+; License and third-party notices. The GUI carries warp.green (MIT) and Chia
+; (Apache-2.0) code whose notices have to travel with it. Installed as .txt so
+; a double-click opens them.
+Source: "LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
+Source: "THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; DestName: "THIRD_PARTY_NOTICES.txt"; Flags: ignoreversion
+
 [Icons]
 ; Start Menu
 Name: "{group}\XOPTrader";                    Filename: "{app}\xop_trader_gui.exe"

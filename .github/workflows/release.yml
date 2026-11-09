@@ -305,6 +305,9 @@ jobs:
       #   * scripts/offer_sizing.py -- loaded by file path (gui/utils.py), so
       #     the import graph never sees it;
       #   * the two example configs -- first-run bootstrap copies them out.
+      # LICENSE and THIRD_PARTY_NOTICES.md are never read; they ride along
+      # because the bundle carries warp.green (MIT) and Chia (Apache-2.0)
+      # code whose notices have to travel with every copy.
       # Relative sources resolve against the spec directory; no --specpath is
       # passed, so the spec lands in gui/ and these paths are correct.
       - name: Build with PyInstaller
@@ -326,6 +329,8 @@ jobs:
           --add-data "../scripts/offer_sizing.py:scripts"
           --add-data "../config.example.yaml:."
           --add-data "../secrets.example.yaml:."
+          --add-data "../LICENSE:."
+          --add-data "../THIRD_PARTY_NOTICES.md:."
           --hidden-import requests
           --icon icon.${{ matrix.icon_fmt }}
           main.py
@@ -435,6 +440,8 @@ jobs:
             '--add-data', '../scripts/offer_sizing.py;scripts',
             '--add-data', '../config.example.yaml;.',
             '--add-data', '../secrets.example.yaml;.',
+            '--add-data', '../LICENSE;.',
+            '--add-data', '../THIRD_PARTY_NOTICES.md;.',
             '--hidden-import', 'requests',
             '--icon', 'icon.ico'
           )
@@ -541,6 +548,8 @@ jobs:
           Copy-Item packaging\windows\installer.iss    installer-staging\
           Copy-Item gui\icon.ico                       installer-staging\
           Copy-Item config.example.yaml                installer-staging\
+          Copy-Item LICENSE                            installer-staging\
+          Copy-Item THIRD_PARTY_NOTICES.md             installer-staging\
 
           # Compile the installer
           iscc /DAppVersion=$version `
@@ -562,7 +571,7 @@ jobs:
                 -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=C:\XOPSmoke" `
                 -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "installer exited $($p.ExitCode)" }
-          foreach ($f in "xop_trader_gui.exe","xop_trader.exe","config.example.yaml","icon.ico") {
+          foreach ($f in "xop_trader_gui.exe","xop_trader.exe","config.example.yaml","icon.ico","LICENSE.txt","THIRD_PARTY_NOTICES.txt") {
             if (-not (Test-Path "C:\XOPSmoke\$f")) { throw "missing $f after install" }
           }
           $dlls = (Get-ChildItem "C:\XOPSmoke\*.dll").Count
@@ -714,6 +723,8 @@ jobs:
           cp dl/xop_trader-gui-linux-x64        linux-bundle/xop_trader_gui
           cp gui/icon.png                       linux-bundle/
           cp config.example.yaml                linux-bundle/
+          cp LICENSE                            linux-bundle/
+          cp THIRD_PARTY_NOTICES.md             linux-bundle/
           cp packaging/linux/xop_trader.desktop  linux-bundle/
           cp packaging/linux/install.sh          linux-bundle/
           cp packaging/linux/uninstall.sh        linux-bundle/
