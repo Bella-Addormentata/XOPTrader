@@ -8,6 +8,11 @@ This is a faithful port of warpdotgreen ``cli/drivers/portal.py`` +
 *constructed* and hashed; the one place we read an existing on-chain puzzle
 (the portal parent's lineage proof) is handled by the caller and passed in.
 
+The ported code keeps its upstream licenses, not the WTFPL: MIT for
+warp.green's (Copyright (c) 2024 Mihai Dancaescu (yakuhito)) and Apache-2.0 for
+Chia's singleton driver. Both notices are in THIRD_PARTY_NOTICES.md at the
+repository root.
+
 The claim is a five-spend bundle, pushed atomically:
 
 1. **portal singleton** -- reveals the validator BLS set + a sig-switch bitmask;

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: WTFPL
 //
 // fee_controller.hpp -- closed-loop control of the blockchain fee RATE.
 //

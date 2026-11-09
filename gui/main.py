@@ -629,6 +629,7 @@ def _run_self_check() -> int:
     the printed lines are a convenience where a console exists.
     """
     frozen = bool(getattr(sys, "frozen", False))
+    checks: list[str] = []
     failures: list[str] = []
 
     def _fail(label: str, exc: BaseException) -> None:
@@ -642,6 +643,7 @@ def _run_self_check() -> int:
             _emit(f"     | {line}")
 
     def _check(label: str, fn, *, optional_deps: bool = False) -> None:
+        checks.append(label)
         try:
             fn()
         except ModuleNotFoundError as exc:
@@ -667,21 +669,26 @@ def _run_self_check() -> int:
         from gui.utils import load_offer_sizing
         load_offer_sizing()
 
-    def _example(name: str):
-        def _check_example() -> None:
+    def _bundled(name: str):
+        def _check_bundled() -> None:
             if not (bundle_dir() / name).is_file():
                 raise FileNotFoundError(bundle_dir() / name)
-        return _check_example
+        return _check_bundled
 
     _emit(f"xop_trader_gui self-check (frozen={frozen}, bundle={bundle_dir()})")
     _check("warp puzzle reveals (gui.services.warp.drivers)", _warp_drivers,
            optional_deps=True)
     _check("offer sizing calculator (scripts/offer_sizing.py)", _offer_sizing)
-    _check(f"{_EXAMPLE_CONFIG_NAME}", _example(_EXAMPLE_CONFIG_NAME))
-    _check(f"{_EXAMPLE_SECRETS_NAME}", _example(_EXAMPLE_SECRETS_NAME))
+    _check(f"{_EXAMPLE_CONFIG_NAME}", _bundled(_EXAMPLE_CONFIG_NAME))
+    _check(f"{_EXAMPLE_SECRETS_NAME}", _bundled(_EXAMPLE_SECRETS_NAME))
+    # Never read at run time. They ride in the bundle because it carries
+    # warp.green (MIT) and Chia (Apache-2.0) code whose notices have to travel
+    # with every copy.
+    _check("LICENSE", _bundled("LICENSE"))
+    _check("THIRD_PARTY_NOTICES.md", _bundled("THIRD_PARTY_NOTICES.md"))
 
     if failures:
-        _emit(f"self-check FAILED ({len(failures)} of 4)")
+        _emit(f"self-check FAILED ({len(failures)} of {len(checks)})")
         return 1
     _emit("self-check passed")
     return 0

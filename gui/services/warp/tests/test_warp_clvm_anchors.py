@@ -17,6 +17,8 @@ on-chain:
 The wrapped-asset derivation helpers below are a faithful port of warp's
 ``cli/drivers/wrapped_assets.py`` mint path; they will be promoted into
 ``drivers.py`` (Commit 5). Keeping a copy here makes this anchor self-contained.
+The ported helpers keep warpdotgreen/cli's MIT license; its notice is in
+THIRD_PARTY_NOTICES.md at the repository root.
 """
 
 from __future__ import annotations

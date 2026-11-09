@@ -7,7 +7,10 @@ Sources and licences:
 * warp-ui ``drivers/erc20bridge.tsx`` (MIT): ``cat_burner``,
   ``burn_inner_puzzle`` (published as JS constants, not shipped as ``.hex``).
 * chia-blockchain (Apache-2.0): ``singleton_top_layer_v1_1``, ``cat_v2``,
-  ``p2_delegated_puzzle_or_hidden_puzzle``.
+  ``p2_delegated_puzzle_or_hidden_puzzle``, ``p2_m_of_n_delegate_direct``.
+
+These reveals keep their upstream licenses, not the WTFPL. The full license
+texts are in THIRD_PARTY_NOTICES.md at the repository root.
 
 Each reveal is verified against :mod:`gui.services.warp.puzzles.hashes` at load
 time (see :func:`gui.services.warp.clvm_utils.load_puzzle`) -- a corrupted or

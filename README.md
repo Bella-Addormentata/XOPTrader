@@ -29,6 +29,7 @@ XOPTrader deploys capital across dexie.space, TibetSwap, and other CHIA DEX venu
 - [Development](#development)
 - [Roadmap](#roadmap)
 - [Research Documentation](#research-documentation)
+- [License](#license)
 
 ---
 
@@ -1089,3 +1090,18 @@ In-depth research and planning documents covering the ecosystem, strategies, arc
 | Document | Description |
 |----------|-------------|
 | [docs/chia-market-maker.md](docs/chia-market-maker.md) | Concise research brief: DEX landscape, four market-making models, risk controls, architecture playbook |
+
+---
+
+## License
+
+XOPTrader is free software. It comes without any warranty, to the extent
+permitted by applicable law. You can redistribute it and/or modify it under the
+terms of the Do What The Fuck You Want To Public License, Version 2, as
+published by Sam Hocevar. See [LICENSE](LICENSE) and <http://www.wtfpl.net/>
+for more details.
+
+A few files carry code or data by other people (from warp.green, Chia Network,
+Pieter Wuille's bech32 and BIP 340). That work keeps its own permissive
+license. The release builds also bundle third-party libraries under their own
+licenses. Both are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

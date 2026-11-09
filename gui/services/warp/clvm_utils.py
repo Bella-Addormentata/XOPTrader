@@ -217,6 +217,11 @@ def puzzle_hash(name: str) -> bytes:
 # 0x2bc830a3). This mirrors chia.util.bech32m exactly -- warp's cli imports the
 # same functions to build the Nostr filter tags, so byte-for-byte compatibility
 # here is what lets us find the validator signature events.
+#
+# chia.util.bech32m is Pieter Wuille's bech32 reference code, so the functions
+# from _bech32_polymod to convertbits stay under its MIT license (Copyright (c)
+# 2017 Pieter Wuille), not the WTFPL. The full notice is in
+# THIRD_PARTY_NOTICES.md at the repository root.
 
 _BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 _BECH32M_CONST = 0x2BC830A3

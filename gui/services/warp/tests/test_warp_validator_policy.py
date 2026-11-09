@@ -11,7 +11,8 @@ COLLECTING_EVM_SIGS until it expires.
 check, from warpdotgreen/cli@29f6bd1 (chia ``Program`` -> our clvm ``SExp``).
 It runs on what :func:`build_burn_bundle` emits, so a builder change the
 validators would refuse fails here, before it can cost an unwrap. Re-port it
-when upstream changes the policy.
+when upstream changes the policy. The port keeps warpdotgreen/cli's MIT
+license; its notice is in THIRD_PARTY_NOTICES.md at the repository root.
 """
 
 from __future__ import annotations
