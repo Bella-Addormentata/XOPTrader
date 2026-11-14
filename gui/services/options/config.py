@@ -197,7 +197,11 @@ class OptionsConfig:
     withdraw_pct: float
     stop_before_expiry_seconds: int
     confirm_timeout_seconds: int
-    fee_mojos: int
+    fee_mojos: int  # per transaction; 0 with fee_auto
+    fee_auto: bool  # size each fee from the wallet's estimate, under limits.max_fee_mojos
+    withdraw_min_life_seconds: int
+    withdraw_cooldown_seconds: int
+    max_withdrawals_per_hour: int
     upload_offers: bool
     pricing: PricingConfig
     limits: Limits
@@ -348,7 +352,8 @@ def parse(root: Any) -> OptionsConfig | None:
         max_contracts_per_expiry=_cap(limits_raw, "max_contracts_per_expiry", 1),
         max_fee_mojos=int(_number(limits_raw, "max_fee_mojos", 0)),
     )
-    fee = int(_number(section, "fee_mojos", 0))
+    fee_auto = str(section.get("fee_mojos", 0)).strip().lower() == "auto"
+    fee = 0 if fee_auto else int(_number(section, "fee_mojos", 0))
     if fee > limits.max_fee_mojos:
         raise OptionsConfigError("options.fee_mojos is above options.limits.max_fee_mojos")
 
@@ -368,10 +373,14 @@ def parse(root: Any) -> OptionsConfig | None:
         offer_ttl_seconds=ttl,
         refresh_before_seconds=refresh,
         reprice_pct=_number(section, "reprice_pct", 2.0),
-        withdraw_pct=_number(section, "withdraw_pct", 1.0, minimum=0.01),
+        withdraw_pct=_number(section, "withdraw_pct", 2.0, minimum=0.01),
+        withdraw_min_life_seconds=int(_number(section, "withdraw_min_life_seconds", 180)),
+        withdraw_cooldown_seconds=int(_number(section, "withdraw_cooldown_seconds", 300)),
+        max_withdrawals_per_hour=int(_number(section, "max_withdrawals_per_hour", 6)),
         stop_before_expiry_seconds=int(_number(section, "stop_before_expiry_seconds", 6 * 3600)),
         confirm_timeout_seconds=int(_number(section, "confirm_timeout_seconds", 1800, minimum=60)),
         fee_mojos=fee,
+        fee_auto=fee_auto,
         upload_offers=bool(section.get("upload_offers", True)),
         pricing=PricingConfig(
             rate=_number(pricing_raw, "rate", 0.0),

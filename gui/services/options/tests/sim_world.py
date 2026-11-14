@@ -67,6 +67,27 @@ class Party:
         )
 
 
+class SimChain:
+    """The simulator as a chain reader that can also tell the chain's time.
+
+    The simulator refuses ``ASSERT_BEFORE_SECONDS_ABSOLUTE(t)`` once its next
+    block's timestamp has reached ``t``, so that timestamp is its clock in the
+    sense a node's latest transaction block is mainnet's.
+    """
+
+    def __init__(self, sim: Any) -> None:
+        self.sim = sim
+
+    def coin_state(self, coin_id: bytes) -> Any:
+        return self.sim.coin_state(coin_id)
+
+    def coin_spend(self, coin_id: bytes) -> Any:
+        return self.sim.coin_spend(coin_id)
+
+    def chain_time(self) -> int:
+        return int(self.sim.next_timestamp())
+
+
 class World:
     def __init__(self) -> None:
         self.sim = sdk.Simulator()

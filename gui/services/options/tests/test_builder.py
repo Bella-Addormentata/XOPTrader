@@ -102,6 +102,84 @@ def test_mint_put_locks_the_cat(world: World) -> None:
     assert loaded.locked.cat is not None
 
 
+# ---------------------------------------------------------------------------
+# A transaction that runs out
+# ---------------------------------------------------------------------------
+
+
+def test_a_mint_can_carry_a_time_after_which_the_chain_refuses_it(world: World) -> None:
+    maker, taker = world.party(250), world.party(250)
+    usd = world.issue_cat(taker, 1000)
+    world.advance(10_000)
+    terms = _call_terms(world, maker, usd)
+    late = builder.build_mint(
+        terms, maker.funding(), maker.custody(), valid_until_seconds=world.now() + 600
+    )
+    in_time = builder.build_mint(
+        terms, maker.funding(), maker.custody(), valid_until_seconds=world.now() + 600
+    )
+
+    world.push(in_time.coin_spends)  # before the deadline: accepted
+    assert world.load(in_time.launcher_id).status is OptionStatus.LIVE
+
+    again = builder.build_mint(
+        terms, maker.funding(), maker.custody(), valid_until_seconds=world.now() + 600
+    )
+    world.advance(600)
+    with pytest.raises(RejectedError, match="AssertBeforeSecondsAbsolute"):
+        world.push(again.coin_spends)
+    assert late.launcher_id == in_time.launcher_id  # same coin, same launcher
+
+
+def test_a_transfer_and_a_cancel_can_carry_one_too(world: World) -> None:
+    maker, taker = world.party(250), world.party(250)
+    usd = world.issue_cat(taker, 1000)
+    world.send_cat(taker, maker.puzzle_hash, usd, 1)
+    world.advance(10_000)
+    minted = _mint(world, maker, _call_terms(world, maker, usd))
+    deadline = world.now() + 300
+    moved = builder.build_transfer(
+        minted.option,
+        maker.puzzle_hash,
+        maker.funding(),
+        maker.custody(),
+        valid_until_seconds=deadline,
+    )
+    cancel = builder.build_cancel(
+        minted.option,
+        minted.underlying,
+        minted.locked,
+        maker.funding(usd),
+        maker.custody(),
+        valid_until_seconds=deadline,
+    )
+
+    world.advance(300)
+
+    for coin_spends in (moved.coin_spends, cancel):
+        with pytest.raises(RejectedError, match="AssertBeforeSecondsAbsolute"):
+            world.push(coin_spends)
+    # The same spends without a deadline are still good.
+    world.push(
+        builder.build_cancel(
+            minted.option, minted.underlying, minted.locked, maker.funding(usd), maker.custody()
+        )
+    )
+
+
+@pytest.mark.parametrize("bad", [0, -5, True, 1.5, "soon"])
+def test_a_deadline_must_be_a_positive_whole_number(world: World, bad) -> None:
+    maker = world.party(250)
+    usd = world.issue_cat(world.party(1), 10)
+    with pytest.raises(builder.OptionBuildError, match="valid_until_seconds"):
+        builder.build_mint(
+            _call_terms(world, maker, usd),
+            maker.funding(),
+            maker.custody(),
+            valid_until_seconds=bad,
+        )
+
+
 def test_mint_needs_the_collateral(world: World) -> None:
     maker, other = world.party(50), world.party(1)
     usd = world.issue_cat(other, 10)

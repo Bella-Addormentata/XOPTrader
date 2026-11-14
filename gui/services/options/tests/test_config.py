@@ -181,5 +181,28 @@ def test_bad_chain_settings_are_refused(overrides, message) -> None:
         _parse(**overrides)
 
 
+def test_fees_are_fixed_or_follow_the_wallet_s_estimate_under_the_cap() -> None:
+    assert (_parse().fee_mojos, _parse().fee_auto) == (0, False)
+
+    fixed = _parse(fee_mojos=500, limits={**_section()["limits"], "max_fee_mojos": 1000})
+    assert (fixed.fee_mojos, fixed.fee_auto) == (500, False)
+
+    auto = _parse(fee_mojos="auto", limits={**_section()["limits"], "max_fee_mojos": 1000})
+    assert (auto.fee_mojos, auto.fee_auto, auto.limits.max_fee_mojos) == (0, True, 1000)
+    # With no cap, "auto" can only ever mean no fee, which is allowed.
+    assert _parse(fee_mojos=" Auto ").fee_auto
+
+
+def test_withdrawals_are_reined_in_by_default() -> None:
+    parsed = _parse()
+    assert parsed.withdraw_pct == 2.0
+    assert parsed.withdraw_min_life_seconds == 180
+    assert parsed.withdraw_cooldown_seconds == 300
+    assert parsed.max_withdrawals_per_hour == 6
+    assert _parse(max_withdrawals_per_hour=0).max_withdrawals_per_hour == 0
+    with pytest.raises(config.OptionsConfigError, match="max_withdrawals_per_hour"):
+        _parse(max_withdrawals_per_hour=-1)
+
+
 def test_testnet_uses_testnet_addresses() -> None:
     assert _parse(network="testnet11").address_prefix == "txch"

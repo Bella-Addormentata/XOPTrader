@@ -191,6 +191,28 @@ class CoinsetClient:
         peak = state.get("peak") or {}
         return int(peak.get("height", 0) or 0)
 
+    def get_chain_time(self) -> Optional[int]:
+        """The timestamp of the node's latest transaction block, or ``None``.
+
+        This is the clock the chain judges timelocks by. Only transaction
+        blocks carry a timestamp, so when the peak is not one, the block it
+        names as its previous transaction block is read as well (a second
+        request). ``None`` while the node has no peak or is not synced: a node
+        that is behind must not be believed about what time it is.
+        """
+        state = self.get_blockchain_state()
+        peak = state.get("peak") or {}
+        if not peak or not (state.get("sync") or {}).get("synced", False):
+            return None
+        if peak.get("timestamp") is not None:
+            return int(peak["timestamp"])
+        height = peak.get("prev_transaction_block_height")
+        if height is None:
+            return None
+        data = self._post("get_block_record_by_height", {"height": int(height)}) or {}
+        stamp = (data.get("block_record") or {}).get("timestamp")
+        return int(stamp) if stamp is not None else None
+
     def get_coin_record_by_name(self, name: str) -> Optional[CoinRecord]:
         """The coin record, or ``None`` when the coin is not on chain yet.
 

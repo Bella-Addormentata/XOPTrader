@@ -26,7 +26,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from gui.services.options import builder, chain, config, safety, store
+from gui.services.options import builder, chain, config, fees, safety, store
 from gui.services.options.reference_wallet import ReferenceWallet
 from gui.services.options.runtime import (
     _ADDITIONAL_DATA,
@@ -43,6 +43,9 @@ LIVE_TEST_SLOT = "live-test"
 
 _POLL_SECONDS = 15
 _REPUSH_EVERY_POLLS = 8  # two minutes: the first push may never have reached a node
+# With ``fee_mojos: auto`` the test pays one flat fee per spend, sized for the
+# costliest of them (the cancel, about 165 million), so its sums stay simple.
+_LIVE_TEST_COST = 170_000_000
 
 
 def _load(path: str) -> config.OptionsConfig:
@@ -82,6 +85,12 @@ def _status(cfg: config.OptionsConfig) -> int:
     del book
     print(f"network {cfg.network}   dry_run {cfg.dry_run}")
     print(f"chain is read from {chain_source(cfg)}")
+    if cfg.fee_auto:
+        print(
+            f"fees: the wallet's estimate, at most {cfg.limits.max_fee_mojos} mojos a transaction"
+        )
+    else:
+        print(f"fees: {cfg.fee_mojos} mojos a transaction")
     print(f"options address {coins.address()}")
     xch = sum(int(coin.amount) for coin in coins.xch_coins())
     quote = sum(int(cat.coin.amount) for cat in coins.cats(cfg.quote_asset_id))
@@ -206,6 +215,7 @@ class _LiveTest:
     custody: builder.Custody
     assume_yes: bool
     timeout: float
+    fee: int = 0  # paid by each of the test's spends
 
     @staticmethod
     def now() -> int:
@@ -275,7 +285,7 @@ class _LiveTest:
 
 def _cancel_stage(test: _LiveTest, contract: store.Contract) -> None:
     loaded = chain.load_option(test.reader, contract.launcher_id, now_seconds=test.now())
-    fee = test.cfg.fee_mojos
+    fee = test.fee
     amount = contract.underlying_amount
     cancel = builder.build_cancel(
         loaded.option,
@@ -313,7 +323,7 @@ def _cancel_stage(test: _LiveTest, contract: store.Contract) -> None:
 
 def _clawback_stage(test: _LiveTest, contract: store.Contract) -> None:
     loaded = chain.load_option(test.reader, contract.launcher_id, now_seconds=test.now())
-    fee = test.cfg.fee_mojos
+    fee = test.fee
     amount = contract.underlying_amount
     clawback = builder.build_clawback(
         loaded.underlying,
@@ -407,6 +417,12 @@ def _live_test(
     key = wallet.synthetic_key(address)
     custody = builder.Custody()
     custody.add_key(key)
+    fee = cfg.fee_mojos
+    if cfg.fee_auto:
+        rate = wallet.fee_rate()
+        fee = fees.fee_for(_LIVE_TEST_COST, rate or 0, cfg.limits.max_fee_mojos)
+        said = "no estimate from the wallet" if rate is None else f"{rate} mojos per cost"
+        print(f"fee per spend: {fee} mojos (auto: {said}, capped at {cfg.limits.max_fee_mojos})")
     test = _LiveTest(
         cfg=cfg,
         wallet=wallet,
@@ -419,6 +435,7 @@ def _live_test(
         custody=custody,
         assume_yes=assume_yes,
         timeout=timeout,
+        fee=fee,
     )
     try:
         # Held throughout: a book stepping over the same database must not act
@@ -433,9 +450,9 @@ def _live_test(
 
 
 def _run_live_test(test: _LiveTest, amount_xch: float) -> int:
-    cfg, coins, address, custody = test.cfg, test.coins, test.address, test.custody
+    coins, address, custody = test.coins, test.address, test.custody
     amount = int(round(amount_xch * config.XCH_MOJOS))
-    fee = cfg.fee_mojos
+    fee = test.fee
     xch = coins.xch_coins()
     have = sum(int(coin.amount) for coin in xch)
     # Three fees, or one spare mojo when there is no fee: the cancel needs an

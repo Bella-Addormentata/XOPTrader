@@ -68,6 +68,7 @@ class FakeWallet:
         self.by_fingerprint = {_fingerprint(party.pk): party for party in parties}
         self.calls: list[tuple[str, dict]] = []
         self.rejected: list[str] = []
+        self.fee_per_cost: Any = 0
         self.tamper: dict[str, Callable[[dict], Any]] = {}
 
     def endpoints(self) -> list[str]:
@@ -143,6 +144,11 @@ class FakeWallet:
                 for hook, group in by_hook.items()
             ]
         }
+
+    def _get_fee_estimate(self, body: dict) -> dict:
+        # chia-blockchain 2.7.5 answers {"fee_per_cost": <whole mojos per cost>}.
+        assert body == {}
+        return {"fee_per_cost": self.fee_per_cost}
 
     def _push_tx(self, body: dict) -> dict:
         # The real wallet forwards the bundle to its node and returns; whatever
@@ -304,6 +310,33 @@ def test_old_wallet_without_signer_rpcs_is_a_signing_error() -> None:
     reference = ReferenceWallet(old, agg_sig_me_additional_data=ADDITIONAL_DATA)
     with pytest.raises(signing.SigningError, match="unknown endpoint"):
         reference.sign(_mint_spends(world, maker, usd).coin_spends)
+
+
+def test_the_wallet_passes_on_its_node_s_fee_estimate() -> None:
+    _, _, _, _, wallet, reference = _setup()
+    assert reference.fee_rate() == 0
+    wallet.fee_per_cost = 5
+    assert reference.fee_rate() == 5
+    assert wallet.endpoints().count("get_fee_estimate") == 2
+
+
+@pytest.mark.parametrize("answer", ["soon", None, -1, {"mojos": 5}])
+def test_a_fee_estimate_that_is_not_a_rate_is_no_estimate(answer) -> None:
+    _, _, _, _, wallet, reference = _setup()
+    wallet.fee_per_cost = answer
+    assert reference.fee_rate() is None
+
+
+def test_a_wallet_that_cannot_estimate_fees_says_so_instead_of_failing() -> None:
+    def no_peer(endpoint: str, body: dict) -> dict:
+        return {"success": False, "error": "Wallet is not currently connected to any full node"}
+
+    def old(endpoint: str, body: dict) -> dict:
+        raise ConnectionError(f"404 for /{endpoint}")
+
+    for rpc in (no_peer, old):
+        reference = ReferenceWallet(rpc, agg_sig_me_additional_data=ADDITIONAL_DATA)
+        assert reference.fee_rate() is None
 
 
 # ---------------------------------------------------------------------------

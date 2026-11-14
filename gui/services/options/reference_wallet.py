@@ -234,6 +234,22 @@ class ReferenceWallet:
 
     # -- broadcast ----------------------------------------------------------
 
+    def fee_rate(self) -> int | None:
+        """What inclusion in the next block costs, in mojos per unit of cost.
+
+        The wallet's ``get_fee_estimate`` passes on its full-node peer's
+        estimate, so no other node has to be asked. It is a whole number: 0
+        while the mempool has room, 1 or more once it is competing for space.
+        None when the wallet cannot say (no peer, or a wallet older than the
+        RPC), which a caller should treat as "do not guess".
+        """
+        try:
+            answer = self._call("get_fee_estimate", {})
+            rate = int(answer["fee_per_cost"])
+        except (SigningError, KeyError, TypeError, ValueError):
+            return None
+        return rate if rate >= 0 else None
+
     def push(self, coin_spends: Sequence[CoinSpend], aggregated_signature: bytes) -> bytes:
         """Hand a signed bundle to the wallet's full-node peer.
 

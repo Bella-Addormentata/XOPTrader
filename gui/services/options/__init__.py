@@ -16,7 +16,8 @@ do the same work against the wallet it already trades through:
   and refuses one that differs from what the operation declared.
 * :mod:`chain` reads an option, or the outcome of a broadcast, back from chain.
 * :mod:`pricing`, :mod:`market` and :mod:`quoting` decide what to offer and at
-  what price; :mod:`desk` talks to xchoptions.com; :mod:`store` is the durable
+  what price; :mod:`fees` sizes each transaction's fee from its cost;
+  :mod:`desk` talks to xchoptions.com; :mod:`store` is the durable
   record; :mod:`service` is the loop that ties them together and
   :mod:`monitor` is its read-only counterpart for other makers' offers.
 * :mod:`runtime` and ``python -m gui.services.options`` wire it to a real
@@ -54,9 +55,12 @@ What has been checked, and what has not:
 One thing to know before wiring this in: the wallet's ``push_tx`` reports no
 verdict. A bundle its node refuses looks the same to the caller as one it
 accepts, so outcomes are read from the chain with :func:`chain.bundle_status`.
-A bundle that has not confirmed is never given up on by the clock alone: it
+A bundle that has not confirmed is never given up on by the local clock: it
 stays on the books, its coins stay set aside and it keeps being pushed until
-the chain shows it confirmed or shows one of its coins spent another way.
+the chain rules on it. A mint, a cancel and a withdrawal each carry a deadline
+the chain enforces, so the ruling can be "too late": once the chain's own
+clock is safely past it, the bundle can never confirm and is given up without
+another transaction. A clawback has no deadline and is pushed until it lands.
 
 One process acts on a database at a time (:meth:`store.OptionStore.acting`).
 A second ``step`` or ``live-test`` over the same file is refused, not queued.

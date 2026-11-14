@@ -46,6 +46,10 @@ class Node:
         self.log.append(("spend", 1))
         return self.sim.coin_spend(coin.coin_id())
 
+    def chain_time(self) -> int:
+        self.log.append(("time", 1))
+        return int(self.sim.next_timestamp())
+
     def coin_state(self, coin_id: bytes) -> Any:
         raise AssertionError("asked for one coin when several could travel together")
 
@@ -402,11 +406,18 @@ def test_a_waiting_transaction_is_followed_at_the_poll_interval() -> None:
 
 
 def test_a_stalled_transaction_is_only_looked_at_on_the_routine_interval() -> None:
-    desk = Desk(put_strikes_pct=[], confirm_timeout_seconds=600)
+    # A clawback, which has no deadline of its own and so can sit stalled.
+    desk = _open_book(
+        1, put_strikes_pct=[], limits={"max_contracts": 1}, confirm_timeout_seconds=600
+    )
+    (call,) = desk.contracts()
+    desk.world.take(desk.taker, desk.live_offer(call).offer_text)
+    desk.run(2)
+    desk.world.advance(14 * DAY)
     real_push = desk.wallet.push
     desk.wallet.push = ts._unheard()  # type: ignore[method-assign]
-    desk.run(12)  # past the deadline: flagged as stalled
-    assert desk.store.broadcasts("stalled")
+    desk.run(12)  # the clawback is signed, unheard, and past its deadline: stalled
+    assert [row.kind for row in desk.store.broadcasts("stalled")] == [store.CLAWBACK]
     asked = desk.node.requests
 
     reports = desk.run(130)  # two hours and a little more
@@ -419,7 +430,22 @@ def test_a_stalled_transaction_is_only_looked_at_on_the_routine_interval() -> No
     desk.run(1)
     (report,) = desk.run(1)
     assert report.chain_looked == "the wallet's coins changed"
-    assert [item.status for item in desk.contracts()] == [store.OPEN]
+    assert desk.store.contract(call.launcher_id).status == store.CLOSED
+
+
+def test_giving_up_a_timed_out_transaction_costs_two_requests() -> None:
+    desk = Desk(put_strikes_pct=[], confirm_timeout_seconds=600)
+    desk.wallet.push = ts._unheard()  # type: ignore[method-assign]
+    desk.run(1)  # a mint no node hears
+    desk.world.advance(1100)
+    asked = desk.node.requests
+
+    (report,) = desk.run(1)
+
+    assert report.chain_looked == "a transaction ran out of time"
+    # The chain's clock first, then one look at the mint's coins.
+    assert [kind for kind, _ in desk.node.log[asked:]][:2] == ["time", "states"]
+    assert [event.detail for event in desk.events("mint_failed")] == [{"reason": "lapsed"}]
 
 
 def test_reaching_expiry_is_a_reason_to_look() -> None:

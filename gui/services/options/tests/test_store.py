@@ -294,6 +294,116 @@ def test_an_in_memory_database_needs_no_lock() -> None:
         _add(book)
 
 
+def test_a_broadcast_remembers_the_time_it_is_valid_until() -> None:
+    book = store.OptionStore(":memory:")
+    _add(book, valid_until=700)
+    book.set_status(LAUNCHER, store.OPEN)
+    book.add_broadcast(
+        launcher_id=LAUNCHER, kind=store.CANCEL, bundle=b"c", deadline=900, valid_until=950, now=200
+    )
+    book.add_broadcast(
+        launcher_id=LAUNCHER, kind=store.CLAWBACK, bundle=b"k", deadline=900, now=210
+    )
+
+    assert [(row.kind, row.valid_until) for row in book.broadcasts(None)] == [
+        (store.MINT, 700),
+        (store.CANCEL, 950),
+        (store.CLAWBACK, None),  # collateral is always wanted back: no deadline
+    ]
+
+
+def test_a_database_from_before_deadlines_is_brought_up_to_date(tmp_path) -> None:
+    path = tmp_path / "options_jobs.db"
+    old = sqlite3.connect(path)
+    old.executescript(
+        """
+        CREATE TABLE contracts (launcher_id TEXT PRIMARY KEY, slot TEXT NOT NULL,
+            side TEXT NOT NULL, underlying_asset TEXT, underlying_amount INTEGER NOT NULL,
+            strike_asset TEXT, strike_amount INTEGER NOT NULL, expiration INTEGER NOT NULL,
+            creator_puzzle_hash TEXT NOT NULL, status TEXT NOT NULL,
+            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+        CREATE TABLE broadcasts (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            launcher_id TEXT NOT NULL REFERENCES contracts (launcher_id), kind TEXT NOT NULL,
+            bundle BLOB NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL,
+            deadline INTEGER NOT NULL);
+        """
+    )
+    old.execute(
+        "INSERT INTO contracts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            LAUNCHER.hex(),
+            "C110@1000",
+            "call",
+            None,
+            20,
+            USD.hex(),
+            24,
+            1000,
+            ME.hex(),
+            "minting",
+            1,
+            1,
+        ),
+    )
+    old.execute(
+        "INSERT INTO broadcasts (launcher_id, kind, bundle, status, created_at, deadline)"
+        " VALUES (?,?,?,?,?,?)",
+        (LAUNCHER.hex(), "mint", b"old", "pending", 1, 500),
+    )
+    old.commit()
+    old.close()
+
+    book = store.OptionStore(path)
+
+    (row,) = book.unresolved()
+    assert (row.bundle, row.valid_until) == (b"old", None)  # an old bundle has no deadline
+    book.add_broadcast(
+        launcher_id=LAUNCHER, kind=store.CANCEL, bundle=b"new", deadline=900, valid_until=950
+    )
+    assert book.unresolved()[-1].valid_until == 950
+    store.OptionStore(path).close()  # opening it again changes nothing
+
+
+def test_withdrawals_are_counted_by_when_they_were_sent() -> None:
+    book = store.OptionStore(":memory:")
+    _add(book)
+    _add(book, OTHER)
+    for launcher, at in ((LAUNCHER, 1000), (LAUNCHER, 3000), (OTHER, 5000)):
+        book.add_broadcast(
+            launcher_id=launcher, kind=store.WITHDRAW, bundle=b"w", deadline=at + 600, now=at
+        )
+    book.add_broadcast(launcher_id=OTHER, kind=store.CANCEL, bundle=b"c", deadline=9000, now=5500)
+
+    assert book.withdrawals() == {LAUNCHER: 3000, OTHER: 5000}
+    assert [book.withdrawals_since(at) for at in (0, 3000, 3001, 6000)] == [3, 2, 1, 0]
+
+
+def test_a_failed_mint_s_record_is_taken_over_when_the_same_coin_is_minted_from_again() -> None:
+    book = store.OptionStore(":memory:")
+    first = _add(book)
+    book.settle_broadcast(first, "conflict", contract_status=store.FAILED, event="mint_failed")
+
+    # Same funding coin, so the same launcher id; new terms.
+    second = _add(book, slot="C120@2000", strike_amount=26, expiration=2000, now=900)
+
+    contract = book.contract(LAUNCHER)
+    assert (contract.status, contract.slot, contract.strike_amount, contract.expiration) == (
+        store.MINTING,
+        "C120@2000",
+        26,
+        2000,
+    )
+    assert contract.created_at == 900
+    assert [(row.id, row.status) for row in book.broadcasts(None)] == [
+        (first, "conflict"),
+        (second, "pending"),
+    ]
+    assert [event.kind for event in book.events(LAUNCHER)] == ["mint_failed"]
+    # A contract that is not a failed mint is never overwritten.
+    with pytest.raises(sqlite3.IntegrityError):
+        _add(book)
+
+
 def test_an_offer_for_an_unknown_contract_is_refused() -> None:
     book = store.OptionStore(":memory:")
     with pytest.raises(sqlite3.IntegrityError):

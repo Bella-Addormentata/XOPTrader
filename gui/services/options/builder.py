@@ -267,6 +267,27 @@ def _complete(clvm: Clvm, spends: Spends, actions: list[Action], custody: Custod
         raise OptionBuildError(f"could not build the spend: {exc}") from exc
 
 
+def _valid_until(clvm: Clvm, spends: Spends, valid_until_seconds: int | None) -> None:
+    """Make the whole bundle refuse to confirm from ``valid_until_seconds`` on.
+
+    One spend asserts ``ASSERT_BEFORE_SECONDS_ABSOLUTE``, the condition an offer
+    uses for its expiry, and every spend of a bundle asserts the others are
+    spent with it, so none of it can be included once the chain's clock has
+    reached that time. A transaction that has not confirmed by then never
+    will, which is what lets its coins be given to something else without the
+    risk of both confirming.
+    """
+    if valid_until_seconds is None:
+        return
+    if (
+        isinstance(valid_until_seconds, bool)
+        or not isinstance(valid_until_seconds, int)
+        or valid_until_seconds <= 0
+    ):
+        raise OptionBuildError("valid_until_seconds must be a positive integer")
+    spends.add_required_condition(clvm.assert_before_seconds_absolute(valid_until_seconds))
+
+
 def _hint(clvm: Clvm, puzzle_hash: bytes) -> Program:
     """The memo list that lets the receiving wallet find a coin: ``(puzzle_hash)``."""
     return clvm.alloc([bytes(puzzle_hash)])
@@ -326,18 +347,26 @@ class MintResult:
 
 
 def build_mint(
-    terms: OptionTerms, funding: Funding, custody: Custody, *, fee: int = 0
+    terms: OptionTerms,
+    funding: Funding,
+    custody: Custody,
+    *,
+    fee: int = 0,
+    valid_until_seconds: int | None = None,
 ) -> MintResult:
     """Mint an option: lock the underlying and create the singleton.
 
     The option is owned by ``funding.change_puzzle_hash``. The locked coin can
     then only leave through an exercise (which pays the strike to
     ``terms.creator_puzzle_hash``) or, after expiry, back to the creator.
+
+    With ``valid_until_seconds`` the mint cannot confirm from that time on.
     """
     _check_fee(fee)
     sdk = _sdk()
     clvm = sdk.Clvm()
     spends = _new_spends(clvm, funding, custody)
+    _valid_until(clvm, spends, valid_until_seconds)
     actions = [
         sdk.Action.fee(fee),
         sdk.Action.mint_option(
@@ -594,12 +623,15 @@ def build_transfer(
     custody: Custody,
     *,
     fee: int = 0,
+    valid_until_seconds: int | None = None,
 ) -> TransferResult:
     """Move an option to ``to_puzzle_hash``.
 
     Sending it to our own address is how an open offer is cancelled: an offer is
     a signed spend of one particular option coin, and once that coin is spent
     the offer can never settle.
+
+    With ``valid_until_seconds`` the transfer cannot confirm from that time on.
     """
     _check_fee(fee)
     _check_hash(to_puzzle_hash, "to_puzzle_hash")
@@ -607,6 +639,7 @@ def build_transfer(
     clvm = sdk.Clvm()
     spends = _new_spends(clvm, funding, custody)
     spends.add_option(option)
+    _valid_until(clvm, spends, valid_until_seconds)
     actions = [
         sdk.Action.fee(fee),
         sdk.Action.send(
@@ -747,6 +780,7 @@ def build_cancel(
     custody: Custody,
     *,
     fee: int = 0,
+    valid_until_seconds: int | None = None,
 ) -> list[CoinSpend]:
     """Release the collateral of an option we created and still own, before expiry.
 
@@ -768,6 +802,9 @@ def build_cancel(
 
     Refused unless custody holds the creator's key: for anyone else the strike
     payment would be a real payment to a stranger.
+
+    With ``valid_until_seconds`` the cancel cannot confirm from that time on
+    (it can never confirm after the option's own expiry in any case).
     """
     _check_fee(fee)
     _check_locked(option, underlying, locked)
@@ -876,6 +913,7 @@ def build_cancel(
     spends = _new_spends(
         clvm, Funding(change_puzzle_hash=change, xch=xch_funding, cats=cat_funding), custody
     )
+    _valid_until(clvm, spends, valid_until_seconds)
     try:
         _release_underlying(clvm, spends, option, underlying, locked)
     except Exception as exc:

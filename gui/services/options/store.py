@@ -98,7 +98,8 @@ CREATE TABLE IF NOT EXISTS broadcasts (
     bundle      BLOB NOT NULL,
     status      TEXT NOT NULL CHECK (status IN ('pending', 'confirmed', 'conflict', 'stalled')),
     created_at  INTEGER NOT NULL,
-    deadline    INTEGER NOT NULL
+    deadline    INTEGER NOT NULL,
+    valid_until INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_broadcasts_status ON broadcasts (status);
 
@@ -189,6 +190,15 @@ class OfferRow:
 
 @dataclasses.dataclass(frozen=True)
 class Broadcast:
+    """A signed bundle that was pushed.
+
+    ``status`` is ``pending``, ``stalled`` (still unresolved, flagged for the
+    operator at ``deadline``), ``confirmed``, or ``conflict``: it can never
+    confirm, because one of its coins went elsewhere or because the chain's
+    clock passed ``valid_until``, the time the bundle itself refuses to be
+    included from.
+    """
+
     id: int
     launcher_id: bytes
     kind: str
@@ -196,6 +206,7 @@ class Broadcast:
     status: str
     created_at: int
     deadline: int
+    valid_until: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -267,6 +278,10 @@ class OptionStore:
         self._db.execute("PRAGMA foreign_keys = ON")
         with self._db:
             self._db.executescript(_SCHEMA)
+            # A database from before bundles carried their own deadline.
+            columns = {row["name"] for row in self._db.execute("PRAGMA table_info(broadcasts)")}
+            if "valid_until" not in columns:
+                self._db.execute("ALTER TABLE broadcasts ADD COLUMN valid_until INTEGER")
         self._lock: sqlite3.Connection | None = None
         self._lock_depth = 0
 
@@ -331,32 +346,63 @@ class OptionStore:
         creator_puzzle_hash: bytes,
         bundle: bytes,
         deadline: int,
+        valid_until: int | None = None,
         now: int | None = None,
     ) -> int:
-        """Record a contract and its mint broadcast in one transaction."""
+        """Record a contract and its mint broadcast in one transaction.
+
+        A launcher id is the id of a coin made from the mint's funding coin, so
+        a mint that failed without touching that coin and is tried again over
+        it comes out with the same one. The failed contract never existed on
+        chain; its row is taken over by the new mint, and its history (the old
+        broadcast and the ``mint_failed`` event) stays. Any other duplicate is
+        an error.
+        """
         now = int(time.time()) if now is None else int(now)
+        described = (
+            slot,
+            side,
+            _hex(underlying_asset),
+            int(underlying_amount),
+            _hex(strike_asset),
+            int(strike_amount),
+            int(expiration),
+            _hex(creator_puzzle_hash),
+            MINTING,
+            now,
+            now,
+        )
         with self._write() as db:
-            db.execute(
-                "INSERT INTO contracts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            failed = db.execute(
+                "SELECT 1 FROM contracts WHERE launcher_id = ? AND status = ?",
+                (_hex(launcher_id), FAILED),
+            ).fetchone()
+            if failed is not None:
+                db.execute(
+                    "UPDATE contracts SET slot = ?, side = ?, underlying_asset = ?,"
+                    " underlying_amount = ?, strike_asset = ?, strike_amount = ?, expiration = ?,"
+                    " creator_puzzle_hash = ?, status = ?, created_at = ?, updated_at = ?"
+                    " WHERE launcher_id = ?",
+                    (*described, _hex(launcher_id)),
+                )
+            else:
+                db.execute(
+                    "INSERT INTO contracts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (_hex(launcher_id), *described),
+                )
+            cursor = db.execute(
+                "INSERT INTO broadcasts"
+                " (launcher_id, kind, bundle, status, created_at, deadline, valid_until)"
+                " VALUES (?,?,?,?,?,?,?)",
                 (
                     _hex(launcher_id),
-                    slot,
-                    side,
-                    _hex(underlying_asset),
-                    int(underlying_amount),
-                    _hex(strike_asset),
-                    int(strike_amount),
-                    int(expiration),
-                    _hex(creator_puzzle_hash),
-                    MINTING,
+                    MINT,
+                    bytes(bundle),
+                    "pending",
                     now,
-                    now,
+                    int(deadline),
+                    None if valid_until is None else int(valid_until),
                 ),
-            )
-            cursor = db.execute(
-                "INSERT INTO broadcasts (launcher_id, kind, bundle, status, created_at, deadline)"
-                " VALUES (?,?,?,?,?,?)",
-                (_hex(launcher_id), MINT, bytes(bundle), "pending", now, int(deadline)),
             )
             return int(cursor.lastrowid or 0)
 
@@ -556,15 +602,25 @@ class OptionStore:
         bundle: bytes,
         deadline: int,
         contract_status: str | None = None,
+        valid_until: int | None = None,
         now: int | None = None,
     ) -> int:
         """Record a signed bundle BEFORE it is pushed; optionally move the contract too."""
         now = int(time.time()) if now is None else int(now)
         with self._write() as db:
             cursor = db.execute(
-                "INSERT INTO broadcasts (launcher_id, kind, bundle, status, created_at, deadline)"
-                " VALUES (?,?,?,?,?,?)",
-                (_hex(launcher_id), kind, bytes(bundle), "pending", now, int(deadline)),
+                "INSERT INTO broadcasts"
+                " (launcher_id, kind, bundle, status, created_at, deadline, valid_until)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    _hex(launcher_id),
+                    kind,
+                    bytes(bundle),
+                    "pending",
+                    now,
+                    int(deadline),
+                    None if valid_until is None else int(valid_until),
+                ),
             )
             if contract_status is not None:
                 db.execute(
@@ -589,6 +645,7 @@ class OptionStore:
                 status=row["status"],
                 created_at=int(row["created_at"]),
                 deadline=int(row["deadline"]),
+                valid_until=None if row["valid_until"] is None else int(row["valid_until"]),
             )
             for row in rows
         ]
@@ -601,6 +658,23 @@ class OptionStore:
         """
         rows = self.broadcasts("pending") + self.broadcasts("stalled")
         return sorted(rows, key=lambda row: row.id)
+
+    def withdrawals(self) -> dict[bytes, int]:
+        """When the latest withdrawal of each contract's offers was sent."""
+        rows = self._db.execute(
+            "SELECT launcher_id, MAX(created_at) AS at FROM broadcasts WHERE kind = ?"
+            " GROUP BY launcher_id",
+            (WITHDRAW,),
+        )
+        return {bytes.fromhex(row["launcher_id"]): int(row["at"]) for row in rows}
+
+    def withdrawals_since(self, since: int) -> int:
+        """How many withdrawals were sent at or after ``since``, whatever became of them."""
+        row = self._db.execute(
+            "SELECT COUNT(*) AS sent FROM broadcasts WHERE kind = ? AND created_at >= ?",
+            (WITHDRAW, int(since)),
+        ).fetchone()
+        return int(row["sent"])
 
     def set_broadcast(self, broadcast_id: int, status: str) -> None:
         with self._write() as db:

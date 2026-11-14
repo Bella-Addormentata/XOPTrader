@@ -17,14 +17,25 @@ import pytest
 
 sdk = pytest.importorskip("chia_wallet_sdk")
 
-from gui.services.options import builder, chain, config, desk, market, signing, store  # noqa: E402
-from gui.services.options.service import OptionsBook  # noqa: E402
+from gui.services.options import (  # noqa: E402
+    builder,
+    chain,
+    config,
+    desk,
+    fees,
+    market,
+    quoting,
+    signing,
+    store,
+)
+from gui.services.options.service import OptionsBook, unpack_bundle  # noqa: E402
 from gui.services.options.tests.sim_world import (  # noqa: E402
     ADDITIONAL_DATA,
     CAT,
     XCH,
     Party,
     RejectedError,
+    SimChain,
     World,
 )
 
@@ -42,6 +53,12 @@ class SimWallet:
         self.pushed = 0
         self.rejected: list[str] = []
         self.fail_signing = False
+        self.rate: int | None = 0  # what its node estimates, in mojos per cost
+        self.rate_asked = 0
+
+    def fee_rate(self) -> int | None:
+        self.rate_asked += 1
+        return self.rate
 
     def synthetic_key(self, puzzle_hash: bytes) -> Any:
         assert bytes(puzzle_hash) == self.party.puzzle_hash
@@ -103,9 +120,9 @@ class FakeDesk:
 class Rig:
     def __init__(self, reader: Any = None, **overrides: Any) -> None:
         self.world = World()
-        # What its books read the chain through: the simulator itself, or a
-        # stand-in for a node built over it.
-        self.reader = self.world.sim if reader is None else reader(self.world.sim)
+        # What its books read the chain through: the simulator, or a stand-in
+        # for a node built over it.
+        self.reader = (SimChain if reader is None else reader)(self.world.sim)
         self.maker = self.world.party(500)
         self.taker = self.world.party(500)
         self.usd = self.world.issue_cat(self.taker, 5000)
@@ -352,7 +369,7 @@ def test_a_small_move_reprices_with_a_new_offer() -> None:
     assert len(rig.store.offers(call.launcher_id, "live")) == 2
 
 
-def test_a_large_rise_withdraws_the_cheap_offer_before_requoting() -> None:
+def test_a_large_rise_withdraws_the_cheap_offer_then_sits_out_before_requoting() -> None:
     rig = Rig()
     rig.steps(4)
     call = _by_side(rig, "call", store.OPEN)
@@ -363,14 +380,163 @@ def test_a_large_rise_withdraws_the_cheap_offer_before_requoting() -> None:
     assert any("withdrawing offers" in action for action in report.actions)
     with pytest.raises(RejectedError, match="DoubleSpend"):
         rig.world.take(rig.taker, cheap.offer_text)
+    # The withdrawal must not outlive the offer it kills.
+    (sent,) = [row for row in rig.store.broadcasts(None) if row.kind == store.WITHDRAW]
+    assert sent.valid_until == cheap.expires_at
 
+    # Confirmed, and then nothing is on offer for a while: the price is running.
+    rig.spot = 1.40
     rig.steps(2)
+    assert rig.store.offers(call.launcher_id, "live") == []
+    assert len([row for row in rig.store.broadcasts(None) if row.kind == store.WITHDRAW]) == 1
+
+    rig.world.advance(300)
+    rig.steps(1)
     fresh = rig.live_offer(call)
     assert fresh.price_amount > cheap.price_amount * 1.5
     assert [offer.status for offer in rig.store.offers(call.launcher_id)][0] == "dead"
-    assert rig.contracts(store.OPEN) and call.launcher_id in {
-        item.launcher_id for item in rig.contracts(store.OPEN)
-    }
+    assert call.launcher_id in {item.launcher_id for item in rig.contracts(store.OPEN)}
+
+
+def _ask_gap_pct(rig: Rig, contract: store.Contract, offer: store.OfferRow) -> float:
+    """How far the current ask is above an offer, as a percentage of notional."""
+    view = rig.read_market()
+    ask = quoting.ask_mojos(contract, view, rig.config, rig.world.now(), 0.0)
+    notional = quoting.contract_size_xch(contract) * view.spot * rig.config.quote_unit_mojos
+    return (ask - offer.price_amount) / notional * 100.0
+
+
+@pytest.mark.parametrize("withdraw_pct, withdrawn", [(None, False), (1.0, True)])
+def test_a_moderate_rise_is_repriced_not_withdrawn(withdraw_pct, withdrawn) -> None:
+    rig = (
+        Rig(put_strikes_pct=[])
+        if withdraw_pct is None
+        else Rig(put_strikes_pct=[], withdraw_pct=withdraw_pct)
+    )
+    assert rig.config.withdraw_pct == (2.0 if withdraw_pct is None else withdraw_pct)
+    rig.steps(3)
+    call = _by_side(rig, "call", store.OPEN)
+    cheap = rig.live_offer(call)
+
+    rig.spot = 1.14
+    assert 1.0 <= _ask_gap_pct(rig, call, cheap) < 2.0  # between the old trigger and the new
+    (report,) = rig.steps(1)
+
+    assert any("withdrawing offers" in action for action in report.actions) is withdrawn
+    if not withdrawn:
+        # A dearer offer is posted beside the old one, which runs out by itself.
+        assert rig.live_offer(call).price_amount > cheap.price_amount
+        assert len(rig.store.offers(call.launcher_id, "live")) == 2
+
+
+def test_a_stale_offer_about_to_run_out_is_not_worth_a_withdrawal() -> None:
+    rig = Rig(put_strikes_pct=[])
+    rig.steps(3)
+    call = _by_side(rig, "call", store.OPEN)
+    cheap = rig.live_offer(call)
+
+    rig.world.advance(800)  # the offer has about a hundred seconds left
+    rig.spot = 1.25
+    assert _ask_gap_pct(rig, call, cheap) >= 2.0
+    (report,) = rig.steps(1)
+
+    # A withdrawal takes a block or two; the offer would be dead before it landed.
+    assert not any("withdrawing" in action for action in report.actions)
+    assert [row.kind for row in rig.store.broadcasts(None)] == [store.MINT]
+    assert rig.live_offer(call).price_amount > cheap.price_amount  # re-quoted instead
+
+
+def test_withdrawals_are_capped_per_hour_and_the_rest_stand_down() -> None:
+    rig = Rig(
+        call_strikes_pct=[100, 110],
+        put_strikes_pct=[],
+        max_withdrawals_per_hour=1,
+        strike_drift_pct=90,  # keep retirement out of it: this is about withdrawals
+    )
+    rig.steps(5)
+    first, second = rig.contracts(store.OPEN)
+    stale = {item.launcher_id: rig.live_offer(item) for item in (first, second)}
+
+    rig.spot = 1.30
+    (report,) = rig.steps(1)
+
+    assert sum("withdrawing offers" in action for action in report.actions) == 1
+    assert sum("withdrawals are used up" in problem for problem in report.problems) == 1
+    (sent,) = [row for row in rig.store.broadcasts(None) if row.kind == store.WITHDRAW]
+    held_back = second if sent.launcher_id == first.launcher_id else first
+    # The one that could not be withdrawn is not re-quoted: its stale offer is
+    # left to run out, with no dearer one posted beside it.
+    assert [offer.id for offer in rig.store.offers(held_back.launcher_id, "live")] == [
+        stale[held_back.launcher_id].id
+    ]
+    rig.steps(2)
+    assert len(rig.store.offers(held_back.launcher_id)) == 1
+
+    rig.world.advance(900)  # it has run out
+    rig.steps(1)
+    requoted = rig.live_offer(held_back)
+    assert requoted.price_amount > stale[held_back.launcher_id].price_amount
+    assert len([row for row in rig.store.broadcasts(None) if row.kind == store.WITHDRAW]) == 1
+
+    # An hour later the allowance is back.
+    rig.world.advance(3600)
+    rig.steps(1)
+    rig.spot = 1.60
+    (later,) = rig.steps(1)
+    assert sum("withdrawing offers" in action for action in later.actions) == 1
+    assert sum("withdrawals are used up" in problem for problem in later.problems) == 1
+
+
+def test_with_no_withdrawals_allowed_stale_offers_are_left_to_run_out() -> None:
+    rig = Rig(put_strikes_pct=[], max_withdrawals_per_hour=0)
+    rig.steps(3)
+    call = _by_side(rig, "call", store.OPEN)
+    cheap = rig.live_offer(call)
+
+    rig.spot = 1.25
+    reports = rig.steps(3)
+
+    assert [row.kind for row in rig.store.broadcasts(None)] == [store.MINT]
+    assert all(
+        any("withdrawals are used up" in problem for problem in report.problems)
+        for report in reports
+    )
+    assert rig.store.offers(call.launcher_id, "live") == [cheap]
+    rig.world.take(
+        rig.taker, cheap.offer_text
+    )  # the exposure that was accepted, bounded by its life
+
+
+def test_a_withdrawal_that_does_not_confirm_lapses_and_the_contract_is_offered_again() -> None:
+    rig = Rig(put_strikes_pct=[])
+    rig.steps(3)
+    call = _by_side(rig, "call", store.OPEN)
+    cheap = rig.live_offer(call)
+    rig.wallet.push = _unheard()  # type: ignore[method-assign]
+    rig.spot = 1.25
+    rig.steps(1)  # the withdrawal is signed; no node hears it
+    (sent,) = [row for row in rig.store.unresolved() if row.kind == store.WITHDRAW]
+    assert sent.valid_until == cheap.expires_at
+
+    # While it is unresolved the contract is not offered.
+    rig.world.advance(600)
+    rig.steps(1)
+    assert rig.store.offers(call.launcher_id, "live") == [cheap]
+
+    # The offer it was for has run out and the chain's clock is safely past it:
+    # the withdrawal can never confirm, so the contract goes back on offer.
+    rig.world.advance(900)
+    (report,) = rig.steps(1)
+
+    assert report.chain_looked == "a transaction ran out of time"
+    assert any("back on offer" in action for action in report.actions)
+    assert rig.store.unresolved() == []
+    assert [event.detail for event in rig.events("broadcast_lapsed")] == [{"kind": "withdraw"}]
+    assert rig.live_offer(call).price_amount > cheap.price_amount
+    # And it truly cannot: a node that hears it now refuses it.
+    spends, signature = unpack_bundle(sent.bundle)
+    with pytest.raises(RejectedError, match="AssertBeforeSecondsAbsolute"):
+        rig.world.push(spends, signature)
 
 
 # ---------------------------------------------------------------------------
@@ -588,35 +754,98 @@ def _unheard(calls: list[int] | None = None) -> Any:
     return push
 
 
-def test_a_stalled_bundle_keeps_its_coins_and_is_pushed_until_it_confirms() -> None:
+def test_a_mint_that_does_not_confirm_in_time_lapses_and_is_minted_again() -> None:
     rig = Rig(call_strikes_pct=[100, 110], put_strikes_pct=[], confirm_timeout_seconds=600)
     real_push = rig.wallet.push
     rig.wallet.push = _unheard()  # type: ignore[method-assign]
     rig.steps(1)  # one mint is signed over the address's only coin
+    (stuck,) = rig.contracts(store.MINTING)
+    (sent,) = rig.store.unresolved()
+    assert sent.valid_until == sent.created_at + 600
     rig.world.advance(700)
 
     reports = rig.steps(3)
 
+    # Late by our clock, but the chain's has not safely passed its deadline:
+    # it is flagged, and its coin is not handed to a second mint.
     assert len(rig.events("broadcast_stalled")) == 1
     assert all(
         any("has not confirmed" in problem for problem in report.problems) for report in reports
     )
-    # The bundle is still signed and could still confirm, so its coin is not
-    # handed to a second mint that would conflict with it.
     assert rig.wallet.signed == 1
     assert [item.status for item in rig.contracts()] == [store.MINTING]
 
-    # The outage ends and the process is restarted. The stalled bundle is on
-    # record and still being pushed, so it confirms.
+    # The outage ends and the process is restarted, too late for this mint.
     rig.wallet.push = real_push  # type: ignore[method-assign]
     rig.book = rig.make_book()
+    rig.world.advance(400)
+    (report,) = rig.steps(1)
+
+    assert report.chain_looked == "a transaction ran out of time"
+    assert any("did not confirm in time" in problem for problem in report.problems)
+    assert [event.detail for event in rig.events("mint_failed")] == [{"reason": "lapsed"}]
+    # Nothing was locked, the coin is free, and the slot is minted again at
+    # once. The new mint spends the same coin, so its launcher has the same id
+    # and takes over the failed contract's record.
+    assert rig.wallet.signed == 2
+    assert rig.store.contract(stuck.launcher_id).status == store.MINTING
+    assert [(row.kind, row.status) for row in rig.store.broadcasts(None)] == [
+        (store.MINT, "conflict"),
+        (store.MINT, "pending"),
+    ]
+    assert rig.maker.balance() == 500 * XCH - 20 * XCH - builder.OPTION_COIN_AMOUNT
+    rig.steps(4)
+    assert len(rig.contracts(store.OPEN)) == 2
+    assert len(rig.contracts()) == 2
+    # The dead mint really is dead: the chain refuses it.
+    spends, signature = unpack_bundle(sent.bundle)
+    with pytest.raises(RejectedError, match="AssertBeforeSecondsAbsolute"):
+        rig.world.push(spends, signature)
+
+
+def test_a_mint_is_not_given_up_while_the_chain_s_clock_is_behind_ours() -> None:
+    rig = Rig(put_strikes_pct=[], confirm_timeout_seconds=600)
+    rig.wallet.push = _unheard()  # type: ignore[method-assign]
+    rig.steps(1)
+    rig.world.advance(1200)  # long past the deadline by our clock...
+    rig.reader.chain_time = lambda: rig.world.now() - 700  # type: ignore[method-assign]
+
+    (report,) = rig.steps(1)
+
+    # ...but the chain has not got there, so the mint could still confirm.
+    assert [item.status for item in rig.contracts()] == [store.MINTING]
+    assert rig.wallet.signed == 1
+    assert not any("did not confirm in time" in problem for problem in report.problems)
+
+
+def test_a_clawback_has_no_deadline_and_is_pushed_until_it_confirms() -> None:
+    rig = Rig(put_strikes_pct=[], limits={"max_contracts": 1}, confirm_timeout_seconds=600)
+    rig.steps(3)
+    call = _by_side(rig, "call", store.OPEN)
+    rig.world.take(rig.taker, rig.live_offer(call).offer_text)
+    rig.steps(1)
+    rig.world.advance(14 * DAY)
+    real_push = rig.wallet.push
+    rig.wallet.push = _unheard()  # type: ignore[method-assign]
+    rig.steps(1)  # the clawback is signed; no node hears it
+    (sent,) = rig.store.unresolved()
+    assert (sent.kind, sent.valid_until) == (store.CLAWBACK, None)
+
+    rig.world.advance(6 * 3600)  # hours of outage
+    reports = rig.steps(2)
+
+    # Flagged, never given up: the collateral is always wanted back.
+    assert rig.events("broadcast_stalled")
+    assert all("did not confirm in time" not in p for r in reports for p in r.problems)
+    assert [row.status for row in rig.store.unresolved()] == ["stalled"]
+    assert rig.store.contract(call.launcher_id).status == store.CLOSING
+
+    rig.wallet.push = real_push  # type: ignore[method-assign]
+    rig.book = rig.make_book()  # across a restart, too
     rig.steps(2)
 
-    assert rig.store.broadcasts("stalled") == []
-    assert store.OPEN in [item.status for item in rig.contracts()]
-    assert rig.wallet.rejected == []
-    rig.steps(2)  # and its change now funds the second slot
-    assert len(rig.contracts(store.OPEN)) == 2
+    assert rig.store.contract(call.launcher_id).status == store.CLOSED
+    assert rig.events("collateral_returned")[0].detail["by"] == store.CLAWBACK
 
 
 def test_a_crash_while_a_verdict_is_written_leaves_it_to_be_read_again(monkeypatch) -> None:
@@ -645,8 +874,7 @@ def test_a_crash_while_a_verdict_is_written_leaves_it_to_be_read_again(monkeypat
     assert rig.store.unresolved() == []
 
 
-def test_a_cancel_that_misses_expiry_gives_way_to_a_clawback() -> None:
-    rig = Rig(put_strikes_pct=[])
+def _cancel_misses_expiry(rig: Rig) -> tuple[store.Contract, list[Any]]:
     rig.steps(3)
     call = _by_side(rig, "call", store.OPEN)
     rig.world.advance(14 * DAY - 1800)  # inside the stop window: it is retired
@@ -656,9 +884,10 @@ def test_a_cancel_that_misses_expiry_gives_way_to_a_clawback() -> None:
     assert rig.store.contract(call.launcher_id).status == store.CLOSING
     rig.wallet.push = real_push  # type: ignore[method-assign]
     rig.world.advance(3600)  # expiry passes: the cancel can never confirm now
+    return call, rig.steps(3)
 
-    reports = rig.steps(3)
 
+def _collateral_came_home_by_clawback(rig: Rig, call: store.Contract) -> None:
     # The collateral is not left locked behind a cancel the chain will refuse.
     assert rig.store.contract(call.launcher_id).status == store.CLOSED
     (returned,) = rig.events("collateral_returned")
@@ -670,6 +899,30 @@ def test_a_cancel_that_misses_expiry_gives_way_to_a_clawback() -> None:
         store.CLAWBACK: "confirmed",
     }
     assert rig.store.unresolved() == []
+
+
+def test_a_cancel_that_misses_expiry_lapses_and_the_collateral_is_clawed_back() -> None:
+    rig = Rig(put_strikes_pct=[])
+
+    call, reports = _cancel_misses_expiry(rig)
+
+    _collateral_came_home_by_clawback(rig, call)
+    # The chain's clock showed the cancel dead, so it was given up first and
+    # the clawback then went out for a contract back on the book.
+    assert [event.detail for event in rig.events("broadcast_lapsed")] == [{"kind": "cancel"}]
+    problems = [problem for report in reports for problem in report.problems]
+    assert any("cancel" in p and "did not confirm in time" in p for p in problems)
+
+
+def test_without_a_chain_clock_a_missed_cancel_gives_way_to_a_clawback_sent_beside_it() -> None:
+    # A reader that cannot tell the chain's time: nothing can be shown to have
+    # lapsed, so the clawback is sent beside the cancel and the chain picks.
+    rig = Rig(reader=lambda sim: sim, put_strikes_pct=[])
+
+    call, reports = _cancel_misses_expiry(rig)
+
+    _collateral_came_home_by_clawback(rig, call)
+    assert rig.events("broadcast_lapsed") == []
     actions = [action for report in reports for action in report.actions]
     assert any("gave way to the clawback" in action for action in actions)
 
@@ -883,6 +1136,122 @@ def test_a_sale_is_not_booked_without_its_premium_while_the_chain_is_unreadable(
 
     (sold,) = rig.events("sold")
     assert sold.detail == {"asset": rig.usd.hex(), "amount": offer.price_amount}
+
+
+# ---------------------------------------------------------------------------
+# Fees
+# ---------------------------------------------------------------------------
+
+
+def _auto_fee(rig_cap: int = 10**9, **overrides: Any) -> Rig:
+    limits = {"max_fee_mojos": rig_cap, **overrides.pop("limits", {})}
+    return Rig(fee_mojos="auto", limits=limits, **overrides)
+
+
+def _fees_paid(reports: list[Any]) -> list[int]:
+    paid = []
+    for report in reports:
+        for action in report.actions:
+            if ", fee " in action:
+                paid.append(int(action.split(", fee ")[1].split(" ")[0]))
+    return paid
+
+
+def test_auto_fee_is_the_bundle_s_cost_at_the_wallet_s_rate() -> None:
+    rig = _auto_fee(put_strikes_pct=[])
+    rig.wallet.rate = 1  # one mojo per unit of cost
+
+    reports = rig.steps(2)
+
+    (fee,) = _fees_paid(reports)
+    # A call mint costs about 53 million; the bundle is priced from its own cost.
+    assert 50_000_000 < fee < 60_000_000
+    (minted,) = rig.contracts(store.OPEN)
+    spends, _ = unpack_bundle(rig.store.broadcasts(None)[0].bundle)
+    assert fee == fees.bundle_cost(spends)
+    assert rig.maker.balance() == 500 * XCH - 20 * XCH - builder.OPTION_COIN_AMOUNT - fee
+    assert rig.wallet.rejected == []
+
+
+def test_auto_fee_pays_nothing_while_the_mempool_has_room() -> None:
+    rig = _auto_fee(put_strikes_pct=[])
+    rig.wallet.rate = 0
+
+    reports = rig.steps(2)
+
+    assert _fees_paid(reports) == []
+    assert rig.maker.balance() == 500 * XCH - 20 * XCH - builder.OPTION_COIN_AMOUNT
+
+
+def test_auto_fee_never_exceeds_the_cap() -> None:
+    rig = _auto_fee(rig_cap=20_000_000, put_strikes_pct=[])
+    rig.wallet.rate = 5  # a full mempool: far more than the cap allows
+
+    reports = rig.steps(2)
+
+    assert _fees_paid(reports) == [20_000_000]
+    assert rig.maker.balance() == 500 * XCH - 20 * XCH - builder.OPTION_COIN_AMOUNT - 20_000_000
+
+
+def test_auto_fee_with_no_cap_never_asks_and_never_pays() -> None:
+    rig = _auto_fee(rig_cap=0, put_strikes_pct=[])
+    rig.wallet.rate = 5
+
+    reports = rig.steps(2)
+
+    assert _fees_paid(reports) == [] and rig.wallet.rate_asked == 0
+
+
+def test_no_estimate_from_the_wallet_means_no_fee_and_says_so() -> None:
+    rig = _auto_fee(put_strikes_pct=[])
+    rig.wallet.rate = None
+
+    reports = rig.steps(2)
+
+    assert _fees_paid(reports) == []
+    assert any("no fee estimate" in problem for problem in reports[0].problems)
+    assert len(rig.contracts(store.OPEN)) == 1  # sent all the same, without one
+
+
+def test_the_fee_estimate_is_asked_for_every_few_minutes_not_every_bundle() -> None:
+    rig = _auto_fee()
+    rig.wallet.rate = 1
+    rig.steps(4)  # two mints
+    assert rig.wallet.rate_asked == 1
+
+    rig.world.advance(400)
+    rig.spot = 1.60  # both contracts drift out of their slots and are retired
+    rig.steps(1)
+    assert rig.wallet.rate_asked == 2
+
+
+def test_every_kind_of_transaction_is_priced_and_the_books_still_balance() -> None:
+    rig = _auto_fee(put_strikes_pct=[], limits={"max_contracts": 1})
+    rig.wallet.rate = 2
+    reports = rig.steps(3)  # mint, confirm, offer
+    call = _by_side(rig, "call", store.OPEN)
+
+    rig.spot = 1.25  # withdraw the stale offer
+    reports += rig.steps(2)
+    rig.world.advance(14 * DAY - 1800)  # inside the stop window: retired by a cancel
+    reports += rig.steps(3)
+
+    paid = _fees_paid(reports)
+    assert len(paid) == 3  # mint, withdrawal, cancel
+    mint_fee, withdraw_fee, cancel_fee = paid
+    # A withdrawal is the cheapest of the three and a cancel the dearest.
+    assert withdraw_fee < mint_fee < cancel_fee
+    assert rig.store.contract(call.launcher_id).status == store.CLOSED
+    assert rig.maker.balance() == 500 * XCH - sum(paid)
+    assert rig.wallet.rejected == []
+
+
+def test_a_fixed_fee_is_paid_as_given() -> None:
+    rig = Rig(put_strikes_pct=[], fee_mojos=1_000, limits={"max_fee_mojos": 5_000})
+
+    reports = rig.steps(2)
+
+    assert _fees_paid(reports) == [1_000] and rig.wallet.rate_asked == 0
 
 
 # ---------------------------------------------------------------------------

@@ -145,6 +145,57 @@ def test_coinset_records_by_names_asks_for_all_in_one_request():
     assert c.get_coin_records_by_names([]) == [] and len(poster.calls) == 1  # nothing to ask
 
 
+def test_coinset_chain_time_is_the_latest_transaction_block_s():
+    synced = {"sync_mode": False, "synced": True}
+    # The peak is a transaction block: its own timestamp, in one request.
+    poster = FakePoster(
+        {
+            "get_blockchain_state": {
+                "success": True,
+                "blockchain_state": {"sync": synced, "peak": {"height": 9, "timestamp": 1700}},
+            }
+        }
+    )
+    c = CoinsetClient("https://api.coinset.org", poster=poster)
+    assert c.get_chain_time() == 1700 and len(poster.calls) == 1
+
+    # The peak is not: the block it names as its previous transaction block is read.
+    poster = FakePoster(
+        {
+            "get_blockchain_state": {
+                "success": True,
+                "blockchain_state": {
+                    "sync": synced,
+                    "peak": {"height": 9, "timestamp": None, "prev_transaction_block_height": 6},
+                },
+            },
+            "get_block_record_by_height": {
+                "success": True,
+                "block_record": {"height": 6, "timestamp": 1650},
+            },
+        }
+    )
+    c = CoinsetClient("https://api.coinset.org", poster=poster)
+    assert c.get_chain_time() == 1650
+    assert poster.body_for("get_block_record_by_height") == {"height": 6}
+
+
+def test_coinset_chain_time_is_not_given_by_a_node_that_is_behind_or_empty():
+    behind = {
+        "success": True,
+        "blockchain_state": {
+            "sync": {"sync_mode": True, "synced": False},
+            "peak": {"height": 9, "timestamp": 1700},
+        },
+    }
+    empty = {"success": True, "blockchain_state": {"sync": {"synced": True}, "peak": None}}
+    for state in (behind, empty):
+        c = CoinsetClient(
+            "https://api.coinset.org", poster=FakePoster({"get_blockchain_state": state})
+        )
+        assert c.get_chain_time() is None
+
+
 def test_coinset_records_by_puzzle_hash_passes_filters():
     poster = FakePoster(
         {

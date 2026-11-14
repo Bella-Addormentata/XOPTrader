@@ -162,6 +162,21 @@ class NodeChainReader:
             return None
         return self.spend_at(state.coin, int(state.spent_height))
 
+    def chain_time(self) -> int | None:
+        """The timestamp of the node's latest transaction block, or None if it cannot say.
+
+        The clock timelocks are judged by. One request, two when the node's
+        peak is not a transaction block.
+        """
+        ask = getattr(self._client, "get_chain_time", None)
+        if ask is None:
+            return None
+        try:
+            stamp = ask()
+        except Exception as exc:
+            raise ChainError(f"chain time lookup failed: {exc}") from exc
+        return None if stamp is None else int(stamp)
+
 
 def _unhex(value: Any) -> bytes:
     text = str(value)
@@ -279,6 +294,20 @@ class CachedChain:
         self._due |= self._asked
         self._asked = set()
         self._seen = {}
+
+    def chain_time(self) -> int | None:
+        """The chain's own clock, asked afresh every time, or None if the node cannot say.
+
+        Ask it BEFORE starting the look whose answers it is to be compared
+        with. "The chain had reached this time, and after that this coin was
+        still unspent" is proof a timelocked spend can no longer confirm; the
+        other order is not.
+        """
+        ask = getattr(self._inner, "chain_time", None)
+        if ask is None:
+            return None
+        self.requests += 1
+        return ask()
 
     def want(self, coin_ids: Iterable[bytes]) -> None:
         """Say which coins are about to be asked for, so they travel together."""

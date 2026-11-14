@@ -152,18 +152,61 @@ Two things follow from looking less often:
   looked. `step` run by hand, or from cron, is a new process every time and
   looks every time: two requests per open contract.
 
+## Transactions that run out, withdrawals and fees
+
+**Deadlines.** A mint, a cancel and a withdrawal each carry a time after which
+the chain itself refuses them. A mint or cancel gets `confirm_timeout_seconds`
+(half an hour); a withdrawal gets until the last offer it was sent to kill
+expires. One that has not confirmed by then never will, so it is given up
+without another transaction: its coins are free again, a lapsed mint is made
+again at the current strike, and a contract whose withdrawal or cancel lapsed
+goes back on offer. `step` reports "did not confirm in time". Nothing is given
+up on this machine's clock: the chain's own clock must be five minutes past
+the deadline first. A clawback has no deadline. Collateral is always wanted
+back, so a clawback is flagged after `confirm_timeout_seconds` and pushed until
+it confirms.
+
+**Withdrawals.** Raising a price does not remove the cheaper offer already
+out; only spending the option coin does, and that is a transaction. So it is
+kept for when it matters and capped:
+
+- the ask must have risen by `withdraw_pct` (2%) of the contract's notional;
+- the stale offer must have more than `withdraw_min_life_seconds` (3 minutes)
+  left, because a withdrawal could not confirm before a shorter one ran out;
+- after a withdrawal the contract is not quoted for `withdraw_cooldown_seconds`
+  (5 minutes), so a trending market cannot turn one into a run of them;
+- the whole book sends at most `max_withdrawals_per_hour` (6). Once that is
+  used up, a contract that would need one is not re-quoted until its stale
+  offer has run out by itself, and `step` says so.
+
+What is given up is bounded: a stale offer can be taken at its old price for
+at most the rest of its life, 15 minutes by default.
+
+**Fees.** `fee_mojos` is a fixed fee per transaction, or `auto`. With `auto`
+each transaction is priced from its own cost at the rate the wallet's node
+estimates: nothing while the mempool has room, and never more than
+`limits.max_fee_mojos`. A mint costs about 55 to 90 million cost units, a
+withdrawal about 35 to 45 million, a cancel about 140 to 170 million and a
+clawback 15 to 40 million, so at 1 mojo per unit a mint pays roughly
+0.00006 XCH. The estimate comes from the wallet (`get_fee_estimate`, in
+chia-blockchain 2.7.5; an older wallet without it gives none, and the
+transaction is sent without a fee and says so). With no fee, a transaction
+waits whenever the mempool is busy, and with deadlines that means mints that
+lapse and are retried. `live-test` pays one flat fee per spend, sized for its
+costliest.
+
 ## Known limits
 
 - **Dedicated wallet only.** `wallet.mode: trading` is refused until the engine
   keeps option coins out of its own offers and books option events.
 - **The wallet reports no verdict on a broadcast.** Outcomes are read from the
   chain, so a rejected transaction shows up as one that never confirms. It is
-  pushed again on every step and flagged after `confirm_timeout_seconds`. The
-  flag changes nothing else: the transaction is still signed and could still
-  confirm, so its coins stay set aside and are not used for anything new. They
-  are released when the chain shows it confirmed, or shows one of its coins
-  spent some other way. To free the coins of a transaction that will never
-  confirm, send one of them to yourself from the wallet.
+  pushed again on every step. While it is unresolved its coins stay set aside
+  and are not used for anything new. A mint, cancel or withdrawal resolves by
+  itself at its deadline (above). A clawback, and anything signed before
+  deadlines existed, is released only when the chain shows it confirmed or
+  shows one of its coins spent some other way; to free the coins of one that
+  will never confirm, send one of them to yourself from the wallet.
 - **The price feed must say when its price was observed.** Spot comes from
   CoinGecko with its `last_updated_at` time, and `market.max_age_seconds` is
   measured from that. If the feed's price is older than the limit, or carries

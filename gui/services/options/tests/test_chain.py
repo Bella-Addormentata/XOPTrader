@@ -549,6 +549,52 @@ def test_node_chain_reader_loads_an_option_through_the_batched_call() -> None:
     assert loaded.status is OptionStatus.LIVE and loaded.terms == terms
 
 
+def test_node_chain_reader_tells_the_chain_s_time_when_its_client_can() -> None:
+    class Timed:
+        def __init__(self, answer: Any) -> None:
+            self.answer = answer
+
+        def get_chain_time(self) -> Any:
+            if isinstance(self.answer, Exception):
+                raise self.answer
+            return self.answer
+
+    assert chain.NodeChainReader(Timed(1_700_000_000)).chain_time() == 1_700_000_000
+    assert chain.NodeChainReader(Timed(None)).chain_time() is None  # no peak, or not synced
+    with pytest.raises(chain.ChainError, match="chain time lookup failed"):
+        chain.NodeChainReader(Timed(TimeoutError("timed out"))).chain_time()
+    # A client that has no way to ask is simply one that cannot say.
+    assert chain.NodeChainReader(object()).chain_time() is None
+
+
+def test_the_cache_asks_the_chain_s_time_afresh_and_counts_it() -> None:
+    world, _, _, _ = _setup()
+
+    class Clocked:
+        def __init__(self) -> None:
+            self.now = 100
+
+        def coin_state(self, coin_id: bytes) -> Any:
+            return world.sim.coin_state(coin_id)
+
+        def coin_spend(self, coin_id: bytes) -> Any:
+            return world.sim.coin_spend(coin_id)
+
+        def chain_time(self) -> int:
+            return self.now
+
+    inner = Clocked()
+    reader = chain.CachedChain(inner)
+
+    assert reader.chain_time() == 100
+    inner.now = 160
+    assert reader.chain_time() == 160  # never served from memory: time moves
+    assert reader.requests == 2
+    # Over a reader that cannot tell the time, neither can the cache, at no cost.
+    plain = chain.CachedChain(world.sim)
+    assert plain.chain_time() is None and plain.requests == 0
+
+
 def test_node_chain_reader_wraps_client_failures() -> None:
     class Down:
         def get_coin_record_by_name(self, name: str) -> Any:

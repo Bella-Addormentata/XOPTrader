@@ -423,6 +423,36 @@ def test_a_live_test_offer_that_is_taken_is_booked_and_clawed_back_later(
     assert maker.balance() == before + DUST - 1
 
 
+def test_live_test_pays_the_estimated_fee_on_each_spend(tmp_path, monkeypatch, capsys) -> None:
+    world, maker, _, rpc = _live(tmp_path, monkeypatch)
+    usd = world.issue_cat(world.party(1), 5)
+    cfg = _config(tmp_path, usd, fee_mojos="auto", limits={"max_fee_mojos": 10**9})
+    rpc.fee_per_cost = 1
+    before = maker.balance()
+
+    assert cli._live_test(cfg, 0.0001, True, 60.0) == 0
+
+    out = capsys.readouterr().out
+    # One flat fee per spend, sized for the costliest of the three.
+    assert "fee per spend: 170000000 mojos (auto: 1 mojos per cost" in out
+    assert maker.balance() == before - 3 * 170_000_000
+    assert f"fees paid: {3 * 170_000_000}" in out
+    assert rpc.rejected == []
+
+
+def test_live_test_with_no_estimate_pays_no_fee(tmp_path, monkeypatch, capsys) -> None:
+    world, maker, _, rpc = _live(tmp_path, monkeypatch)
+    usd = world.issue_cat(world.party(1), 5)
+    cfg = _config(tmp_path, usd, fee_mojos="auto", limits={"max_fee_mojos": 10**9})
+    rpc.fee_per_cost = None  # the wallet cannot say
+    before = maker.balance()
+
+    assert cli._live_test(cfg, 0.0001, True, 60.0) == 0
+
+    assert "fee per spend: 0 mojos (auto: no estimate from the wallet" in capsys.readouterr().out
+    assert maker.balance() == before
+
+
 def test_live_test_will_not_run_beside_another_process(tmp_path, monkeypatch) -> None:
     world, maker, cfg, rpc = _live(tmp_path, monkeypatch)
     other = store.OptionStore(cfg.database_path)
@@ -504,3 +534,4 @@ def test_status_prints_the_book(tmp_path, monkeypatch, capsys) -> None:
     out = capsys.readouterr().out
     assert "3 XCH" in out and "C110@5" in out and "minting" in out and "waiting: mint" in out
     assert "chain is read from coinset" in out
+    assert "fees: 0 mojos a transaction" in out

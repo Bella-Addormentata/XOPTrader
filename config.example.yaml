@@ -1674,15 +1674,31 @@ options:
   offer_ttl_seconds: 900
   refresh_before_seconds: 180            # re-post this long before an offer expires
   reprice_pct: 2                         # re-post when the ask has moved this much
-  # If the ask has RISEN by this much of the contract's notional, a cheaper
-  # offer is still out: spend the option coin to kill it (one transaction).
-  withdraw_pct: 1.0
+  # Withdrawing. If the ask has RISEN by this much of the contract's notional,
+  # a cheaper offer is still out, and the only way to kill it is to spend the
+  # option coin: an on-chain transaction. It is kept rare:
+  withdraw_pct: 2.0                      # how far behind an offer must be to be worth it
+  withdraw_min_life_seconds: 180         # ...and it must have this long left; a withdrawal
+                                         # takes a block or two, so anything nearer its end
+                                         # runs out first
+  withdraw_cooldown_seconds: 300         # after one, that contract is not quoted for this long
+  max_withdrawals_per_hour: 6            # across the whole book. Once used up, a contract
+                                         # that would need one is not re-quoted until its
+                                         # stale offer has run out. 0 = never withdraw.
   stop_before_expiry_seconds: 21600      # stop offering, and cancel, this long before expiry
-  # A broadcast that has not confirmed by then is flagged. It is still pushed,
-  # and its coins stay set aside, until the chain shows it confirmed or shows
-  # one of its coins spent some other way.
+  # How long a transaction has to confirm. A mint or a cancel carries this as a
+  # deadline the chain enforces: unconfirmed by then it never can be, so it is
+  # given up (once the chain's own clock is safely past), its coins are free,
+  # and a mint is simply made again at the current strike. A withdrawal's
+  # deadline is the end of the offer it kills. A clawback has none: collateral
+  # is always wanted back, so it is flagged at this age and pushed until it
+  # confirms.
   confirm_timeout_seconds: 1800
-  fee_mojos: 0                           # per transaction; must be <= limits.max_fee_mojos
+  # The fee each transaction pays: a number of mojos, or "auto" to price each
+  # one from its own cost at the rate the wallet's node currently estimates
+  # (nothing while the mempool has room). Never above limits.max_fee_mojos.
+  # A transaction that pays nothing waits when the mempool is busy.
+  fee_mojos: auto
   upload_offers: true                    # list each offer on xchoptions.com
 
   pricing:
@@ -1703,7 +1719,9 @@ options:
     max_locked_quote: null               # quote asset locked in puts
     max_contracts: null                  # contracts alive at once
     max_contracts_per_expiry: null
-    max_fee_mojos: 0
+    # The most any one transaction may pay. 1000000000 is 0.001 XCH, enough for
+    # the costliest of them (a cancel) when the mempool is full. 0 = never pay.
+    max_fee_mojos: 1000000000
 
   # Quotes stop when the price view is stale, the Dexie book cannot fill the
   # hedge size, is wider than max_spread_pct, or does not contain the external
