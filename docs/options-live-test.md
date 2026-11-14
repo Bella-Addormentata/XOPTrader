@@ -139,7 +139,10 @@ so the cost is visible. For scale: a book of six open contracts stepped once a
 minute used to make about 90,000 requests a day. It now makes 24 on a quiet
 day (one an hour), about 7 when it mints a contract, and about 5 when one
 sells. Lowering `chain_refresh_seconds` from 3600 to 900 makes the quiet-day
-figure 96 and shortens the wait described below to a quarter of an hour.
+figure 96 and shortens the wait described below to a quarter of an hour. A
+transaction that runs out of time adds a few: from ten minutes after its
+deadline the chain's clock is read at most once a minute (counted as three
+requests each time, which is the most it can be) until it is seen to be past.
 
 Two things follow from looking less often:
 

@@ -443,7 +443,7 @@ def test_a_stalled_transaction_is_only_looked_at_on_the_routine_interval() -> No
     assert desk.store.contract(call.launcher_id).status == store.CLOSED
 
 
-def test_giving_up_a_timed_out_transaction_costs_two_requests() -> None:
+def test_giving_up_a_timed_out_transaction_costs_the_clock_and_one_look() -> None:
     desk = Desk(put_strikes_pct=[], confirm_timeout_seconds=600)
     desk.wallet.push = ts._unheard()  # type: ignore[method-assign]
     desk.run(1)  # a mint no node hears
@@ -456,6 +456,8 @@ def test_giving_up_a_timed_out_transaction_costs_two_requests() -> None:
     # The chain's clock first, read 32 blocks down, then one look at the mint's coins.
     assert desk.node.log[asked] == ("time", 32)
     assert desk.node.log[asked + 1][0] == "states"
+    # Reported at what the clock costs a node at most (three requests), plus the look.
+    assert report.chain_requests == chain.CHAIN_TIME_REQUESTS + 1
     assert [event.detail for event in desk.events("mint_failed")] == [{"reason": "lapsed"}]
 
 

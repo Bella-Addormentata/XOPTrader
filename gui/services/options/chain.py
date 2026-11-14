@@ -178,6 +178,12 @@ class NodeChainReader:
         return None if stamp is None else int(stamp)
 
 
+#: What reading the chain's clock costs the node, counted at its most: its
+#: state, the block that many below the peak, and that block's previous
+#: transaction block when it is not one itself.
+CHAIN_TIME_REQUESTS = 3
+
+
 def _unhex(value: Any) -> bytes:
     text = str(value)
     if text[:2].lower() == "0x":
@@ -317,7 +323,7 @@ class CachedChain:
         ask = getattr(self._inner, "chain_time", None)
         if ask is None:
             return None
-        self.requests += 1
+        self.requests += CHAIN_TIME_REQUESTS
         return ask(depth)
 
     def want(self, coin_ids: Iterable[bytes]) -> None:

@@ -595,7 +595,8 @@ def test_the_cache_asks_the_chain_s_time_afresh_and_counts_it() -> None:
     inner.now = 160
     assert reader.chain_time() == 160  # never served from memory: time moves
     assert reader.chain_time(3) == 100  # three blocks down
-    assert reader.requests == 3
+    # Counted at what each costs a node at most, not as one request apiece.
+    assert reader.requests == 3 * chain.CHAIN_TIME_REQUESTS
     assert reader.tells_time
     # Over a reader that cannot tell the time, neither can the cache, at no cost.
     plain = chain.CachedChain(world.sim)
