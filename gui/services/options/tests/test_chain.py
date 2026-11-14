@@ -13,6 +13,7 @@ option to be rejected, not priced.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 from typing import Any
 
@@ -21,7 +22,7 @@ import pytest
 sdk = pytest.importorskip("chia_wallet_sdk")
 
 from gui.services.options import builder, chain  # noqa: E402
-from gui.services.options.chain import OptionStatus  # noqa: E402
+from gui.services.options.chain import BundleStatus, OptionStatus  # noqa: E402
 from gui.services.options.tests.sim_world import CAT, XCH, World  # noqa: E402
 
 HOUR = 3600
@@ -347,6 +348,83 @@ def test_node_failures_are_chain_errors_not_verdicts() -> None:
         _load(reader, world, real.launcher_id)
     with pytest.raises(chain.ChainError, match="unreachable"):
         chain.load_cat(reader, real.locked.coin.coin_id())
+
+
+# ---------------------------------------------------------------------------
+# Outcome of a broadcast
+# ---------------------------------------------------------------------------
+
+
+def test_bundle_status_follows_a_mint_onto_the_chain() -> None:
+    world, maker, _, usd = _setup()
+    terms = builder.OptionTerms(
+        builder.Asset(None, 100 * XCH),
+        builder.Asset(usd, 120 * CAT),
+        world.now() + HOUR,
+        maker.puzzle_hash,
+    )
+    minted = builder.build_mint(terms, maker.funding(), maker.custody())
+
+    assert chain.bundle_status(world.sim, minted.coin_spends) is BundleStatus.PENDING
+    world.push(minted.coin_spends)
+    assert chain.bundle_status(world.sim, minted.coin_spends) is BundleStatus.CONFIRMED
+
+
+def test_bundle_status_reports_a_coin_spent_some_other_way() -> None:
+    world, maker, other, usd = _setup()
+    (coin,) = maker.xch_coins()
+    terms = builder.OptionTerms(
+        builder.Asset(None, 100 * XCH),
+        builder.Asset(usd, 120 * CAT),
+        world.now() + HOUR,
+        maker.puzzle_hash,
+    )
+    funding = builder.Funding(change_puzzle_hash=maker.puzzle_hash, xch=[coin])
+    wanted = builder.build_mint(terms, funding, maker.custody())
+    different = dataclasses.replace(terms, strike=builder.Asset(usd, 121 * CAT))
+    world.push(builder.build_mint(different, funding, maker.custody()).coin_spends)
+
+    # The funding coin is spent, but not the way ``wanted`` spends it.
+    assert chain.bundle_status(world.sim, wanted.coin_spends) is BundleStatus.CONFLICT
+
+
+def test_bundle_status_tells_a_taken_offer_from_a_cancelled_one() -> None:
+    world, maker, other, usd = _setup()
+    _, taken = _mint_call(world, maker, usd)
+    _, cancelled = _mint_call(world, maker, usd)
+    signer = world.signer()
+    taken_draft = builder.build_offer(
+        taken.option, builder.Asset(usd, 2100), maker.puzzle_hash, maker.custody()
+    )
+    cancelled_draft = builder.build_offer(
+        cancelled.option, builder.Asset(usd, 2100), maker.puzzle_hash, maker.custody()
+    )
+    assert chain.bundle_status(world.sim, taken_draft.coin_spends) is BundleStatus.PENDING
+
+    world.take(other, taken_draft.encode(signer.sign(taken_draft.coin_spends)))
+    world.push(
+        builder.build_transfer(
+            cancelled.option, maker.puzzle_hash, maker.funding(), maker.custody()
+        ).coin_spends
+    )
+
+    assert chain.bundle_status(world.sim, taken_draft.coin_spends) is BundleStatus.CONFIRMED
+    assert chain.bundle_status(world.sim, cancelled_draft.coin_spends) is BundleStatus.CONFLICT
+
+
+def test_bundle_status_needs_spends_and_a_working_node() -> None:
+    world, maker, _, usd = _setup()
+    _, minted = _mint_call(world, maker, usd)
+    with pytest.raises(ValueError):
+        chain.bundle_status(world.sim, [])
+    reader = Lying(world.sim)
+
+    def down() -> None:
+        raise ConnectionError("node unreachable")
+
+    reader.broken = down
+    with pytest.raises(chain.ChainError, match="unreachable"):
+        chain.bundle_status(reader, minted.coin_spends)
 
 
 # ---------------------------------------------------------------------------

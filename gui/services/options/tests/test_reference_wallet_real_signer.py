@@ -52,6 +52,7 @@ from gui.services.options.tests.sim_world import (  # noqa: E402
     ADDITIONAL_DATA,
     CAT,
     XCH,
+    RejectedError,
     World,
 )
 
@@ -84,6 +85,7 @@ class RealWallet:
         self.world = world
         self.root = AugSchemeMPL.key_gen(bytes([7]) * 32)
         self.calls: list[str] = []
+        self.rejected: list[str] = []
         self._child_keys: dict[bytes, Any] = {}
         self.unhardened: list[bytes] = []
         self.hardened: list[bytes] = []
@@ -143,7 +145,12 @@ class RealWallet:
             raise ValueError(f"Puzzle hash {puzzle_hash.hex()} is not in the wallet") from None
 
     async def _push(self, bundle: Any) -> None:
-        self.world.push_bundle(sdk.SpendBundle.from_bytes(bytes(bundle)))
+        # ``WalletNode.push_tx`` only sends the bundle to its peers; a node's
+        # refusal is not reported back, so it is not reported here either.
+        try:
+            self.world.push_bundle(sdk.SpendBundle.from_bytes(bytes(bundle)))
+        except RejectedError as exc:
+            self.rejected.append(str(exc))
 
     def __call__(self, endpoint: str, body: dict) -> dict:
         """One RPC call, as the wallet's HTTP layer would answer it."""
@@ -245,6 +252,7 @@ def test_real_signer_carries_a_call_from_mint_to_clawback(kind: str) -> None:
         "execute_signing_instructions",
         "push_tx",
     }
+    assert wallet.rejected == []
 
 
 def test_real_signer_cancels_an_offer_and_unwinds_by_self_exercise() -> None:
@@ -338,3 +346,71 @@ def test_real_signer_will_not_sign_for_coins_it_does_not_own() -> None:
     spends = builder.build_mint(terms, stranger.funding(), stranger.custody()).coin_spends
     with pytest.raises(signing.SigningError, match="execute_signing_instructions"):
         reference.sign(spends)
+
+
+def _as_chia_spend(coin_spend: Any) -> Any:
+    from chia.types.blockchain_format.serialized_program import SerializedProgram
+    from chia_rs import Coin, CoinSpend
+    from chia_rs.sized_ints import uint64
+
+    coin = coin_spend.coin
+    return CoinSpend(
+        Coin(bytes32(coin.parent_coin_info), bytes32(coin.puzzle_hash), uint64(coin.amount)),
+        SerializedProgram.from_bytes(bytes(coin_spend.puzzle_reveal)),
+        SerializedProgram.from_bytes(bytes(coin_spend.solution)),
+    )
+
+
+@pytest.mark.parametrize("kind", ["call", "put"])
+def test_wallet_sync_dismisses_an_option_mint(kind: str) -> None:
+    """The wallet's own coin-recognition code, run on a real option mint.
+
+    Minting from the reference wallet shows its sync loop two things it has
+    never seen. One of its coins creates a singleton launcher, which it probes
+    as a pool wallet and then as a DataLayer store; and an option coin appears
+    hinted to one of its addresses, which ``determine_coin_type`` tries to match
+    against every asset it knows. This runs those probes exactly as
+    ``WalletStateManager`` calls them. The launcher must be dismissed with an
+    exception type the sync loop catches (anything else aborts the whole batch
+    of coin states), and the option coin must match nothing.
+
+    It does not run the sync loop itself against a live node.
+    """
+    from chia.data_layer.data_layer_wallet import DataLayerWallet
+    from chia.pools.pool_puzzles import solution_to_pool_state
+    from chia.wallet.cat_wallet.cat_utils import match_cat_puzzle
+    from chia.wallet.did_wallet.did_wallet_puzzles import match_did_puzzle
+    from chia.wallet.nft_wallet.uncurry_nft import UncurriedNFT
+    from chia.wallet.puzzles.clawback.drivers import match_clawback_puzzle
+    from chia.wallet.uncurried_puzzle import uncurry_puzzle
+    from chia.wallet.vc_wallet.vc_drivers import VerifiedCredential
+
+    world = World()
+    maker = world.party(150)
+    usd = world.issue_cat(maker, 500)
+    if kind == "call":
+        underlying, strike = builder.Asset(None, 100 * XCH), builder.Asset(usd, 120 * CAT)
+    else:
+        underlying, strike = builder.Asset(usd, 115 * CAT), builder.Asset(None, 100 * XCH)
+    terms = builder.OptionTerms(underlying, strike, world.now() + 3600, maker.puzzle_hash)
+    minted = builder.build_mint(terms, maker.funding(usd), maker.custody())
+    world.push(minted.coin_spends)
+
+    launcher = _as_chia_spend(world.sim.coin_spend(minted.launcher_id))
+    # ``except (AssertionError, ValueError)`` is what the sync loop catches here.
+    with pytest.raises((AssertionError, ValueError)):
+        assert solution_to_pool_state(launcher) is not None
+    assert asyncio.run(DataLayerWallet.match_dl_launcher(launcher)) == (False, None)
+
+    (eve,) = [
+        spend
+        for spend in minted.coin_spends
+        if bytes(spend.coin.parent_coin_info) == minted.launcher_id
+    ]
+    parent = _as_chia_spend(eve)
+    uncurried = uncurry_puzzle(parent.puzzle_reveal)
+    assert match_cat_puzzle(uncurried) is None
+    assert UncurriedNFT.uncurry(uncurried.mod, uncurried.args) is None
+    assert match_did_puzzle(uncurried.mod, uncurried.args) is None
+    assert match_clawback_puzzle(uncurried, parent.puzzle_reveal, parent.solution) is None
+    assert VerifiedCredential.is_vc(uncurried)[0] is False

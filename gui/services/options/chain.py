@@ -18,12 +18,16 @@ wallet RPC's coin record does not carry.
 Chain access is injected as :class:`ChainReader`. The SDK's ``Simulator``
 already has that shape, which is what the tests use; :class:`NodeChainReader`
 adapts a full-node style client such as warp's ``CoinsetClient``.
+
+:func:`bundle_status` reads the outcome of a broadcast, or of an offer, from the
+chain, which is the only place the reference wallet lets us learn it.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import enum
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
 from gui.services.options.builder import Asset, Locked, OptionTerms
@@ -174,6 +178,66 @@ def load_cat(chain: ChainReader, coin_id: bytes) -> Cat:
         if bytes(cat.coin.coin_id()) == bytes(coin_id):
             return cat
     raise ChainError(f"coin {bytes(coin_id).hex()} is not a CAT coin")
+
+
+# ---------------------------------------------------------------------------
+# Outcome of a broadcast
+# ---------------------------------------------------------------------------
+
+
+class BundleStatus(enum.Enum):
+    PENDING = "pending"  # at least one of its coins is still unspent
+    CONFIRMED = "confirmed"  # every coin was spent exactly as the bundle spends it
+    CONFLICT = "conflict"  # a coin was spent some other way; the bundle can never confirm
+
+
+def _tree_hash(clvm: Any, serialized: bytes) -> bytes:
+    """A program's tree hash, whichever serialization the node chose to return."""
+    try:
+        return bytes(clvm.deserialize(bytes(serialized)).tree_hash())
+    except Exception:
+        return bytes(clvm.deserialize_with_backrefs(bytes(serialized)).tree_hash())
+
+
+def bundle_status(chain: ChainReader, coin_spends: Sequence[CoinSpend]) -> BundleStatus:
+    """What became of ``coin_spends``, read from the chain.
+
+    The reference wallet's ``push_tx`` hands a bundle to its full-node peer and
+    returns; a rejection is never reported back. So the outcome of a broadcast
+    has to be read from the chain: a bundle has confirmed when each of its coins
+    is spent with the very puzzle and solution the bundle carries.
+
+    The same test tells an offer's fate. An offer is a set of signed coin
+    spends, so ``CONFIRMED`` on ``OfferDraft.coin_spends`` means it was taken,
+    and ``CONFLICT`` means the option coin went somewhere else first (a newer
+    quote was taken, or we cancelled, exercised or transferred it).
+
+    ``PENDING`` covers both "not yet mined" and "never accepted"; only time and
+    ``CONFLICT`` separate them, so callers need their own deadline.
+    """
+    if not coin_spends:
+        raise ValueError("no coin spends to look up")
+    sdk = _sdk()
+    clvm = sdk.Clvm()
+    unspent = False
+    for coin_spend in coin_spends:
+        coin_id = bytes(coin_spend.coin.coin_id())
+        state = _state(chain, coin_id, "a coin of the bundle")
+        if state is None or state.spent_height is None:
+            unspent = True
+            continue
+        on_chain = _spend(chain, coin_id, "a coin of the bundle")
+        if on_chain is None:
+            raise ChainError("a spent coin's spend is not available")
+        try:
+            same = _tree_hash(clvm, on_chain.puzzle_reveal) == _tree_hash(
+                clvm, coin_spend.puzzle_reveal
+            ) and _tree_hash(clvm, on_chain.solution) == _tree_hash(clvm, coin_spend.solution)
+        except Exception as exc:
+            raise ChainError(f"could not compare a spend with the chain: {exc}") from exc
+        if not same:
+            return BundleStatus.CONFLICT
+    return BundleStatus.PENDING if unspent else BundleStatus.CONFIRMED
 
 
 # ---------------------------------------------------------------------------

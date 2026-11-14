@@ -26,8 +26,8 @@ import pytest
 
 sdk = pytest.importorskip("chia_wallet_sdk")
 
-from gui.services.options import builder, signing  # noqa: E402
-from gui.services.options.chain import OptionStatus  # noqa: E402
+from gui.services.options import builder, chain, signing  # noqa: E402
+from gui.services.options.chain import BundleStatus, OptionStatus  # noqa: E402
 from gui.services.options.reference_wallet import (  # noqa: E402
     ReferenceWallet,
     coin_from_json,
@@ -38,6 +38,7 @@ from gui.services.options.tests.sim_world import (  # noqa: E402
     CAT,
     XCH,
     Party,
+    RejectedError,
     World,
 )
 
@@ -66,6 +67,7 @@ class FakeWallet:
         self.by_address = {party.puzzle_hash: party for party in parties}
         self.by_fingerprint = {_fingerprint(party.pk): party for party in parties}
         self.calls: list[tuple[str, dict]] = []
+        self.rejected: list[str] = []
         self.tamper: dict[str, Callable[[dict], Any]] = {}
 
     def endpoints(self) -> list[str]:
@@ -143,7 +145,12 @@ class FakeWallet:
         }
 
     def _push_tx(self, body: dict) -> dict:
-        self.world.push_bundle(sdk.SpendBundle.from_bytes(_unhex(body["spend_bundle"])))
+        # The real wallet forwards the bundle to its node and returns; whatever
+        # the node thinks of it never reaches the RPC caller.
+        try:
+            self.world.push_bundle(sdk.SpendBundle.from_bytes(_unhex(body["spend_bundle"])))
+        except RejectedError as exc:
+            self.rejected.append(str(exc))
         return {}
 
 
@@ -444,14 +451,26 @@ def test_push_refuses_a_signature_that_does_not_cover_the_bundle() -> None:
     assert maker.balance() == 150 * XCH
 
 
-def test_push_reports_a_chain_rejection() -> None:
-    world, maker, _, usd, _, reference = _setup()
-    spends = _mint_spends(world, maker, usd).coin_spends
-    signature = reference.sign(spends)
-    reference.push(spends, signature)
-    # The same coins again: the simulated node refuses, as a real one would.
-    with pytest.raises(signing.SigningError, match="push_tx"):
-        reference.push(spends, signature)
+def test_push_gives_no_verdict_so_the_outcome_is_read_from_the_chain() -> None:
+    """A rejected bundle looks exactly like an accepted one to the RPC caller."""
+    world, maker, _, usd, wallet, reference = _setup()
+    first = _mint_spends(world, maker, usd).coin_spends
+    # A different mint built from the same coin: only one of the two can confirm.
+    rival_terms = builder.OptionTerms(
+        builder.Asset(None, 100 * XCH),
+        builder.Asset(usd, 121 * CAT),
+        world.now() + 3600,
+        maker.puzzle_hash,
+    )
+    rival = builder.build_mint(rival_terms, maker.funding(), maker.custody()).coin_spends
+    assert chain.bundle_status(world.sim, first) is BundleStatus.PENDING
+
+    reference.push(first, reference.sign(first))
+    reference.push(rival, reference.sign(rival))  # the node refuses; the call does not
+
+    assert len(wallet.rejected) == 1
+    assert chain.bundle_status(world.sim, first) is BundleStatus.CONFIRMED
+    assert chain.bundle_status(world.sim, rival) is BundleStatus.CONFLICT
 
 
 # ---------------------------------------------------------------------------

@@ -26,16 +26,22 @@ What has been checked, and what has not:
   not model mempool fee or cost policy.
 * The same paths were signed by chia-blockchain 2.7.5's own RPC handlers and
   ``WalletSigner`` (``tests/test_reference_wallet_real_signer.py``; skipped in
-  CI, where chia-blockchain is not installed).
+  CI, where chia-blockchain is not installed). The same module runs that
+  wallet's coin-recognition code on a real option mint: it dismisses the
+  launcher and matches the option coin against nothing.
 * The read-only parts were run by hand against mainnet on 2026-11-14:
   :func:`chain.load_option` loaded all 20 options then listed on
   xchoptions.com through warp's ``CoinsetClient`` and derived the terms the
   site shows, and :func:`signing.verify` accepted the signatures of four live
   offers, which have the same structure as the offers built here.
 * NOT checked: a live wallet daemon over its HTTPS RPC, any broadcast to
-  mainnet, xchoptions.com accepting an offer built here, and how the reference
-  wallet reacts to the hinted option coin it does not recognise. Do those on a
-  throwaway key with dust amounts before trusting this with funds.
+  mainnet, xchoptions.com accepting an offer built here, and the wallet's full
+  sync loop meeting an option mint against a live node. Do those on a throwaway
+  key with dust amounts before trusting this with funds.
+
+One thing to know before wiring this in: the wallet's ``push_tx`` reports no
+verdict. A bundle its node refuses looks the same to the caller as one it
+accepts, so outcomes are read from the chain with :func:`chain.bundle_status`.
 
 ``chia_wallet_sdk`` is imported inside functions, as warp does with its heavy
 dependencies, so importing the GUI never fails when it is absent.

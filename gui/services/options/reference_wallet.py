@@ -24,10 +24,11 @@ returned. That guards against a confused or substituted RPC endpoint. It does
 not review the spends -- deciding that a bundle does what was intended is the
 caller's job, before :meth:`ReferenceWallet.sign` is called.
 
-Checked against chia-blockchain 2.7.5 (the JSON below is that release's). The
-signer RPCs are believed to date from the 2.4 line, which has not been verified
-here; a wallet without them answers with an unknown-endpoint error, which
-surfaces as :class:`SigningError`.
+Checked against chia-blockchain 2.7.5 (the JSON below is that release's). Its
+changelog lists "Add support for external signers" and "Conform to CHIP-0029"
+under 2.4.3 (2024-08-21), so that is the oldest wallet expected to have the
+signer RPCs; no older release was tried. A wallet without them answers with an
+unknown-endpoint error, which surfaces as :class:`SigningError`.
 """
 
 from __future__ import annotations
@@ -234,10 +235,16 @@ class ReferenceWallet:
     # -- broadcast ----------------------------------------------------------
 
     def push(self, coin_spends: Sequence[CoinSpend], aggregated_signature: bytes) -> bytes:
-        """Broadcast a signed bundle through the wallet's full-node peer.
+        """Hand a signed bundle to the wallet's full-node peer.
 
         Refuses a bundle whose signature does not verify, so a signing mistake
         costs nothing. Returns the spend bundle's name (its mempool id).
+
+        NO VERDICT COMES BACK. The wallet's ``push_tx`` forwards the bundle to
+        its peer and returns; if the node rejects it (a coin already spent, a
+        timelock not yet reached) this call still succeeds. Read the outcome
+        with :func:`gui.services.options.chain.bundle_status`, or push through
+        a full node's own ``push_tx``, which does answer.
         """
         required = required_signatures(coin_spends, self._additional_data)
         if not verify(required, aggregated_signature):
