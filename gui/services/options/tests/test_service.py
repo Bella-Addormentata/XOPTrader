@@ -590,8 +590,10 @@ def test_a_stalled_bundle_keeps_its_coins_and_is_pushed_until_it_confirms() -> N
     assert rig.wallet.signed == 1
     assert [item.status for item in rig.contracts()] == [store.MINTING]
 
-    # The outage ends. The stalled bundle is still being pushed, so it confirms.
+    # The outage ends and the process is restarted. The stalled bundle is on
+    # record and still being pushed, so it confirms.
     rig.wallet.push = real_push  # type: ignore[method-assign]
+    rig.book = rig.make_book()
     rig.steps(2)
 
     assert rig.store.broadcasts("stalled") == []
