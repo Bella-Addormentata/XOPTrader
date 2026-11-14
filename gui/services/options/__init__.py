@@ -8,16 +8,25 @@ do the same work against the wallet it already trades through:
 
 * :mod:`builder` builds the unsigned coin spends -- mint, offer, transfer,
   exercise, cancel and post-expiry clawback -- with ``chia_wallet_sdk``.
-* :mod:`signing` gets them signed. Every signature an option needs belongs to an
-  ordinary wallet address, so the reference wallet's signer RPCs
-  (``gather_signing_info`` / ``execute_signing_instructions``) can produce them.
-  XOPTrader holds no key.
-* :mod:`chain` reads an option back from the chain and applies the CHIP-0045
-  validity checks, for a contract we minted before a restart or one somebody
-  else is offering.
+* :mod:`signing` and :mod:`reference_wallet` get them signed. Every signature an
+  option needs belongs to an ordinary wallet address, so the reference wallet's
+  signer RPCs (``gather_signing_info`` / ``execute_signing_instructions``) can
+  produce them. XOPTrader holds no key.
+* :mod:`safety` works out what a bundle does to our money before it is signed
+  and refuses one that differs from what the operation declared.
+* :mod:`chain` reads an option, or the outcome of a broadcast, back from chain.
+* :mod:`pricing`, :mod:`market` and :mod:`quoting` decide what to offer and at
+  what price; :mod:`desk` talks to xchoptions.com; :mod:`store` is the durable
+  record; :mod:`service` is the loop that ties them together and
+  :mod:`monitor` is its read-only counterpart for other makers' offers.
+* :mod:`runtime` and ``python -m gui.services.options`` wire it to a real
+  wallet and run it from a terminal.
 
-STATUS: library only. Nothing here is wired into the GUI or the engine, nothing
-reads config, and no code path in XOPTrader calls it yet.
+STATUS: runs from the command line against a DEDICATED reference wallet. There
+is no GUI page, and ``wallet.mode: trading`` is refused: the engine does not yet
+keep option coins out of its own offers or book option events, and nothing in
+the engine reads this package's ``events`` table. It is off unless config.yaml
+has ``options.enabled: true``, and it rehearses (``dry_run``) by default.
 
 What has been checked, and what has not:
 
@@ -34,10 +43,13 @@ What has been checked, and what has not:
   xchoptions.com through warp's ``CoinsetClient`` and derived the terms the
   site shows, and :func:`signing.verify` accepted the signatures of four live
   offers, which have the same structure as the offers built here.
+* The desk client and monitor were run read-only against the live site.
 * NOT checked: a live wallet daemon over its HTTPS RPC, any broadcast to
-  mainnet, xchoptions.com accepting an offer built here, and the wallet's full
-  sync loop meeting an option mint against a live node. Do those on a throwaway
-  key with dust amounts before trusting this with funds.
+  mainnet, xchoptions.com accepting an offer built here, the wallet's full sync
+  loop meeting an option mint against a live node, and the CoinGecko feed in
+  :mod:`market` (tested against scripted answers only). ``docs/options-live-test.md``
+  is the checklist for the first of these; follow it on a throwaway key with
+  dust amounts before trusting this with funds.
 
 One thing to know before wiring this in: the wallet's ``push_tx`` reports no
 verdict. A bundle its node refuses looks the same to the caller as one it

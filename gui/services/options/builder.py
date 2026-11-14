@@ -484,6 +484,98 @@ def build_offer(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class MintOffer:
+    """An offer that mints its option only when it is taken."""
+
+    draft: OfferDraft
+    launcher_id: bytes
+    underlying: OptionUnderlying
+
+
+def build_mint_offer(
+    terms: OptionTerms,
+    requested: Asset,
+    receive_puzzle_hash: bytes,
+    funding: Funding,
+    custody: Custody,
+    *,
+    expires_at_seconds: int | None = None,
+) -> MintOffer:
+    """Offer an option that does not exist yet.
+
+    The offer's own spends mint the option and lock the underlying, so nothing
+    is locked while the quote is unsold: the funding coins stay ordinary wallet
+    coins until a taker completes the bundle. Several of these built on the same
+    coins are alternatives -- whichever is taken first spends the coins and the
+    rest can never settle -- which lets one coin advertise a ladder of strikes.
+
+    This is the flow CHIP-0045 itself describes. Whether a given venue or wallet
+    accepts such an offer is a separate matter: one that validates an offered
+    option against the chain will not find it there until it is taken.
+    """
+    _check_hash(receive_puzzle_hash, "receive_puzzle_hash")
+    if expires_at_seconds is not None and (
+        isinstance(expires_at_seconds, bool)
+        or not isinstance(expires_at_seconds, int)
+        or expires_at_seconds <= 0
+    ):
+        raise OptionBuildError("expires_at_seconds must be a positive integer")
+    sdk = _sdk()
+    clvm = sdk.Clvm()
+    spends = _new_spends(clvm, funding, custody)
+    coin_ids = [coin.coin_id() for coin in funding.xch] + [
+        cat.coin.coin_id() for cat in funding.cats
+    ]
+    if not coin_ids:
+        raise OptionBuildError("an offer needs at least one funding coin")
+    payment = sdk.NotarizedPayment(
+        sdk.Offer.nonce(coin_ids),
+        [sdk.Payment(receive_puzzle_hash, requested.amount, _hint(clvm, receive_puzzle_hash))],
+    )
+    requested_payments = sdk.RequestedPayments(clvm)
+    asset_info = sdk.AssetInfo(clvm)
+    if requested.asset_id is None:
+        requested_payments.add_xch(payment)
+    else:
+        asset_info.insert_cat(requested.asset_id, sdk.CatAssetInfo(None))
+        requested_payments.add_cat(requested.asset_id, payment)
+    try:
+        for assertion in requested_payments.assertions(asset_info):
+            spends.add_required_condition(assertion)
+    except Exception as exc:
+        raise OptionBuildError(f"could not build the offer: {exc}") from exc
+    if expires_at_seconds is not None:
+        spends.add_required_condition(clvm.assert_before_seconds_absolute(expires_at_seconds))
+
+    actions = [
+        sdk.Action.fee(0),
+        sdk.Action.mint_option(
+            terms.creator_puzzle_hash,
+            terms.expiration_seconds,
+            terms.underlying.sdk_id(),
+            terms.underlying.amount,
+            terms.strike.sdk_option_type(),
+            OPTION_COIN_AMOUNT,
+        ),
+        sdk.Action.send(
+            sdk.Id.new(1), sdk.Constants.settlement_payment_hash(), OPTION_COIN_AMOUNT, None
+        ),
+    ]
+    outputs = _complete(clvm, spends, actions, custody)
+    option = outputs.option(sdk.Id.new(1))
+    launcher_id = bytes(option.info.launcher_id)
+    underlying = terms.underlying_puzzle(launcher_id)
+    if bytes(underlying.delegated_puzzle_hash()) != bytes(
+        option.info.underlying_delegated_puzzle_hash
+    ):
+        raise OptionBuildError("the offered option does not commit to the requested terms")
+    draft = OfferDraft(
+        clvm, clvm.coin_spends(), requested_payments, asset_info, requested, expires_at_seconds
+    )
+    return MintOffer(draft=draft, launcher_id=launcher_id, underlying=underlying)
+
+
 # ---------------------------------------------------------------------------
 # Transfer (also how an open offer is cancelled)
 # ---------------------------------------------------------------------------

@@ -1609,3 +1609,104 @@ warp:
   # refuses to start and the Warp tab shows a blocked banner. A typo here is a
   # blocked bridge, never a lost deposit. This is the Base-bridged wUSDC.b CAT.
   expected_asset_id: "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"
+
+# ============================================================================
+# Options: covered calls and cash-secured puts (CHIP-0045) on xchoptions.com
+# ============================================================================
+# GUI-side Python only; the C++ engine never reads this section. No section, or
+# enabled: false, means the subsystem is off and nothing below is read.
+#
+# What it does when on: keeps a grid of option contracts minted and on offer --
+# calls that lock XCH, puts that lock the quote asset -- from a DEDICATED Chia
+# reference wallet, re-posting each offer before it expires, noticing sales and
+# exercises on chain, and reclaiming collateral at expiry.
+#
+# Run it from a terminal (there is no GUI page yet):
+#   python -m gui.services.options --config config.yaml status
+#   python -m gui.services.options --config config.yaml live-test
+#   python -m gui.services.options --config config.yaml monitor --interval 300
+#   python -m gui.services.options --config config.yaml run
+# Read docs/options-live-test.md before the first live run.
+options:
+  enabled: false                         # [OPTIONAL, default: false] master switch
+  # [SAFETY, default: true] Rehearsal. Each step builds the next mint, checks
+  # what it would do to the wallet and reports it. Nothing is signed, sent or
+  # listed, and no contract is recorded.
+  dry_run: true
+  network: mainnet                       # mainnet | testnet11
+
+  # The wallet that signs. It must be a SECOND reference-wallet daemon with its
+  # own key: its own CHIA_ROOT, its own RPC port, its own certificates. One
+  # wallet daemon serves one key at a time, so it cannot be the trading wallet,
+  # and pointing this at the trading wallet's port is refused.
+  # mode: trading is parsed and refused: the engine does not yet keep option
+  # coins out of its own offers or book option events.
+  wallet:
+    mode: dedicated
+    host: localhost
+    port: 9356                           # [REQUIRED] the dedicated wallet's rpc_port
+    cert_path: ""                        # [REQUIRED] its config/ssl/wallet/private_wallet.crt
+    key_path: ""                         # [REQUIRED] its config/ssl/wallet/private_wallet.key
+    fingerprint: null                    # [OPTIONAL] informational
+    # The one address used as creator, owner and change. Blank asks the wallet
+    # for its current address. ONLY coins at this address are used: fund it.
+    address: ""
+
+  # The asset options are struck and paid in: Base-bridged wUSDC.b.
+  quote_asset_id: "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"
+  quote_asset_decimals: 3
+
+  # The grid. One slot per expiry and strike; a slot is refilled when it sells.
+  contract_xch: 20                       # [REQUIRED] XCH per contract
+  expiries: []                           # e.g. ["2026-12-01T13:00:00Z", "2026-12-31T13:00:00Z"]
+  call_strikes_pct: [100, 110, 120]      # percent of spot, rounded to strike_step
+  put_strikes_pct: [80, 90, 100]
+  strike_step: 0.05                      # in the quote asset per XCH
+  # An unsold contract whose strike has drifted this far from its slot is
+  # cancelled so its collateral can back a current one.
+  strike_drift_pct: 25
+
+  # Offers. A new offer does NOT withdraw the old one, so the lifetime is the
+  # real limit on how long a stale price stays takeable.
+  offer_ttl_seconds: 900
+  refresh_before_seconds: 180            # re-post this long before an offer expires
+  reprice_pct: 2                         # re-post when the ask has moved this much
+  # If the ask has RISEN by this much of the contract's notional, a cheaper
+  # offer is still out: spend the option coin to kill it (one transaction).
+  withdraw_pct: 1.0
+  stop_before_expiry_seconds: 21600      # stop offering, and cancel, this long before expiry
+  confirm_timeout_seconds: 1800          # flag a broadcast that has not confirmed by then
+  fee_mojos: 0                           # per transaction; must be <= limits.max_fee_mojos
+  upload_offers: true                    # list each offer on xchoptions.com
+
+  pricing:
+    rate: 0.0                            # risk-free rate in the model
+    sigma_markup: 0.02                   # volatility points added for the ask
+    lock_rate: 0.10                      # yearly return charged on locked collateral
+    markup_fraction: 0.03                # of the model value
+    min_premium: 0.01                    # per XCH; floor for far out-of-the-money asks
+    # Steering: at a lean of steer_scale_xch (net delta of what has been sold),
+    # markups move by steer_strength towards rebalancing. 0 turns it off.
+    steer_strength: 0.25
+    steer_scale_xch: 100
+
+  # [SAFETY] No defaults. A limit left unset refuses every mint; it is not read
+  # as "no limit". Write "unlimited" to mean that.
+  limits:
+    max_locked_xch: null                 # XCH locked in calls, sold or not
+    max_locked_quote: null               # quote asset locked in puts
+    max_contracts: null                  # contracts alive at once
+    max_contracts_per_expiry: null
+    max_fee_mojos: 0
+
+  # Quotes stop when the price view is stale, the Dexie book cannot fill the
+  # hedge size, is wider than max_spread_pct, or does not contain the external
+  # spot (the sign of a quote-asset depeg).
+  market:
+    max_age_seconds: 600
+    max_spread_pct: 10
+    require_book: true
+    hedge_size_xch: 20
+
+  coinset_url: ""                        # [OPTIONAL] blank = network default
+  database_path: "data/options_jobs.db"

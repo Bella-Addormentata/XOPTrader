@@ -17,7 +17,7 @@ import pytest
 
 sdk = pytest.importorskip("chia_wallet_sdk")
 
-from gui.services.options import builder  # noqa: E402
+from gui.services.options import builder, chain  # noqa: E402
 from gui.services.options.chain import OptionStatus  # noqa: E402
 from gui.services.options.tests.sim_world import CAT, XCH, RejectedError, World  # noqa: E402
 
@@ -259,6 +259,87 @@ def test_offer_needs_the_owner_key(world: World) -> None:
     with pytest.raises(builder.OptionBuildError, match="owner"):
         builder.build_offer(
             minted.option, builder.Asset(usd, 2100), other.puzzle_hash, other.custody()
+        )
+
+
+def test_mint_on_take_locks_nothing_until_the_offer_is_taken(world: World) -> None:
+    maker, taker = world.party(100), world.party(10)
+    usd = world.issue_cat(taker, 1000)
+    terms = builder.OptionTerms(
+        builder.Asset(None, 50 * XCH),
+        builder.Asset(usd, 60 * CAT),
+        world.now() + HOUR,
+        maker.puzzle_hash,
+    )
+
+    quote = builder.build_mint_offer(
+        terms,
+        builder.Asset(usd, 2100),
+        maker.puzzle_hash,
+        maker.funding(),
+        maker.custody(),
+        expires_at_seconds=world.now() + 900,
+    )
+    offer = quote.draft.encode(world.signer().sign(quote.draft.coin_spends))
+
+    # Quoted, and nothing has moved: the option does not exist yet.
+    assert maker.balance() == 100 * XCH
+    with pytest.raises(chain.InvalidOptionError):
+        world.load(quote.launcher_id)
+
+    world.take(taker, offer)
+
+    loaded = world.load(quote.launcher_id)
+    assert loaded.status is OptionStatus.LIVE
+    assert loaded.terms == terms
+    assert loaded.owner_puzzle_hash == taker.puzzle_hash
+    assert maker.balance() == 50 * XCH - builder.OPTION_COIN_AMOUNT
+    assert maker.balance(usd) == 2100
+
+
+def test_mint_on_take_quotes_on_one_coin_are_alternatives(world: World) -> None:
+    """A ladder of strikes on one coin: the first taken wins, the rest die."""
+    maker, taker = world.party(100), world.party(10)
+    usd = world.issue_cat(taker, 1000)
+    signer = world.signer()
+    expiry = world.now() + HOUR
+    quotes = {}
+    for strike in (60, 65, 70):
+        terms = builder.OptionTerms(
+            builder.Asset(None, 50 * XCH),
+            builder.Asset(usd, strike * CAT),
+            expiry,
+            maker.puzzle_hash,
+        )
+        quote = builder.build_mint_offer(
+            terms, builder.Asset(usd, 2000), maker.puzzle_hash, maker.funding(), maker.custody()
+        )
+        quotes[strike] = (quote, quote.draft.encode(signer.sign(quote.draft.coin_spends)))
+
+    world.take(taker, quotes[65][1])
+
+    assert world.load(quotes[65][0].launcher_id).terms.strike.amount == 65 * CAT
+    for strike in (60, 70):
+        with pytest.raises(RejectedError, match="DoubleSpend"):
+            world.take(taker, quotes[strike][1])
+    assert maker.balance() == 50 * XCH - builder.OPTION_COIN_AMOUNT  # one contract's worth
+
+
+def test_mint_on_take_needs_funding(world: World) -> None:
+    maker = world.party(100)
+    terms = builder.OptionTerms(
+        builder.Asset(None, 50 * XCH),
+        builder.Asset(b"\x07" * 32, CAT),
+        world.now() + HOUR,
+        maker.puzzle_hash,
+    )
+    with pytest.raises(builder.OptionBuildError, match="funding coin"):
+        builder.build_mint_offer(
+            terms,
+            builder.Asset(None, XCH),
+            maker.puzzle_hash,
+            builder.Funding(change_puzzle_hash=maker.puzzle_hash),
+            maker.custody(),
         )
 
 
