@@ -22,7 +22,6 @@ import pytest
 sdk = pytest.importorskip("chia_wallet_sdk")
 
 from gui.services.options import builder, chain, store  # noqa: E402
-from gui.services.options.service import OptionsBook  # noqa: E402
 from gui.services.options.tests import test_service as ts  # noqa: E402
 from gui.services.options.tests.sim_world import World  # noqa: E402
 from gui.services.options.tests.test_chain import _mint_call, _setup  # noqa: E402
@@ -299,21 +298,12 @@ class Desk(ts.Rig):
 
     def __init__(self, **overrides: Any) -> None:
         settings = {"chain_poll_seconds": 30, "chain_refresh_seconds": 900, **overrides}
-        super().__init__(**settings)
-        self.node = Node(self.world.sim)
-        self.book = self.make_book()
+        super().__init__(Node, **settings)
 
-    def make_book(self) -> OptionsBook:
-        return OptionsBook(
-            self.config,
-            book_store=self.store,
-            wallet=self.wallet,
-            coins=ts.SimCoins(self.maker),
-            chain_reader=getattr(self, "node", self.world.sim),
-            market=self.read_market,
-            desk=self.desk,
-            clock=self.world.now,
-        )
+    @property
+    def node(self) -> Node:
+        """The request-counting node the book currently reads through."""
+        return self.reader
 
     def run(self, steps: int, every: int = 60) -> list[Any]:
         reports = []
@@ -477,7 +467,7 @@ def test_a_restarted_book_reads_the_chain_once_and_carries_on() -> None:
     desk = _open_book()
     desk.run(20)  # long enough for the mints to settle
 
-    desk.node = Node(desk.world.sim)  # a new process: nothing in memory
+    desk.reader = Node(desk.world.sim)  # a new process: nothing in memory
     desk.book = desk.make_book()
     (first,) = desk.run(1)
     rest = desk.run(5)

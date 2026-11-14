@@ -101,8 +101,11 @@ class FakeDesk:
 
 
 class Rig:
-    def __init__(self, **overrides: Any) -> None:
+    def __init__(self, reader: Any = None, **overrides: Any) -> None:
         self.world = World()
+        # What its books read the chain through: the simulator itself, or a
+        # stand-in for a node built over it.
+        self.reader = self.world.sim if reader is None else reader(self.world.sim)
         self.maker = self.world.party(500)
         self.taker = self.world.party(500)
         self.usd = self.world.issue_cat(self.taker, 5000)
@@ -156,7 +159,7 @@ class Rig:
             book_store=self.store,
             wallet=self.wallet,
             coins=SimCoins(self.maker),
-            chain_reader=self.world.sim,
+            chain_reader=self.reader,
             market=self.read_market,
             desk=self.desk,
             clock=self.world.now,
