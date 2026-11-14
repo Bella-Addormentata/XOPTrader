@@ -267,12 +267,17 @@ def test_only_one_process_acts_on_a_database(tmp_path) -> None:
             pytest.fail("two processes held the acting lock")
 
 
+def _fail_while_acting(book: store.OptionStore) -> None:
+    with book.acting():
+        raise RuntimeError("boom")
+
+
 def test_the_acting_lock_is_released_when_its_holder_fails_or_closes(tmp_path) -> None:
     path = tmp_path / "options_jobs.db"
     first, second = store.OptionStore(path), store.OptionStore(path)
 
-    with pytest.raises(RuntimeError, match="boom"), first.acting():
-        raise RuntimeError("boom")
+    with pytest.raises(RuntimeError, match="boom"):
+        _fail_while_acting(first)
     with second.acting():
         pass
 

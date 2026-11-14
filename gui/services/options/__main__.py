@@ -389,7 +389,7 @@ def _live_test(
         agg_sig_me_additional_data=_ADDITIONAL_DATA[cfg.network],
         address_prefix=cfg.address_prefix,
     )
-    book, book_store, coins = build(cfg, rpc=rpc, reader=reader, clock=lambda: time.time())
+    book, book_store, coins = build(cfg, rpc=rpc, reader=reader, clock=time.time)
     address = coins.puzzle_hash()
     print(f"network {cfg.network}; options address {coins.address()}")
     print("1. asking the wallet for the address's public key")

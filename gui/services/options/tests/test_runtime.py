@@ -213,7 +213,7 @@ def test_live_test_completes_on_the_least_it_asks_for(tmp_path, monkeypatch) -> 
     assert cli._live_test(cfg, 0.0001, True, 60.0) == 0
 
     assert maker.balance() == DUST + 2
-    book, (contract,) = _test_contracts(cfg)
+    _, (contract,) = _test_contracts(cfg)
     assert contract.status == store.CLOSED
 
 
@@ -286,7 +286,7 @@ def test_live_test_pushes_again_while_it_waits(tmp_path, monkeypatch) -> None:
     assert cli._live_test(cfg, 0.0001, True, 600.0) == 0
 
     assert len(pushes) == 4  # the mint twice, then the withdrawal and the cancel
-    book, (contract,) = _test_contracts(cfg)
+    _, (contract,) = _test_contracts(cfg)
     assert contract.status == store.CLOSED
 
 

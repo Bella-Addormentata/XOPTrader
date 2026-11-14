@@ -803,7 +803,7 @@ def test_a_second_process_over_the_same_database_skips_its_step(tmp_path) -> Non
     # It planned nothing from rows the other process was about to change.
     assert rig.contracts() == [] and rig.wallet.signed == 0
 
-    (report,) = rig.steps(1)
+    rig.steps(1)
     assert len(rig.contracts()) == 1
 
 
