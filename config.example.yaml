@@ -1716,5 +1716,22 @@ options:
     require_book: true
     hedge_size_xch: 20
 
-  coinset_url: ""                        # [OPTIONAL] blank = network default
+  # Reading the chain. The wallet does not track option coins, so the book
+  # reads them from a full node. It asks as little as it can: what is settled
+  # is kept in the database and never asked for again, and what can still
+  # change is asked for in one request, only when something may have happened.
+  #
+  # If you run a full node, name it here and coinset.org is never contacted.
+  # The certificate pair is the node's own:
+  #   <CHIA_ROOT>/config/ssl/full_node/private_full_node.crt and .key
+  node:
+    host: localhost
+    port: 8555                           # the full node's rpc_port
+    cert_path: ""                        # [OPTIONAL] blank = no node; coinset is used
+    key_path: ""
+  coinset_url: ""                        # [OPTIONAL] blank = network default; unused with a node
+  # The chain is looked at when the wallet's own coins change (a payment came
+  # in, a transaction of ours confirmed), when a contract reaches expiry, and:
+  chain_poll_seconds: 30                 # ...this often while a transaction of ours is waiting
+  chain_refresh_seconds: 900             # ...this often otherwise. Each look is one request.
   database_path: "data/options_jobs.db"

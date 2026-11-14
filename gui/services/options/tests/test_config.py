@@ -152,5 +152,34 @@ def test_fee_needs_an_allowance() -> None:
     assert parsed.fee_mojos == 5 and parsed.limits.max_fee_mojos == 10
 
 
+def test_the_chain_is_read_from_coinset_unless_a_node_is_given() -> None:
+    parsed = _parse()
+    assert not parsed.node.enabled and (parsed.node.host, parsed.node.port) == ("localhost", 8555)
+    # Look when something is waiting every half minute; otherwise every quarter hour.
+    assert (parsed.chain_poll_seconds, parsed.chain_refresh_seconds) == (30, 900)
+
+    own = _parse(
+        node={"host": "10.0.0.5", "port": 8666, "cert_path": "/n/c.crt", "key_path": "/n/k"}
+    )
+    assert own.node.enabled
+    assert (own.node.host, own.node.port, own.node.cert_path) == ("10.0.0.5", 8666, "/n/c.crt")
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"node": {"cert_path": "/n/c.crt"}}, "both cert_path and key_path"),
+        ({"node": {"key_path": "/n/k.key"}}, "both cert_path and key_path"),
+        ({"node": "localhost:8555"}, "options.node must be a mapping"),
+        ({"node": {"port": 0, "cert_path": "c", "key_path": "k"}}, "port"),
+        ({"chain_poll_seconds": 600, "chain_refresh_seconds": 60}, "must not be shorter"),
+        ({"chain_poll_seconds": -1}, "chain_poll_seconds"),
+    ],
+)
+def test_bad_chain_settings_are_refused(overrides, message) -> None:
+    with pytest.raises(config.OptionsConfigError, match=message):
+        _parse(**overrides)
+
+
 def test_testnet_uses_testnet_addresses() -> None:
     assert _parse(network="testnet11").address_prefix == "txch"

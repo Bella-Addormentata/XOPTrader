@@ -501,6 +501,54 @@ def test_node_chain_reader_reports_unknown_and_unspent_coins() -> None:
     assert reader.coin_spend(coin.coin_id()) is None
 
 
+class _BatchClient(_NodeClient):
+    """As coinset and a real node are: any number of coins in one request."""
+
+    def __init__(self, sim: Any) -> None:
+        super().__init__(sim)
+        self.batches: list[int] = []
+
+    def get_coin_record_by_name(self, name: str) -> Any:
+        raise AssertionError("one coin at a time, when they could travel together")
+
+    def get_coin_records_by_names(self, names: list[str], *, include_spent: bool = True) -> Any:
+        assert include_spent
+        self.batches.append(len(names))
+        states = (self._sim.coin_state(bytes.fromhex(name)) for name in names)
+        # A name the node does not know is simply missing from the answer.
+        return [_Record(state) for state in states if state is not None]
+
+
+def test_node_chain_reader_asks_for_many_coins_in_one_request() -> None:
+    world, maker, _, usd = _setup()
+    _, minted = _mint_call(world, maker, usd)
+    client = _BatchClient(world.sim)
+    reader = chain.NodeChainReader(client)
+    known = [bytes(spend.coin.coin_id()) for spend in minted.coin_spends]
+    unknown = b"\x42" * 32
+
+    states = reader.coin_states([*known, unknown])
+
+    assert client.batches == [len(known) + 1]
+    assert set(states) == set(known)
+    assert all(states[coin_id].spent_height is not None for coin_id in known)
+    assert reader.coin_state(unknown) is None
+    # A spend is asked for at the height the batch reported, with no second lookup.
+    spent = states[known[0]]
+    spend = reader.spend_at(spent.coin, spent.spent_height)
+    assert bytes(spend.coin.coin_id()) == known[0]
+    assert client.heights == [spent.spent_height]
+
+
+def test_node_chain_reader_loads_an_option_through_the_batched_call() -> None:
+    world, maker, _, usd = _setup()
+    terms, minted = _mint_call(world, maker, usd)
+
+    loaded = _load(chain.NodeChainReader(_BatchClient(world.sim)), world, minted.launcher_id)
+
+    assert loaded.status is OptionStatus.LIVE and loaded.terms == terms
+
+
 def test_node_chain_reader_wraps_client_failures() -> None:
     class Down:
         def get_coin_record_by_name(self, name: str) -> Any:
@@ -508,3 +556,16 @@ def test_node_chain_reader_wraps_client_failures() -> None:
 
     with pytest.raises(chain.ChainError, match="timed out"):
         chain.NodeChainReader(Down()).coin_state(b"\x01" * 32)
+
+    class DownTogether:
+        def get_coin_records_by_names(self, names: list[str], *, include_spent: bool) -> Any:
+            raise TimeoutError("timed out")
+
+        def get_puzzle_and_solution(self, coin_id: str, height: int) -> Any:
+            raise TimeoutError("timed out")
+
+    reader = chain.NodeChainReader(DownTogether())
+    with pytest.raises(chain.ChainError, match="coin record lookup failed"):
+        reader.coin_states([b"\x01" * 32])
+    with pytest.raises(chain.ChainError, match="puzzle and solution lookup failed"):
+        reader.spend_at(sdk.Coin(b"\x01" * 32, b"\x02" * 32, 1), 5)

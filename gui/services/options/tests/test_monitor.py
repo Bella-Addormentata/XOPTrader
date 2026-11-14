@@ -41,7 +41,7 @@ class Board:
 
 
 class Rig:
-    def __init__(self) -> None:
+    def __init__(self, node: Any = None) -> None:
         self.world = World()
         self.maker = self.world.party(300)
         self.taker = self.world.party(50)
@@ -53,7 +53,7 @@ class Rig:
         )
         self.monitor = monitor.DeskMonitor(
             desk_client=self.board,
-            chain_reader=self.world.sim,
+            chain_reader=self.world.sim if node is None else node(self.world.sim),
             market=self.read_market,
             book_store=self.store,
             quote_asset_id=self.usd,
@@ -174,6 +174,26 @@ def test_a_delisted_offer_with_no_expiry_ends_with_its_contract() -> None:
     rig.world.advance(1 * DAY + 60)  # past the contract's own expiry
     assert rig.monitor.scan().closed == {"undated": monitor.EXPIRED}
     assert rig.store.listings(open_only=True) == []
+
+
+def test_scans_ask_the_chain_only_about_what_is_new_or_being_followed() -> None:
+    from gui.services.options.tests.test_chain_use import Node  # a node that counts requests
+
+    rig = Rig(Node)
+    rig.list_call("listed")
+    rig.list_call("undated", ttl=None)
+
+    first = rig.monitor.scan()
+    assert len(first.new) == 2 and first.chain_requests > 0  # each new option is validated once
+
+    rig.world.advance(300)
+    assert rig.monitor.scan().chain_requests == 0  # nothing new, nothing delisted
+
+    del rig.board.offers["undated"]
+    for _ in range(3):  # still takeable, so followed: one request a scan
+        rig.world.advance(300)
+        followed = rig.monitor.scan()
+        assert followed.closed == {} and followed.chain_requests == 1
 
 
 def test_a_desk_outage_concludes_nothing() -> None:

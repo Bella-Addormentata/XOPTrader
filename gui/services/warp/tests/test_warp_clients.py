@@ -109,6 +109,42 @@ def test_coinset_coin_record_missing_is_none():
     assert c.get_coin_record_by_name("00") is None
 
 
+def test_coinset_records_by_names_asks_for_all_in_one_request():
+    poster = FakePoster(
+        {
+            "get_coin_records_by_names": {
+                "success": True,
+                "coin_records": [
+                    {
+                        "coin": {"parent_coin_info": "0x01", "puzzle_hash": "0xAB", "amount": 7},
+                        "confirmed_block_index": 10,
+                        "spent_block_index": 12,
+                    },
+                    {
+                        "coin": {"parent_coin_info": "0x02", "puzzle_hash": "0xcd", "amount": 9},
+                        "confirmed_block_index": 11,
+                        "spent_block_index": 0,
+                        "spent": False,
+                    },
+                ],
+            }
+        }
+    )
+    c = CoinsetClient("https://api.coinset.org", poster=poster)
+
+    # Three asked for, two known: the unknown one is simply absent, not an error.
+    recs = c.get_coin_records_by_names(["aa", "0xBB", "cc"])
+
+    assert [(r.coin.parent_coin_info, r.coin.amount, r.spent) for r in recs] == [
+        ("01", 7, True),
+        ("02", 9, False),
+    ]
+    assert len(poster.calls) == 1
+    body = poster.body_for("get_coin_records_by_names")
+    assert body == {"names": ["0xaa", "0xbb", "0xcc"], "include_spent_coins": True}
+    assert c.get_coin_records_by_names([]) == [] and len(poster.calls) == 1  # nothing to ask
+
+
 def test_coinset_records_by_puzzle_hash_passes_filters():
     poster = FakePoster(
         {

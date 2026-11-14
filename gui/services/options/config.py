@@ -164,6 +164,20 @@ class MarketConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class NodeConfig:
+    """The operator's own full node, read instead of coinset when it is given."""
+
+    host: str
+    port: int
+    cert_path: str
+    key_path: str
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.cert_path)
+
+
+@dataclasses.dataclass(frozen=True)
 class OptionsConfig:
     enabled: bool
     dry_run: bool
@@ -188,7 +202,10 @@ class OptionsConfig:
     pricing: PricingConfig
     limits: Limits
     market: MarketConfig
+    node: NodeConfig
     coinset_url: str
+    chain_poll_seconds: int
+    chain_refresh_seconds: int
     database_path: str
 
     @property
@@ -298,9 +315,30 @@ def parse(root: Any) -> OptionsConfig | None:
     pricing_raw = section.get("pricing") or {}
     limits_raw = section.get("limits") or {}
     market_raw = section.get("market") or {}
-    for name, value in (("pricing", pricing_raw), ("limits", limits_raw), ("market", market_raw)):
+    node_raw = section.get("node") or {}
+    for name, value in (
+        ("pricing", pricing_raw),
+        ("limits", limits_raw),
+        ("market", market_raw),
+        ("node", node_raw),
+    ):
         if not isinstance(value, dict):
             raise OptionsConfigError(f"options.{name} must be a mapping")
+
+    node = NodeConfig(
+        host=str(node_raw.get("host") or "localhost").strip(),
+        port=int(_number(node_raw, "port", 8555, minimum=1)),
+        cert_path=str(node_raw.get("cert_path") or "").strip(),
+        key_path=str(node_raw.get("key_path") or "").strip(),
+    )
+    if bool(node.cert_path) != bool(node.key_path):
+        raise OptionsConfigError("options.node needs both cert_path and key_path, or neither")
+    chain_poll = int(_number(section, "chain_poll_seconds", 30))
+    chain_refresh = int(_number(section, "chain_refresh_seconds", 900))
+    if chain_refresh < chain_poll:
+        raise OptionsConfigError(
+            "options.chain_refresh_seconds must not be shorter than chain_poll_seconds"
+        )
 
     quote_unit = 10**quote_decimals
     limits = Limits(
@@ -351,6 +389,9 @@ def parse(root: Any) -> OptionsConfig | None:
             require_book=bool(market_raw.get("require_book", True)),
             hedge_size_xch=_number(market_raw, "hedge_size_xch", contract_xch, minimum=1e-9),
         ),
+        node=node,
         coinset_url=str(section.get("coinset_url") or "").strip(),
+        chain_poll_seconds=chain_poll,
+        chain_refresh_seconds=chain_refresh,
         database_path=str(section.get("database_path") or "data/options_jobs.db").strip(),
     )

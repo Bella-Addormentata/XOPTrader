@@ -61,6 +61,15 @@ the chain shows it confirmed or shows one of its coins spent another way.
 One process acts on a database at a time (:meth:`store.OptionStore.acting`).
 A second ``step`` or ``live-test`` over the same file is refused, not queued.
 
+The chain is read from the operator's own full node when ``options.node`` names
+one, and otherwise from coinset.org, through :class:`chain.CachedChain`, which
+asks for as little as it can: settled spends are kept and never requested
+again, everything still watched travels in one request, and the book only
+looks when something may have happened. A six-contract book that made about
+ninety thousand requests a day makes about a hundred. The batched reader was
+run read-only against coinset on mainnet; the own-node path speaks the same
+RPC and has only been run against scripted answers.
+
 ``chia_wallet_sdk`` is imported inside functions, as warp does with its heavy
 dependencies, so importing the GUI never fails when it is absent.
 """

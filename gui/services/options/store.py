@@ -23,6 +23,13 @@ both plan from the same rows and mint the same slot twice.
 The ``events`` table is an append-only log of what happened to our money (a
 mint locked collateral, a premium arrived, a contract was exercised). It is
 what an accounting integration would read; nothing reads it yet.
+
+``chain_facts`` is not a record of ours at all. It keeps what was read from the
+chain about spent coins (that a coin was spent, at what height, and how), so
+that it is not asked for twice, across restarts included. A row starts out
+provisional and becomes ``final`` once the spend is old enough that a reorg
+cannot undo it; only final rows are trusted without looking again. Deleting the
+table loses nothing but the lookups it saves.
 """
 
 from __future__ import annotations
@@ -114,6 +121,19 @@ CREATE TABLE IF NOT EXISTS listings (
     closed_at     INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_listings_open ON listings (outcome);
+
+CREATE TABLE IF NOT EXISTS chain_facts (
+    coin_id        TEXT PRIMARY KEY,
+    parent         TEXT NOT NULL,
+    puzzle_hash    TEXT NOT NULL,
+    amount         TEXT NOT NULL,
+    created_height INTEGER,
+    spent_height   INTEGER NOT NULL,
+    puzzle_reveal  BLOB,
+    solution       BLOB,
+    seen_at        INTEGER NOT NULL,
+    final          INTEGER NOT NULL DEFAULT 0
+);
 
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -214,6 +234,27 @@ class Listing:
         if self.hedged_value is None or self.ask is None:
             return None
         return self.hedged_value - self.ask
+
+
+@dataclasses.dataclass(frozen=True)
+class ChainFact:
+    """A spent coin as it was read from the chain.
+
+    ``seen_at`` is when it was first seen spent at ``spent_height``. ``final``
+    is set once it has stayed that way long enough to be beyond a reorg.
+    ``puzzle_reveal`` and ``solution`` are None until the spend itself is read.
+    """
+
+    coin_id: bytes
+    parent: bytes
+    puzzle_hash: bytes
+    amount: int
+    created_height: int | None
+    spent_height: int
+    seen_at: int
+    final: bool = False
+    puzzle_reveal: bytes | None = None
+    solution: bytes | None = None
 
 
 class OptionStore:
@@ -640,6 +681,47 @@ class OptionStore:
             )
             for row in rows
         ]
+
+    # -- what was read from the chain (a cache, not a record of ours) --------
+
+    def chain_fact(self, coin_id: bytes) -> ChainFact | None:
+        row = self._db.execute(
+            "SELECT * FROM chain_facts WHERE coin_id = ?", (_hex(coin_id),)
+        ).fetchone()
+        if row is None:
+            return None
+        reveal, solution = row["puzzle_reveal"], row["solution"]
+        return ChainFact(
+            coin_id=bytes.fromhex(row["coin_id"]),
+            parent=bytes.fromhex(row["parent"]),
+            puzzle_hash=bytes.fromhex(row["puzzle_hash"]),
+            amount=int(row["amount"]),
+            created_height=None if row["created_height"] is None else int(row["created_height"]),
+            spent_height=int(row["spent_height"]),
+            seen_at=int(row["seen_at"]),
+            final=bool(row["final"]),
+            puzzle_reveal=None if reveal is None else bytes(reveal),
+            solution=None if solution is None else bytes(solution),
+        )
+
+    def remember_chain_fact(self, fact: ChainFact) -> None:
+        """Keep what was read about a spent coin. Writing it again replaces it."""
+        with self._write() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO chain_facts VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    _hex(fact.coin_id),
+                    _hex(fact.parent),
+                    _hex(fact.puzzle_hash),
+                    str(int(fact.amount)),  # text: a coin can exceed SQLite's 63 bits
+                    None if fact.created_height is None else int(fact.created_height),
+                    int(fact.spent_height),
+                    None if fact.puzzle_reveal is None else bytes(fact.puzzle_reveal),
+                    None if fact.solution is None else bytes(fact.solution),
+                    int(fact.seen_at),
+                    1 if fact.final else 0,
+                ),
+            )
 
     # -- desk listings (other makers' offers, read-only monitoring) ---------
 

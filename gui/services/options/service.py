@@ -41,6 +41,19 @@ its creator can move it.
 ONE AT A TIME. A step holds the store's acting lock. A second process over the
 same database skips its step instead of planning from the same rows.
 
+THE CHAIN IS ASKED AS LITTLE AS POSSIBLE. The node behind the chain reader is
+usually coinset.org, so the book reads through :class:`chain.CachedChain` and
+decides, each step, whether to look at the chain at all (:meth:`OptionsBook._look`).
+It looks when something may have happened: the wallet's own coins changed (a
+premium or a strike payment arrived, a mint or a cancel confirmed), a
+transaction of ours is waiting, a contract has just reached expiry, or the
+routine interval has passed. Otherwise the step runs on what the last look
+found and makes no request. A look is one request for every coin being watched,
+plus one for each spend not read before. Acting on a view that has gone stale
+cannot lose money, because every spend is judged by the chain itself: an offer
+for a coin already sold cannot be taken, and a cancel of one never confirms and
+is settled as overtaken at the next look.
+
 TIME. Expiry on chain is judged against the previous transaction block's
 timestamp, which trails the clock. This book uses the clock. The difference
 only ever makes it early, and an early clawback is simply refused by the node
@@ -99,6 +112,13 @@ class CoinSource(Protocol):
     def cats(self, asset_id: bytes) -> list[Cat]:
         """Spendable coins of one CAT at that address, with lineage proofs."""
 
+    def held(self, asset_ids: Any) -> Any:
+        """Ids of the spendable coins there, in XCH and each given CAT.
+
+        Asked of the wallet alone, every step, to notice that something
+        happened without asking the chain.
+        """
+
 
 class Desk(Protocol):
     """Where offers are advertised. ``DeskClient`` provides it."""
@@ -117,6 +137,8 @@ class StepReport:
     market_error: str = ""
     blocked: str = ""
     net_delta_xch: float = 0.0
+    chain_looked: str = ""  # why this step read the chain afresh, or "" if it did not
+    chain_requests: int = 0  # requests the step made of the chain's node
     actions: list[str] = dataclasses.field(default_factory=list)
     problems: list[str] = dataclasses.field(default_factory=list)
 
@@ -168,13 +190,73 @@ class OptionsBook:
         self._store = book_store
         self._wallet = wallet
         self._coins = coins
-        self._chain = chain_reader
+        self._chain = chain.CachedChain.over(chain_reader, book_store, clock=clock)
         self._market = market
         self._desk = desk
         self._clock = clock
         self._keys: dict[bytes, Any] = {}
         self._loaded: dict[bytes, chain.LoadedOption] = {}
         self._spot = 0.0
+        self._looked_at: int | None = None  # when the chain was last read afresh
+        self._look_again_until = 0
+        self._held: Any = None  # the wallet's coins as last listed
+
+    @property
+    def chain(self) -> chain.CachedChain:
+        """The reader the book reads the chain through, cache and all."""
+        return self._chain
+
+    # -- when to look at the chain --------------------------------------------
+
+    def _held_now(self, report: StepReport) -> Any:
+        try:
+            return frozenset(self._coins.held((self._config.quote_asset_id,)))
+        except (RuntimeError, OSError, ValueError) as exc:
+            # The wallet being away must not stop the chain being read.
+            report.problem(f"could not list the wallet's coins: {exc}")
+            return None
+
+    def _look(self, now: int, report: StepReport, *, always: bool = False) -> None:
+        """Start a fresh look at the chain if something may have happened.
+
+        Reasons, in order: the caller insists; nothing has been read yet; the
+        wallet's coins changed (a payment arrived or a spend of ours
+        confirmed); a transaction of ours is waiting and ``chain_poll_seconds``
+        have passed; a contract reached expiry since the last look; or
+        ``chain_refresh_seconds`` have passed. With none of them, this step
+        costs the chain's node nothing.
+        """
+        held = self._held_now(report)
+        changed = held is not None and self._held is not None and held != self._held
+        if held is not None:
+            self._held = held
+        fast = self._config.chain_poll_seconds
+        if changed:
+            # The node asked may be a block behind the wallet that noticed.
+            self._look_again_until = now + 3 * fast
+        reason = ""
+        if always:
+            reason = "asked to"
+        elif self._looked_at is None:
+            reason = "first look"
+        elif changed:
+            reason = "the wallet's coins changed"
+        else:
+            age = now - self._looked_at
+            waiting = any(row.status == "pending" for row in self._store.unresolved())
+            if (waiting or now < self._look_again_until) and age >= fast:
+                reason = "a transaction is waiting" if waiting else "following a change"
+            elif any(
+                self._looked_at < item.expiration <= now
+                for item in self._store.contracts(store.ACTIVE)
+            ):
+                reason = "a contract reached expiry"
+            elif age >= self._config.chain_refresh_seconds:
+                reason = "routine"
+        if reason:
+            self._chain.begin()
+            self._looked_at = now
+        report.chain_looked = reason
 
     # -- keys and coins -----------------------------------------------------
 
@@ -735,15 +817,18 @@ class OptionsBook:
     def step(self) -> StepReport:
         now = int(self._clock())
         report = StepReport(at=now, dry_run=self._config.dry_run)
+        asked = self._chain.requests
         try:
             with self._store.acting():
                 self._step(now, report)
         except store.BusyError as exc:
             report.problem(f"step skipped: {exc}")
+        report.chain_requests = self._chain.requests - asked
         return report
 
     def _step(self, now: int, report: StepReport) -> None:
         act = not self._config.dry_run
+        self._look(now, report)
         self._settle_broadcasts(now, report, act=act)
         self._reconcile(now, report, act=act)
 
@@ -790,27 +875,33 @@ class OptionsBook:
         """Bring the book up to date with the chain. Signs nothing and sends nothing."""
         now = int(self._clock())
         report = StepReport(at=now, dry_run=self._config.dry_run)
+        asked = self._chain.requests
         try:
             with self._store.acting():
+                self._look(now, report, always=True)
                 self._settle_broadcasts(now, report, act=False)
                 self._reconcile(now, report, act=False)
         except store.BusyError as exc:
             report.problem(f"not refreshed: {exc}")
+        report.chain_requests = self._chain.requests - asked
         return report
 
     def withdraw_all(self) -> StepReport:
         """Kill switch: take every open offer off the market by spending its coin."""
         now = int(self._clock())
         report = StepReport(at=now, dry_run=self._config.dry_run)
+        asked = self._chain.requests
         try:
             with self._store.acting():
                 self._withdraw_all(now, report)
         except store.BusyError as exc:
             report.problem(f"nothing withdrawn: {exc}")
+        report.chain_requests = self._chain.requests - asked
         return report
 
     def _withdraw_all(self, now: int, report: StepReport) -> None:
         act = not self._config.dry_run
+        self._look(now, report, always=True)  # a kill switch acts on what is true now
         self._reconcile(now, report, act=act)
         busy = {row.launcher_id for row in self._store.unresolved()}
         found = False

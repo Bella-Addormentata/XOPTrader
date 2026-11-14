@@ -16,7 +16,7 @@ sdk = pytest.importorskip("chia_wallet_sdk")
 yaml = pytest.importorskip("yaml")
 
 from gui.services.options import __main__ as cli  # noqa: E402
-from gui.services.options import config, market, runtime, store  # noqa: E402
+from gui.services.options import chain, config, market, runtime, store  # noqa: E402
 from gui.services.options.service import OptionsError  # noqa: E402
 from gui.services.options.tests.sim_world import CAT, XCH, Party, World  # noqa: E402
 from gui.services.options.tests.test_reference_wallet import FakeWallet, _hex  # noqa: E402
@@ -96,6 +96,89 @@ def test_coin_source_lists_only_coins_at_the_options_address(tmp_path) -> None:
     (cat,) = source.cats(usd)
     assert int(cat.coin.amount) == 40 * CAT and cat.lineage_proof is not None
     assert source.cats(b"\x09" * 32) == []  # no wallet for that asset
+
+
+def test_coin_source_lists_coins_without_the_chain_and_reads_a_cat_s_parent_once() -> None:
+    world = World()
+    maker, other = world.party(100), world.party(5)
+    usd = world.issue_cat(other, 500)
+    world.send_cat(other, maker.puzzle_hash, usd, 40 * CAT)
+    rpc = WalletRpc(world, maker, usd)
+    reader = chain.CachedChain(world.sim)
+    source = runtime.WalletCoinSource(rpc, reader, prefix="txch")
+
+    held = source.held((usd,))
+
+    # Every spendable coin at the address, XCH and CAT, from the wallet alone.
+    assert len(held) == len(maker.xch_coins()) + 1 and reader.requests == 0
+    assert source.held((b"\x09" * 32,)) == frozenset(
+        bytes(coin.coin_id()) for coin in maker.xch_coins()
+    )
+
+    (cat,) = source.cats(usd)
+    asked = reader.requests
+    assert cat.lineage_proof is not None and asked > 0
+    reader.begin()
+    source.cats(usd)
+    # A later look re-checks that the parent's spend still stands; it is not read again.
+    assert reader.requests - asked == 1
+
+    # The wallet list is not asked for again on every step for an asset it lacks.
+    listed = rpc.endpoints().count("get_wallets")
+    for _ in range(5):
+        source.held((b"\x09" * 32,))
+    assert rpc.endpoints().count("get_wallets") == listed
+
+
+def test_the_chain_is_read_from_the_operator_s_node_when_one_is_configured(
+    tmp_path, monkeypatch
+) -> None:
+    world = World()
+    maker = world.party(1)
+    usd = world.issue_cat(world.party(1), 5)
+    (coin,) = maker.xch_coins()
+    asked: list[tuple[str, dict]] = []
+
+    def node(url: str, body: dict) -> dict:
+        # What chia-blockchain's own full node answers on this endpoint.
+        asked.append((url, body))
+        assert body == {"names": ["0x" + bytes(coin.coin_id()).hex()], "include_spent_coins": True}
+        return {
+            "success": True,
+            "coin_records": [
+                {
+                    "coin": {
+                        "parent_coin_info": "0x" + bytes(coin.parent_coin_info).hex(),
+                        "puzzle_hash": "0x" + bytes(coin.puzzle_hash).hex(),
+                        "amount": int(coin.amount),
+                    },
+                    "confirmed_block_index": 7,
+                    "spent_block_index": 0,
+                    "spent": False,
+                    "coinbase": False,
+                    "timestamp": 1,
+                }
+            ],
+        }
+
+    certs: list[tuple[str, str]] = []
+
+    def poster(cert: str, key: str, timeout: float):
+        certs.append((cert, key))
+        return node
+
+    monkeypatch.setattr(runtime, "_node_poster", poster)
+    cfg = _config(tmp_path, usd, node={"port": 8666, "cert_path": "/n/c.crt", "key_path": "/n/k"})
+
+    reader = runtime.chain_reader(cfg)
+    state = reader.coin_state(coin.coin_id())
+
+    assert certs == [("/n/c.crt", "/n/k")]
+    assert [url for url, _ in asked] == ["https://localhost:8666/get_coin_records_by_names"]
+    assert state.spent_height is None and state.created_height == 7
+    assert "your full node at localhost:8666" in runtime.chain_source(cfg)
+    assert "coinset is not used" in runtime.chain_source(cfg)
+    assert runtime.chain_source(_config(tmp_path, usd)).startswith("coinset (https://testnet11.")
 
 
 def test_coin_source_refuses_an_address_for_another_network() -> None:
@@ -420,3 +503,4 @@ def test_status_prints_the_book(tmp_path, monkeypatch, capsys) -> None:
 
     out = capsys.readouterr().out
     assert "3 XCH" in out and "C110@5" in out and "minting" in out and "waiting: mint" in out
+    assert "chain is read from coinset" in out

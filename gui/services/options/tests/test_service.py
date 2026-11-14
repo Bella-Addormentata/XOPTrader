@@ -76,6 +76,15 @@ class SimCoins:
     def cats(self, asset_id: bytes) -> list[Any]:
         return self.party.cats(asset_id)
 
+    def held(self, asset_ids: Any) -> frozenset[bytes]:
+        ids = {bytes(coin.coin_id()) for coin in self.party.xch_coins()}
+        for asset_id in asset_ids:
+            wrapped = sdk.cat_puzzle_hash(asset_id, self.party.puzzle_hash)
+            ids.update(
+                bytes(c.coin_id()) for c in self.party.world.sim.unspent_coins(wrapped, False)
+            )
+        return frozenset(ids)
+
 
 class FakeDesk:
     def __init__(self) -> None:
@@ -121,6 +130,10 @@ class Rig:
             "put_strikes_pct": [90],
             "strike_step": 0.05,
             "stop_before_expiry_seconds": 3600,
+            # These tests follow contracts, not the chain-reading policy: look
+            # at the chain on every step. test_chain_use.py holds the policy.
+            "chain_poll_seconds": 0,
+            "chain_refresh_seconds": 0,
             "limits": {
                 "max_locked_xch": 100,
                 "max_locked_quote": 200,

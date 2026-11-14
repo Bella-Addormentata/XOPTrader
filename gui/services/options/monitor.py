@@ -23,6 +23,11 @@ shows an outcome or the contract itself expires.
 
 Over days this answers the two questions the business case rests on: how often
 does a takeable price appear, and how much actually trades.
+
+The chain is read through :class:`chain.CachedChain`, one look per scan. A new
+listing costs the handful of requests it takes to validate its option, once.
+After that a scan costs one request for all the delisted offers still being
+followed, and none when there are none.
 """
 
 from __future__ import annotations
@@ -50,6 +55,7 @@ class ScanReport:
     closed: dict[str, str] = dataclasses.field(default_factory=dict)  # offer id -> outcome
     problems: list[str] = dataclasses.field(default_factory=list)
     market_error: str = ""
+    chain_requests: int = 0  # requests this scan made of the chain's node
 
 
 def _sdk() -> Any:
@@ -74,7 +80,7 @@ class DeskMonitor:
         max_new_per_scan: int = 40,
     ) -> None:
         self._desk = desk_client
-        self._chain = chain_reader
+        self._chain = chain.CachedChain.over(chain_reader, book_store, clock=clock)
         self._market = market
         self._store = book_store
         self._quote = bytes(quote_asset_id)
@@ -200,14 +206,21 @@ class DeskMonitor:
         report.closed[listing.offer_id] = outcome
 
     def scan(self) -> ScanReport:
-        now = int(self._clock())
         report = ScanReport()
+        asked = self._chain.requests
+        self._chain.begin()
+        self._scan(report)
+        report.chain_requests = self._chain.requests - asked
+        return report
+
+    def _scan(self, report: ScanReport) -> None:
+        now = int(self._clock())
         try:
             listing = self._desk.list_offers()
         except desk.DeskError as exc:
             # No listing means no conclusions: nothing is recorded and nothing closed.
             report.problems.append(f"could not read the desk: {exc}")
-            return report
+            return
         report.listed = len(listing.offer_ids)
 
         view: Market | None
@@ -245,4 +258,3 @@ class DeskMonitor:
                 self._close(item, now, report)
             except chain.ChainError as exc:
                 report.problems.append(f"{offer_id[:8]}: {exc}")
-        return report

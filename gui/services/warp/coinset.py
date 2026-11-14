@@ -208,6 +208,25 @@ class CoinsetClient:
         record = data.get("coin_record")
         return _coin_record(record) if record else None
 
+    def get_coin_records_by_names(
+        self, names: Sequence[str], *, include_spent: bool = True
+    ) -> list[CoinRecord]:
+        """Records for any number of coins in ONE request.
+
+        A name the node does not know is simply absent from the answer -- a
+        normal success, on coinset and on a real full node alike -- so a caller
+        that needs the state of several coins should prefer this to a loop over
+        :meth:`get_coin_record_by_name`. The records carry no name; a caller
+        matches them up by the coin id it computes from each ``coin``.
+        """
+        if not names:
+            return []
+        data = self._post(
+            "get_coin_records_by_names",
+            {"names": [_0x(n) for n in names], "include_spent_coins": bool(include_spent)},
+        ) or {}
+        return [_coin_record(r) for r in (data.get("coin_records") or [])]
+
     def get_coin_records_by_puzzle_hash(
         self,
         puzzle_hash: str,

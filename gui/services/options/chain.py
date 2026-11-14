@@ -17,17 +17,31 @@ wallet RPC's coin record does not carry.
 
 Chain access is injected as :class:`ChainReader`. The SDK's ``Simulator``
 already has that shape, which is what the tests use; :class:`NodeChainReader`
-adapts a full-node style client such as warp's ``CoinsetClient``.
+adapts a full-node RPC client, which is coinset.org or the operator's own node.
 
 :func:`bundle_status` reads the outcome of a broadcast, or of an offer, from the
 chain, which is the only place the reference wallet lets us learn it.
+
+ASKING AS LITTLE AS POSSIBLE. The node behind a reader is usually somebody
+else's (coinset.org), so every request is one to avoid. :class:`CachedChain`
+wraps a reader and makes three savings:
+
+* What is settled is never asked for again. A coin that was spent stays spent,
+  and how it was spent does not change. Both are kept on disk, and trusted
+  without another look once the spend is old enough that a reorg cannot undo
+  it.
+* What can still change is asked for together. The coins a caller looked at
+  last time are fetched in ONE request the next time it looks.
+* The caller decides when to look (:meth:`CachedChain.begin`). Between looks
+  every answer comes from the last one, at no cost.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import enum
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
 from gui.services.options.builder import Asset, Locked, OptionTerms
@@ -70,24 +84,26 @@ class ChainReader(Protocol):
 
 
 class NodeChainReader:
-    """Adapts a full-node style client to :class:`ChainReader`.
+    """Adapts a full-node RPC client to :class:`ChainReader`.
 
-    ``client`` needs ``get_coin_record_by_name(hex) -> record | None`` and
-    ``get_puzzle_and_solution(hex, height) -> solution``, as
-    ``gui.services.warp.coinset.CoinsetClient`` provides: records with ``.coin``
-    (hex ``parent_coin_info`` / ``puzzle_hash``, int ``amount``),
-    ``.confirmed_block_index``, ``.spent_block_index`` and ``.spent``; solutions
-    with hex ``.puzzle_reveal`` and ``.solution``.
+    ``client`` is ``gui.services.warp.coinset.CoinsetClient`` or anything shaped
+    like it, pointed at coinset.org or at the operator's own full node; the RPC
+    is the same on both. Only two endpoints are used:
+
+    * ``get_coin_records_by_names(names, include_spent=True) -> records``: any
+      number of coins in one request. A coin the node does not know is absent
+      from the answer rather than an error, on coinset and on a real node alike.
+    * ``get_puzzle_and_solution(hex, height) -> solution``.
+
+    Records have ``.coin`` (hex ``parent_coin_info`` / ``puzzle_hash``, int
+    ``amount``), ``.confirmed_block_index``, ``.spent_block_index`` and
+    ``.spent``; solutions have hex ``.puzzle_reveal`` and ``.solution``. A client
+    with only ``get_coin_record_by_name(hex) -> record | None`` is still served,
+    one request per coin.
     """
 
     def __init__(self, client: Any) -> None:
         self._client = client
-
-    def _record(self, coin_id: bytes) -> Any:
-        try:
-            return self._client.get_coin_record_by_name(bytes(coin_id).hex())
-        except Exception as exc:
-            raise ChainError(f"coin record lookup failed: {exc}") from exc
 
     @staticmethod
     def _coin(record: Any) -> Coin:
@@ -96,10 +112,7 @@ class NodeChainReader:
             _unhex(coin.parent_coin_info), _unhex(coin.puzzle_hash), int(coin.amount)
         )
 
-    def coin_state(self, coin_id: bytes) -> Any:
-        record = self._record(coin_id)
-        if record is None:
-            return None
+    def _state(self, record: Any) -> Any:
         spent = bool(getattr(record, "spent", False)) or int(record.spent_block_index or 0) > 0
         return _sdk().CoinState(
             self._coin(record),
@@ -107,21 +120,47 @@ class NodeChainReader:
             int(record.confirmed_block_index),
         )
 
-    def coin_spend(self, coin_id: bytes) -> Any:
-        record = self._record(coin_id)
-        if record is None:
-            return None
-        if not (bool(getattr(record, "spent", False)) or int(record.spent_block_index or 0) > 0):
-            return None
+    def coin_states(self, coin_ids: Iterable[bytes]) -> dict[bytes, Any]:
+        """The state of each coin the node knows, in one request where it can."""
+        wanted = [bytes(coin_id) for coin_id in coin_ids]
+        if not wanted:
+            return {}
+        together = getattr(self._client, "get_coin_records_by_names", None)
+        try:
+            if together is not None:
+                records = together([coin_id.hex() for coin_id in wanted], include_spent=True)
+            else:
+                looked_up = (
+                    self._client.get_coin_record_by_name(coin_id.hex()) for coin_id in wanted
+                )
+                records = [record for record in looked_up if record is not None]
+        except Exception as exc:
+            raise ChainError(f"coin record lookup failed: {exc}") from exc
+        states = {}
+        for record in records:
+            state = self._state(record)
+            states[bytes(state.coin.coin_id())] = state
+        # A node answers for the names it was asked; anything else is not ours.
+        return {coin_id: states[coin_id] for coin_id in wanted if coin_id in states}
+
+    def coin_state(self, coin_id: bytes) -> Any:
+        return self.coin_states([coin_id]).get(bytes(coin_id))
+
+    def spend_at(self, coin: Coin, spent_height: int) -> Any:
+        """How a coin known to be spent at ``spent_height`` was spent. One request."""
         try:
             solution = self._client.get_puzzle_and_solution(
-                bytes(coin_id).hex(), int(record.spent_block_index)
+                bytes(coin.coin_id()).hex(), int(spent_height)
             )
         except Exception as exc:
             raise ChainError(f"puzzle and solution lookup failed: {exc}") from exc
-        return _sdk().CoinSpend(
-            self._coin(record), _unhex(solution.puzzle_reveal), _unhex(solution.solution)
-        )
+        return _sdk().CoinSpend(coin, _unhex(solution.puzzle_reveal), _unhex(solution.solution))
+
+    def coin_spend(self, coin_id: bytes) -> Any:
+        state = self.coin_state(coin_id)
+        if state is None or state.spent_height is None:
+            return None
+        return self.spend_at(state.coin, int(state.spent_height))
 
 
 def _unhex(value: Any) -> bytes:
@@ -153,17 +192,235 @@ def _spend(chain: ChainReader, coin_id: bytes, what: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Asking as little as possible
+# ---------------------------------------------------------------------------
+
+
+class FactStore(Protocol):
+    """Where what was read about spent coins is kept. ``store.OptionStore`` provides it."""
+
+    def chain_fact(self, coin_id: bytes) -> Any:
+        """The kept ``store.ChainFact`` for ``coin_id``, or None."""
+
+    def remember_chain_fact(self, fact: Any) -> None:
+        """Keep a fact, replacing any kept before for the same coin."""
+
+
+class _Memory:
+    """A :class:`FactStore` that lasts as long as the process."""
+
+    def __init__(self) -> None:
+        self._facts: dict[bytes, Any] = {}
+
+    def chain_fact(self, coin_id: bytes) -> Any:
+        return self._facts.get(bytes(coin_id))
+
+    def remember_chain_fact(self, fact: Any) -> None:
+        self._facts[bytes(fact.coin_id)] = fact
+
+
+class CachedChain:
+    """A :class:`ChainReader` that asks its node only for what may have changed.
+
+    LOOKS. :meth:`begin` starts a look. Until the next one, a coin's state is
+    whatever this look found, so calling :meth:`coin_state` a hundred times
+    costs one request at most. The first lookup of a look fetches, in a single
+    request, every coin that was asked about during the look before: the
+    reader learns what its caller watches by being asked. A caller that never
+    calls :meth:`begin` gets one long look, which is right for a one-shot
+    command.
+
+    SETTLED. The first time a coin is seen spent, the fact is written down with
+    the time. Seen spent again at the same height ``final_after_seconds`` or
+    more later (fifteen minutes by default, some forty blocks: beyond any reorg
+    seen on mainnet) it is final: its state and its spend are answered from
+    ``facts`` and never requested again, by this process or the next. Until
+    then it is re-read with everything else at each look, which costs nothing
+    extra, and a spend that moved to another height is read again. How a coin
+    was spent is kept from the first time it is read, so even an unsettled
+    spend is fetched once.
+
+    ``requests`` counts the round trips actually made, so a caller can report
+    them and a test can hold them to a number.
+    """
+
+    def __init__(
+        self,
+        inner: Any,
+        facts: FactStore | None = None,
+        *,
+        clock: Callable[[], float] = time.time,
+        final_after_seconds: float = 900.0,
+        batch_size: int = 200,
+    ) -> None:
+        self._inner = inner
+        self._facts: FactStore = _Memory() if facts is None else facts
+        self._clock = clock
+        self._final_after = float(final_after_seconds)
+        self._batch = max(1, int(batch_size))
+        self._final: dict[bytes, Any] = {}  # coin id -> a final store.ChainFact
+        self._spent: dict[bytes, Any] = {}  # coin id -> a fact not yet final
+        self._seen: dict[bytes, Any] = {}  # this look: coin id -> state, or None
+        self._asked: set[bytes] = set()  # coins not final that were asked about this look
+        self._due: set[bytes] = set()  # to fetch together at the next lookup
+        self.requests = 0
+
+    @classmethod
+    def over(
+        cls, reader: Any, facts: FactStore | None, *, clock: Callable[[], float] = time.time
+    ) -> CachedChain:
+        """``reader`` itself if it already caches, else a cache around it."""
+        return reader if isinstance(reader, cls) else cls(reader, facts, clock=clock)
+
+    # -- looks ---------------------------------------------------------------
+
+    def begin(self) -> None:
+        """Start a new look: what can still change is read afresh, together."""
+        self._due |= self._asked
+        self._asked = set()
+        self._seen = {}
+
+    def want(self, coin_ids: Iterable[bytes]) -> None:
+        """Say which coins are about to be asked for, so they travel together."""
+        for coin_id in coin_ids:
+            coin_id = bytes(coin_id)
+            if coin_id not in self._seen and self._settled(coin_id) is None:
+                self._due.add(coin_id)
+
+    # -- kept facts ------------------------------------------------------------
+
+    def _settled(self, coin_id: bytes) -> Any:
+        """The final fact about ``coin_id``, or None while it can still change."""
+        fact = self._final.get(coin_id)
+        if fact is None and coin_id not in self._seen and coin_id not in self._spent:
+            kept = self._facts.chain_fact(coin_id)
+            if kept is not None and kept.final:
+                self._final[coin_id] = fact = kept
+        return fact
+
+    def _keep(self, fact: Any) -> None:
+        self._facts.remember_chain_fact(fact)
+        if fact.final:
+            self._final[fact.coin_id] = fact
+            self._spent.pop(fact.coin_id, None)
+            self._seen.pop(fact.coin_id, None)
+            self._asked.discard(fact.coin_id)
+        else:
+            self._spent[fact.coin_id] = fact
+
+    @staticmethod
+    def _coin(fact: Any) -> Coin:
+        return _sdk().Coin(fact.parent, fact.puzzle_hash, int(fact.amount))
+
+    def _state(self, fact: Any) -> Any:
+        return _sdk().CoinState(self._coin(fact), int(fact.spent_height), fact.created_height)
+
+    # -- reading ---------------------------------------------------------------
+
+    def _observe(self, coin_id: bytes, state: Any, now: float) -> None:
+        from gui.services.options.store import ChainFact  # a plain record; no cycle at import
+
+        self._seen[coin_id] = state
+        if state is None or state.spent_height is None:
+            # Unspent, or gone. Whatever was kept about a spend no longer stands;
+            # it is overwritten if the coin is ever seen spent again.
+            self._spent.pop(coin_id, None)
+            return
+        height = int(state.spent_height)
+        fact = self._spent.get(coin_id) or self._facts.chain_fact(coin_id)
+        if fact is None or int(fact.spent_height) != height:
+            # First sight, or a reorg moved the spend: start counting from now.
+            fact = ChainFact(
+                coin_id=coin_id,
+                parent=bytes(state.coin.parent_coin_info),
+                puzzle_hash=bytes(state.coin.puzzle_hash),
+                amount=int(state.coin.amount),
+                created_height=None if state.created_height is None else int(state.created_height),
+                spent_height=height,
+                seen_at=int(now),
+            )
+            self._keep(fact)
+        elif now - fact.seen_at >= self._final_after:
+            self._keep(dataclasses.replace(fact, final=True))
+        else:
+            self._spent[coin_id] = fact
+
+    def _fetch(self, coin_ids: set[bytes]) -> None:
+        wanted = sorted(coin_id for coin_id in coin_ids if coin_id not in self._final)
+        together = getattr(self._inner, "coin_states", None)
+        now = self._clock()
+        for start in range(0, len(wanted), self._batch):
+            chunk = wanted[start : start + self._batch]
+            if together is not None:
+                self.requests += 1
+                found = together(chunk)
+            else:
+                self.requests += len(chunk)
+                found = {coin_id: self._inner.coin_state(coin_id) for coin_id in chunk}
+            for coin_id in chunk:
+                self._observe(coin_id, found.get(coin_id), now)
+
+    def coin_state(self, coin_id: bytes) -> Any:
+        coin_id = bytes(coin_id)
+        fact = self._settled(coin_id)
+        if fact is not None:
+            return self._state(fact)
+        self._asked.add(coin_id)
+        if coin_id not in self._seen:
+            due, self._due = self._due | {coin_id}, set()
+            self._fetch(due)
+            fact = self._final.get(coin_id)
+            if fact is not None:  # this very read made it final
+                return self._state(fact)
+        return self._seen[coin_id]
+
+    def coin_spend(self, coin_id: bytes) -> Any:
+        coin_id = bytes(coin_id)
+        state = self.coin_state(coin_id)
+        if state is None or state.spent_height is None:
+            return None
+        fact = self._final.get(coin_id) or self._spent.get(coin_id)
+        if fact is None or int(fact.spent_height) != int(state.spent_height):
+            return None  # not reachable: a spent coin always has a fact by now
+        if fact.puzzle_reveal is None:
+            exact = getattr(self._inner, "spend_at", None)
+            self.requests += 1
+            if exact is not None:
+                spend = exact(state.coin, int(state.spent_height))
+            else:
+                spend = self._inner.coin_spend(coin_id)
+            if spend is None:
+                return None
+            fact = dataclasses.replace(
+                fact, puzzle_reveal=bytes(spend.puzzle_reveal), solution=bytes(spend.solution)
+            )
+            self._keep(fact)
+        return _sdk().CoinSpend(self._coin(fact), fact.puzzle_reveal, fact.solution)
+
+
+# ---------------------------------------------------------------------------
 # CAT coins
 # ---------------------------------------------------------------------------
 
 
 def load_cat(chain: ChainReader, coin_id: bytes) -> Cat:
     """Rebuild a spendable CAT (coin, lineage proof, asset id) from its parent's spend."""
-    sdk = _sdk()
     state = _state(chain, coin_id, "the CAT coin")
     if state is None:
         raise ChainError(f"coin {bytes(coin_id).hex()} is not on chain")
-    parent = _spend(chain, state.coin.parent_coin_info, "the CAT coin's parent")
+    return load_cat_coin(chain, state.coin)
+
+
+def load_cat_coin(chain: ChainReader, coin: Coin) -> Cat:
+    """:func:`load_cat` for a coin already in hand, as a wallet reports its own.
+
+    Only the parent's spend is read. That spend is settled, so a caching reader
+    answers it from memory ever after and a wallet's CAT coins cost nothing to
+    list again.
+    """
+    sdk = _sdk()
+    coin_id = bytes(coin.coin_id())
+    parent = _spend(chain, coin.parent_coin_info, "the CAT coin's parent")
     if parent is None:
         raise ChainError("the CAT coin's parent spend is not available")
     clvm = sdk.Clvm()
@@ -217,6 +474,9 @@ def bundle_status(chain: ChainReader, coin_spends: Sequence[CoinSpend]) -> Bundl
         raise ValueError("no coin spends to look up")
     sdk = _sdk()
     clvm = sdk.Clvm()
+    together = getattr(chain, "want", None)
+    if together is not None:
+        together(bytes(coin_spend.coin.coin_id()) for coin_spend in coin_spends)
     unspent = False
     for coin_spend in coin_spends:
         coin_id = bytes(coin_spend.coin.coin_id())

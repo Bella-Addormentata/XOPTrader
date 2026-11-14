@@ -18,6 +18,11 @@ stops at the first thing that does not match.
   `.key`, entered under `options.wallet` in `config.yaml`.
 - A few thousand mojos of XCH sent to the address `status` prints. Only coins
   at that one address are used.
+- Optional: a full node of your own. Enter its RPC port and its
+  `config/ssl/full_node/private_full_node.crt` and `.key` under `options.node`
+  and the chain is read from it; coinset.org is then never contacted. Without
+  it the chain is read from coinset.org, sparingly (see "How often the chain is
+  asked" below). `status` prints which of the two is in use.
 
 ## Stage 1: testnet11
 
@@ -106,6 +111,45 @@ Two things to know once contracts are out:
   `live-test` take a lock on `options.database_path`; a second one started
   beside it reports "another process is acting" and does nothing. `status` and
   `monitor` are not affected.
+
+## How often the chain is asked
+
+The wallet does not track option coins, so the book reads them from a full
+node: yours if `options.node` is set, otherwise coinset.org. It is built to ask
+as little as possible.
+
+- What is settled is asked for once. A spent coin and how it was spent are kept
+  in `options.database_path` and, once a quarter of an hour old, never
+  requested again, by this run or the next.
+- What can still change is asked for together. Each contract has two coins
+  worth watching (the option and its collateral); all of them, for every
+  contract, go in one request.
+- The book looks only when something may have happened: the wallet's own coins
+  changed (a premium or a strike payment arrived, a transaction of ours
+  confirmed), a transaction of ours is waiting (`chain_poll_seconds`), a
+  contract just reached expiry, or `chain_refresh_seconds` have passed.
+  Listing the wallet's coins is a call to your own wallet, not to the node.
+
+Every `step` ends with a line such as `chain requests this step: 1 (routine)`,
+so the cost is visible. For scale: a book of six open contracts stepped once a
+minute used to make about 90,000 requests a day. It now makes about 100 on a
+quiet day (one every fifteen minutes), about 7 when it mints a contract, and
+about 5 when one sells. Raising `chain_refresh_seconds` to 3600 brings the
+quiet-day figure to 24.
+
+Two things follow from looking less often:
+
+- Between looks the book acts on what the last look found. That cannot lose
+  money, because the chain itself judges every spend: an offer for a contract
+  already sold cannot be taken, and a cancel of one never confirms and is
+  settled as overtaken at the next look. A sale is normally noticed within one
+  step, because the premium arriving changes the wallet's coins. That needs the
+  wallet to have a wallet for the quote asset (it creates one by itself when
+  the first payment arrives, unless that has been switched off); without one a
+  sale is noticed at the next routine look instead.
+- `run` is the mode that saves requests, because it remembers when it last
+  looked. `step` run by hand, or from cron, is a new process every time and
+  looks every time: two requests per open contract.
 
 ## Known limits
 

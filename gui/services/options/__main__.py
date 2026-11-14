@@ -28,7 +28,13 @@ from typing import Any
 
 from gui.services.options import builder, chain, config, safety, store
 from gui.services.options.reference_wallet import ReferenceWallet
-from gui.services.options.runtime import _ADDITIONAL_DATA, build, chain_reader, wallet_rpc
+from gui.services.options.runtime import (
+    _ADDITIONAL_DATA,
+    build,
+    chain_reader,
+    chain_source,
+    wallet_rpc,
+)
 from gui.services.options.service import pack_bundle, unpack_bundle
 
 #: The slot a live-test contract is stored under. It is in no grid, so a live
@@ -67,12 +73,15 @@ def _print_report(report: Any) -> None:
         print("  nothing to do")
     if report.market is not None:
         print(f"net delta of sold contracts: {report.net_delta_xch:+.2f} XCH")
+    looked = f" ({report.chain_looked})" if report.chain_looked else ""
+    print(f"chain requests this step: {report.chain_requests}{looked}")
 
 
 def _status(cfg: config.OptionsConfig) -> int:
     book, book_store, coins = build(cfg)
     del book
     print(f"network {cfg.network}   dry_run {cfg.dry_run}")
+    print(f"chain is read from {chain_source(cfg)}")
     print(f"options address {coins.address()}")
     xch = sum(int(coin.amount) for coin in coins.xch_coins())
     quote = sum(int(cat.coin.amount) for cat in coins.cats(cfg.quote_asset_id))
@@ -135,7 +144,7 @@ def _monitor(cfg: config.OptionsConfig, interval: float) -> int:
         report = watcher.scan()
         print(
             f"{time.strftime('%H:%M:%S')} listed {report.listed}, new {len(report.new)}, "
-            f"closed {len(report.closed)}"
+            f"closed {len(report.closed)}, chain requests {report.chain_requests}"
         )
         if report.market_error:
             print(f"  no market view: {report.market_error}")
@@ -216,6 +225,7 @@ class _LiveTest:
         print(f"  waiting for the {what} to confirm", end="", flush=True)
         polls = 0
         while time.time() < deadline:
+            self.reader.begin()  # each poll reads afresh: one request for the bundle's coins
             try:
                 status = chain.bundle_status(self.reader, coin_spends)
             except chain.ChainError:
@@ -392,6 +402,7 @@ def _live_test(
     book, book_store, coins = build(cfg, rpc=rpc, reader=reader, clock=time.time)
     address = coins.puzzle_hash()
     print(f"network {cfg.network}; options address {coins.address()}")
+    print(f"chain is read from {chain_source(cfg)}")
     print("1. asking the wallet for the address's public key")
     key = wallet.synthetic_key(address)
     custody = builder.Custody()
@@ -399,7 +410,7 @@ def _live_test(
     test = _LiveTest(
         cfg=cfg,
         wallet=wallet,
-        reader=reader,
+        reader=book.chain,
         book=book,
         book_store=book_store,
         coins=coins,
