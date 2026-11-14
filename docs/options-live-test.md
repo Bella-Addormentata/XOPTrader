@@ -15,7 +15,11 @@ stops at the first thing that does not match.
   so it cannot share the trading wallet's daemon. Give it its own `CHIA_ROOT`
   and its own ports, start only the wallet service, and let it sync.
 - That wallet's RPC port and its `config/ssl/wallet/private_wallet.crt` and
-  `.key`, entered under `options.wallet` in `config.yaml`.
+  `.key`, entered under `options.wallet` in `config.yaml` (or in `secrets.yaml`
+  beside it, which is laid over `config.yaml` as everywhere else in the app).
+  Enter the key's `fingerprint` too: the wallet is logged in to it before every
+  step, and nothing is done while the wallet reports itself still syncing.
+  `status` prints whether it is ready.
 - A few thousand mojos of XCH sent to the address `status` prints. Only coins
   at that one address are used.
 - Optional: a full node of your own. Enter its RPC port and its

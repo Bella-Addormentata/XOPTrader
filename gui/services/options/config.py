@@ -51,6 +51,20 @@ def _number(section: dict, key: str, default: float | None, *, minimum: float = 
     return value
 
 
+def _flag(section: dict, key: str, default: bool) -> bool:
+    """A yes/no setting. Only a YAML true or false will do.
+
+    ``bool("false")`` is True, so a quoted "false", or "no", or "off", would
+    read as yes: for ``enabled`` that is a book switched on by a typo.
+    """
+    raw = section.get(key)
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    raise OptionsConfigError(f"options: {key} must be true or false (got {raw!r})")
+
+
 def _cap(section: dict, key: str, scale: int) -> int:
     """A limit in mojos or units: UNSET if absent, UNLIMITED if so stated."""
     raw = section.get(key)
@@ -211,6 +225,9 @@ class OptionsConfig:
     chain_poll_seconds: int
     chain_refresh_seconds: int
     database_path: str
+    #: The app's CoinGecko key (``coingecko.api_key``, kept in secrets.yaml).
+    #: Not an options setting; carried here so the price feed can send it.
+    coingecko_api_key: str = dataclasses.field(default="", repr=False)
 
     @property
     def address_prefix(self) -> str:
@@ -230,7 +247,7 @@ def parse(root: Any) -> OptionsConfig | None:
         return None
     if not isinstance(section, dict):
         raise OptionsConfigError("options: must be a mapping")
-    if not bool(section.get("enabled", False)):
+    if not _flag(section, "enabled", False):
         return None
 
     network = str(section.get("network", MAINNET)).strip().lower()
@@ -267,6 +284,7 @@ def parse(root: Any) -> OptionsConfig | None:
             "differ from the trading wallet's"
         )
     chia = root.get("chia") if isinstance(root.get("chia"), dict) else {}
+    coingecko = root.get("coingecko") if isinstance(root.get("coingecko"), dict) else {}
     trading_host = str(chia.get("wallet_host") or "localhost").strip().lower()
     host = str(wallet_raw.get("host") or "localhost").strip()
     local = {"localhost", "127.0.0.1", "::1"}
@@ -359,7 +377,7 @@ def parse(root: Any) -> OptionsConfig | None:
 
     return OptionsConfig(
         enabled=True,
-        dry_run=bool(section.get("dry_run", True)),
+        dry_run=_flag(section, "dry_run", True),
         network=network,
         wallet=wallet,
         quote_asset_id=_asset_id(section.get("quote_asset_id"), "quote_asset_id"),
@@ -381,7 +399,7 @@ def parse(root: Any) -> OptionsConfig | None:
         confirm_timeout_seconds=int(_number(section, "confirm_timeout_seconds", 1800, minimum=60)),
         fee_mojos=fee,
         fee_auto=fee_auto,
-        upload_offers=bool(section.get("upload_offers", True)),
+        upload_offers=_flag(section, "upload_offers", True),
         pricing=PricingConfig(
             rate=_number(pricing_raw, "rate", 0.0),
             sigma_markup=_number(pricing_raw, "sigma_markup", 0.02),
@@ -395,7 +413,7 @@ def parse(root: Any) -> OptionsConfig | None:
         market=MarketConfig(
             max_age_seconds=_number(market_raw, "max_age_seconds", 600, minimum=1),
             max_spread_pct=_number(market_raw, "max_spread_pct", 10.0, minimum=0.01),
-            require_book=bool(market_raw.get("require_book", True)),
+            require_book=_flag(market_raw, "require_book", True),
             hedge_size_xch=_number(market_raw, "hedge_size_xch", contract_xch, minimum=1e-9),
         ),
         node=node,
@@ -403,4 +421,5 @@ def parse(root: Any) -> OptionsConfig | None:
         chain_poll_seconds=chain_poll,
         chain_refresh_seconds=chain_refresh,
         database_path=str(section.get("database_path") or "data/options_jobs.db").strip(),
+        coingecko_api_key=str(coingecko.get("api_key") or "").strip(),
     )

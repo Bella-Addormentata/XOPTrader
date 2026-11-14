@@ -507,6 +507,46 @@ def test_cli_reports_disabled_and_bad_config(tmp_path, capsys) -> None:
     assert "not supported yet" in capsys.readouterr().err
 
 
+def test_cli_reads_secrets_yaml_over_the_config_as_the_app_does(tmp_path) -> None:
+    # Certificate paths and API keys live in secrets.yaml, beside config.yaml.
+    section = {
+        "enabled": True,
+        "network": "testnet11",
+        "wallet": {"port": 9356},
+        "quote_asset_id": "ab" * 32,
+        "contract_xch": 20,
+    }
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({"options": section}))
+    with pytest.raises(config.OptionsConfigError, match="cert_path and key_path are required"):
+        cli._load(str(path))
+
+    secrets = {
+        "options": {"wallet": {"cert_path": "c", "key_path": "k", "fingerprint": 42}},
+        "coingecko": {"api_key": "CG-secret"},
+    }
+    (tmp_path / "secrets.yaml").write_text(yaml.safe_dump(secrets))
+
+    cfg = cli._load(str(path))
+    assert (cfg.wallet.port, cfg.wallet.cert_path, cfg.wallet.fingerprint) == (9356, "c", 42)
+    assert cfg.coingecko_api_key == "CG-secret"
+
+
+def test_live_test_will_not_start_on_a_wallet_that_is_not_ready(tmp_path, monkeypatch) -> None:
+    world = World()
+    maker = world.party(3)
+    usd = world.issue_cat(world.party(1), 5)
+    cfg = _config(tmp_path, usd)
+    rpc = WalletRpc(world, maker)
+    rpc.sync = {"synced": False, "syncing": True}
+    monkeypatch.setattr(cli, "wallet_rpc", lambda _cfg: rpc)
+    monkeypatch.setattr(cli, "chain_reader", lambda _cfg: world.sim)
+
+    with pytest.raises(SystemExit, match="still syncing"):
+        cli._live_test(cfg, 0.001, True, 60.0)
+    assert "push_tx" not in rpc.endpoints()
+
+
 def test_status_prints_the_book(tmp_path, monkeypatch, capsys) -> None:
     world = World()
     maker = world.party(3)

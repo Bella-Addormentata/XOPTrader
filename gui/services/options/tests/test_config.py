@@ -206,3 +206,32 @@ def test_withdrawals_are_reined_in_by_default() -> None:
 
 def test_testnet_uses_testnet_addresses() -> None:
     assert _parse(network="testnet11").address_prefix == "txch"
+
+
+@pytest.mark.parametrize("raw", ["false", "no", "off", "true", 0, 1, "0"])
+@pytest.mark.parametrize("key", ["enabled", "dry_run", "upload_offers"])
+def test_a_yes_or_no_setting_must_be_a_real_true_or_false(key, raw) -> None:
+    # bool("false") is True: a quoted "false" used to switch the book ON.
+    with pytest.raises(config.OptionsConfigError, match=f"{key} must be true or false"):
+        config.parse({"options": _section(**{key: raw})})
+
+
+def test_a_quoted_false_does_not_turn_the_order_book_check_off_or_on() -> None:
+    with pytest.raises(config.OptionsConfigError, match="require_book must be true or false"):
+        _parse(market={"require_book": "false"})
+    assert _parse(market={"require_book": False}).market.require_book is False
+    assert _parse().market.require_book is True
+
+
+def test_yes_or_no_settings_left_empty_take_their_defaults() -> None:
+    parsed = _parse(dry_run=None, upload_offers=None)
+    assert parsed.dry_run is True and parsed.upload_offers is True
+    assert config.parse({"options": {"enabled": None}}) is None
+
+
+def test_the_app_s_coingecko_key_is_carried_but_never_printed() -> None:
+    root = {"options": _section(), "coingecko": {"api_key": " CG-secret "}}
+    parsed = config.parse(root)
+    assert parsed is not None and parsed.coingecko_api_key == "CG-secret"
+    assert "CG-secret" not in repr(parsed)
+    assert _parse().coingecko_api_key == ""

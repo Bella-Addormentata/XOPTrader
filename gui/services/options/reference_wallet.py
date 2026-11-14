@@ -124,10 +124,12 @@ class ReferenceWallet:
         *,
         agg_sig_me_additional_data: bytes = MAINNET_AGG_SIG_ME_ADDITIONAL_DATA,
         address_prefix: str = "xch",
+        fingerprint: int | None = None,
     ) -> None:
         self._rpc = rpc
         self._additional_data = bytes(agg_sig_me_additional_data)
         self._prefix = address_prefix
+        self._fingerprint = fingerprint
 
     def _call(self, endpoint: str, body: dict) -> dict:
         try:
@@ -141,6 +143,28 @@ class ReferenceWallet:
         if response.get("success") is False:
             raise SigningError(f"wallet {endpoint} failed: {response.get('error') or 'unknown'}")
         return response
+
+    # -- readiness ----------------------------------------------------------
+
+    def not_ready(self) -> str | None:
+        """Why the wallet should not be acted on right now, or None if it can be.
+
+        The daemon answers for whichever key is logged in, and another client
+        may have changed that, so the configured fingerprint is selected first
+        (the daemon does nothing if it is already the one). Then the wallet
+        must call itself synced: one that is behind lists coins already spent
+        and misses ones that have arrived. With no fingerprint configured the
+        key in use is whichever is logged in.
+        """
+        try:
+            if self._fingerprint is not None:
+                self._call("log_in", {"fingerprint": int(self._fingerprint)})
+            status = self._call("get_sync_status", {})
+        except SigningError as exc:
+            return f"the options wallet is not answering ({exc})"
+        if status.get("synced") is not True or status.get("syncing") is True:
+            return "the options wallet is still syncing"
+        return None
 
     # -- keys ---------------------------------------------------------------
 

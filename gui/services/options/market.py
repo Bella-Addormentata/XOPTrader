@@ -37,7 +37,8 @@ COINGECKO_URL = "https://api.coingecko.com/api/v3"
 DEXIE_URL = "https://api.dexie.space"
 
 # url -> (status, body text)
-Get = Callable[[str], tuple[int, str]]
+#: ``get(url)`` or ``get(url, headers)`` -> ``(status, body)``.
+Get = Callable[..., tuple[int, str]]
 
 _SECONDS_PER_YEAR = 365 * 24 * 3600
 # An observation stamped later than this past our own clock is not believed.
@@ -54,8 +55,8 @@ def _default_get(timeout: float) -> Get:
     session = requests.Session()
     session.headers.update({"User-Agent": "XOPTrader", "Accept": "application/json"})
 
-    def get(url: str) -> tuple[int, str]:
-        response = session.get(url, timeout=timeout)
+    def get(url: str, headers: dict[str, str] | None = None) -> tuple[int, str]:
+        response = session.get(url, timeout=timeout, headers=headers)
         return response.status_code, response.text
 
     return get
@@ -152,6 +153,7 @@ class MarketSource:
         history_days: int = 30,
         history_max_age_seconds: float = 6 * 3600,
         coingecko_url: str = COINGECKO_URL,
+        coingecko_api_key: str = "",
         dexie_url: str = DEXIE_URL,
     ) -> None:
         self._asset = bytes(quote_asset_id).hex()
@@ -161,13 +163,17 @@ class MarketSource:
         self._days = int(history_days)
         self._history_max_age = float(history_max_age_seconds)
         self._coingecko = coingecko_url.rstrip("/")
+        # The key the rest of the app uses (coingecko.api_key), sent as a
+        # header and never in the address, which ends up in error messages.
+        key = str(coingecko_api_key or "").strip()
+        self._coingecko_headers = {"x-cg-demo-api-key": key} if key else None
         self._dexie = dexie_url.rstrip("/")
         self._sigma: float | None = None
         self._sigma_at = 0.0
 
-    def _json(self, url: str) -> Any:
+    def _json(self, url: str, headers: dict[str, str] | None = None) -> Any:
         try:
-            status, text = self._get(url)
+            status, text = self._get(url, headers) if headers else self._get(url)
         except Exception as exc:
             raise MarketError(f"request failed: {exc}") from exc
         if status != 200:
@@ -181,7 +187,8 @@ class MarketSource:
         """The spot price and the time the feed observed it."""
         data = self._json(
             f"{self._coingecko}/simple/price?ids=chia&vs_currencies=usd"
-            "&include_last_updated_at=true"
+            "&include_last_updated_at=true",
+            self._coingecko_headers,
         )
         try:
             spot = float(data["chia"]["usd"])
@@ -207,7 +214,8 @@ class MarketSource:
         if self._sigma is not None and now - self._sigma_at <= self._history_max_age:
             return self._sigma
         data = self._json(
-            f"{self._coingecko}/coins/chia/market_chart?vs_currency=usd&days={self._days}"
+            f"{self._coingecko}/coins/chia/market_chart?vs_currency=usd&days={self._days}",
+            self._coingecko_headers,
         )
         try:
             series = [(float(at) / 1000.0, float(price)) for at, price in data["prices"]]
@@ -221,7 +229,7 @@ class MarketSource:
         """Open single-asset offers as ``(quote per XCH, XCH size)``."""
         data = self._json(
             f"{self._dexie}/v1/offers?offered={offered}&requested={requested}"
-            "&status=0&page_size=100&compact=true"
+            "&status=0&page_size=100&compact=true&sort=price"  # best price first
         )
         levels = []
         for offer in data.get("offers", []) if isinstance(data, dict) else []:

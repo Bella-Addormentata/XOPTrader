@@ -155,6 +155,9 @@ class Wallet(Protocol):
     def push(self, coin_spends: Any, aggregated_signature: bytes) -> bytes:
         """Hand a signed bundle to a node. No verdict comes back."""
 
+    def not_ready(self) -> str | None:
+        """Why the wallet cannot be relied on right now, or None."""
+
     def fee_rate(self) -> int | None:
         """Mojos per unit of cost for prompt inclusion, or None if it cannot say."""
 
@@ -1141,8 +1144,27 @@ class OptionsBook:
         report.chain_requests = self._chain.requests - asked
         return report
 
+    def wallet_not_ready(self) -> str | None:
+        """Why the wallet cannot be relied on right now, or None. For display."""
+        return self._wallet.not_ready()
+
+    def _wallet_ready(self, report: StepReport) -> bool:
+        """Select the configured key and see that the wallet is synced.
+
+        A wallet on another key would hand over that key's address and coins,
+        and one that is behind lists coins already spent: either way a
+        transaction built from what it says is wasted.
+        """
+        why = self._wallet.not_ready()
+        if why is not None:
+            report.problem(why)
+        return why is None
+
     def _step(self, now: int, report: StepReport) -> None:
         act = not self._config.dry_run
+        if not self._wallet_ready(report):
+            report.problem("nothing done this step")
+            return
         self._look(now, report)
         self._settle_broadcasts(now, report, act=act)
         self._reconcile(now, report, act=act)
@@ -1194,9 +1216,10 @@ class OptionsBook:
         asked = self._chain.requests
         try:
             with self._store.acting():
-                self._look(now, report, always=True)
-                self._settle_broadcasts(now, report, act=False)
-                self._reconcile(now, report, act=False)
+                if self._wallet_ready(report):
+                    self._look(now, report, always=True)
+                    self._settle_broadcasts(now, report, act=False)
+                    self._reconcile(now, report, act=False)
         except store.BusyError as exc:
             report.problem(f"not refreshed: {exc}")
         report.chain_requests = self._chain.requests - asked
@@ -1217,6 +1240,9 @@ class OptionsBook:
 
     def _withdraw_all(self, now: int, report: StepReport) -> None:
         act = not self._config.dry_run
+        # A kill switch does not wait for a wallet that is catching up: the
+        # option coins it spends are read from the chain, not from the wallet.
+        self._wallet_ready(report)
         self._look(now, report, always=True)  # a kill switch acts on what is true now
         self._reconcile(now, report, act=act)
         busy = {row.launcher_id for row in self._store.unresolved()}

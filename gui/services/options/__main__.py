@@ -24,6 +24,7 @@ import logging
 import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from gui.services.options import builder, chain, config, fees, safety, store
@@ -49,10 +50,11 @@ _LIVE_TEST_COST = 170_000_000
 
 
 def _load(path: str) -> config.OptionsConfig:
-    import yaml
+    # With secrets.yaml from the same folder laid over it, as the GUI and the
+    # engine read it: that is where certificate paths and API keys are kept.
+    from gui.services.config_split import load_merged
 
-    with open(path, encoding="utf-8") as handle:
-        root = yaml.safe_load(handle)
+    root = load_merged(Path(path))
     parsed = config.parse(root)
     if parsed is None:
         raise SystemExit(f"{path}: options are not enabled (options.enabled: true to turn on)")
@@ -90,8 +92,8 @@ def _learned_rate(book_store: store.OptionStore) -> float:
 
 def _status(cfg: config.OptionsConfig) -> int:
     book, book_store, coins = build(cfg)
-    del book
     print(f"network {cfg.network}   dry_run {cfg.dry_run}")
+    print(f"wallet: {book.wallet_not_ready() or 'the configured key, synced'}")
     print(f"chain is read from {chain_source(cfg)}")
     if cfg.fee_auto:
         print(
@@ -417,7 +419,11 @@ def _live_test(
         rpc,
         agg_sig_me_additional_data=_ADDITIONAL_DATA[cfg.network],
         address_prefix=cfg.address_prefix,
+        fingerprint=cfg.wallet.fingerprint,
     )
+    why = wallet.not_ready()
+    if why is not None:
+        raise SystemExit(f"{why}; run the test again once it is ready")
     book, book_store, coins = build(cfg, rpc=rpc, reader=reader, clock=time.time)
     address = coins.puzzle_hash()
     print(f"network {cfg.network}; options address {coins.address()}")

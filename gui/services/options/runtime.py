@@ -228,13 +228,16 @@ def build(
         rpc,
         agg_sig_me_additional_data=_ADDITIONAL_DATA[cfg.network],
         address_prefix=cfg.address_prefix,
+        fingerprint=cfg.wallet.fingerprint,
     )
     coins = WalletCoinSource(
         rpc, reader, address=cfg.wallet.address, prefix=cfg.address_prefix, clock=clock
     )
     if market_reader is None:
         market_reader = market.MarketSource(
-            cfg.quote_asset_id, hedge_size_xch=cfg.market.hedge_size_xch
+            cfg.quote_asset_id,
+            hedge_size_xch=cfg.market.hedge_size_xch,
+            coingecko_api_key=cfg.coingecko_api_key,
         ).read
     # The site lists mainnet options only.
     listing = desk.DeskClient() if cfg.network == config.MAINNET else None

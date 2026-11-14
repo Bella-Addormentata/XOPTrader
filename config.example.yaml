@@ -1644,13 +1644,18 @@ options:
   # and pointing this at the trading wallet's port is refused.
   # mode: trading is parsed and refused: the engine does not yet keep option
   # coins out of its own offers or book option events.
+  # Every step first selects the fingerprint below on that wallet and asks
+  # whether it is synced; until it is, the step does nothing and says why.
+  # These keys, like the rest of this file, can be given in secrets.yaml.
   wallet:
     mode: dedicated
     host: localhost
     port: 9356                           # [REQUIRED] the dedicated wallet's rpc_port
     cert_path: ""                        # [REQUIRED] its config/ssl/wallet/private_wallet.crt
     key_path: ""                         # [REQUIRED] its config/ssl/wallet/private_wallet.key
-    fingerprint: null                    # [OPTIONAL] informational
+    fingerprint: null                    # [RECOMMENDED] the key to use. The wallet is
+                                         # logged in to it before each step. Blank =
+                                         # whichever key the wallet has open.
     # The one address used as creator, owner and change. Blank asks the wallet
     # for its current address. ONLY coins at this address are used: fund it.
     address: ""

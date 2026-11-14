@@ -56,6 +56,10 @@ class SimWallet:
         self.fail_signing = False
         self.rate: int | None = 0  # what its node estimates, in mojos per cost
         self.rate_asked = 0
+        self.unready: str | None = None  # why it cannot be relied on, if it cannot
+
+    def not_ready(self) -> str | None:
+        return self.unready
 
     def fee_rate(self) -> int | None:
         self.rate_asked += 1
@@ -1385,3 +1389,36 @@ def test_withdraw_all_kills_every_open_offer() -> None:
     for contract in rig.contracts():
         assert rig.world.load(contract.launcher_id).owner_puzzle_hash == rig.maker.puzzle_hash
     assert chain.OptionStatus.LIVE is rig.world.load(rig.contracts()[0].launcher_id).status
+
+
+def test_nothing_is_done_while_the_wallet_is_not_ready() -> None:
+    # A wallet on the wrong key, or behind the chain, lists coins that are not
+    # ours to spend or are already spent. Nothing is built from what it says.
+    rig = Rig()
+    rig.wallet.unready = "the options wallet is still syncing"
+
+    (report,) = rig.steps(1)
+
+    assert report.problems == ["the options wallet is still syncing", "nothing done this step"]
+    assert not report.actions and report.chain_requests == 0
+    assert rig.wallet.signed == 0 and rig.contracts() == []
+
+    rig.wallet.unready = None
+    rig.steps(3)
+    assert len(rig.contracts(store.OPEN)) == 2
+
+
+def test_the_kill_switch_does_not_wait_for_the_wallet() -> None:
+    rig = Rig()
+    rig.steps(4)
+    offers = [rig.live_offer(item) for item in rig.contracts(store.OPEN)]
+    rig.wallet.unready = "the options wallet is still syncing"
+
+    report = rig.book.withdraw_all()
+
+    # Said, and done anyway: the coins it spends are read from the chain.
+    assert "the options wallet is still syncing" in report.problems
+    assert sum("withdrawing offers" in action for action in report.actions) == 2
+    for offer in offers:
+        with pytest.raises(RejectedError, match="DoubleSpend"):
+            rig.world.take(rig.taker, offer.offer_text)

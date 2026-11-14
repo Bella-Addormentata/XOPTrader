@@ -193,3 +193,31 @@ def _view(**overrides) -> market.Market:
 def test_unusable_views_are_refused(view: market.Market, now: float, message: str) -> None:
     with pytest.raises(market.MarketError, match=message):
         view.require_usable(now=now, max_age_seconds=600, max_spread_pct=10, require_book=True)
+
+
+def test_the_coingecko_key_goes_in_a_header_and_only_to_coingecko() -> None:
+    feeds = Feeds()
+    sent: list[tuple[str, dict | None]] = []
+
+    def get(url: str, headers: dict | None = None) -> tuple[int, str]:
+        sent.append((url, headers))
+        return feeds(url)
+
+    market.MarketSource(
+        USD, hedge_size_xch=20.0, get=get, clock=lambda: 5000.0, coingecko_api_key="CG-secret"
+    ).read()
+
+    for url, headers in sent:
+        assert "CG-secret" not in url  # an address ends up in error messages
+        if "coingecko" in url:
+            assert headers == {"x-cg-demo-api-key": "CG-secret"}
+        else:
+            assert headers is None
+    assert sum("coingecko" in url for url, _ in sent) == 2
+
+
+def test_the_book_is_asked_for_best_price_first() -> None:
+    feeds = Feeds()
+    _source(feeds).read()
+    book = [url for url in feeds.calls if "/v1/offers" in url]
+    assert len(book) == 2 and all("sort=price" in url for url in book)

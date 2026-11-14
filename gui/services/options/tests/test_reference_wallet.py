@@ -70,6 +70,8 @@ class FakeWallet:
         self.rejected: list[str] = []
         self.fee_per_cost: Any = 0
         self.tamper: dict[str, Callable[[dict], Any]] = {}
+        self.logged_in: int | None = None
+        self.sync: dict = {"synced": True, "syncing": False, "genesis_initialized": True}
 
     def endpoints(self) -> list[str]:
         return [endpoint for endpoint, _ in self.calls]
@@ -144,6 +146,14 @@ class FakeWallet:
                 for hook, group in by_hook.items()
             ]
         }
+
+    def _log_in(self, body: dict) -> dict:
+        self.logged_in = int(body["fingerprint"])
+        return {"fingerprint": self.logged_in}
+
+    def _get_sync_status(self, body: dict) -> dict:
+        assert body == {}
+        return dict(self.sync)
 
     def _get_fee_estimate(self, body: dict) -> dict:
         # chia-blockchain 2.7.5 answers {"fee_per_cost": <whole mojos per cost>}.
@@ -318,6 +328,59 @@ def test_the_wallet_passes_on_its_node_s_fee_estimate() -> None:
     wallet.fee_per_cost = 5
     assert reference.fee_rate() == 5
     assert wallet.endpoints().count("get_fee_estimate") == 2
+
+
+def test_a_synced_wallet_on_the_configured_key_is_ready() -> None:
+    world = World()
+    wallet = FakeWallet(world, world.party(1))
+    reference = ReferenceWallet(
+        wallet, agg_sig_me_additional_data=ADDITIONAL_DATA, fingerprint=1234567890
+    )
+
+    assert reference.not_ready() is None
+    # The key is selected before the wallet is asked anything about itself.
+    assert wallet.endpoints() == ["log_in", "get_sync_status"]
+    assert wallet.logged_in == 1234567890
+
+
+def test_with_no_fingerprint_the_logged_in_key_is_left_alone() -> None:
+    world = World()
+    wallet = FakeWallet(world, world.party(1))
+    reference = ReferenceWallet(wallet, agg_sig_me_additional_data=ADDITIONAL_DATA)
+
+    assert reference.not_ready() is None
+    assert wallet.endpoints() == ["get_sync_status"]
+
+
+@pytest.mark.parametrize(
+    "sync",
+    [
+        {"synced": False, "syncing": True},
+        {"synced": False, "syncing": False},
+        {"synced": True, "syncing": True},  # flapping: not settled
+        {},
+    ],
+)
+def test_a_wallet_that_is_not_synced_is_not_ready(sync) -> None:
+    world = World()
+    wallet = FakeWallet(world, world.party(1))
+    wallet.sync = sync
+    reference = ReferenceWallet(wallet, agg_sig_me_additional_data=ADDITIONAL_DATA)
+
+    assert reference.not_ready() == "the options wallet is still syncing"
+
+
+def test_a_wallet_that_cannot_log_in_or_answer_is_not_ready() -> None:
+    def no_such_key(endpoint: str, body: dict) -> dict:
+        return {"success": False, "error": "fingerprint not found"}
+
+    def down(endpoint: str, body: dict) -> dict:
+        raise ConnectionError("connection refused")
+
+    for rpc, why in ((no_such_key, "fingerprint not found"), (down, "connection refused")):
+        reference = ReferenceWallet(rpc, agg_sig_me_additional_data=ADDITIONAL_DATA, fingerprint=7)
+        answer = reference.not_ready()
+        assert answer is not None and "not answering" in answer and why in answer
 
 
 @pytest.mark.parametrize("answer", ["soon", None, -1, {"mojos": 5}])
