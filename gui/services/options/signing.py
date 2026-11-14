@@ -161,7 +161,6 @@ class Signer(Protocol):
 
     def sign(self, coin_spends: Sequence[CoinSpend]) -> bytes:
         """Return the aggregated signature (96 bytes) for ``coin_spends``."""
-        ...
 
 
 class LocalKeySigner:

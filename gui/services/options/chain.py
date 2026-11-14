@@ -64,11 +64,9 @@ class ChainReader(Protocol):
 
     def coin_state(self, coin_id: bytes) -> Any:
         """The coin with ``.coin``, ``.created_height`` and ``.spent_height``, or None."""
-        ...
 
     def coin_spend(self, coin_id: bytes) -> Any:
         """A spent coin's ``.coin``, ``.puzzle_reveal`` and ``.solution``, or None."""
-        ...
 
 
 class NodeChainReader:

@@ -64,25 +64,34 @@ class OptionsError(RuntimeError):
 class Wallet(Protocol):
     """What the book needs from a signer. ``ReferenceWallet`` provides it."""
 
-    def synthetic_key(self, puzzle_hash: bytes) -> PublicKey: ...
+    def synthetic_key(self, puzzle_hash: bytes) -> PublicKey:
+        """The synthetic public key of one of the wallet's own addresses."""
 
-    def sign(self, coin_spends: Any) -> bytes: ...
+    def sign(self, coin_spends: Any) -> bytes:
+        """The aggregated signature for ``coin_spends``. Broadcasts nothing."""
 
-    def push(self, coin_spends: Any, aggregated_signature: bytes) -> bytes: ...
+    def push(self, coin_spends: Any, aggregated_signature: bytes) -> bytes:
+        """Hand a signed bundle to a node. No verdict comes back."""
 
 
 class CoinSource(Protocol):
     """The options address and the spendable coins sitting at it."""
 
-    def puzzle_hash(self) -> bytes: ...
+    def puzzle_hash(self) -> bytes:
+        """The one address used as creator, owner and change."""
 
-    def xch_coins(self) -> list[Coin]: ...
+    def xch_coins(self) -> list[Coin]:
+        """Spendable XCH coins at that address."""
 
-    def cats(self, asset_id: bytes) -> list[Cat]: ...
+    def cats(self, asset_id: bytes) -> list[Cat]:
+        """Spendable coins of one CAT at that address, with lineage proofs."""
 
 
 class Desk(Protocol):
-    def upload_offer(self, offer: str) -> Any: ...
+    """Where offers are advertised. ``DeskClient`` provides it."""
+
+    def upload_offer(self, offer: str) -> Any:
+        """List an offer; returns a record with an ``offer_id``."""
 
 
 @dataclasses.dataclass
