@@ -22,6 +22,7 @@ WTFPL.
 | `gui/services/warp/tests/test_warp_clvm_anchors.py` | Mint derivation ported from warpdotgreen/cli `drivers/wrapped_assets.py` | MIT, [warp.green](#warpgreen-mit) |
 | `gui/services/warp/tests/test_warp_validator_policy.py` | `validate_chia_erc20_unwrap` ported from warpdotgreen/cli `commands/spend_policy.py` | MIT, [warp.green](#warpgreen-mit) |
 | `gui/services/warp/clvm_utils.py`, the bech32m section | Pieter Wuille's bech32 reference implementation, as carried in Chia's `chia/util/bech32m.py` | MIT, [Pieter Wuille](#bech32m-mit) |
+| `gui/services/options/builder.py`, `gui/services/options/chain.py`, `gui/services/options/tests/sim_world.py` | Option contract flows (mint, offer, take, exercise, cancel, clawback, and reading an option from the chain) ported to Python from [xch-dev/sage](https://github.com/xch-dev/sage) `crates/sage-wallet/src/wallet/options.rs`, `wallet/offer/make_offer.rs`, `wallet/offer/take_offer.rs`, `wallet.rs` and `puzzle_context.rs` at commit `e2bbfbe` | Apache-2.0, [Sage](#sage-apache-20) |
 | `gui/services/warp/tests/fixtures_bip340_vectors.csv` | [BIP 340](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki) test vectors (`bip-0340/test-vectors.csv`), content unchanged | CC0-1.0, [BIP 340](#bip-340-test-vectors-cc0-10) |
 
 ### warp.green (MIT)
@@ -255,6 +256,18 @@ SOFTWARE.
    See the License for the specific language governing permissions and
    limitations under the License.
 ```
+
+### Sage (Apache-2.0)
+
+Sage is by Rigidity and the xch-dev contributors, under the Apache License,
+Version 2.0. Its text is the same license reproduced in full under
+[Chia Network](#chia-network-apache-20) above. Sage ships no NOTICE file.
+
+What XOPTrader took is the order of operations, not source text: the listed
+files are new Python that calls the same `chia-wallet-sdk` functions Sage's Rust
+does. `build_cancel` departs from Sage's `cancel_options` (it builds the strike
+payment loop directly, because the Python bindings do not expose the state Sage
+rewrites), and the validity checks in `chain.py` go beyond what was ported.
 
 ### bech32m (MIT)
 

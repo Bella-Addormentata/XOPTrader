@@ -180,24 +180,29 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install --only-binary=chia_rs,PySide6,pyqtgraph -r gui/requirements.lock.txt
+          pip install --only-binary=chia_rs,chia-wallet-sdk,PySide6,pyqtgraph -r gui/requirements.lock.txt
           pip install -r gui/requirements-tools.lock.txt
 
       # Every warp test module opens with pytest.importorskip("clvm") /
       # ("chia_rs").  If those wheels are absent the suite drops from 244 tests
       # to 76 and still reports success -- green while covering a third of the
       # bridge.  Fail here instead, where the cause is legible.
-      - name: Verify the warp dependencies actually installed
+      #
+      # The option-contract suite (gui/services/options/tests) skips the same
+      # way on chia_wallet_sdk, so it is checked here too.
+      - name: Verify the warp and options dependencies actually installed
         run: |
           python - <<'PY'
           import importlib.util
-          missing = [m for m in ("clvm", "chia_rs", "eth_account", "eth_utils")
+          missing = [m for m in ("clvm", "chia_rs", "eth_account", "eth_utils",
+                                 "chia_wallet_sdk")
                      if importlib.util.find_spec(m) is None]
           if missing:
               raise SystemExit(
-                  "warp dependencies missing: " + ", ".join(missing) +
-                  " -- the warp suite would skip silently and report green")
-          print("warp dependencies present")
+                  "test dependencies missing: " + ", ".join(missing) +
+                  " -- the warp or options suite would skip silently and"
+                  " report green")
+          print("warp and options dependencies present")
           PY
 
       - name: Run tests
@@ -243,7 +248,7 @@ jobs:
       - name: Install both dependency locks
         run: |
           pip install --upgrade pip
-          pip install --no-deps --only-binary=chia_rs,PySide6,pyqtgraph -r gui/requirements.lock.txt
+          pip install --no-deps --only-binary=chia_rs,chia-wallet-sdk,PySide6,pyqtgraph -r gui/requirements.lock.txt
           pip install --no-deps -r gui/requirements-tools.lock.txt
 
       - name: Audit the installed set
