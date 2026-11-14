@@ -54,6 +54,12 @@ What has been checked, and what has not:
 One thing to know before wiring this in: the wallet's ``push_tx`` reports no
 verdict. A bundle its node refuses looks the same to the caller as one it
 accepts, so outcomes are read from the chain with :func:`chain.bundle_status`.
+A bundle that has not confirmed is never given up on by the clock alone: it
+stays on the books, its coins stay set aside and it keeps being pushed until
+the chain shows it confirmed or shows one of its coins spent another way.
+
+One process acts on a database at a time (:meth:`store.OptionStore.acting`).
+A second ``step`` or ``live-test`` over the same file is refused, not queued.
 
 ``chia_wallet_sdk`` is imported inside functions, as warp does with its heavy
 dependencies, so importing the GUI never fails when it is absent.

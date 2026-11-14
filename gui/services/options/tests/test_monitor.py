@@ -21,6 +21,7 @@ class Board:
         self.offers: dict[str, str] = {}
         self.down = False
         self.suggestions = 0
+        self.fetches = 0
 
     def post(self, offer_id: str, text: str) -> None:
         self.offers[offer_id] = text
@@ -31,6 +32,7 @@ class Board:
         return desk.Listing(tuple(self.offers), (), len(self.offers))
 
     def fetch_offer(self, offer_id: str) -> str | None:
+        self.fetches += 1
         return self.offers.get(offer_id)
 
     def suggested_price(self, launcher_id: bytes) -> desk.Suggestion:
@@ -144,8 +146,34 @@ def test_outcomes_are_read_from_the_chain() -> None:
     }
     # Delisted, but with no expiry and an unspent coin it can still be taken.
     assert [row.offer_id for row in rig.store.listings(open_only=True)] == ["still-good"]
-    rig.world.advance(3700)
-    assert rig.monitor.scan().closed == {"still-good": monitor.EXPIRED}
+
+
+def test_a_delisted_offer_with_no_expiry_is_followed_until_it_is_taken() -> None:
+    rig = Rig()
+    _, text = rig.list_call("undated", ttl=None)
+    rig.monitor.scan()
+    rig.board.offers.clear()
+
+    # Hours off the listing end nothing: whoever kept the file can still take it.
+    rig.world.advance(5 * 3600)
+    assert rig.monitor.scan().closed == {}
+    assert [row.offer_id for row in rig.store.listings(open_only=True)] == ["undated"]
+
+    rig.world.take(rig.taker, text)
+    assert rig.monitor.scan().closed == {"undated": monitor.TAKEN}
+
+
+def test_a_delisted_offer_with_no_expiry_ends_with_its_contract() -> None:
+    rig = Rig()
+    rig.list_call("undated", ttl=None)
+    rig.monitor.scan()
+    rig.board.offers.clear()
+
+    rig.world.advance(13 * DAY)
+    assert rig.monitor.scan().closed == {}
+    rig.world.advance(1 * DAY + 60)  # past the contract's own expiry
+    assert rig.monitor.scan().closed == {"undated": monitor.EXPIRED}
+    assert rig.store.listings(open_only=True) == []
 
 
 def test_a_desk_outage_concludes_nothing() -> None:
@@ -194,6 +222,68 @@ def test_an_offer_for_a_dead_option_is_a_problem_not_a_price() -> None:
 
     assert report.new == []
     assert any("closed" in problem for problem in report.problems)
+    (row,) = rig.store.listings()
+    assert row.outcome == monitor.WITHDRAWN and row.our_value is None and row.edge is None
+    # Judged once: still on the board, it is neither fetched nor reported again.
+    fetches = rig.board.fetches
+    again = rig.monitor.scan()
+    assert rig.board.fetches == fetches and again.problems == [] and again.new == []
+
+
+def test_an_offer_for_a_coin_that_has_moved_on_is_not_a_price() -> None:
+    rig = Rig()
+    minted, _ = rig.list_call("stale")
+    # The maker moved the option (withdrawing this offer) but the board still lists it.
+    # The contract is live and the signature is good; the offer is dead all the same.
+    rig.world.push(
+        builder.build_transfer(
+            minted.option, rig.maker.puzzle_hash, rig.maker.funding(), rig.maker.custody()
+        ).coin_spends
+    )
+
+    report = rig.monitor.scan()
+
+    assert report.new == []
+    assert any("already been spent" in problem for problem in report.problems)
+    (row,) = rig.store.listings()
+    assert row.outcome == monitor.WITHDRAWN
+    assert row.our_value is None and row.hedged_value is None and row.site_premium is None
+    assert rig.board.suggestions == 0
+    assert rig.store.listings(open_only=True) == []
+
+
+def test_an_offer_another_quote_sold_out_from_under_is_not_a_price() -> None:
+    rig = Rig()
+    minted, first = rig.list_call("first")
+    # A second quote on the same option coin; taking either kills the other.
+    second = builder.build_offer(
+        minted.option,
+        builder.Asset(rig.usd, 1400),
+        rig.maker.puzzle_hash,
+        rig.maker.custody(),
+        expires_at_seconds=rig.world.now() + 900,
+    )
+    rig.board.post("second", second.encode(rig.world.signer().sign(second.coin_spends)))
+    rig.world.take(rig.taker, first)
+
+    report = rig.monitor.scan()
+
+    assert report.new == []
+    outcomes = {row.offer_id: row.outcome for row in rig.store.listings()}
+    assert outcomes == {"first": monitor.TAKEN, "second": monitor.WITHDRAWN}
+
+
+def test_an_offer_that_has_run_out_is_not_a_price() -> None:
+    rig = Rig()
+    rig.list_call("late", ttl=300)
+    rig.world.advance(600)  # the board has not noticed
+
+    report = rig.monitor.scan()
+
+    assert report.new == []
+    assert any("run out" in problem for problem in report.problems)
+    (row,) = rig.store.listings()
+    assert row.outcome == monitor.EXPIRED and row.our_value is None
 
 
 def _cancel_with_seed(rig: Rig, minted: Any) -> list[Any]:

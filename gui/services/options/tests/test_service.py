@@ -39,6 +39,7 @@ class SimWallet:
         self.party = party
         self.signer = signing.LocalKeySigner([party.sk], ADDITIONAL_DATA)
         self.signed = 0
+        self.pushed = 0
         self.rejected: list[str] = []
         self.fail_signing = False
 
@@ -53,6 +54,7 @@ class SimWallet:
         return self.signer.sign(coin_spends)
 
     def push(self, coin_spends: Any, aggregated_signature: bytes) -> bytes:
+        self.pushed += 1
         bundle = sdk.SpendBundle(list(coin_spends), sdk.Signature.from_bytes(aggregated_signature))
         try:
             self.world.push_bundle(bundle)
@@ -552,6 +554,317 @@ def test_restart_picks_up_where_it_left_off() -> None:
     assert {item.launcher_id for item in rig.contracts()} == before
     assert len(rig.contracts(store.OPEN)) == 2
     assert len(rig.store.offers(status="live")) == 2
+
+
+# ---------------------------------------------------------------------------
+# Bundles that do not confirm
+# ---------------------------------------------------------------------------
+
+
+def _unheard(calls: list[int] | None = None) -> Any:
+    """A push the node never sees, as when the wallet has lost its peer."""
+
+    def push(coin_spends: Any, signature: bytes) -> bytes:
+        if calls is not None:
+            calls.append(1)
+        return b"\x00" * 32
+
+    return push
+
+
+def test_a_stalled_bundle_keeps_its_coins_and_is_pushed_until_it_confirms() -> None:
+    rig = Rig(call_strikes_pct=[100, 110], put_strikes_pct=[], confirm_timeout_seconds=600)
+    real_push = rig.wallet.push
+    rig.wallet.push = _unheard()  # type: ignore[method-assign]
+    rig.steps(1)  # one mint is signed over the address's only coin
+    rig.world.advance(700)
+
+    reports = rig.steps(3)
+
+    assert len(rig.events("broadcast_stalled")) == 1
+    assert all(
+        any("has not confirmed" in problem for problem in report.problems) for report in reports
+    )
+    # The bundle is still signed and could still confirm, so its coin is not
+    # handed to a second mint that would conflict with it.
+    assert rig.wallet.signed == 1
+    assert [item.status for item in rig.contracts()] == [store.MINTING]
+
+    # The outage ends. The stalled bundle is still being pushed, so it confirms.
+    rig.wallet.push = real_push  # type: ignore[method-assign]
+    rig.steps(2)
+
+    assert rig.store.broadcasts("stalled") == []
+    assert store.OPEN in [item.status for item in rig.contracts()]
+    assert rig.wallet.rejected == []
+    rig.steps(2)  # and its change now funds the second slot
+    assert len(rig.contracts(store.OPEN)) == 2
+
+
+def test_a_crash_while_a_verdict_is_written_leaves_it_to_be_read_again(monkeypatch) -> None:
+    rig = Rig(put_strikes_pct=[])
+    rig.steps(1)  # minted on chain; the store does not know yet
+
+    def power_cut(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("power cut")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store.OptionStore, "_transition", staticmethod(power_cut))
+        with pytest.raises(RuntimeError, match="power cut"):
+            rig.book.step()
+
+    # Nothing was half applied: not a confirmed broadcast beside a contract
+    # that would then sit in "minting" for ever.
+    assert [row.status for row in rig.store.unresolved()] == ["pending"]
+    assert [item.status for item in rig.contracts()] == [store.MINTING]
+    assert rig.events("collateral_locked") == []
+
+    rig.book = rig.make_book()  # the process comes back
+    rig.steps(1)
+
+    assert [item.status for item in rig.contracts()] == [store.OPEN]
+    assert len(rig.events("collateral_locked")) == 1
+    assert rig.store.unresolved() == []
+
+
+def test_a_cancel_that_misses_expiry_gives_way_to_a_clawback() -> None:
+    rig = Rig(put_strikes_pct=[])
+    rig.steps(3)
+    call = _by_side(rig, "call", store.OPEN)
+    rig.world.advance(14 * DAY - 1800)  # inside the stop window: it is retired
+    real_push = rig.wallet.push
+    rig.wallet.push = _unheard()  # type: ignore[method-assign]
+    rig.steps(1)  # the cancel is signed, and the node never sees it
+    assert rig.store.contract(call.launcher_id).status == store.CLOSING
+    rig.wallet.push = real_push  # type: ignore[method-assign]
+    rig.world.advance(3600)  # expiry passes: the cancel can never confirm now
+
+    reports = rig.steps(3)
+
+    # The collateral is not left locked behind a cancel the chain will refuse.
+    assert rig.store.contract(call.launcher_id).status == store.CLOSED
+    (returned,) = rig.events("collateral_returned")
+    assert returned.detail == {"asset": None, "amount": 20 * XCH, "by": store.CLAWBACK}
+    assert rig.maker.balance() == 500 * XCH - builder.OPTION_COIN_AMOUNT
+    assert {row.kind: row.status for row in rig.store.broadcasts(None)} == {
+        store.MINT: "confirmed",
+        store.CANCEL: "conflict",
+        store.CLAWBACK: "confirmed",
+    }
+    assert rig.store.unresolved() == []
+    actions = [action for report in reports for action in report.actions]
+    assert any("gave way to the clawback" in action for action in actions)
+
+
+def test_a_cancel_and_a_clawback_in_flight_together_settle_on_whichever_confirms() -> None:
+    rig = Rig(put_strikes_pct=[])
+    rig.steps(3)
+    call = _by_side(rig, "call", store.OPEN)
+    rig.world.advance(14 * DAY - 1800)
+    held: list[tuple[Any, bytes]] = []
+    real_push = rig.wallet.push
+    rig.wallet.push = lambda spends, signature: held.append((spends, signature)) or b""  # type: ignore[method-assign]
+    rig.steps(1)  # the cancel is signed and sits in a mempool, in time
+    rig.wallet.push = _unheard()  # type: ignore[method-assign]
+    # The book's clock reaches expiry before the chain's does, so a clawback
+    # goes out beside the cancel...
+    rig.book = OptionsBook(
+        rig.config,
+        book_store=rig.store,
+        wallet=rig.wallet,
+        coins=SimCoins(rig.maker),
+        chain_reader=rig.world.sim,
+        market=rig.read_market,
+        clock=lambda: rig.world.now() + 3600,
+    )
+    rig.steps(1)
+    assert {row.kind for row in rig.store.unresolved()} == {store.CANCEL, store.CLAWBACK}
+    # ...and the chain, still short of expiry, takes the cancel.
+    real_push(*held[0])
+
+    rig.steps(2)
+
+    assert rig.store.contract(call.launcher_id).status == store.CLOSED
+    (returned,) = rig.events("collateral_returned")
+    assert returned.detail["by"] == store.CANCEL
+    assert {row.kind: row.status for row in rig.store.broadcasts(None)} == {
+        store.MINT: "confirmed",
+        store.CANCEL: "confirmed",
+        store.CLAWBACK: "conflict",
+    }
+    assert rig.events("exercised") == []
+    assert rig.maker.balance() == 500 * XCH
+
+
+# ---------------------------------------------------------------------------
+# Dry run over a book that already exists
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_over_a_live_book_reads_the_chain_and_sends_nothing() -> None:
+    rig = Rig()
+    rig.steps(4)
+    call = _by_side(rig, "call", store.OPEN)
+    rig.world.take(rig.taker, rig.live_offer(call).offer_text)
+    # The operator switches dry run back on with contracts out.
+    rig.config = rig.make_config(dry_run=True)
+    rig.book = rig.make_book()
+    signed, pushed = rig.wallet.signed, rig.wallet.pushed
+    balance = rig.maker.balance()
+    rig.world.advance(15 * DAY)  # everything expires
+
+    reports = rig.steps(3)
+
+    # The chain is still read, so the books are right...
+    assert rig.store.contract(call.launcher_id).status == store.SOLD
+    assert len(rig.events("sold")) == 1
+    # ...but nothing is signed and nothing is sent, clawbacks included.
+    assert (rig.wallet.signed, rig.wallet.pushed) == (signed, pushed)
+    assert rig.maker.balance() == balance
+    assert rig.events("collateral_returned") == []
+    for report in reports:
+        assert sum("dry run: would claw back" in action for action in report.actions) == 2
+
+    # With dry run off again the collateral comes home.
+    rig.config = rig.make_config()
+    rig.book = rig.make_book()
+    rig.steps(2)
+    assert [item.status for item in rig.contracts()] == [store.CLOSED, store.CLOSED]
+
+
+def test_dry_run_does_not_push_a_pending_bundle_again() -> None:
+    rig = Rig(put_strikes_pct=[])
+    calls: list[int] = []
+    rig.wallet.push = _unheard(calls)  # type: ignore[method-assign]
+    rig.steps(1)
+    assert calls == [1]
+    rig.world.advance(130)  # old enough to be pushed again
+
+    rig.config = rig.make_config(put_strikes_pct=[], dry_run=True)
+    rig.book = rig.make_book()
+    rig.steps(2)
+    assert calls == [1]
+
+    rig.config = rig.make_config(put_strikes_pct=[])
+    rig.book = rig.make_book()
+    rig.steps(1)
+    assert calls == [1, 1]
+
+
+def test_withdraw_all_in_dry_run_says_what_it_would_do() -> None:
+    rig = Rig()
+    rig.steps(4)
+    rig.config = rig.make_config(dry_run=True)
+    rig.book = rig.make_book()
+    signed = rig.wallet.signed
+
+    report = rig.book.withdraw_all()
+
+    assert sum("dry run: would withdraw offers" in action for action in report.actions) == 2
+    assert any("set dry_run: false" in problem for problem in report.problems)
+    assert rig.wallet.signed == signed
+    assert len(rig.store.offers(status="live")) == 2
+
+
+def test_refresh_brings_the_book_up_to_date_and_sends_nothing() -> None:
+    rig = Rig()
+    rig.steps(4)
+    call = _by_side(rig, "call", store.OPEN)
+    rig.world.take(rig.taker, rig.live_offer(call).offer_text)
+    signed, pushed = rig.wallet.signed, rig.wallet.pushed
+    rig.world.advance(15 * DAY)
+
+    report = rig.book.refresh()
+
+    assert rig.store.contract(call.launcher_id).status == store.SOLD
+    assert (rig.wallet.signed, rig.wallet.pushed) == (signed, pushed)
+    assert sum(action.startswith("would claw back") for action in report.actions) == 2
+
+
+# ---------------------------------------------------------------------------
+# Two processes, one database
+# ---------------------------------------------------------------------------
+
+
+def test_a_second_process_over_the_same_database_skips_its_step(tmp_path) -> None:
+    rig = Rig()
+    path = tmp_path / "options_jobs.db"
+    rig.store = store.OptionStore(path)
+    rig.book = rig.make_book()
+    other = store.OptionStore(path)
+
+    with other.acting():  # another process is in the middle of a step
+        (report,) = rig.steps(1)
+        assert any("step skipped" in problem for problem in report.problems)
+        assert any("nothing withdrawn" in item for item in rig.book.withdraw_all().problems)
+        assert any("not refreshed" in item for item in rig.book.refresh().problems)
+    # It planned nothing from rows the other process was about to change.
+    assert rig.contracts() == [] and rig.wallet.signed == 0
+
+    (report,) = rig.steps(1)
+    assert len(rig.contracts()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Sales that are easy to miss
+# ---------------------------------------------------------------------------
+
+
+def test_a_sale_and_an_exercise_between_two_steps_are_both_booked() -> None:
+    rig = Rig()
+    rig.steps(4)
+    call = _by_side(rig, "call", store.OPEN)
+    offer = rig.live_offer(call)
+    # Taken and exercised before the book looks again: the option is melted, so
+    # there is no new owner to notice.
+    rig.world.take(rig.taker, offer.offer_text)
+    loaded = rig.world.load(call.launcher_id)
+    rig.world.push(
+        builder.build_exercise(
+            loaded.option,
+            loaded.underlying,
+            loaded.locked,
+            rig.taker.funding(rig.usd),
+            rig.taker.custody(),
+        )
+    )
+
+    rig.steps(1)
+
+    assert rig.store.contract(call.launcher_id).status == store.EXERCISED
+    kinds = [event.kind for event in rig.store.events(call.launcher_id)]
+    assert kinds == ["collateral_locked", "sold", "exercised"]
+    (sold,) = rig.events("sold")
+    assert sold.detail == {"asset": rig.usd.hex(), "amount": offer.price_amount}
+    statuses = [row.status for row in rig.store.offers(call.launcher_id)]
+    assert statuses.count("taken") == 1 and "live" not in statuses
+    assert rig.store.offers(call.launcher_id)[-1].id == offer.id
+
+
+def test_a_sale_is_not_booked_without_its_premium_while_the_chain_is_unreadable(
+    monkeypatch,
+) -> None:
+    rig = Rig()
+    rig.steps(4)
+    call = _by_side(rig, "call", store.OPEN)
+    offer = rig.live_offer(call)
+    rig.world.take(rig.taker, offer.offer_text)
+
+    def unreachable(*args: Any, **kwargs: Any) -> Any:
+        raise chain.ChainError("node unreachable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(chain, "bundle_status", unreachable)
+        (report,) = rig.steps(1)
+
+    assert any("could not be read yet" in problem for problem in report.problems)
+    assert rig.store.contract(call.launcher_id).status == store.OPEN
+    assert rig.events("sold") == []
+
+    rig.steps(1)
+
+    (sold,) = rig.events("sold")
+    assert sold.detail == {"asset": rig.usd.hex(), "amount": offer.price_amount}
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,11 @@ Three numbers, from two places, with one rule between them:
 
 Volatility is never taken from Dexie trades. Prints bounce across a spread of
 several percent and come out at more than twice the real figure.
+
+A view is as old as its spot observation, not as the request that fetched it:
+``Market.as_of`` is the time CoinGecko says the price was last updated. A feed
+that answers promptly with an old price is therefore refused as stale, and one
+that does not say when its price was observed is refused outright.
 """
 
 from __future__ import annotations
@@ -35,6 +40,8 @@ DEXIE_URL = "https://api.dexie.space"
 Get = Callable[[str], tuple[int, str]]
 
 _SECONDS_PER_YEAR = 365 * 24 * 3600
+# An observation stamped later than this past our own clock is not believed.
+_MAX_CLOCK_SKEW_SECONDS = 300
 
 
 class MarketError(RuntimeError):
@@ -102,7 +109,7 @@ class Market:
     sigma: float  # annualised
     bid: float | None  # what selling the hedge size on Dexie would fetch
     ask: float | None  # what buying it would cost
-    as_of: float  # unix seconds of the spot reading
+    as_of: float  # unix seconds at which the feed observed the spot, not when we asked
 
     def require_usable(
         self, *, now: float, max_age_seconds: float, max_spread_pct: float, require_book: bool
@@ -170,15 +177,31 @@ class MarketSource:
         except ValueError as exc:
             raise MarketError(f"non-JSON answer from {url.split('?')[0]}") from exc
 
-    def _spot(self) -> float:
-        data = self._json(f"{self._coingecko}/simple/price?ids=chia&vs_currencies=usd")
+    def _spot(self, now: float) -> tuple[float, float]:
+        """The spot price and the time the feed observed it."""
+        data = self._json(
+            f"{self._coingecko}/simple/price?ids=chia&vs_currencies=usd"
+            "&include_last_updated_at=true"
+        )
         try:
             spot = float(data["chia"]["usd"])
         except (KeyError, TypeError, ValueError) as exc:
             raise MarketError("CoinGecko returned no XCH price") from exc
         if not math.isfinite(spot) or spot <= 0:
             raise MarketError("CoinGecko returned an unusable XCH price")
-        return spot
+        try:
+            observed = float(data["chia"]["last_updated_at"])
+        except (KeyError, TypeError, ValueError) as exc:
+            # Without it a stale price cannot be told from a fresh one.
+            raise MarketError("CoinGecko did not say when the XCH price was observed") from exc
+        if not math.isfinite(observed) or observed <= 0:
+            raise MarketError("CoinGecko returned an unusable time for the XCH price")
+        if observed - now > _MAX_CLOCK_SKEW_SECONDS:
+            raise MarketError(
+                f"the XCH price is stamped {int(observed - now)} s in the future; "
+                "check this machine's clock"
+            )
+        return spot, min(observed, now)
 
     def _volatility(self, now: float) -> float:
         if self._sigma is not None and now - self._sigma_at <= self._history_max_age:
@@ -219,7 +242,7 @@ class MarketSource:
 
     def read(self) -> Market:
         now = self._clock()
-        spot = self._spot()
+        spot, observed = self._spot(now)
         sigma = self._volatility(now)
         try:
             asks = sorted(self._side("xch", self._asset))
@@ -231,5 +254,5 @@ class MarketSource:
             sigma=sigma,
             bid=executable_price(bids, self._hedge),
             ask=executable_price(asks, self._hedge),
-            as_of=now,
+            as_of=observed,
         )

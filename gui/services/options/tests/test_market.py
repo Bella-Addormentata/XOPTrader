@@ -32,6 +32,7 @@ def _offer(give_code: str, give: float, want: float) -> dict:
 class Feeds:
     def __init__(self) -> None:
         self.spot = 1.11
+        self.observed: object = 4940  # a minute before the 5000.0 the clock reads
         self.history = _history()
         self.asks = [_offer("XCH", 100.0, 113.0), _offer("XCH", 50.0, 58.0)]
         self.bids = [_offer("wUSDC.b", 109.0, 100.0), _offer("wUSDC.b", 1.33, 1.149)]
@@ -43,7 +44,10 @@ class Feeds:
         if self.fail and self.fail in url:
             return 500, "oops"
         if "simple/price" in url:
-            return 200, json.dumps({"chia": {"usd": self.spot}})
+            quote: dict = {"usd": self.spot}
+            if self.observed is not None:
+                quote["last_updated_at"] = self.observed
+            return 200, json.dumps({"chia": quote})
         if "market_chart" in url:
             return 200, json.dumps({"prices": self.history})
         if "offered=xch" in url:
@@ -92,8 +96,39 @@ def test_read_combines_the_feed_and_the_book() -> None:
     assert view.ask == pytest.approx(1.13)  # the 100 XCH ask covers a 20 XCH hedge
     # The dust bid at 1.158 cannot fill 20 XCH, so the real bid sets the price.
     assert view.bid == pytest.approx((1.33 + 109.0) / (1.149 + 100.0))
-    assert view.as_of == 5000.0
+    # As old as the observation, not as the request that fetched it.
+    assert view.as_of == 4940.0
+    assert any("include_last_updated_at=true" in url for url in feeds.calls)
     view.require_usable(now=5000.0, max_age_seconds=600, max_spread_pct=10, require_book=True)
+
+
+def test_a_freshly_fetched_stale_price_is_stale() -> None:
+    feeds = Feeds()
+    feeds.observed = 5000 - 3600  # the feed answers at once, with an hour-old price
+
+    view = _source(feeds).read()
+
+    assert view.as_of == 1400.0
+    with pytest.raises(market.MarketError, match="3600 s old"):
+        view.require_usable(now=5000.0, max_age_seconds=600, max_spread_pct=10, require_book=True)
+
+
+@pytest.mark.parametrize("observed", [None, "soon", 0, -5, float("nan")])
+def test_a_price_without_a_usable_time_is_refused(observed: object) -> None:
+    feeds = Feeds()
+    feeds.observed = observed
+    with pytest.raises(market.MarketError, match="when the XCH price was observed|unusable time"):
+        _source(feeds).read()
+
+
+def test_a_price_stamped_in_the_future_is_refused_beyond_clock_skew() -> None:
+    feeds = Feeds()
+    feeds.observed = 5000 + 120  # two minutes ahead: ordinary skew, read as "now"
+    assert _source(feeds).read().as_of == 5000.0
+
+    feeds.observed = 5000 + 3600
+    with pytest.raises(market.MarketError, match="in the future"):
+        _source(feeds).read()
 
 
 def test_history_is_fetched_once_and_reused() -> None:

@@ -139,6 +139,156 @@ def test_a_broadcast_can_move_its_contract_in_the_same_write() -> None:
     assert [item.status for item in book.broadcasts(None)] == ["pending", "confirmed"]
 
 
+def _offer(book: store.OptionStore, price: int) -> int:
+    return book.add_offer(
+        launcher_id=LAUNCHER,
+        price_asset=USD,
+        price_amount=price,
+        expires_at=None,
+        bundle=b"offer",
+        offer_text=f"offer{price}",
+        now=150,
+    )
+
+
+def test_a_verdict_and_what_follows_from_it_are_one_write() -> None:
+    book = store.OptionStore(":memory:")
+    mint = _add(book)
+    live = _offer(book, 5)
+
+    book.settle_broadcast(
+        mint,
+        "confirmed",
+        contract_status=store.CLOSED,
+        kill_offers=True,
+        event="collateral_returned",
+        detail={"by": "cancel"},
+        now=300,
+    )
+
+    assert book.broadcasts(None)[0].status == "confirmed"
+    assert book.contract(LAUNCHER).status == store.CLOSED
+    assert book.offers()[0].id == live and book.offers()[0].status == "dead"
+    assert [(event.kind, event.detail) for event in book.events()] == [
+        ("collateral_returned", {"by": "cancel"})
+    ]
+
+
+def test_a_verdict_that_cannot_be_written_whole_is_not_written_at_all() -> None:
+    book = store.OptionStore(":memory:")
+    mint = _add(book)
+    _offer(book, 5)
+
+    with pytest.raises(TypeError):  # the event detail cannot be stored
+        book.settle_broadcast(
+            mint,
+            "confirmed",
+            contract_status=store.OPEN,
+            kill_offers=True,
+            event="collateral_locked",
+            detail={"amount": object()},
+            now=300,
+        )
+
+    # Still unresolved, so the next step reads the verdict again.
+    assert [row.id for row in book.unresolved()] == [mint]
+    assert book.contract(LAUNCHER).status == store.MINTING
+    assert book.offers()[0].status == "live"
+    assert book.events() == []
+    with pytest.raises(KeyError):
+        book.settle_broadcast(999, "confirmed")
+
+
+def test_a_verdict_can_be_made_to_move_a_contract_only_from_one_status() -> None:
+    book = store.OptionStore(":memory:")
+    _add(book)
+    book.set_status(LAUNCHER, store.CLOSED)
+    cancel = book.add_broadcast(
+        launcher_id=LAUNCHER, kind=store.CANCEL, bundle=b"cancel", deadline=900, now=200
+    )
+
+    book.settle_broadcast(cancel, "conflict", contract_status=store.OPEN, only_from=store.CLOSING)
+
+    assert book.contract(LAUNCHER).status == store.CLOSED  # it was not closing; left alone
+    assert book.broadcasts("conflict")[0].id == cancel
+
+
+def test_a_sale_marks_its_offer_and_kills_the_rest_in_one_write() -> None:
+    book = store.OptionStore(":memory:")
+    _add(book)
+    old, taken, newer = _offer(book, 5), _offer(book, 6), _offer(book, 7)
+    book.set_offer(old, status="dead")
+
+    book.set_status(
+        LAUNCHER,
+        store.SOLD,
+        event="sold",
+        detail={"amount": 6},
+        taken_offer=taken,
+        kill_offers=True,
+        now=400,
+    )
+
+    assert {row.id: row.status for row in book.offers()} == {
+        old: "dead",
+        taken: "taken",
+        newer: "dead",
+    }
+    assert book.contract(LAUNCHER).status == store.SOLD
+    assert book.events()[0].detail == {"amount": 6}
+
+
+def test_stalled_broadcasts_are_still_unresolved() -> None:
+    book = store.OptionStore(":memory:")
+    mint = _add(book)
+    _add(book, OTHER)
+    book.set_broadcast(mint, "stalled")
+
+    assert [row.status for row in book.unresolved()] == ["stalled", "pending"]
+    book.settle_broadcast(mint, "confirmed")
+    assert [row.status for row in book.unresolved()] == ["pending"]
+
+
+def test_only_one_process_acts_on_a_database(tmp_path) -> None:
+    path = tmp_path / "options_jobs.db"
+    first, second = store.OptionStore(path), store.OptionStore(path)
+
+    with first.acting():
+        with first.acting():  # the holder may take it again
+            pass
+        with pytest.raises(store.BusyError, match="another process"), second.acting():
+            pytest.fail("two processes held the acting lock")
+        # Reading and writing rows is not what the lock guards.
+        _add(second)
+        assert first.contract(LAUNCHER) is not None
+
+    with second.acting():  # released: the other may act now
+        with pytest.raises(store.BusyError), first.acting():
+            pytest.fail("two processes held the acting lock")
+
+
+def test_the_acting_lock_is_released_when_its_holder_fails_or_closes(tmp_path) -> None:
+    path = tmp_path / "options_jobs.db"
+    first, second = store.OptionStore(path), store.OptionStore(path)
+
+    with pytest.raises(RuntimeError, match="boom"), first.acting():
+        raise RuntimeError("boom")
+    with second.acting():
+        pass
+
+    held = first.acting()
+    held.__enter__()
+    first.close()  # as a dying process would
+    with second.acting():
+        pass
+
+
+def test_an_in_memory_database_needs_no_lock() -> None:
+    book = store.OptionStore(":memory:")
+    with book.acting(), book.acting():
+        _add(book)
+
+
 def test_an_offer_for_an_unknown_contract_is_refused() -> None:
     book = store.OptionStore(":memory:")
     with pytest.raises(sqlite3.IntegrityError):

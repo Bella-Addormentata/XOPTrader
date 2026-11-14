@@ -38,6 +38,13 @@ wallet. Testnet XCH is free, so nothing is at risk.
      offer is now: conflict".
    - **Cancel.** Expect the locked amount to return to the wallet.
    - Expect the final spendable balance to equal the starting one minus fees.
+   - **If it stops part way** (you answered no, a spend did not confirm in
+     time, the terminal closed): run `live-test` again. The contract and every
+     bundle the test signed are written to `options.database_path` before they
+     are sent, so the next run starts by reading the chain and finishing the
+     earlier contract: it re-sends what was signed and never confirmed, cancels
+     a contract that is still yours, and claws back one that has expired. Only
+     then does it start a new test. `status` lists the contract as `live-test`.
 3. Check the wallet itself.
    - Its balance agrees with the last line of the test.
    - Its log has no error or traceback from around the mint. (The wallet's own
@@ -62,8 +69,10 @@ cannot show:
 5. **Another wallet can take it.** Run `live-test` again and this time take the
    offer from another wallet (Sage has option support) before continuing.
    - The withdrawal stage then reports the offer was taken first and the test
-     ends. The contract is sold; its collateral returns after expiry, or goes to
-     the buyer if they exercise.
+     ends. The contract is sold and the sale is on record with what it paid.
+     Its collateral goes to the buyer if they exercise. Otherwise run
+     `live-test` again after the expiry time it prints (24 hours after the
+     mint) and it claws the collateral back.
 
 ## Stage 3: the book, in dry run
 
@@ -84,13 +93,38 @@ before `run`. `withdraw-all` takes every open offer off the market by spending
 its coin. Stopping `run` is safe: offers already out expire on their own and
 collateral waits to be reclaimed on the next `step` after expiry.
 
+Two things to know once contracts are out:
+
+- **Setting `dry_run: true` again stops all spending**, housekeeping included.
+  A dry-run `step` still reads the chain and keeps the record right, and says
+  what it would do ("dry run: would claw back ..."), but it sends no clawback
+  and re-sends nothing. Expired collateral is safe to leave: only its creator
+  can move it. `withdraw-all` in dry run only lists what it would withdraw, so
+  turn dry run off to use it. Offers already out stay takeable until they
+  expire (15 minutes by default).
+- **Run one process per database.** `step`, `run`, `withdraw-all` and
+  `live-test` take a lock on `options.database_path`; a second one started
+  beside it reports "another process is acting" and does nothing. `status` and
+  `monitor` are not affected.
+
 ## Known limits
 
 - **Dedicated wallet only.** `wallet.mode: trading` is refused until the engine
   keeps option coins out of its own offers and books option events.
 - **The wallet reports no verdict on a broadcast.** Outcomes are read from the
   chain, so a rejected transaction shows up as one that never confirms. It is
-  pushed again, and flagged after `confirm_timeout_seconds`.
+  pushed again on every step and flagged after `confirm_timeout_seconds`. The
+  flag changes nothing else: the transaction is still signed and could still
+  confirm, so its coins stay set aside and are not used for anything new. They
+  are released when the chain shows it confirmed, or shows one of its coins
+  spent some other way. To free the coins of a transaction that will never
+  confirm, send one of them to yourself from the wallet.
+- **The price feed must say when its price was observed.** Spot comes from
+  CoinGecko with its `last_updated_at` time, and `market.max_age_seconds` is
+  measured from that. If the feed's price is older than the limit, or carries
+  no time, the book does not quote. This has only been run against scripted
+  answers; if the first dry-run `step` reports the spot as too old, compare the
+  age it prints with `max_age_seconds` before raising the limit.
 - **No hedging.** The book steers its asks by the net delta of what it has
   sold. It places no spot trades.
 - **No taking.** It writes and sells. It does not buy other makers' offers.

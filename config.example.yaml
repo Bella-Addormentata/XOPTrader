@@ -1631,7 +1631,10 @@ options:
   enabled: false                         # [OPTIONAL, default: false] master switch
   # [SAFETY, default: true] Rehearsal. Each step builds the next mint, checks
   # what it would do to the wallet and reports it. Nothing is signed, sent or
-  # listed, and no contract is recorded.
+  # listed, and no contract is recorded. Switched back on over a book that has
+  # contracts out, it still reads the chain and keeps the record right, but it
+  # sends nothing at all: no clawback of expired collateral, no re-push of a
+  # pending transaction. Offers already out stay takeable until they expire.
   dry_run: true
   network: mainnet                       # mainnet | testnet11
 
@@ -1675,7 +1678,10 @@ options:
   # offer is still out: spend the option coin to kill it (one transaction).
   withdraw_pct: 1.0
   stop_before_expiry_seconds: 21600      # stop offering, and cancel, this long before expiry
-  confirm_timeout_seconds: 1800          # flag a broadcast that has not confirmed by then
+  # A broadcast that has not confirmed by then is flagged. It is still pushed,
+  # and its coins stay set aside, until the chain shows it confirmed or shows
+  # one of its coins spent some other way.
+  confirm_timeout_seconds: 1800
   fee_mojos: 0                           # per transaction; must be <= limits.max_fee_mojos
   upload_offers: true                    # list each offer on xchoptions.com
 
@@ -1701,7 +1707,9 @@ options:
 
   # Quotes stop when the price view is stale, the Dexie book cannot fill the
   # hedge size, is wider than max_spread_pct, or does not contain the external
-  # spot (the sign of a quote-asset depeg).
+  # spot (the sign of a quote-asset depeg). max_age_seconds is measured from
+  # the time the price feed says the spot was observed, not from when it was
+  # fetched.
   market:
     max_age_seconds: 600
     max_spread_pct: 10

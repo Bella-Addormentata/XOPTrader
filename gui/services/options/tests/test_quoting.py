@@ -221,6 +221,28 @@ def test_steering_never_goes_below_model_plus_carry() -> None:
     assert steered >= floor
 
 
+def test_steering_never_discounts_the_minimum_premium() -> None:
+    # A far out-of-the-money call a few hours from expiry: the model value and
+    # carry are next to nothing, so the whole ask is the minimum premium.
+    cfg = _config(
+        call_strikes_pct=[300],
+        stop_before_expiry_seconds=60,
+        pricing={"min_premium": 0.01, "steer_strength": 0.25},
+    )
+    soon = NEAR - 6 * 3600
+    wanted = quoting.plan(cfg, _market(), [], soon).mint
+    call = _contract(next(i for i in wanted if i.side == "call"), store.OPEN, 1)
+    floor = round(0.01 * 20 * 1000)  # per XCH, for 20 XCH, in quote mojos
+
+    flat = quoting.ask_mojos(call, _market(), cfg, soon, 0.0)
+    cheaper = quoting.ask_mojos(call, _market(), cfg, soon, 1.0)  # long book: calls discounted
+    dearer = quoting.ask_mojos(call, _market(), cfg, soon, -1.0)
+
+    assert flat == floor
+    assert cheaper == floor  # was 0.0075 per XCH before the floor was put back
+    assert dearer > floor
+
+
 def test_ask_scales_with_size_and_rounds_up() -> None:
     cfg = _config()
     wanted = quoting.plan(cfg, _market(), [], NOW).mint[0]

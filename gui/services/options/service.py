@@ -11,11 +11,16 @@ One step, in order:
    (:func:`chain.bundle_status`), because the wallet's ``push_tx`` reports
    nothing. A confirmed mint opens its contract; a mint that lost its coins to
    something else failed and locked nothing. A bundle still pending is pushed
-   again, which is harmless, and past its deadline it is flagged.
+   again, which is harmless. Past its deadline it is flagged as stalled and
+   nothing else changes: it is still signed and may yet confirm, so its coins
+   stay set aside and it keeps being pushed until the chain shows it confirmed
+   or overtaken.
 2. **Reconcile contracts** against the chain. An option we no longer own was
    sold (the offer that was taken tells us the premium). Collateral gone from a
    sold contract means it was exercised. An expired contract whose collateral
-   is still locked is clawed back.
+   is still locked is clawed back, including one whose cancel was still in
+   flight at expiry: that cancel can never confirm, so the clawback is sent
+   beside it and the chain takes one of the two.
 3. **Read the market** and refuse to quote from one that is stale, crossed, too
    wide, or whose spot lies outside what Dexie would actually fill.
 4. **Plan** (:func:`quoting.plan`) and act: retire one stale contract, mint one
@@ -23,10 +28,18 @@ One step, in order:
 
 Every bundle passes :func:`safety.require` against what the operation is
 declared to do before the wallet is asked to sign it, and is written to the
-store before it is pushed.
+store before it is pushed. What a chain verdict changes is written in one
+transaction, so a crash leaves a verdict unread, never half applied.
 
 DRY RUN builds and checks the next mint and reports it. It signs nothing,
-pushes nothing, uploads nothing and writes no contract.
+pushes nothing, uploads nothing and writes no contract. That holds over a book
+that already has contracts: the chain is still read and the store brought up to
+date, but nothing pending is pushed again and no clawback is sent; the step
+says what it would have done. Collateral past expiry waits safely, since only
+its creator can move it.
+
+ONE AT A TIME. A step holds the store's acting lock. A second process over the
+same database skips its step instead of planning from the same rows.
 
 TIME. Expiry on chain is judged against the previous transaction block's
 timestamp, which trails the clock. This book uses the clock. The difference
@@ -126,12 +139,14 @@ def _sdk() -> Any:
     return chia_wallet_sdk
 
 
-def _pack(coin_spends: list[CoinSpend], signature: bytes) -> bytes:
+def pack_bundle(coin_spends: list[CoinSpend], signature: bytes) -> bytes:
+    """A signed bundle as the store keeps it."""
     sdk = _sdk()
     return bytes(sdk.SpendBundle(coin_spends, sdk.Signature.from_bytes(signature)).to_bytes())
 
 
-def _unpack(bundle: bytes) -> tuple[list[CoinSpend], bytes]:
+def unpack_bundle(bundle: bytes) -> tuple[list[CoinSpend], bytes]:
+    """The coin spends and aggregated signature of a stored bundle."""
     parsed = _sdk().SpendBundle.from_bytes(bytes(bundle))
     return list(parsed.coin_spends), bytes(parsed.aggregated_signature.to_bytes())
 
@@ -184,10 +199,16 @@ class OptionsBook:
         return mine
 
     def _reserved(self) -> set[bytes]:
-        """Coins a pending broadcast already spends; they must not fund another."""
+        """Coins an unresolved broadcast already spends; they must not fund another.
+
+        A stalled broadcast counts. Its bundle is still signed and can still
+        confirm, so handing its coins to a second bundle would put two
+        conflicting spends in flight. They are freed by chain evidence only:
+        the bundle confirms, or one of its coins is spent some other way.
+        """
         taken: set[bytes] = set()
-        for row in self._store.broadcasts("pending"):
-            for spend in _unpack(row.bundle)[0]:
+        for row in self._store.unresolved():
+            for spend in unpack_bundle(row.bundle)[0]:
                 taken.add(bytes(spend.coin.coin_id()))
         return taken
 
@@ -244,7 +265,7 @@ class OptionsBook:
         self._store.add_broadcast(
             launcher_id=launcher_id,
             kind=kind,
-            bundle=_pack(coin_spends, signature),
+            bundle=pack_bundle(coin_spends, signature),
             deadline=now + self._config.confirm_timeout_seconds,
             contract_status=contract_status,
             now=now,
@@ -253,10 +274,9 @@ class OptionsBook:
 
     # -- step 1: broadcasts -------------------------------------------------
 
-    def _settle_broadcasts(self, now: int, report: StepReport) -> None:
-        rows = self._store.broadcasts("pending") + self._store.broadcasts("stalled")
-        for row in rows:
-            coin_spends, signature = _unpack(row.bundle)
+    def _settle_broadcasts(self, now: int, report: StepReport, *, act: bool) -> None:
+        for row in self._store.unresolved():
+            coin_spends, signature = unpack_bundle(row.bundle)
             try:
                 status = chain.bundle_status(self._chain, coin_spends)
             except chain.ChainError as exc:
@@ -264,67 +284,102 @@ class OptionsBook:
                 continue
             name = row.launcher_id.hex()[:10]
             if status is chain.BundleStatus.CONFIRMED:
-                self._store.set_broadcast(row.id, "confirmed")
                 self._confirmed(row, now, report)
-            elif status is chain.BundleStatus.CONFLICT:
-                self._store.set_broadcast(row.id, "conflict")
-                if row.kind == store.MINT:
-                    self._store.set_status(
-                        row.launcher_id, store.FAILED, event="mint_failed", now=now
-                    )
-                    report.problem(f"mint of {name} lost its coins to another spend")
-                else:
-                    # The coin moved some other way; reconciliation reads how.
-                    contract = self._store.contract(row.launcher_id)
-                    back = store.SOLD if row.kind == store.CLAWBACK else store.OPEN
-                    if contract is not None and contract.status == store.CLOSING:
-                        self._store.set_status(row.launcher_id, back, now=now)
-                    report.problem(f"{row.kind} of {name} was overtaken on chain")
-            elif row.status == "pending" and now >= row.deadline:
-                self._store.set_broadcast(row.id, "stalled")
-                self._store.add_event(
-                    "broadcast_stalled", {"kind": row.kind}, launcher_id=row.launcher_id, now=now
+                continue
+            if status is chain.BundleStatus.CONFLICT:
+                self._overtaken(row, now, report)
+                continue
+            if row.status == "pending" and now >= row.deadline:
+                # A flag for the operator, nothing more. The bundle is still
+                # signed and can still confirm, so it keeps its coins and keeps
+                # being pushed; only the chain resolves it.
+                self._store.settle_broadcast(
+                    row.id,
+                    "stalled",
+                    event="broadcast_stalled",
+                    detail={"kind": row.kind},
+                    now=now,
                 )
+            if row.status == "stalled" or now >= row.deadline:
                 report.problem(f"{row.kind} of {name} has not confirmed; check the wallet's node")
-            elif row.status == "pending" and now - row.created_at >= _REPUSH_AFTER_SECONDS:
+            if act and now - row.created_at >= _REPUSH_AFTER_SECONDS:
                 try:
                     self._wallet.push(coin_spends, signature)
                 except signing.SigningError as exc:
                     report.problem(f"could not re-push the {row.kind} of {name}: {exc}")
 
     def _confirmed(self, row: store.Broadcast, now: int, report: StepReport) -> None:
+        """Apply a confirmed broadcast: its verdict and its contract in one write."""
         contract = self._store.contract(row.launcher_id)
         if contract is None:
+            self._store.settle_broadcast(row.id, "confirmed", now=now)
             return
         name = row.launcher_id.hex()[:10]
         asset = None if contract.underlying_asset is None else contract.underlying_asset.hex()
         detail = {"asset": asset, "amount": contract.underlying_amount}
         if row.kind == store.MINT:
-            self._store.set_status(
-                row.launcher_id, store.OPEN, event="collateral_locked", detail=detail, now=now
+            self._store.settle_broadcast(
+                row.id,
+                "confirmed",
+                contract_status=store.OPEN,
+                event="collateral_locked",
+                detail=detail,
+                now=now,
             )
             report.did(f"mint of {contract.slot} ({name}) confirmed")
         elif row.kind in (store.CANCEL, store.CLAWBACK):
-            self._store.kill_offers(row.launcher_id)
-            self._store.set_status(
-                row.launcher_id,
-                store.CLOSED,
+            self._store.settle_broadcast(
+                row.id,
+                "confirmed",
+                contract_status=store.CLOSED,
+                kill_offers=True,
                 event="collateral_returned",
                 detail={**detail, "by": row.kind},
                 now=now,
             )
             report.did(f"{row.kind} of {contract.slot} ({name}) confirmed")
-        elif row.kind == store.WITHDRAW:
-            self._store.kill_offers(row.launcher_id)
+        else:  # a withdrawal: the option coin moved to ourselves
+            self._store.settle_broadcast(row.id, "confirmed", kill_offers=True, now=now)
             report.did(f"offers for {contract.slot} ({name}) withdrawn")
+
+    def _overtaken(self, row: store.Broadcast, now: int, report: StepReport) -> None:
+        """Apply a broadcast that can never confirm: a coin of it went elsewhere."""
+        name = row.launcher_id.hex()[:10]
+        if row.kind == store.MINT:
+            self._store.settle_broadcast(
+                row.id, "conflict", contract_status=store.FAILED, event="mint_failed", now=now
+            )
+            report.problem(f"mint of {name} lost its coins to another spend")
+            return
+        # The coin moved some other way; reconciliation reads how. The contract
+        # goes back to where it stood, unless another cancel or clawback of it
+        # is still in flight (a clawback sent after a cancel missed expiry):
+        # then that one settles it.
+        back = None
+        rival = None
+        if row.kind in (store.CANCEL, store.CLAWBACK):
+            for other in self._store.unresolved():
+                same = other.launcher_id == row.launcher_id and other.id != row.id
+                if same and other.kind in (store.CANCEL, store.CLAWBACK):
+                    rival = other
+            if rival is None:
+                back = store.SOLD if row.kind == store.CLAWBACK else store.OPEN
+        self._store.settle_broadcast(
+            row.id, "conflict", contract_status=back, only_from=store.CLOSING, now=now
+        )
+        if rival is not None:
+            report.did(f"{row.kind} of {name} gave way to the {rival.kind}")
+        else:
+            report.problem(f"{row.kind} of {name} was overtaken on chain")
 
     # -- step 2: contracts --------------------------------------------------
 
-    def _reconcile(self, now: int, report: StepReport) -> None:
+    def _reconcile(self, now: int, report: StepReport, *, act: bool) -> None:
         self._loaded = {}
-        busy = {row.launcher_id for row in self._store.broadcasts("pending")}
-        busy |= {row.launcher_id for row in self._store.broadcasts("stalled")}
-        for contract in self._store.contracts((store.OPEN, store.SOLD)):
+        unresolved = self._store.unresolved()
+        busy = {row.launcher_id for row in unresolved}
+        clawing = {row.launcher_id for row in unresolved if row.kind == store.CLAWBACK}
+        for contract in self._store.contracts((store.OPEN, store.SOLD, store.CLOSING)):
             name = contract.launcher_id.hex()[:10]
             try:
                 loaded = chain.load_option(self._chain, contract.launcher_id, now_seconds=now)
@@ -335,61 +390,102 @@ class OptionsBook:
                 report.problem(f"{name} no longer validates on chain: {exc}")
                 continue
             self._loaded[contract.launcher_id] = loaded
-            mine = loaded.owner_puzzle_hash in self._ours()
+            expired = loaded.status is chain.OptionStatus.EXPIRED  # collateral still locked
 
-            if contract.status == store.OPEN and loaded.option is not None and not mine:
-                self._sold(contract, now, report)
+            if contract.status == store.CLOSING:
+                # Its cancel or clawback settles it, with one exception. A
+                # cancel still in flight at expiry can never confirm, and the
+                # collateral would stay locked behind it. Send the clawback
+                # beside it: the chain takes one and the other is overtaken.
+                if expired and contract.launcher_id not in clawing:
+                    self._clawback(contract, loaded, now, report, act=act)
+                continue
+
+            mine = loaded.owner_puzzle_hash in self._ours()
+            if contract.status == store.OPEN and not mine:
+                if loaded.option is None and contract.launcher_id in busy:
+                    continue  # melted, perhaps by our own cancel; its broadcast says which
+                # Somebody else holds it, or held it just long enough to
+                # exercise it between two steps. Either way one of our offers
+                # was taken first, and the premium is booked from that offer.
+                if not self._sold(contract, now, report):
+                    continue
                 contract = dataclasses.replace(contract, status=store.SOLD)
 
             if loaded.locked is None:
                 if contract.launcher_id in busy:
                     continue  # our own cancel or clawback; the broadcast settles it
-                self._store.kill_offers(contract.launcher_id)
                 strike = None if contract.strike_asset is None else contract.strike_asset.hex()
                 self._store.set_status(
                     contract.launcher_id,
                     store.EXERCISED,
                     event="exercised",
                     detail={"strike_asset": strike, "strike_amount": contract.strike_amount},
+                    kill_offers=True,
                     now=now,
                 )
                 report.did(f"{contract.slot} ({name}) was exercised")
-            elif loaded.status is chain.OptionStatus.EXPIRED and contract.launcher_id not in busy:
-                self._clawback(contract, loaded, now, report)
+            elif expired and contract.launcher_id not in busy:
+                self._clawback(contract, loaded, now, report, act=act)
 
         for offer in self._store.offers(status="live"):
             if offer.expires_at is not None and offer.expires_at <= now:
                 self._store.set_offer(offer.id, status="dead")
 
-    def _sold(self, contract: store.Contract, now: int, report: StepReport) -> None:
-        """Record a sale: the taken offer says what was paid."""
-        price: dict[str, Any] = {}
-        for offer in self._store.offers(contract.launcher_id):
+    def _sold(self, contract: store.Contract, now: int, report: StepReport) -> bool:
+        """Record a sale: the taken offer says what was paid. False if it could not be read."""
+        name = contract.launcher_id.hex()[:10]
+        taken: store.OfferRow | None = None
+        unread = False
+        # Newest first: the offer a taker is likeliest to have held.
+        for offer in reversed(self._store.offers(contract.launcher_id)):
             if offer.status == "taken":
-                continue
+                taken = offer
+                break
             try:
-                taken = (
-                    chain.bundle_status(self._chain, _unpack(offer.bundle)[0])
-                    is chain.BundleStatus.CONFIRMED
-                )
+                status = chain.bundle_status(self._chain, unpack_bundle(offer.bundle)[0])
             except chain.ChainError:
-                taken = False
-            if taken:
-                self._store.set_offer(offer.id, status="taken")
-                asset = None if offer.price_asset is None else offer.price_asset.hex()
-                price = {"asset": asset, "amount": offer.price_amount}
-        self._store.kill_offers(contract.launcher_id)
+                unread = True
+                continue
+            if status is chain.BundleStatus.CONFIRMED:
+                taken = offer
+                break
+        if taken is None and unread:
+            # Booking the sale now would book it without its premium for good.
+            report.problem(f"{contract.slot} ({name}) was sold; its offers could not be read yet")
+            return False
+        price: dict[str, Any] = {}
+        if taken is not None:
+            asset = None if taken.price_asset is None else taken.price_asset.hex()
+            price = {"asset": asset, "amount": taken.price_amount}
         self._store.set_status(
-            contract.launcher_id, store.SOLD, event="sold", detail=price, now=now
+            contract.launcher_id,
+            store.SOLD,
+            event="sold",
+            detail=price,
+            taken_offer=None if taken is None else taken.id,
+            kill_offers=True,
+            now=now,
         )
-        report.did(f"{contract.slot} ({contract.launcher_id.hex()[:10]}) was sold")
+        report.did(f"{contract.slot} ({name}) was sold")
+        return True
 
     def _clawback(
-        self, contract: store.Contract, loaded: chain.LoadedOption, now: int, report: StepReport
+        self,
+        contract: store.Contract,
+        loaded: chain.LoadedOption,
+        now: int,
+        report: StepReport,
+        *,
+        act: bool,
     ) -> None:
         if loaded.locked is None:
             return
         name = contract.launcher_id.hex()[:10]
+        if not act:
+            prefix = "dry run: " if report.dry_run else ""
+            report.did(f"{prefix}would claw back {contract.slot} ({name})")
+            return
         fee = self._config.fee_mojos
         amount = contract.underlying_amount
         try:
@@ -521,7 +617,7 @@ class OptionsBook:
                     strike_amount=wanted.strike_asset.amount,
                     expiration=wanted.expiration,
                     creator_puzzle_hash=self._address(),
-                    bundle=_pack(minted.coin_spends, signature),
+                    bundle=pack_bundle(minted.coin_spends, signature),
                     deadline=now + self._config.confirm_timeout_seconds,
                     now=now,
                 )
@@ -583,7 +679,7 @@ class OptionsBook:
             price_asset=self._config.quote_asset_id,
             price_amount=ask,
             expires_at=draft.expires_at_seconds,
-            bundle=_pack(draft.coin_spends, signature),
+            bundle=pack_bundle(draft.coin_spends, signature),
             offer_text=text,
             now=now,
         )
@@ -639,8 +735,17 @@ class OptionsBook:
     def step(self) -> StepReport:
         now = int(self._clock())
         report = StepReport(at=now, dry_run=self._config.dry_run)
-        self._settle_broadcasts(now, report)
-        self._reconcile(now, report)
+        try:
+            with self._store.acting():
+                self._step(now, report)
+        except store.BusyError as exc:
+            report.problem(f"step skipped: {exc}")
+        return report
+
+    def _step(self, now: int, report: StepReport) -> None:
+        act = not self._config.dry_run
+        self._settle_broadcasts(now, report, act=act)
+        self._reconcile(now, report, act=act)
 
         try:
             market = self._market()
@@ -654,7 +759,7 @@ class OptionsBook:
             # No price, no quotes. Offers already out expire on their own.
             report.market_error = str(exc)
             report.problem(f"not quoting: {exc}")
-            return report
+            return
         report.market = market
         self._spot = market.spot
 
@@ -664,11 +769,11 @@ class OptionsBook:
         if plan.blocked:
             report.problem(plan.blocked)
 
-        if self._config.dry_run:
+        if not act:
             self._mint(plan, now, report)
-            return report
+            return
 
-        busy = {row.launcher_id for row in self._store.broadcasts("pending")}
+        busy = {row.launcher_id for row in self._store.unresolved()}
         for launcher_id in plan.retire[:1]:
             contract = self._store.contract(launcher_id)
             if contract is not None and launcher_id not in busy:
@@ -680,22 +785,48 @@ class OptionsBook:
             if contract is None or contract.status != store.OPEN or launcher_id in busy:
                 continue
             self._offer(contract, ask, now, report)
+
+    def refresh(self) -> StepReport:
+        """Bring the book up to date with the chain. Signs nothing and sends nothing."""
+        now = int(self._clock())
+        report = StepReport(at=now, dry_run=self._config.dry_run)
+        try:
+            with self._store.acting():
+                self._settle_broadcasts(now, report, act=False)
+                self._reconcile(now, report, act=False)
+        except store.BusyError as exc:
+            report.problem(f"not refreshed: {exc}")
         return report
 
     def withdraw_all(self) -> StepReport:
         """Kill switch: take every open offer off the market by spending its coin."""
         now = int(self._clock())
         report = StepReport(at=now, dry_run=self._config.dry_run)
-        if self._config.dry_run:
-            report.problem("dry run: nothing is on offer, so there is nothing to withdraw")
-            return report
-        self._reconcile(now, report)
-        busy = {row.launcher_id for row in self._store.broadcasts("pending")}
+        try:
+            with self._store.acting():
+                self._withdraw_all(now, report)
+        except store.BusyError as exc:
+            report.problem(f"nothing withdrawn: {exc}")
+        return report
+
+    def _withdraw_all(self, now: int, report: StepReport) -> None:
+        act = not self._config.dry_run
+        self._reconcile(now, report, act=act)
+        busy = {row.launcher_id for row in self._store.unresolved()}
+        found = False
         for contract in self._store.contracts((store.OPEN,)):
             loaded = self._loaded.get(contract.launcher_id)
             if loaded is None or contract.launcher_id in busy:
                 continue
             if not self._store.offers(contract.launcher_id, "live"):
                 continue
-            self._withdraw(contract, loaded, now, report)
-        return report
+            found = True
+            if act:
+                self._withdraw(contract, loaded, now, report)
+            else:
+                name = contract.launcher_id.hex()[:10]
+                report.did(f"dry run: would withdraw offers for {contract.slot} ({name})")
+        if not act and not found:
+            report.problem("dry run: no live offers on record, so there is nothing to withdraw")
+        elif not act:
+            report.problem("dry run: nothing was sent; set dry_run: false to withdraw them")

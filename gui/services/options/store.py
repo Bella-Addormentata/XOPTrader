@@ -11,6 +11,15 @@ is pushed). A crash between the two leaves a row whose outcome can be read from
 the chain on the next start; the reverse order would leave collateral locked in
 a contract nothing remembers.
 
+ONE VERDICT, ONE WRITE. What follows from a chain verdict (the broadcast's
+status, the contract's, its offers', the event) is committed together
+(:meth:`OptionStore.settle_broadcast`, :meth:`OptionStore.set_status`). A crash
+can leave a verdict unread; it cannot leave one half applied.
+
+ONE PROCESS ACTS. :meth:`OptionStore.acting` is a lock on the database file.
+Whoever signs or spends holds it, so two processes over one database cannot
+both plan from the same rows and mint the same slot twice.
+
 The ``events`` table is an append-only log of what happened to our money (a
 mint locked collateral, a premium arrived, a contract was exercised). It is
 what an accounting integration would read; nothing reads it yet.
@@ -116,6 +125,10 @@ CREATE TABLE IF NOT EXISTS events (
 """
 
 
+class BusyError(RuntimeError):
+    """Another process is acting on this database."""
+
+
 def _hex(value: bytes | None) -> str | None:
     return None if value is None else bytes(value).hex()
 
@@ -213,14 +226,53 @@ class OptionStore:
         self._db.execute("PRAGMA foreign_keys = ON")
         with self._db:
             self._db.executescript(_SCHEMA)
+        self._lock: sqlite3.Connection | None = None
+        self._lock_depth = 0
 
     def close(self) -> None:
+        if self._lock is not None:
+            self._lock.close()
+            self._lock = None
+            self._lock_depth = 0
         self._db.close()
 
     @contextlib.contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
         with self._db:  # one transaction: commit on success, roll back on error
             yield self._db
+
+    @contextlib.contextmanager
+    def acting(self) -> Iterator[None]:
+        """Hold this database's acting lock, or raise :class:`BusyError`.
+
+        The lock is an exclusive transaction on a second file beside the
+        database (``<path>.lock``), so the operating system releases it if the
+        process dies, and it behaves the same on every platform SQLite does. It
+        never waits: a second process is told at once. One store may take it
+        again while it holds it. An in-memory database has no other process to
+        exclude.
+        """
+        if self._path == ":memory:":
+            yield
+            return
+        if self._lock is None:
+            lock = sqlite3.connect(self._path + ".lock", timeout=0, isolation_level=None)
+            try:
+                lock.execute("BEGIN EXCLUSIVE")
+            except sqlite3.OperationalError as exc:
+                lock.close()
+                raise BusyError(
+                    "another process is acting on this options database; it was left alone"
+                ) from exc
+            self._lock = lock
+        self._lock_depth += 1
+        try:
+            yield
+        finally:
+            self._lock_depth -= 1
+            if self._lock_depth == 0 and self._lock is not None:
+                self._lock.close()  # ends the transaction and frees the file
+                self._lock = None
 
     # -- contracts ----------------------------------------------------------
 
@@ -302,6 +354,44 @@ class OptionStore:
             )
         return [self._contract(row) for row in rows]
 
+    @staticmethod
+    def _transition(
+        db: sqlite3.Connection,
+        launcher: str,
+        *,
+        status: str | None,
+        only_from: str | None,
+        taken_offer: int | None,
+        kill_offers: bool,
+        event: str | None,
+        detail: dict | None,
+        now: int,
+    ) -> None:
+        """Apply one contract transition inside the caller's transaction."""
+        if taken_offer is not None:
+            db.execute("UPDATE offers SET status = 'taken' WHERE id = ?", (int(taken_offer),))
+        if kill_offers:
+            db.execute(
+                "UPDATE offers SET status = 'dead' WHERE launcher_id = ? AND status = 'live'",
+                (launcher,),
+            )
+        if status is not None and only_from is None:
+            db.execute(
+                "UPDATE contracts SET status = ?, updated_at = ? WHERE launcher_id = ?",
+                (status, now, launcher),
+            )
+        elif status is not None:
+            db.execute(
+                "UPDATE contracts SET status = ?, updated_at = ? WHERE launcher_id = ?"
+                " AND status = ?",
+                (status, now, launcher, only_from),
+            )
+        if event is not None:
+            db.execute(
+                "INSERT INTO events (at, launcher_id, kind, detail) VALUES (?,?,?,?)",
+                (now, launcher, event, json.dumps(detail or {}, sort_keys=True)),
+            )
+
     def set_status(
         self,
         launcher_id: bytes,
@@ -309,20 +399,29 @@ class OptionStore:
         *,
         event: str | None = None,
         detail: dict | None = None,
+        taken_offer: int | None = None,
+        kill_offers: bool = False,
         now: int | None = None,
     ) -> None:
-        """Move a contract to ``status``, logging ``event`` in the same transaction."""
+        """Move a contract to ``status`` and record what came with it, in one write.
+
+        ``taken_offer`` marks that offer taken, ``kill_offers`` marks every
+        offer still live dead, and ``event`` is logged. Either all of it is
+        committed or none of it.
+        """
         now = int(time.time()) if now is None else int(now)
         with self._write() as db:
-            db.execute(
-                "UPDATE contracts SET status = ?, updated_at = ? WHERE launcher_id = ?",
-                (status, now, _hex(launcher_id)),
+            self._transition(
+                db,
+                _hex(launcher_id) or "",
+                status=status,
+                only_from=None,
+                taken_offer=taken_offer,
+                kill_offers=kill_offers,
+                event=event,
+                detail=detail,
+                now=now,
             )
-            if event is not None:
-                db.execute(
-                    "INSERT INTO events (at, launcher_id, kind, detail) VALUES (?,?,?,?)",
-                    (now, _hex(launcher_id), event, json.dumps(detail or {}, sort_keys=True)),
-                )
 
     # -- offers -------------------------------------------------------------
 
@@ -453,9 +552,59 @@ class OptionStore:
             for row in rows
         ]
 
+    def unresolved(self) -> list[Broadcast]:
+        """Broadcasts the chain has not ruled on yet: pending, and flagged as stalled.
+
+        A stalled bundle is still signed and can still confirm, so it is treated
+        exactly as a pending one everywhere but in what the operator is told.
+        """
+        rows = self.broadcasts("pending") + self.broadcasts("stalled")
+        return sorted(rows, key=lambda row: row.id)
+
     def set_broadcast(self, broadcast_id: int, status: str) -> None:
         with self._write() as db:
             db.execute("UPDATE broadcasts SET status = ? WHERE id = ?", (status, int(broadcast_id)))
+
+    def settle_broadcast(
+        self,
+        broadcast_id: int,
+        status: str,
+        *,
+        contract_status: str | None = None,
+        only_from: str | None = None,
+        kill_offers: bool = False,
+        event: str | None = None,
+        detail: dict | None = None,
+        now: int | None = None,
+    ) -> None:
+        """Record a broadcast's verdict and all that follows from it, in one write.
+
+        ``contract_status`` moves the broadcast's contract (only out of
+        ``only_from`` when that is given), ``kill_offers`` marks its live offers
+        dead and ``event`` is logged against it. A crash before the commit
+        leaves the broadcast unresolved, so the next step reads the verdict
+        again; there is no state in which the verdict is stored and the
+        contract has not followed.
+        """
+        now = int(time.time()) if now is None else int(now)
+        with self._write() as db:
+            row = db.execute(
+                "SELECT launcher_id FROM broadcasts WHERE id = ?", (int(broadcast_id),)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"no broadcast {broadcast_id}")
+            db.execute("UPDATE broadcasts SET status = ? WHERE id = ?", (status, int(broadcast_id)))
+            self._transition(
+                db,
+                row["launcher_id"],
+                status=contract_status,
+                only_from=only_from,
+                taken_offer=None,
+                kill_offers=kill_offers,
+                event=event,
+                detail=detail,
+                now=now,
+            )
 
     # -- events -------------------------------------------------------------
 
@@ -555,6 +704,11 @@ class OptionStore:
             )
             for row in rows
         ]
+
+    def closed_listing_ids(self) -> set[str]:
+        """Offer ids whose listing has already been closed with an outcome."""
+        rows = self._db.execute("SELECT offer_id FROM listings WHERE outcome IS NOT NULL")
+        return {row["offer_id"] for row in rows}
 
     def close_listing(self, offer_id: str, outcome: str, now: int) -> None:
         with self._write() as db:

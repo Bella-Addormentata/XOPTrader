@@ -20,7 +20,7 @@ on downside. The net of the two over what has been sold is the book's delta, in
 XCH. When it leans one way, the side that would lean it further is made dearer
 and the side that would bring it back is made cheaper, by at most
 ``steer_strength`` at a lean of ``steer_scale_xch``. No ask is ever pushed
-below its model value plus carry.
+below its model value plus carry, nor below the configured minimum premium.
 """
 
 from __future__ import annotations
@@ -150,9 +150,12 @@ def ask_mojos(
         markup_fraction=config.pricing.markup_fraction,
         min_premium=config.pricing.min_premium,
     )
-    floor = quote.model + quote.carry
+    # ``quote.markup`` includes whatever it took to reach the minimum premium,
+    # so steering scales that too. The minimum is a floor, not a markup: it is
+    # put back after steering.
+    floor = max(quote.model + quote.carry, config.pricing.min_premium)
     strength = min(max(config.pricing.steer_strength, 0.0), 0.9)
-    steered = floor + quote.markup * _steer(contract.side, lean, strength)
+    steered = quote.model + quote.carry + quote.markup * _steer(contract.side, lean, strength)
     per_xch = max(floor, steered)
     return max(1, math.ceil(per_xch * contract_size_xch(contract) * config.quote_unit_mojos))
 

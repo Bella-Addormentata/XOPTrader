@@ -5,6 +5,10 @@ listing, and for every offer it has not seen before:
 
 * reads the offer from its own spends and re-validates the option on chain, so
   a listing that names an unsound contract is recorded as a problem, not priced;
+* checks the offer can still be taken: it has not run out, the contract is
+  live, and the coin it spends is the option's current coin. A listing that
+  fails is noted with what became of it and never valued. A signature only
+  proves who made an offer, not that it is still good;
 * asks the site for its suggested price;
 * values the contract at our own spot and volatility, and again at the Dexie
   price a hedge would actually get -- selling XCH at the bid against a bought
@@ -13,6 +17,9 @@ listing, and for every offer it has not seen before:
 
 Offers that have left the listing are closed with what became of them, read
 from the chain: taken, withdrawn (the option coin went elsewhere) or expired.
+Leaving the listing ends nothing by itself. An offer with no expiry of its own
+stays takeable by anyone who kept the file, so it is followed until the chain
+shows an outcome or the contract itself expires.
 
 Over days this answers the two questions the business case rests on: how often
 does a takeable price appear, and how much actually trades.
@@ -34,9 +41,6 @@ log = logging.getLogger(__name__)
 TAKEN = "taken"
 WITHDRAWN = "withdrawn"
 EXPIRED = "expired"
-# An offer missing from the listing with no expiry of its own is given this long
-# to turn out taken or withdrawn before it is written off as gone.
-_UNDATED_GRACE_SECONDS = 3600
 
 
 @dataclasses.dataclass
@@ -108,6 +112,27 @@ class DeskMonitor:
         # A bought call is hedged by selling XCH (at the bid); a put by buying (at the ask).
         return at(view.spot), at(view.bid if call else view.ask)
 
+    @staticmethod
+    def _not_takeable(seen: desk.OfferView, loaded: chain.LoadedOption, now: int) -> str:
+        """Why an offer can no longer be taken, or "" if it still can."""
+        if loaded.status is not chain.OptionStatus.LIVE:
+            return f"lists an option that is {loaded.status.value}"
+        if seen.expires_at_seconds is not None and seen.expires_at_seconds <= now:
+            return "the offer has run out"
+        current = None if loaded.option is None else bytes(loaded.option.coin.coin_id())
+        if current != bytes(seen.option_coin_id):
+            return "offers an option coin that has already been spent"
+        return ""
+
+    def _outcome(self, coin_spends: list[Any]) -> str | None:
+        """What the chain says became of an offer, or None while it is undecided."""
+        status = chain.bundle_status(self._chain, coin_spends)
+        if status is chain.BundleStatus.CONFIRMED:
+            return TAKEN
+        if status is chain.BundleStatus.CONFLICT:
+            return WITHDRAWN
+        return None
+
     def _record(self, offer_id: str, now: int, view: Market | None, report: ScanReport) -> None:
         text = self._desk.fetch_offer(offer_id)
         if text is None:
@@ -117,24 +142,29 @@ class DeskMonitor:
             report.problems.append(f"{offer_id[:8]}: the maker's signature does not verify")
             return
         loaded = chain.load_option(self._chain, seen.launcher_id, now_seconds=now)
-        if loaded.status is not chain.OptionStatus.LIVE:
-            report.problems.append(f"{offer_id[:8]}: lists an option that is {loaded.status.value}")
-            return
+        sdk = _sdk()
+        bundle = sdk.Offer.from_spend_bundle(sdk.Clvm(), sdk.decode_offer(text)).spend_bundle()
+        dead = self._not_takeable(seen, loaded, now)
         terms = self._terms(loaded)
         side = size = strike = ask = our_value = hedged = site = None
         if terms is not None and seen.requested_asset_id == self._quote:
             side, size, strike = terms
             ask = seen.requested_amount / self._unit
-            if view is not None:
+            if view is not None and not dead:
                 our_value, hedged = self._value(
                     side, size, strike, loaded.terms.expiration_seconds, now, view
                 )
-            try:
-                site = self._desk.suggested_price(seen.launcher_id).premium
-            except desk.DeskError as exc:
-                report.problems.append(f"{offer_id[:8]}: no suggested price: {exc}")
-        sdk = _sdk()
-        bundle = sdk.Offer.from_spend_bundle(sdk.Clvm(), sdk.decode_offer(text)).spend_bundle()
+            if not dead:
+                try:
+                    site = self._desk.suggested_price(seen.launcher_id).premium
+                except desk.DeskError as exc:
+                    report.problems.append(f"{offer_id[:8]}: no suggested price: {exc}")
+        outcome = None
+        if dead:
+            # Kept, so it is not fetched again every scan, but closed at once
+            # and never valued: it is not a price anybody can trade at.
+            outcome = self._outcome(list(bundle.coin_spends)) or EXPIRED
+            report.problems.append(f"{offer_id[:8]}: {dead}")
         listing = store.Listing(
             offer_id=offer_id,
             launcher_id=seen.launcher_id,
@@ -150,25 +180,22 @@ class DeskMonitor:
             bundle=bytes(bundle.to_bytes()),
             first_seen=now,
             last_seen=now,
-            outcome=None,
-            closed_at=None,
+            outcome=outcome,
+            closed_at=None if outcome is None else now,
         )
-        if self._store.record_listing(listing):
+        if self._store.record_listing(listing) and outcome is None:
             report.new.append(listing)
 
     def _close(self, listing: store.Listing, now: int, report: ScanReport) -> None:
         coin_spends = list(_sdk().SpendBundle.from_bytes(listing.bundle).coin_spends)
-        status = chain.bundle_status(self._chain, coin_spends)
-        if status is chain.BundleStatus.CONFIRMED:
-            outcome = TAKEN
-        elif status is chain.BundleStatus.CONFLICT:
-            outcome = WITHDRAWN
-        elif listing.offer_expires is not None and listing.offer_expires <= now:
+        outcome = self._outcome(coin_spends)
+        if outcome is None:
+            ran_out = listing.offer_expires is not None and listing.offer_expires <= now
+            # The contract's own expiry ends an offer that carries none.
+            lapsed = listing.expiration is not None and listing.expiration <= now
+            if not (ran_out or lapsed):
+                return  # delisted but still takeable; look again next scan
             outcome = EXPIRED
-        elif listing.offer_expires is None and now - listing.last_seen > _UNDATED_GRACE_SECONDS:
-            outcome = EXPIRED
-        else:
-            return  # delisted but still takeable; look again next scan
         self._store.close_listing(listing.offer_id, outcome, now)
         report.closed[listing.offer_id] = outcome
 
@@ -191,11 +218,14 @@ class DeskMonitor:
             report.market_error = str(exc)
 
         known = {item.offer_id: item for item in self._store.listings(open_only=True)}
+        judged = self._store.closed_listing_ids()
         fresh = 0
         for offer_id in listing.offer_ids:
             if offer_id in known:
                 self._store.record_listing(dataclasses.replace(known[offer_id], last_seen=now))
                 continue
+            if offer_id in judged:
+                continue  # still listed, already closed with an outcome
             if fresh >= self._max_new:
                 break
             fresh += 1
