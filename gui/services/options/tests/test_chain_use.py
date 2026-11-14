@@ -297,7 +297,7 @@ class Desk(ts.Rig):
     """The service rig with the chain-reading policy at its defaults."""
 
     def __init__(self, **overrides: Any) -> None:
-        settings = {"chain_poll_seconds": 30, "chain_refresh_seconds": 900, **overrides}
+        settings = {"chain_poll_seconds": 30, "chain_refresh_seconds": 3600, **overrides}
         super().__init__(Node, **settings)
 
     @property
@@ -325,9 +325,9 @@ def test_a_step_with_nothing_to_notice_asks_the_chain_nothing() -> None:
     desk = _open_book()
     asked = desk.node.requests
 
-    reports = desk.run(30)  # half an hour, a step a minute
+    reports = desk.run(150)  # two and a half hours, a step a minute
 
-    assert [report.problems for report in reports] == [[]] * 30
+    assert [report.problems for report in reports] == [[]] * 150
     # Offers were re-posted as they ran out; that needs no chain.
     assert len(desk.store.offers()) > 2
     looks = [report for report in reports if report.chain_looked]
@@ -409,7 +409,7 @@ def test_a_stalled_transaction_is_only_looked_at_on_the_routine_interval() -> No
     assert desk.store.broadcasts("stalled")
     asked = desk.node.requests
 
-    reports = desk.run(30)  # half an hour more
+    reports = desk.run(130)  # two hours and a little more
 
     assert {report.chain_looked for report in reports} == {"", "routine"}
     assert desk.node.requests - asked == 2
@@ -445,7 +445,7 @@ def test_the_wallet_being_away_does_not_stop_the_chain_being_read() -> None:
         raise RuntimeError("wallet RPC refused the connection")
 
     desk.book._coins.held = away  # type: ignore[method-assign]
-    desk.world.advance(900)
+    desk.world.advance(3600)
 
     (report,) = desk.run(1)
 
@@ -465,7 +465,7 @@ def test_refresh_and_the_kill_switch_always_look() -> None:
 
 def test_a_restarted_book_reads_the_chain_once_and_carries_on() -> None:
     desk = _open_book()
-    desk.run(20)  # long enough for the mints to settle
+    desk.run(20)
 
     desk.reader = Node(desk.world.sim)  # a new process: nothing in memory
     desk.book = desk.make_book()
@@ -473,7 +473,9 @@ def test_a_restarted_book_reads_the_chain_once_and_carries_on() -> None:
     rest = desk.run(5)
 
     assert first.chain_looked == "first look"
-    # What settled is in the database; only what can still change is asked for.
+    # How each coin was spent is in the database from its first reading, so the
+    # new process asks only whether those spends still stand, and never again
+    # for the spends themselves.
     assert {kind for kind, _ in desk.node.log} == {"states"}
     assert sum(report.chain_requests for report in rest) == 0
     assert len(desk.contracts(store.OPEN)) == 2

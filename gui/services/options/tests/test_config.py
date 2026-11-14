@@ -155,8 +155,8 @@ def test_fee_needs_an_allowance() -> None:
 def test_the_chain_is_read_from_coinset_unless_a_node_is_given() -> None:
     parsed = _parse()
     assert not parsed.node.enabled and (parsed.node.host, parsed.node.port) == ("localhost", 8555)
-    # Look when something is waiting every half minute; otherwise every quarter hour.
-    assert (parsed.chain_poll_seconds, parsed.chain_refresh_seconds) == (30, 900)
+    # Look every half minute while something is waiting; otherwise once an hour.
+    assert (parsed.chain_poll_seconds, parsed.chain_refresh_seconds) == (30, 3600)
 
     own = _parse(
         node={"host": "10.0.0.5", "port": 8666, "cert_path": "/n/c.crt", "key_path": "/n/k"}

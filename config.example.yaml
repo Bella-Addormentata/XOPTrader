@@ -1733,5 +1733,5 @@ options:
   # The chain is looked at when the wallet's own coins change (a payment came
   # in, a transaction of ours confirmed), when a contract reaches expiry, and:
   chain_poll_seconds: 30                 # ...this often while a transaction of ours is waiting
-  chain_refresh_seconds: 900             # ...this often otherwise. Each look is one request.
+  chain_refresh_seconds: 3600            # ...this often otherwise. Each look is one request.
   database_path: "data/options_jobs.db"

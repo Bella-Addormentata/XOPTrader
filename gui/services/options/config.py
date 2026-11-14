@@ -334,7 +334,7 @@ def parse(root: Any) -> OptionsConfig | None:
     if bool(node.cert_path) != bool(node.key_path):
         raise OptionsConfigError("options.node needs both cert_path and key_path, or neither")
     chain_poll = int(_number(section, "chain_poll_seconds", 30))
-    chain_refresh = int(_number(section, "chain_refresh_seconds", 900))
+    chain_refresh = int(_number(section, "chain_refresh_seconds", 3600))
     if chain_refresh < chain_poll:
         raise OptionsConfigError(
             "options.chain_refresh_seconds must not be shorter than chain_poll_seconds"

@@ -132,10 +132,10 @@ as little as possible.
 
 Every `step` ends with a line such as `chain requests this step: 1 (routine)`,
 so the cost is visible. For scale: a book of six open contracts stepped once a
-minute used to make about 90,000 requests a day. It now makes about 100 on a
-quiet day (one every fifteen minutes), about 7 when it mints a contract, and
-about 5 when one sells. Raising `chain_refresh_seconds` to 3600 brings the
-quiet-day figure to 24.
+minute used to make about 90,000 requests a day. It now makes 24 on a quiet
+day (one an hour), about 7 when it mints a contract, and about 5 when one
+sells. Lowering `chain_refresh_seconds` from 3600 to 900 makes the quiet-day
+figure 96 and shortens the wait described below to a quarter of an hour.
 
 Two things follow from looking less often:
 
@@ -146,7 +146,8 @@ Two things follow from looking less often:
   step, because the premium arriving changes the wallet's coins. That needs the
   wallet to have a wallet for the quote asset (it creates one by itself when
   the first payment arrives, unless that has been switched off); without one a
-  sale is noticed at the next routine look instead.
+  sale is noticed at the next routine look instead, up to an hour later, and
+  its slot is refilled that much later.
 - `run` is the mode that saves requests, because it remembers when it last
   looked. `step` run by hand, or from cron, is a new process every time and
   looks every time: two requests per open contract.

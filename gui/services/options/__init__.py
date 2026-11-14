@@ -66,7 +66,8 @@ one, and otherwise from coinset.org, through :class:`chain.CachedChain`, which
 asks for as little as it can: settled spends are kept and never requested
 again, everything still watched travels in one request, and the book only
 looks when something may have happened. A six-contract book that made about
-ninety thousand requests a day makes about a hundred. The batched reader was
+ninety thousand requests a day makes about two dozen on a quiet one. The batched
+reader was
 run read-only against coinset on mainnet; the own-node path speaks the same
 RPC and has only been run against scripted answers.
 
