@@ -8,6 +8,7 @@ simulator standing in for the chain.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import pytest
@@ -433,10 +434,12 @@ def test_live_test_pays_the_estimated_fee_on_each_spend(tmp_path, monkeypatch, c
     assert cli._live_test(cfg, 0.0001, True, 60.0) == 0
 
     out = capsys.readouterr().out
-    # One flat fee per spend, sized for the costliest of the three.
-    assert "fee per spend: 170000000 mojos (auto: 1 mojos per cost" in out
-    assert maker.balance() == before - 3 * 170_000_000
-    assert f"fees paid: {3 * 170_000_000}" in out
+    # One flat fee per spend, sized for the costliest of the three, at the
+    # rate a full mempool admits: an estimate of 1 would not get in.
+    flat = math.ceil(170_000_000 * 5.5)
+    assert f"fee per spend: {flat} mojos (auto: the wallet estimates 1, paying 5.5" in out
+    assert maker.balance() == before - 3 * flat
+    assert f"fees paid: {3 * flat}" in out
     assert rpc.rejected == []
 
 

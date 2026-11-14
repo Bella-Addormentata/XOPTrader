@@ -54,16 +54,23 @@ cannot lose money, because every spend is judged by the chain itself: an offer
 for a coin already sold cannot be taken, and a cancel of one never confirms and
 is settled as overtaken at the next look.
 
-TRANSACTIONS THAT RUN OUT. A mint, a cancel and a withdrawal each carry a time
-after which the chain refuses them (``builder``'s ``valid_until_seconds``): a
-mint or cancel after ``confirm_timeout_seconds``, a withdrawal when the last
+TRANSACTIONS THAT RUN OUT. Every transaction carries a time after which the
+chain refuses it (``builder``'s ``valid_until_seconds``): ``confirm_timeout_seconds``
+for a mint, a cancel or a clawback, and for a withdrawal the moment the last
 offer it was sent to kill expires. One that has not confirmed by then never
-will, so once the chain's own clock is safely past that time it is given up
-without another transaction: its coins and its slot are free, a lapsed mint is
-simply minted again at the current strike, and a contract whose withdrawal or
-cancel lapsed goes back on offer. Nothing is given up on the local clock, and a
-clawback never runs out: collateral is always wanted back, so it is pushed
-until it confirms.
+will, so once the chain's own clock is past that time it is given up without
+another transaction: its coins and its slot are free, a lapsed mint is simply
+minted again at the current strike, a contract whose withdrawal or cancel
+lapsed goes back on offer, and a lapsed clawback is signed again.
+
+The clock that decides is the chain's, read 32 blocks below the peak, never the
+local one and never the tip's. A single block at the tip can carry a timestamp
+well ahead of its neighbours and then be reorganised away, taking the "too
+late" with it and leaving the old bundle free to confirm beside its
+replacement. 32 blocks is the depth the engine waits before retiring an expired
+offer (``offer_expiry.hpp``), about ten minutes. And no deadline is set at all
+when the chain reader cannot tell the chain's time: a bundle that could run out
+but never be seen to would hold its coins for ever.
 
 WITHDRAWALS ARE RARE BY CONSTRUCTION. Spending the option coin to kill a stale
 offer is an on-chain transaction, so it is kept for when it matters
@@ -75,8 +82,14 @@ cannot turn it into a loop, and capped across the book
 one is not re-quoted until its stale offers have run out by themselves.
 
 FEES. ``fee_mojos`` is a fixed fee per transaction, or ``auto``: each bundle is
-priced from its own cost at the rate the wallet's node currently estimates,
-never above ``limits.max_fee_mojos``.
+priced from its own cost, never above ``limits.max_fee_mojos``. The rate is the
+larger of two things (:mod:`fees` says why). What the wallet's node estimates,
+lifted to the rate a full mempool admits as soon as it shows any pressure. And
+what the book has learned: a transaction of ours that ran out unconfirmed is
+proof its fee was too low, so the rate is raised to at least double what it
+paid, kept in the database, and allowed to fade after some hours without
+another failure. Since a lapsed transaction is always signed again, raising
+the rate is also how a stuck one gets a better fee.
 
 TIME. Expiry on chain is judged against the previous transaction block's
 timestamp, which trails the clock. This book uses the clock. The difference
@@ -106,12 +119,24 @@ log = logging.getLogger(__name__)
 #: never reached a node.
 _REPUSH_AFTER_SECONDS = 120
 
-#: A bundle is given up once the chain's clock is this far past the time it
-#: stopped being valid. The margin is what a reorg would have to undo.
-_LAPSE_MARGIN_SECONDS = 300
+#: A bundle is given up once the chain's clock, read this many blocks below
+#: the peak, has passed the time it stopped being valid: the block that put it
+#: out of time is then buried that deep. A depth, not a number of seconds,
+#: because timestamps only have to increase and one block at the tip can carry
+#: the clock minutes forward and then be reorganised away. 32 is what the
+#: engine waits before retiring an expired offer (kExpiredRetireDepthBlocks,
+#: cpp/include/xop/execution/offer_expiry.hpp).
+_LAPSE_DEPTH_BLOCKS = 32
+
+#: About how long 32 blocks take. The chain's clock is not asked before a
+#: bundle is this far past its time by our own.
+_LAPSE_AFTER_SECONDS = 600
 
 #: How long the wallet's fee estimate is used before it is asked for again.
 _FEE_RATE_SECONDS = 300
+
+#: A fee rate raised after a failure halves once per this long without another.
+_FEE_MEMORY_SECONDS = 6 * 3600
 
 
 class OptionsError(RuntimeError):
@@ -316,15 +341,14 @@ class OptionsBook:
         due = [
             row
             for row in self._store.unresolved()
-            if row.valid_until is not None
-            and now >= row.valid_until + _LAPSE_MARGIN_SECONDS + _REPUSH_AFTER_SECONDS
+            if row.valid_until is not None and now >= row.valid_until + _LAPSE_AFTER_SECONDS
         ]
         asked = self._chain_time_asked_at
         if not due or (asked is not None and now - asked < 60):
             return False
         self._chain_time_asked_at = now
         try:
-            self._chain_time = self._chain.chain_time()
+            self._chain_time = self._chain.chain_time(_LAPSE_DEPTH_BLOCKS)
         except chain.ChainError as exc:
             report.problem(f"could not read the chain's clock: {exc}")
         return self._chain_time is not None
@@ -415,6 +439,7 @@ class OptionsBook:
         *,
         contract_status: str | None = None,
         valid_until: int | None = None,
+        fee: int = 0,
     ) -> None:
         """Sign, record, then push. The record comes first."""
         signature = self._wallet.sign(coin_spends)
@@ -425,21 +450,63 @@ class OptionsBook:
             deadline=now + self._config.confirm_timeout_seconds,
             contract_status=contract_status,
             valid_until=valid_until,
+            fee=fee,
             now=now,
         )
         self._wallet.push(coin_spends, signature)
 
+    def _valid_until(self, at: int) -> int | None:
+        """``at`` as a bundle's deadline, or None when it could never be seen to pass."""
+        return int(at) if self._chain.tells_time else None
+
     # -- fees ---------------------------------------------------------------
 
-    def _fee_rate(self, now: int, report: StepReport) -> int:
-        """Mojos per unit of cost, from the wallet's node, asked every few minutes."""
+    def _estimate(self, now: int, report: StepReport) -> int | None:
+        """The wallet's node's estimate in mojos per cost, asked every few minutes."""
         if self._rate is None or now - self._rate[0] >= _FEE_RATE_SECONDS:
             rate = self._wallet.fee_rate()
             if rate is None:
-                report.problem("the wallet gave no fee estimate; sending without a fee")
-                return 0  # not remembered: asked again next time
+                report.problem("the wallet gave no fee estimate; going by what was learned")
+                return None  # not remembered: asked again next time
             self._rate = (now, int(rate))
         return self._rate[1]
+
+    def _learned_rate(self, now: int) -> float:
+        """The rate past failures taught, faded by the time since the last one."""
+        try:
+            rate = float(self._store.recall("fee_rate") or 0.0)
+            since = int(self._store.recall("fee_rate_at") or now)
+        except ValueError:
+            return 0.0
+        faded = fees.faded_rate(rate, now - since, _FEE_MEMORY_SECONDS)
+        if faded != rate:
+            periods = (now - since) // _FEE_MEMORY_SECONDS
+            self._store.remember("fee_rate", repr(faded))
+            self._store.remember("fee_rate_at", str(since + periods * _FEE_MEMORY_SECONDS))
+        return faded
+
+    def _fee_rate(self, now: int, report: StepReport) -> float:
+        """Mojos per unit of cost to pay now: the estimate's floor, or what was learned."""
+        return max(fees.pressure_rate(self._estimate(now, report)), self._learned_rate(now))
+
+    def _learn_from_failure(self, row: store.Broadcast, now: int, report: StepReport) -> None:
+        """A transaction ran out unconfirmed: its fee was too low. Pay more next time."""
+        if not self._config.fee_auto or self._config.limits.max_fee_mojos <= 0:
+            return
+        try:
+            cost = fees.bundle_cost(unpack_bundle(row.bundle)[0])
+        except fees.FeeError:
+            return
+        paid = (row.fee or 0) / cost if cost > 0 else 0.0
+        learned = self._learned_rate(now)
+        raised = max(learned, fees.raised_rate(paid))
+        self._store.remember("fee_rate", repr(raised))
+        self._store.remember("fee_rate_at", str(now))
+        if raised > learned:
+            report.problem(
+                f"fee rate raised to {raised:g} mojos per cost: a {row.kind} that paid "
+                f"{paid:g} did not confirm"
+            )
 
     def _priced(self, build: Callable[[int], Any], now: int, report: StepReport) -> tuple[Any, int]:
         """Build a bundle carrying the fee it should pay; returns it and the fee.
@@ -453,16 +520,22 @@ class OptionsBook:
         if not self._config.fee_auto:
             return build(self._config.fee_mojos), self._config.fee_mojos
         cap = self._config.limits.max_fee_mojos
-        rate = self._fee_rate(now, report) if cap > 0 else 0
+        rate = self._fee_rate(now, report) if cap > 0 else 0.0
         built, fee = build(0), 0
         for _ in range(2):
             try:
-                wanted = fees.fee_for(fees.bundle_cost(built[0]), rate, cap)
+                cost = fees.bundle_cost(built[0])
             except fees.FeeError as exc:
                 raise builder.OptionBuildError(f"could not price the bundle: {exc}") from exc
+            wanted = fees.fee_for(cost, rate, cap)
             if wanted <= fee:
                 break
             built, fee = build(wanted), wanted
+        if rate > 0 and fee >= cap:
+            report.problem(
+                f"a fee was held to limits.max_fee_mojos ({cap}); at {rate:g} mojos per cost "
+                "it wanted more, and may not get in"
+            )
         return built, fee
 
     # -- step 1: broadcasts -------------------------------------------------
@@ -485,11 +558,12 @@ class OptionsBook:
             if (
                 row.valid_until is not None
                 and self._chain_time is not None
-                and self._chain_time >= row.valid_until + _LAPSE_MARGIN_SECONDS
+                and self._chain_time >= row.valid_until
             ):
-                # Unspent in a look begun after the chain's clock had passed
-                # the time this bundle refuses to be included from: it can
-                # never confirm. Its coins and its slot are free again.
+                # Unspent in a look begun after the chain's clock, read 32
+                # blocks down, had passed the time this bundle refuses to be
+                # included from: it can never confirm, short of a reorg that
+                # deep. Its coins and its slot are free again.
                 self._overtaken(row, now, report, lapsed=True)
                 continue
             if row.status == "pending" and now >= row.deadline:
@@ -556,6 +630,8 @@ class OptionsBook:
         """
         name = row.launcher_id.hex()[:10]
         why = "lapsed" if lapsed else "overtaken"
+        if lapsed:
+            self._learn_from_failure(row, now, report)
         if row.kind == store.MINT:
             self._store.settle_broadcast(
                 row.id,
@@ -721,6 +797,9 @@ class OptionsBook:
             return
         amount = contract.underlying_amount
         locked = loaded.locked
+        # A clawback can always be signed again, so it runs out like the rest:
+        # one whose fee was too small is replaced, at a better one, not waited for.
+        valid_until = self._valid_until(now + self._config.confirm_timeout_seconds)
 
         def build(fee: int) -> tuple[list[CoinSpend], safety.Expected]:
             # An XCH underlying pays its own fee; a CAT needs an XCH coin for one.
@@ -732,6 +811,7 @@ class OptionsBook:
                 builder.Funding(change_puzzle_hash=self._address(), xch=funding_xch),
                 self._custody(contract.creator_puzzle_hash),
                 fee=fee,
+                valid_until_seconds=valid_until,
             )
             if contract.underlying_asset is None:
                 wallet = {None: amount - fee}
@@ -744,14 +824,14 @@ class OptionsBook:
         try:
             (coin_spends, expected), fee = self._priced(build, now, report)
             self._check(coin_spends, expected, bytes(loaded.underlying.puzzle_hash()))
-            # No deadline: the collateral is always wanted back, so a clawback
-            # is pushed until it confirms.
             self._broadcast(
                 contract.launcher_id,
                 store.CLAWBACK,
                 coin_spends,
                 now,
                 contract_status=store.CLOSING,
+                valid_until=valid_until,
+                fee=fee,
             )
         except (builder.OptionBuildError, safety.SafetyError, signing.SigningError) as exc:
             report.problem(f"clawback of {name} not sent: {exc}")
@@ -769,7 +849,7 @@ class OptionsBook:
         option, locked = loaded.option, loaded.locked
         # Unconfirmed by then, it can no longer confirm, and the contract goes
         # back on the book to be looked at afresh.
-        valid_until = now + self._config.confirm_timeout_seconds
+        valid_until = self._valid_until(now + self._config.confirm_timeout_seconds)
 
         def build(fee: int) -> tuple[list[CoinSpend], safety.Expected]:
             # The strike asset needs one seed coin of any size; XCH also pays the fee.
@@ -805,6 +885,7 @@ class OptionsBook:
                 now,
                 contract_status=store.CLOSING,
                 valid_until=valid_until,
+                fee=fee,
             )
         except (builder.OptionBuildError, safety.SafetyError, signing.SigningError) as exc:
             # Left alone, it simply stops being offered and is clawed back at expiry.
@@ -813,7 +894,7 @@ class OptionsBook:
         report.did(f"retiring {contract.slot} ({name}){_paying(fee)}")
 
     def _build_mint(
-        self, wanted: quoting.Wanted, fee: int, valid_until: int
+        self, wanted: quoting.Wanted, fee: int, valid_until: int | None
     ) -> tuple[list[CoinSpend], builder.MintResult, safety.Expected]:
         amount = wanted.underlying.amount
         singleton = builder.OPTION_COIN_AMOUNT
@@ -846,7 +927,7 @@ class OptionsBook:
     def _mint(self, plan: quoting.Plan, now: int, report: StepReport) -> None:
         # A mint is struck from the spot of the moment. Unconfirmed after this
         # long it can no longer confirm, and the slot is minted afresh.
-        valid_until = now + self._config.confirm_timeout_seconds
+        valid_until = self._valid_until(now + self._config.confirm_timeout_seconds)
         for wanted in plan.mint:
             try:
                 (_, minted, expected), fee = self._priced(
@@ -883,6 +964,7 @@ class OptionsBook:
                     bundle=pack_bundle(minted.coin_spends, signature),
                     deadline=now + self._config.confirm_timeout_seconds,
                     valid_until=valid_until,
+                    fee=fee,
                     now=now,
                 )
                 self._wallet.push(minted.coin_spends, signature)
@@ -1008,9 +1090,9 @@ class OptionsBook:
             if offer.expires_at is None or offer.expires_at > now
         ]
         if ends and all(end is not None for end in ends):
-            valid_until = max(end for end in ends if end is not None)
+            valid_until = self._valid_until(max(end for end in ends if end is not None))
         else:
-            valid_until = now + self._config.confirm_timeout_seconds
+            valid_until = self._valid_until(now + self._config.confirm_timeout_seconds)
 
         def build(fee: int) -> tuple[list[CoinSpend], safety.Expected]:
             moved = builder.build_transfer(
@@ -1031,7 +1113,12 @@ class OptionsBook:
             (coin_spends, expected), fee = self._priced(build, now, report)
             self._check(coin_spends, expected, bytes(loaded.underlying.puzzle_hash()))
             self._broadcast(
-                contract.launcher_id, store.WITHDRAW, coin_spends, now, valid_until=valid_until
+                contract.launcher_id,
+                store.WITHDRAW,
+                coin_spends,
+                now,
+                valid_until=valid_until,
+                fee=fee,
             )
         except (builder.OptionBuildError, safety.SafetyError, signing.SigningError) as exc:
             report.problem(f"could not withdraw offers for {contract.slot} ({name}): {exc}")

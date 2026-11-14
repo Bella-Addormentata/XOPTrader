@@ -112,6 +112,36 @@ def test_a_fee_is_cost_times_rate_rounded_up_and_capped() -> None:
     assert fees.fee_for(53_365_217, 5, 0) == 0
 
 
+def test_any_pressure_is_paid_at_the_rate_a_full_mempool_admits() -> None:
+    # Room in the mempool, or a node that cannot say: nothing.
+    assert [fees.pressure_rate(value) for value in (0, None, -1, float("nan"))] == [0.0] * 4
+    # An estimate short of the admission rate buys nothing, so it is not paid.
+    assert fees.pressure_rate(1) == fees.pressure_rate(0.37) == pytest.approx(5.5)
+    assert fees.PRESSURE_RATE == pytest.approx(5.5)
+    # Above it, the estimate is followed, with the same margin.
+    assert fees.pressure_rate(8) == pytest.approx(8.8)
+
+
+def test_a_failure_at_least_doubles_the_rate_and_never_leaves_it_below_admission() -> None:
+    assert fees.raised_rate(0) == pytest.approx(5.5)  # it paid nothing
+    assert fees.raised_rate(1.0) == pytest.approx(5.5)  # double would still be refused
+    assert fees.raised_rate(5.5) == pytest.approx(11.0)
+    assert fees.raised_rate(11.0) == pytest.approx(22.0)
+    assert fees.raised_rate(float("nan")) == pytest.approx(5.5)
+
+
+def test_a_raised_rate_fades_with_time_and_then_goes() -> None:
+    hours = 3600
+    assert fees.faded_rate(22.0, 5 * hours, 6 * hours) == 22.0  # not yet
+    assert fees.faded_rate(22.0, 6 * hours, 6 * hours) == 11.0
+    assert fees.faded_rate(22.0, 12 * hours, 6 * hours) == 5.5
+    # Under the admission rate it would buy nothing: it goes to zero, not to 2.75.
+    assert fees.faded_rate(22.0, 18 * hours, 6 * hours) == 0.0
+    assert fees.faded_rate(5.5, 6 * hours, 6 * hours) == 0.0
+    assert fees.faded_rate(0.0, 99 * hours, 6 * hours) == 0.0
+    assert fees.faded_rate(11.0, 99 * hours, 0) == 11.0  # no memory configured: no fading
+
+
 def test_a_bundle_that_does_not_run_cannot_be_priced() -> None:
     coin = sdk.Coin(b"\x01" * 32, b"\x02" * 32, 5)
     broken = sdk.CoinSpend(coin, b"\xff\xff", b"\x80")

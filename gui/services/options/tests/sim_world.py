@@ -84,8 +84,10 @@ class SimChain:
     def coin_spend(self, coin_id: bytes) -> Any:
         return self.sim.coin_spend(coin_id)
 
-    def chain_time(self) -> int:
-        return int(self.sim.next_timestamp())
+    def chain_time(self, depth: int = 0) -> int:
+        # The simulator keeps no history of block times; a block is taken to
+        # be the 18.75 seconds mainnet averages.
+        return int(self.sim.next_timestamp()) - int(depth * 18.75)
 
 
 class World:

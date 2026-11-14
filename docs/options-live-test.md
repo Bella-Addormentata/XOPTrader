@@ -154,17 +154,18 @@ Two things follow from looking less often:
 
 ## Transactions that run out, withdrawals and fees
 
-**Deadlines.** A mint, a cancel and a withdrawal each carry a time after which
-the chain itself refuses them. A mint or cancel gets `confirm_timeout_seconds`
-(half an hour); a withdrawal gets until the last offer it was sent to kill
-expires. One that has not confirmed by then never will, so it is given up
-without another transaction: its coins are free again, a lapsed mint is made
-again at the current strike, and a contract whose withdrawal or cancel lapsed
-goes back on offer. `step` reports "did not confirm in time". Nothing is given
-up on this machine's clock: the chain's own clock must be five minutes past
-the deadline first. A clawback has no deadline. Collateral is always wanted
-back, so a clawback is flagged after `confirm_timeout_seconds` and pushed until
-it confirms.
+**Deadlines.** Every transaction carries a time after which the chain itself
+refuses it. A mint, a cancel and a clawback get `confirm_timeout_seconds` (half
+an hour); a withdrawal gets until the last offer it was sent to kill expires.
+One that has not confirmed by then never will, so it is given up without
+another transaction: its coins are free again, a lapsed mint is made again at
+the current strike, a contract whose withdrawal or cancel lapsed goes back on
+offer, and a lapsed clawback is signed again. `step` reports "did not confirm
+in time". Nothing is given up on this machine's clock, nor on the newest
+block's: the chain's clock is read 32 blocks below the peak (about ten
+minutes), the depth the engine waits before retiring an expired offer, so a
+reorganisation cannot bring the old transaction back beside its replacement.
+Expect "did not confirm in time" roughly ten minutes after the deadline.
 
 **Withdrawals.** Raising a price does not remove the cheaper offer already
 out; only spending the option coin does, and that is a transaction. So it is
@@ -183,17 +184,33 @@ What is given up is bounded: a stale offer can be taken at its old price for
 at most the rest of its life, 15 minutes by default.
 
 **Fees.** `fee_mojos` is a fixed fee per transaction, or `auto`. With `auto`
-each transaction is priced from its own cost at the rate the wallet's node
-estimates: nothing while the mempool has room, and never more than
-`limits.max_fee_mojos`. A mint costs about 55 to 90 million cost units, a
-withdrawal about 35 to 45 million, a cancel about 140 to 170 million and a
-clawback 15 to 40 million, so at 1 mojo per unit a mint pays roughly
-0.00006 XCH. The estimate comes from the wallet (`get_fee_estimate`, in
-chia-blockchain 2.7.5; an older wallet without it gives none, and the
-transaction is sent without a fee and says so). With no fee, a transaction
-waits whenever the mempool is busy, and with deadlines that means mints that
-lapse and are retried. `live-test` pays one flat fee per spend, sized for its
-costliest.
+each transaction is priced from its own cost, never above
+`limits.max_fee_mojos`, at the larger of two rates:
+
+- **What the mempool needs.** Nothing while the wallet's node estimates nothing
+  (there is room). As soon as it shows any pressure, 5.5 mojos per unit of
+  cost: the 5 a full mempool admits, plus a tenth. The node's estimate itself
+  is not paid, because it runs far short of that. The engine's fee controller
+  measured it 13 times short on this project's own wallet, and found that above
+  the admission rate a spend confirms promptly whatever it paid, while below it
+  it does not confirm at all.
+- **What failure taught.** A transaction of ours that ran out unconfirmed is
+  proof its fee was too low, so the rate is raised to at least double what it
+  paid (5.5 if it paid nothing). The raised rate is kept in the database, used
+  for everything after, and halves every six hours without another failure.
+  Because a lapsed transaction is always made again, this is also how a stuck
+  one gets a better fee. `step` reports each raise, and `status` shows the rate.
+
+A mint costs about 55 to 90 million cost units, a withdrawal about 35 to 45
+million, a cancel about 140 to 170 million and a clawback 15 to 40 million. At
+5.5 mojos per unit that is roughly 0.0003 to 0.0005 XCH for a mint and 0.0009
+for a cancel, which the example's cap of 0.001 XCH covers; `step` says so when
+a fee is held down by the cap. The estimate comes from the wallet
+(`get_fee_estimate`, in chia-blockchain 2.7.5); an older wallet without it
+gives none, and the book then goes by what failures taught it alone. This is a
+small-scale form of what the engine's `fees:` controller does, not a share of
+it: the two run in different processes on different wallets. `live-test` pays
+one flat fee per spend, sized for its costliest.
 
 ## Known limits
 
@@ -202,11 +219,11 @@ costliest.
 - **The wallet reports no verdict on a broadcast.** Outcomes are read from the
   chain, so a rejected transaction shows up as one that never confirms. It is
   pushed again on every step. While it is unresolved its coins stay set aside
-  and are not used for anything new. A mint, cancel or withdrawal resolves by
-  itself at its deadline (above). A clawback, and anything signed before
-  deadlines existed, is released only when the chain shows it confirmed or
-  shows one of its coins spent some other way; to free the coins of one that
-  will never confirm, send one of them to yourself from the wallet.
+  and are not used for anything new. Every transaction resolves by itself at
+  its deadline (above). One signed before deadlines existed, or while the
+  chain's time could not be read, is released only when the chain shows it
+  confirmed or shows one of its coins spent some other way; to free the coins
+  of one that will never confirm, send one of them to yourself from the wallet.
 - **The price feed must say when its price was observed.** Spot comes from
   CoinGecko with its `last_updated_at` time, and `market.max_age_seconds` is
   measured from that. If the feed's price is older than the limit, or carries

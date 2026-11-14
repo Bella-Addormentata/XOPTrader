@@ -162,17 +162,17 @@ class NodeChainReader:
             return None
         return self.spend_at(state.coin, int(state.spent_height))
 
-    def chain_time(self) -> int | None:
-        """The timestamp of the node's latest transaction block, or None if it cannot say.
+    def chain_time(self, depth: int = 0) -> int | None:
+        """The chain's clock as it stood ``depth`` blocks below the peak, or None.
 
-        The clock timelocks are judged by. One request, two when the node's
-        peak is not a transaction block.
+        The clock timelocks are judged by: the timestamp of the last
+        transaction block at or below that height. Two or three requests.
         """
         ask = getattr(self._client, "get_chain_time", None)
         if ask is None:
             return None
         try:
-            stamp = ask()
+            stamp = ask(depth)
         except Exception as exc:
             raise ChainError(f"chain time lookup failed: {exc}") from exc
         return None if stamp is None else int(stamp)
@@ -295,19 +295,30 @@ class CachedChain:
         self._asked = set()
         self._seen = {}
 
-    def chain_time(self) -> int | None:
-        """The chain's own clock, asked afresh every time, or None if the node cannot say.
+    @property
+    def tells_time(self) -> bool:
+        """Whether the reader behind this one can be asked the chain's time at all.
+
+        A transaction given a deadline can only be given up by seeing the
+        chain's clock pass it, so a caller with no such clock should not set
+        deadlines in the first place.
+        """
+        return callable(getattr(self._inner, "chain_time", None))
+
+    def chain_time(self, depth: int = 0) -> int | None:
+        """The chain's clock ``depth`` blocks below the peak, asked afresh, or None.
 
         Ask it BEFORE starting the look whose answers it is to be compared
         with. "The chain had reached this time, and after that this coin was
         still unspent" is proof a timelocked spend can no longer confirm; the
-        other order is not.
+        other order is not. And ask it at a depth: a time read at the tip can
+        be undone by reorganising one block.
         """
         ask = getattr(self._inner, "chain_time", None)
         if ask is None:
             return None
         self.requests += 1
-        return ask()
+        return ask(depth)
 
     def want(self, coin_ids: Iterable[bytes]) -> None:
         """Say which coins are about to be asked for, so they travel together."""

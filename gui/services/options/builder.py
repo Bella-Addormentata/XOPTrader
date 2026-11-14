@@ -939,6 +939,7 @@ def build_clawback(
     custody: Custody,
     *,
     fee: int = 0,
+    valid_until_seconds: int | None = None,
 ) -> list[CoinSpend]:
     """After expiry, return the locked coin to ``funding.change_puzzle_hash``.
 
@@ -946,6 +947,10 @@ def build_clawback(
     refuses it any earlier; nothing here consults a clock. For a CAT underlying
     a fee needs an XCH coin in ``funding``; for an XCH underlying the fee can
     come out of the locked coin itself.
+
+    With ``valid_until_seconds`` the clawback cannot confirm from that time on.
+    Nothing is lost by that: the creator can sign another whenever it likes,
+    and one that paid too small a fee is better replaced than waited for.
     """
     _check_fee(fee)
     sdk = _sdk()
@@ -964,5 +969,6 @@ def build_clawback(
         spends.add_xch(locked.coin)
     else:
         spends.add_cat(locked.cat)
+    _valid_until(clvm, spends, valid_until_seconds)
     _complete(clvm, spends, [sdk.Action.fee(fee)], custody)
     return clvm.coin_spends()

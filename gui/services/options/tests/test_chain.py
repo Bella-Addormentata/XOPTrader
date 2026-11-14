@@ -553,13 +553,18 @@ def test_node_chain_reader_tells_the_chain_s_time_when_its_client_can() -> None:
     class Timed:
         def __init__(self, answer: Any) -> None:
             self.answer = answer
+            self.depths: list[int] = []
 
-        def get_chain_time(self) -> Any:
+        def get_chain_time(self, depth: int = 0) -> Any:
+            self.depths.append(depth)
             if isinstance(self.answer, Exception):
                 raise self.answer
             return self.answer
 
-    assert chain.NodeChainReader(Timed(1_700_000_000)).chain_time() == 1_700_000_000
+    timed = Timed(1_700_000_000)
+    assert chain.NodeChainReader(timed).chain_time() == 1_700_000_000
+    assert chain.NodeChainReader(timed).chain_time(32) == 1_700_000_000
+    assert timed.depths == [0, 32]  # how far below the peak the clock is read
     assert chain.NodeChainReader(Timed(None)).chain_time() is None  # no peak, or not synced
     with pytest.raises(chain.ChainError, match="chain time lookup failed"):
         chain.NodeChainReader(Timed(TimeoutError("timed out"))).chain_time()
@@ -580,8 +585,8 @@ def test_the_cache_asks_the_chain_s_time_afresh_and_counts_it() -> None:
         def coin_spend(self, coin_id: bytes) -> Any:
             return world.sim.coin_spend(coin_id)
 
-        def chain_time(self) -> int:
-            return self.now
+        def chain_time(self, depth: int = 0) -> int:
+            return self.now - 20 * depth
 
     inner = Clocked()
     reader = chain.CachedChain(inner)
@@ -589,10 +594,13 @@ def test_the_cache_asks_the_chain_s_time_afresh_and_counts_it() -> None:
     assert reader.chain_time() == 100
     inner.now = 160
     assert reader.chain_time() == 160  # never served from memory: time moves
-    assert reader.requests == 2
+    assert reader.chain_time(3) == 100  # three blocks down
+    assert reader.requests == 3
+    assert reader.tells_time
     # Over a reader that cannot tell the time, neither can the cache, at no cost.
     plain = chain.CachedChain(world.sim)
     assert plain.chain_time() is None and plain.requests == 0
+    assert not plain.tells_time
 
 
 def test_node_chain_reader_wraps_client_failures() -> None:

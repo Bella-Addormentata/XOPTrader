@@ -1686,18 +1686,22 @@ options:
                                          # that would need one is not re-quoted until its
                                          # stale offer has run out. 0 = never withdraw.
   stop_before_expiry_seconds: 21600      # stop offering, and cancel, this long before expiry
-  # How long a transaction has to confirm. A mint or a cancel carries this as a
-  # deadline the chain enforces: unconfirmed by then it never can be, so it is
-  # given up (once the chain's own clock is safely past), its coins are free,
-  # and a mint is simply made again at the current strike. A withdrawal's
-  # deadline is the end of the offer it kills. A clawback has none: collateral
-  # is always wanted back, so it is flagged at this age and pushed until it
-  # confirms.
+  # How long a transaction has to confirm. A mint, a cancel and a clawback
+  # carry this as a deadline the chain enforces: unconfirmed by then it never
+  # can be, so it is given up, its coins are free, and it is made again: a mint
+  # at the current strike, a clawback as it was. "By then" is judged on the
+  # chain's own clock read 32 blocks below the peak (about ten minutes), so a
+  # reorganisation cannot bring the old one back beside its replacement. A
+  # withdrawal's deadline is the end of the offer it kills.
   confirm_timeout_seconds: 1800
-  # The fee each transaction pays: a number of mojos, or "auto" to price each
-  # one from its own cost at the rate the wallet's node currently estimates
-  # (nothing while the mempool has room). Never above limits.max_fee_mojos.
-  # A transaction that pays nothing waits when the mempool is busy.
+  # The fee each transaction pays: a number of mojos, or "auto". With auto each
+  # one is priced from its own cost and never above limits.max_fee_mojos:
+  #   - nothing while the wallet's node estimates nothing (the mempool has room);
+  #   - once it shows any pressure, 5.5 mojos per unit of cost, the rate a full
+  #     mempool admits plus a tenth, because the estimate itself runs far short
+  #     of that (the engine's fee controller measured 13 times short);
+  #   - and at least double what the last transaction to run out paid, a rate
+  #     that is remembered and fades over hours without another failure.
   fee_mojos: auto
   upload_offers: true                    # list each offer on xchoptions.com
 

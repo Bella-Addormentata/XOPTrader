@@ -11,6 +11,7 @@ them: minted, offered, sold, exercised or expired, collateral returned.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import pytest
@@ -523,9 +524,9 @@ def test_a_withdrawal_that_does_not_confirm_lapses_and_the_contract_is_offered_a
     rig.steps(1)
     assert rig.store.offers(call.launcher_id, "live") == [cheap]
 
-    # The offer it was for has run out and the chain's clock is safely past it:
-    # the withdrawal can never confirm, so the contract goes back on offer.
-    rig.world.advance(900)
+    # The offer it was for has run out and the chain's clock, 32 blocks down,
+    # is past it: the withdrawal can never confirm, so the contract is offered again.
+    rig.world.advance(1000)
     (report,) = rig.steps(1)
 
     assert report.chain_looked == "a transaction ran out of time"
@@ -766,8 +767,8 @@ def test_a_mint_that_does_not_confirm_in_time_lapses_and_is_minted_again() -> No
 
     reports = rig.steps(3)
 
-    # Late by our clock, but the chain's has not safely passed its deadline:
-    # it is flagged, and its coin is not handed to a second mint.
+    # Late by our clock, but the chain's, read 32 blocks down, has not passed
+    # its deadline: it is flagged, and its coin is not handed to a second mint.
     assert len(rig.events("broadcast_stalled")) == 1
     assert all(
         any("has not confirmed" in problem for problem in report.problems) for report in reports
@@ -778,7 +779,7 @@ def test_a_mint_that_does_not_confirm_in_time_lapses_and_is_minted_again() -> No
     # The outage ends and the process is restarted, too late for this mint.
     rig.wallet.push = real_push  # type: ignore[method-assign]
     rig.book = rig.make_book()
-    rig.world.advance(400)
+    rig.world.advance(700)  # the block that put it out of time is now buried deep
     (report,) = rig.steps(1)
 
     assert report.chain_looked == "a transaction ran out of time"
@@ -807,8 +808,8 @@ def test_a_mint_is_not_given_up_while_the_chain_s_clock_is_behind_ours() -> None
     rig = Rig(put_strikes_pct=[], confirm_timeout_seconds=600)
     rig.wallet.push = _unheard()  # type: ignore[method-assign]
     rig.steps(1)
-    rig.world.advance(1200)  # long past the deadline by our clock...
-    rig.reader.chain_time = lambda: rig.world.now() - 700  # type: ignore[method-assign]
+    rig.world.advance(1400)  # long past the deadline by our clock...
+    rig.reader.chain_time = lambda depth=0: rig.world.now() - 900  # type: ignore[method-assign]
 
     (report,) = rig.steps(1)
 
@@ -818,34 +819,66 @@ def test_a_mint_is_not_given_up_while_the_chain_s_clock_is_behind_ours() -> None
     assert not any("did not confirm in time" in problem for problem in report.problems)
 
 
-def test_a_clawback_has_no_deadline_and_is_pushed_until_it_confirms() -> None:
-    rig = Rig(put_strikes_pct=[], limits={"max_contracts": 1}, confirm_timeout_seconds=600)
+def _sold_and_expired(rig: Rig) -> store.Contract:
     rig.steps(3)
     call = _by_side(rig, "call", store.OPEN)
     rig.world.take(rig.taker, rig.live_offer(call).offer_text)
     rig.steps(1)
     rig.world.advance(14 * DAY)
+    return call
+
+
+def test_a_clawback_that_does_not_confirm_in_time_is_signed_again() -> None:
+    rig = Rig(put_strikes_pct=[], limits={"max_contracts": 1}, confirm_timeout_seconds=600)
+    call = _sold_and_expired(rig)
     real_push = rig.wallet.push
     rig.wallet.push = _unheard()  # type: ignore[method-assign]
     rig.steps(1)  # the clawback is signed; no node hears it
     (sent,) = rig.store.unresolved()
-    assert (sent.kind, sent.valid_until) == (store.CLAWBACK, None)
+    assert (sent.kind, sent.valid_until) == (store.CLAWBACK, sent.created_at + 600)
+
+    rig.wallet.push = real_push  # type: ignore[method-assign]
+    rig.world.advance(1300)  # too late for that one
+    (report,) = rig.steps(1)
+
+    # Given up, and a new one signed in the same step: the collateral is
+    # always wanted back.
+    assert any("clawback" in p and "did not confirm in time" in p for p in report.problems)
+    assert [(row.kind, row.status) for row in rig.store.broadcasts(None)][-2:] == [
+        (store.CLAWBACK, "conflict"),
+        (store.CLAWBACK, "pending"),
+    ]
+    rig.steps(1)
+    assert rig.store.contract(call.launcher_id).status == store.CLOSED
+    assert rig.events("collateral_returned")[0].detail["by"] == store.CLAWBACK
+
+
+def test_with_no_chain_clock_nothing_is_given_a_deadline() -> None:
+    # A bundle that could run out but never be seen to would hold its coins for
+    # ever, so a reader that cannot tell the chain's time gets none.
+    rig = Rig(
+        reader=lambda sim: sim,
+        put_strikes_pct=[],
+        limits={"max_contracts": 1},
+        confirm_timeout_seconds=600,
+    )
+    call = _sold_and_expired(rig)
+    real_push = rig.wallet.push
+    rig.wallet.push = _unheard()  # type: ignore[method-assign]
+    rig.steps(1)
+    assert [row.valid_until for row in rig.store.broadcasts(None)] == [None, None]
 
     rig.world.advance(6 * 3600)  # hours of outage
     reports = rig.steps(2)
 
-    # Flagged, never given up: the collateral is always wanted back.
+    # Flagged, never given up, and still good when a node finally hears it.
     assert rig.events("broadcast_stalled")
     assert all("did not confirm in time" not in p for r in reports for p in r.problems)
     assert [row.status for row in rig.store.unresolved()] == ["stalled"]
-    assert rig.store.contract(call.launcher_id).status == store.CLOSING
-
     rig.wallet.push = real_push  # type: ignore[method-assign]
-    rig.book = rig.make_book()  # across a restart, too
+    rig.book = rig.make_book()
     rig.steps(2)
-
     assert rig.store.contract(call.launcher_id).status == store.CLOSED
-    assert rig.events("collateral_returned")[0].detail["by"] == store.CLAWBACK
 
 
 def test_a_crash_while_a_verdict_is_written_leaves_it_to_be_read_again(monkeypatch) -> None:
@@ -1157,20 +1190,92 @@ def _fees_paid(reports: list[Any]) -> list[int]:
     return paid
 
 
-def test_auto_fee_is_the_bundle_s_cost_at_the_wallet_s_rate() -> None:
+def _mint_cost(rig: Rig) -> int:
+    spends, _ = unpack_bundle(rig.store.broadcasts(None)[0].bundle)
+    return fees.bundle_cost(spends)
+
+
+def test_auto_fee_pays_the_admission_rate_as_soon_as_there_is_any_pressure() -> None:
     rig = _auto_fee(put_strikes_pct=[])
-    rig.wallet.rate = 1  # one mojo per unit of cost
+    rig.wallet.rate = 1  # the node's estimate: far short of what a full mempool admits
 
     reports = rig.steps(2)
 
     (fee,) = _fees_paid(reports)
-    # A call mint costs about 53 million; the bundle is priced from its own cost.
-    assert 50_000_000 < fee < 60_000_000
+    # Priced from the bundle's own cost (a call mint is about 53 million) at
+    # 5 mojos per cost and a tenth, not at the estimate.
+    assert fee == math.ceil(_mint_cost(rig) * 5.5)
+    assert 280_000_000 < fee < 320_000_000
+    assert rig.store.broadcasts(None)[0].fee == fee
     assert len(rig.contracts(store.OPEN)) == 1
-    spends, _ = unpack_bundle(rig.store.broadcasts(None)[0].bundle)
-    assert fee == fees.bundle_cost(spends)
     assert rig.maker.balance() == 500 * XCH - 20 * XCH - builder.OPTION_COIN_AMOUNT - fee
     assert rig.wallet.rejected == []
+
+
+def test_auto_fee_follows_an_estimate_above_the_admission_rate() -> None:
+    rig = _auto_fee(put_strikes_pct=[])
+    rig.wallet.rate = 8
+
+    (fee,) = _fees_paid(rig.steps(2))
+
+    assert fee == math.ceil(_mint_cost(rig) * 8.8)
+
+
+def test_a_transaction_that_runs_out_teaches_the_book_to_pay_more() -> None:
+    rig = _auto_fee(put_strikes_pct=[], confirm_timeout_seconds=600)
+    rig.wallet.rate = 0  # the node says there is room, so nothing is paid...
+    real_push = rig.wallet.push
+    rig.wallet.push = _unheard()  # type: ignore[method-assign]
+    rig.steps(1)
+    assert rig.store.broadcasts(None)[0].fee == 0
+
+    rig.wallet.push = real_push  # type: ignore[method-assign]
+    rig.world.advance(1300)  # ...and the mint never gets in
+    (report,) = rig.steps(1)
+
+    # The failure is the evidence. The mint is made again at the admission rate
+    # although the estimate still reads nothing.
+    assert any("fee rate raised to 5.5" in problem for problem in report.problems)
+    (fee,) = _fees_paid([report])
+    retry = rig.store.broadcasts(None)[-1]
+    assert fee == retry.fee == math.ceil(fees.bundle_cost(unpack_bundle(retry.bundle)[0]) * 5.5)
+    rig.steps(1)
+    assert len(rig.contracts(store.OPEN)) == 1
+
+
+def test_what_was_learned_survives_a_restart_doubles_on_a_second_failure_and_fades() -> None:
+    rig = _auto_fee(put_strikes_pct=[], confirm_timeout_seconds=600)
+    rig.wallet.rate = 0
+    rig.wallet.push = _unheard()  # type: ignore[method-assign]
+    rig.steps(1)
+    rig.world.advance(1300)
+    rig.steps(1)  # first failure: 5.5, and a second mint, unheard too
+    assert float(rig.store.recall("fee_rate")) == pytest.approx(5.5)
+
+    rig.book = rig.make_book()  # a new process
+    rig.world.advance(1300)
+    (report,) = rig.steps(1)  # second failure, at 5.5 this time
+
+    assert any("fee rate raised to 11" in problem for problem in report.problems)
+    # Double what the failed one really paid, which rounding put a hair over 5.5.
+    assert float(rig.store.recall("fee_rate")) == pytest.approx(11.0)
+    third = rig.store.broadcasts(None)[-1]
+    third_cost = fees.bundle_cost(unpack_bundle(third.bundle)[0])
+    assert third.fee == pytest.approx(third_cost * 11, rel=1e-6)
+
+    # Six hours without another failure halve it, and after six more it is gone.
+    learned = rig.book._learned_rate
+    assert learned(rig.world.now() + 6 * 3600) == pytest.approx(5.5)
+    assert learned(rig.world.now() + 13 * 3600) == 0.0
+
+
+def test_a_fee_held_down_by_the_cap_is_reported() -> None:
+    rig = _auto_fee(rig_cap=20_000_000, put_strikes_pct=[])
+    rig.wallet.rate = 5
+
+    (first, _) = rig.steps(2)
+
+    assert any("held to limits.max_fee_mojos (20000000)" in p for p in first.problems)
 
 
 def test_auto_fee_pays_nothing_while_the_mempool_has_room() -> None:
@@ -1202,15 +1307,21 @@ def test_auto_fee_with_no_cap_never_asks_and_never_pays() -> None:
     assert _fees_paid(reports) == [] and rig.wallet.rate_asked == 0
 
 
-def test_no_estimate_from_the_wallet_means_no_fee_and_says_so() -> None:
+def test_no_estimate_from_the_wallet_means_going_by_what_was_learned() -> None:
     rig = _auto_fee(put_strikes_pct=[])
     rig.wallet.rate = None
 
     reports = rig.steps(2)
 
+    # Nothing learned yet, so nothing paid; a failure would raise it all the same.
     assert _fees_paid(reports) == []
     assert any("no fee estimate" in problem for problem in reports[0].problems)
-    assert len(rig.contracts(store.OPEN)) == 1  # sent all the same, without one
+    assert len(rig.contracts(store.OPEN)) == 1
+    rig.store.remember("fee_rate", "5.5")
+    rig.store.remember("fee_rate_at", str(rig.world.now()))
+    rig.spot = 1.60  # the contract drifts out of its slot: retired, and its slot minted again
+    paid = _fees_paid(rig.steps(1))
+    assert paid and all(fee > 0 for fee in paid)
 
 
 def test_the_fee_estimate_is_asked_for_every_few_minutes_not_every_bundle() -> None:

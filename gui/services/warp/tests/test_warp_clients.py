@@ -180,6 +180,42 @@ def test_coinset_chain_time_is_the_latest_transaction_block_s():
     assert poster.body_for("get_block_record_by_height") == {"height": 6}
 
 
+def test_coinset_chain_time_can_be_read_some_blocks_below_the_peak():
+    synced = {"sync_mode": False, "synced": True}
+    asked = []
+
+    def record(body):
+        asked.append(body["height"])
+        # Height 68 is not a transaction block; it points at 66, which is.
+        if body["height"] == 68:
+            return {
+                "success": True,
+                "block_record": {
+                    "height": 68,
+                    "timestamp": None,
+                    "prev_transaction_block_height": 66,
+                },
+            }
+        return {"success": True, "block_record": {"height": 66, "timestamp": 1500}}
+
+    poster = FakePoster(
+        {
+            "get_blockchain_state": {
+                "success": True,
+                "blockchain_state": {"sync": synced, "peak": {"height": 100, "timestamp": 1900}},
+            },
+            "get_block_record_by_height": record,
+        }
+    )
+    c = CoinsetClient("https://api.coinset.org", poster=poster)
+
+    # The clock as it stood 32 blocks ago, not the tip's 1900.
+    assert c.get_chain_time(32) == 1500
+    assert asked == [68, 66]
+    # A node not that deep into the chain has no such time to give.
+    assert c.get_chain_time(100) is None and c.get_chain_time(500) is None
+
+
 def test_coinset_chain_time_is_not_given_by_a_node_that_is_behind_or_empty():
     behind = {
         "success": True,

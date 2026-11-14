@@ -80,6 +80,14 @@ def _print_report(report: Any) -> None:
     print(f"chain requests this step: {report.chain_requests}{looked}")
 
 
+def _learned_rate(book_store: store.OptionStore) -> float:
+    """The fee rate the book has learned from transactions that ran out, as last stored."""
+    try:
+        return float(book_store.recall("fee_rate") or 0.0)
+    except ValueError:
+        return 0.0
+
+
 def _status(cfg: config.OptionsConfig) -> int:
     book, book_store, coins = build(cfg)
     del book
@@ -87,7 +95,8 @@ def _status(cfg: config.OptionsConfig) -> int:
     print(f"chain is read from {chain_source(cfg)}")
     if cfg.fee_auto:
         print(
-            f"fees: the wallet's estimate, at most {cfg.limits.max_fee_mojos} mojos a transaction"
+            f"fees: auto, at most {cfg.limits.max_fee_mojos} mojos a transaction "
+            f"(rate learned from failures: {_learned_rate(book_store):g} mojos per cost)"
         )
     else:
         print(f"fees: {cfg.fee_mojos} mojos a transaction")
@@ -419,10 +428,18 @@ def _live_test(
     custody.add_key(key)
     fee = cfg.fee_mojos
     if cfg.fee_auto:
-        rate = wallet.fee_rate()
-        fee = fees.fee_for(_LIVE_TEST_COST, rate or 0, cfg.limits.max_fee_mojos)
-        said = "no estimate from the wallet" if rate is None else f"{rate} mojos per cost"
-        print(f"fee per spend: {fee} mojos (auto: {said}, capped at {cfg.limits.max_fee_mojos})")
+        estimate = wallet.fee_rate()
+        rate = max(fees.pressure_rate(estimate), _learned_rate(book_store))
+        fee = fees.fee_for(_LIVE_TEST_COST, rate, cfg.limits.max_fee_mojos)
+        said = (
+            "no estimate from the wallet"
+            if estimate is None
+            else f"the wallet estimates {estimate}"
+        )
+        print(
+            f"fee per spend: {fee} mojos (auto: {said}, paying {rate:g} mojos per cost, "
+            f"capped at {cfg.limits.max_fee_mojos})"
+        )
     test = _LiveTest(
         cfg=cfg,
         wallet=wallet,

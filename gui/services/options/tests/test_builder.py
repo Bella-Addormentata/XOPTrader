@@ -167,6 +167,32 @@ def test_a_transfer_and_a_cancel_can_carry_one_too(world: World) -> None:
     )
 
 
+def test_a_clawback_can_carry_one_and_be_signed_again_after_it(world: World) -> None:
+    maker, taker = world.party(250), world.party(250)
+    usd = world.issue_cat(taker, 1000)
+    minted = _mint(world, maker, _call_terms(world, maker, usd))
+    world.advance(2 * HOUR)  # expired
+
+    def clawback(valid_until: int | None) -> list:
+        return builder.build_clawback(
+            minted.underlying,
+            minted.locked,
+            maker.pk,
+            builder.Funding(change_puzzle_hash=maker.puzzle_hash),
+            maker.custody(),
+            valid_until_seconds=valid_until,
+        )
+
+    first = clawback(world.now() + 600)
+    world.advance(600)
+    with pytest.raises(RejectedError, match="AssertBeforeSecondsAbsolute"):
+        world.push(first)
+
+    before = maker.balance()
+    world.push(clawback(world.now() + 600))  # nothing was lost by the first running out
+    assert maker.balance() == before + 100 * XCH
+
+
 @pytest.mark.parametrize("bad", [0, -5, True, 1.5, "soon"])
 def test_a_deadline_must_be_a_positive_whole_number(world: World, bad) -> None:
     maker = world.party(250)

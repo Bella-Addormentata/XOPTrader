@@ -99,7 +99,8 @@ CREATE TABLE IF NOT EXISTS broadcasts (
     status      TEXT NOT NULL CHECK (status IN ('pending', 'confirmed', 'conflict', 'stalled')),
     created_at  INTEGER NOT NULL,
     deadline    INTEGER NOT NULL,
-    valid_until INTEGER
+    valid_until INTEGER,
+    fee         INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_broadcasts_status ON broadcasts (status);
 
@@ -134,6 +135,11 @@ CREATE TABLE IF NOT EXISTS chain_facts (
     solution       BLOB,
     seen_at        INTEGER NOT NULL,
     final          INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS book_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -207,6 +213,7 @@ class Broadcast:
     created_at: int
     deadline: int
     valid_until: int | None = None
+    fee: int | None = None  # what the bundle pays; None for one recorded before fees were
 
 
 @dataclasses.dataclass(frozen=True)
@@ -280,8 +287,9 @@ class OptionStore:
             self._db.executescript(_SCHEMA)
             # A database from before bundles carried their own deadline.
             columns = {row["name"] for row in self._db.execute("PRAGMA table_info(broadcasts)")}
-            if "valid_until" not in columns:
-                self._db.execute("ALTER TABLE broadcasts ADD COLUMN valid_until INTEGER")
+            for column in ("valid_until", "fee"):
+                if column not in columns:
+                    self._db.execute(f"ALTER TABLE broadcasts ADD COLUMN {column} INTEGER")
         self._lock: sqlite3.Connection | None = None
         self._lock_depth = 0
 
@@ -347,6 +355,7 @@ class OptionStore:
         bundle: bytes,
         deadline: int,
         valid_until: int | None = None,
+        fee: int | None = None,
         now: int | None = None,
     ) -> int:
         """Record a contract and its mint broadcast in one transaction.
@@ -392,8 +401,8 @@ class OptionStore:
                 )
             cursor = db.execute(
                 "INSERT INTO broadcasts"
-                " (launcher_id, kind, bundle, status, created_at, deadline, valid_until)"
-                " VALUES (?,?,?,?,?,?,?)",
+                " (launcher_id, kind, bundle, status, created_at, deadline, valid_until, fee)"
+                " VALUES (?,?,?,?,?,?,?,?)",
                 (
                     _hex(launcher_id),
                     MINT,
@@ -402,6 +411,7 @@ class OptionStore:
                     now,
                     int(deadline),
                     None if valid_until is None else int(valid_until),
+                    None if fee is None else int(fee),
                 ),
             )
             return int(cursor.lastrowid or 0)
@@ -603,6 +613,7 @@ class OptionStore:
         deadline: int,
         contract_status: str | None = None,
         valid_until: int | None = None,
+        fee: int | None = None,
         now: int | None = None,
     ) -> int:
         """Record a signed bundle BEFORE it is pushed; optionally move the contract too."""
@@ -610,8 +621,8 @@ class OptionStore:
         with self._write() as db:
             cursor = db.execute(
                 "INSERT INTO broadcasts"
-                " (launcher_id, kind, bundle, status, created_at, deadline, valid_until)"
-                " VALUES (?,?,?,?,?,?,?)",
+                " (launcher_id, kind, bundle, status, created_at, deadline, valid_until, fee)"
+                " VALUES (?,?,?,?,?,?,?,?)",
                 (
                     _hex(launcher_id),
                     kind,
@@ -620,6 +631,7 @@ class OptionStore:
                     now,
                     int(deadline),
                     None if valid_until is None else int(valid_until),
+                    None if fee is None else int(fee),
                 ),
             )
             if contract_status is not None:
@@ -646,6 +658,7 @@ class OptionStore:
                 created_at=int(row["created_at"]),
                 deadline=int(row["deadline"]),
                 valid_until=None if row["valid_until"] is None else int(row["valid_until"]),
+                fee=None if row["fee"] is None else int(row["fee"]),
             )
             for row in rows
         ]
@@ -720,6 +733,16 @@ class OptionStore:
                 detail=detail,
                 now=now,
             )
+
+    # -- small things the book has learned and must not forget ---------------
+
+    def recall(self, key: str) -> str | None:
+        row = self._db.execute("SELECT value FROM book_state WHERE key = ?", (key,)).fetchone()
+        return None if row is None else str(row["value"])
+
+    def remember(self, key: str, value: str) -> None:
+        with self._write() as db:
+            db.execute("INSERT OR REPLACE INTO book_state VALUES (?, ?)", (key, str(value)))
 
     # -- events -------------------------------------------------------------
 

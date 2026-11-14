@@ -308,8 +308,28 @@ def test_a_broadcast_remembers_the_time_it_is_valid_until() -> None:
     assert [(row.kind, row.valid_until) for row in book.broadcasts(None)] == [
         (store.MINT, 700),
         (store.CANCEL, 950),
-        (store.CLAWBACK, None),  # collateral is always wanted back: no deadline
+        (store.CLAWBACK, None),  # set by a caller with no chain clock to see it pass
     ]
+
+
+def test_a_broadcast_remembers_what_it_paid() -> None:
+    book = store.OptionStore(":memory:")
+    _add(book, fee=1234)
+    book.add_broadcast(launcher_id=LAUNCHER, kind=store.CANCEL, bundle=b"c", deadline=9, fee=5)
+    book.add_broadcast(launcher_id=LAUNCHER, kind=store.WITHDRAW, bundle=b"w", deadline=9)
+
+    assert [row.fee for row in book.broadcasts(None)] == [1234, 5, None]
+
+
+def test_the_book_can_keep_small_things_it_has_learned(tmp_path) -> None:
+    path = tmp_path / "options_jobs.db"
+    book = store.OptionStore(path)
+    assert book.recall("fee_rate") is None
+    book.remember("fee_rate", "5.5")
+    book.remember("fee_rate", "11.0")
+    book.close()
+
+    assert store.OptionStore(path).recall("fee_rate") == "11.0"
 
 
 def test_a_database_from_before_deadlines_is_brought_up_to_date(tmp_path) -> None:
@@ -356,7 +376,8 @@ def test_a_database_from_before_deadlines_is_brought_up_to_date(tmp_path) -> Non
     book = store.OptionStore(path)
 
     (row,) = book.unresolved()
-    assert (row.bundle, row.valid_until) == (b"old", None)  # an old bundle has no deadline
+    # An old bundle has no deadline and no record of its fee.
+    assert (row.bundle, row.valid_until, row.fee) == (b"old", None, None)
     book.add_broadcast(
         launcher_id=LAUNCHER, kind=store.CANCEL, bundle=b"new", deadline=900, valid_until=950
     )

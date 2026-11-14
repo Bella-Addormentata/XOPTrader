@@ -57,10 +57,11 @@ verdict. A bundle its node refuses looks the same to the caller as one it
 accepts, so outcomes are read from the chain with :func:`chain.bundle_status`.
 A bundle that has not confirmed is never given up on by the local clock: it
 stays on the books, its coins stay set aside and it keeps being pushed until
-the chain rules on it. A mint, a cancel and a withdrawal each carry a deadline
-the chain enforces, so the ruling can be "too late": once the chain's own
-clock is safely past it, the bundle can never confirm and is given up without
-another transaction. A clawback has no deadline and is pushed until it lands.
+the chain rules on it. Every transaction carries a deadline the chain enforces,
+so the ruling can be "too late": once the chain's own clock, read 32 blocks
+below the peak so that a reorganisation cannot take it back, is past it, the
+bundle can never confirm and is given up without another transaction, and made
+again, at a higher fee if that is what it lacked (:mod:`fees`).
 
 One process acts on a database at a time (:meth:`store.OptionStore.acting`).
 A second ``step`` or ``live-test`` over the same file is refused, not queued.
