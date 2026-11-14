@@ -578,3 +578,8 @@ def test_status_prints_the_book(tmp_path, monkeypatch, capsys) -> None:
     assert "3 XCH" in out and "C110@5" in out and "minting" in out and "waiting: mint" in out
     assert "chain is read from coinset" in out
     assert "fees: 0 mojos a transaction" in out
+    assert "wallet: synced (no fingerprint set, so whichever key it has open)" in out
+
+    rpc.sync = {"synced": False, "syncing": True}
+    assert cli._status(cfg) == 0
+    assert "wallet: the options wallet is still syncing" in capsys.readouterr().out

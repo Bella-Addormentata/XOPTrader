@@ -93,7 +93,12 @@ def _learned_rate(book_store: store.OptionStore) -> float:
 def _status(cfg: config.OptionsConfig) -> int:
     book, book_store, coins = build(cfg)
     print(f"network {cfg.network}   dry_run {cfg.dry_run}")
-    print(f"wallet: {book.wallet_not_ready() or 'the configured key, synced'}")
+    key = (
+        f"logged in to {cfg.wallet.fingerprint}"
+        if cfg.wallet.fingerprint is not None
+        else "no fingerprint set, so whichever key it has open"
+    )
+    print(f"wallet: {book.wallet_not_ready() or f'synced ({key})'}")
     print(f"chain is read from {chain_source(cfg)}")
     if cfg.fee_auto:
         print(
