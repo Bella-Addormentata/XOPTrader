@@ -1166,7 +1166,7 @@ def test_auto_fee_is_the_bundle_s_cost_at_the_wallet_s_rate() -> None:
     (fee,) = _fees_paid(reports)
     # A call mint costs about 53 million; the bundle is priced from its own cost.
     assert 50_000_000 < fee < 60_000_000
-    (minted,) = rig.contracts(store.OPEN)
+    assert len(rig.contracts(store.OPEN)) == 1
     spends, _ = unpack_bundle(rig.store.broadcasts(None)[0].bundle)
     assert fee == fees.bundle_cost(spends)
     assert rig.maker.balance() == 500 * XCH - 20 * XCH - builder.OPTION_COIN_AMOUNT - fee
