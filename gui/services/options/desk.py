@@ -175,11 +175,9 @@ class DeskClient:
                 wait = 60.0
             window.block(wait)
             raise DeskRateLimitedError(f"{method} {path}: rate limited by the site", wait)
-        try:
-            if int(lowered.get("x-ratelimit-remaining", 1_000_000)) <= 2:
-                window.block(60.0)
-        except (TypeError, ValueError):
-            pass
+        remaining = _whole_number(lowered.get("x-ratelimit-remaining"))
+        if remaining is not None and remaining <= 2:
+            window.block(60.0)
         return int(status), text
 
     @staticmethod
@@ -287,6 +285,14 @@ class DeskClient:
             rate=number(basis.get("riskFreeRate")),
             premium=number(primary.get("amount")),
         )
+
+
+def _whole_number(value: Any) -> int | None:
+    """A header value as an integer, or None when it is absent or not a number."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _before_seconds(condition: Any) -> int | None:
