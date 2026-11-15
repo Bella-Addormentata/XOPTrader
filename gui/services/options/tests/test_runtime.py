@@ -502,6 +502,25 @@ def _no_feed() -> market.Market:
     raise market.MarketError("no feed in this test")
 
 
+def test_run_stamps_each_step_with_the_time_and_stops_cleanly(tmp_path, monkeypatch, capsys):
+    usd = b"\x07" * 32
+    cfg = _config(tmp_path, usd, dry_run=True)
+    monkeypatch.setattr(cli, "build", lambda _cfg: (object(), None, None))
+    steps: list[int] = []
+    monkeypatch.setattr(cli, "_guarded_step", lambda *_: steps.append(1) or True)
+
+    def sleep(seconds: float) -> None:
+        if len(steps) >= 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", sleep)
+
+    assert cli._run(cfg, 60.0) == 0
+
+    out = capsys.readouterr().out
+    assert len(steps) == 2 and out.count("--- step at 20") == 2 and out.endswith("stopped\n")
+
+
 def test_without_the_opt_in_the_engine_is_never_asked_about(tmp_path, monkeypatch, capsys) -> None:
     world, maker, cfg, rpc = _live(tmp_path, monkeypatch)
     asked = _engine(monkeypatch, _UP)

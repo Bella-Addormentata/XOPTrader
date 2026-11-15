@@ -203,6 +203,8 @@ def _run(cfg: config.OptionsConfig, interval: float) -> int:
     print(f"stepping every {interval:g} s; Ctrl-C to stop (offers already out expire on their own)")
     try:
         while True:
+            # A log of a long run is read by time; nothing in the report says when.
+            print(f"--- step at {time.strftime('%Y-%m-%d %H:%M:%S %z')}", flush=True)
             try:
                 _guarded_step(cfg, book, book_store)
             except Exception as exc:  # noqa: BLE001 - keep the loop alive; the next step retries
