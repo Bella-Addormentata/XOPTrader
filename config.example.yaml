@@ -1609,3 +1609,185 @@ warp:
   # refuses to start and the Warp tab shows a blocked banner. A typo here is a
   # blocked bridge, never a lost deposit. This is the Base-bridged wUSDC.b CAT.
   expected_asset_id: "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"
+
+# ============================================================================
+# Options: covered calls and cash-secured puts (CHIP-0045) on xchoptions.com
+# ============================================================================
+# GUI-side Python only; the C++ engine never reads this section. No section, or
+# enabled: false, means the subsystem is off and nothing below is read.
+#
+# What it does when on: keeps a grid of option contracts minted and on offer --
+# calls that lock XCH, puts that lock the quote asset -- from a DEDICATED Chia
+# reference wallet, re-posting each offer before it expires, noticing sales and
+# exercises on chain, and reclaiming collateral at expiry.
+#
+# Run it from a terminal (there is no GUI page yet):
+#   python -m gui.services.options --config config.yaml status
+#   python -m gui.services.options --config config.yaml live-test
+#   python -m gui.services.options --config config.yaml monitor --interval 300
+#   python -m gui.services.options --config config.yaml run
+# Read docs/options-live-test.md before the first live run.
+options:
+  enabled: false                         # [OPTIONAL, default: false] master switch
+  # [SAFETY, default: true] Rehearsal. Each step builds the next mint, checks
+  # what it would do to the wallet and reports it. Nothing is signed, sent or
+  # listed, and no contract is recorded. Switched back on over a book that has
+  # contracts out, it still reads the chain and keeps the record right, but it
+  # sends nothing at all: no clawback of expired collateral, no re-push of a
+  # pending transaction. Offers already out stay takeable until they expire.
+  dry_run: true
+  network: mainnet                       # mainnet | testnet11
+
+  # The wallet that signs. It must be a SECOND reference-wallet daemon with its
+  # own key: its own CHIA_ROOT, its own RPC port, its own certificates. One
+  # wallet daemon serves one key at a time, so it cannot be the trading wallet,
+  # and pointing this at the trading wallet's port is refused.
+  # mode: trading is parsed and refused: the engine does not yet keep option
+  # coins out of its own offers or book option events.
+  # Every step first selects the fingerprint below on that wallet and asks
+  # whether it is synced; until it is, the step does nothing and says why.
+  # These keys, like the rest of this file, can be given in secrets.yaml.
+  wallet:
+    mode: dedicated
+    host: localhost
+    port: 9356                           # [REQUIRED] the dedicated wallet's rpc_port
+    cert_path: ""                        # [REQUIRED] its config/ssl/wallet/private_wallet.crt
+    key_path: ""                         # [REQUIRED] its config/ssl/wallet/private_wallet.key
+    fingerprint: null                    # [RECOMMENDED] the key to use. The wallet is
+                                         # logged in to it before each step. Blank =
+                                         # whichever key the wallet has open.
+    # The one address used as creator, owner and change. Blank asks the wallet
+    # for its current address the first time and keeps to it from then on (it
+    # is remembered in the options database). ONLY coins at this address are
+    # used: fund it.
+    address: ""
+
+  # The asset options are struck and paid in: Base-bridged wUSDC.b.
+  quote_asset_id: "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"
+  quote_asset_decimals: 3
+
+  # The grid. One slot per expiry and strike; a slot is refilled when it sells.
+  contract_xch: 20                       # [REQUIRED] XCH per contract
+  expiries: []                           # e.g. ["2026-12-01T13:00:00Z", "2026-12-31T13:00:00Z"]
+  call_strikes_pct: [100, 110, 120]      # percent of spot, rounded to strike_step
+  put_strikes_pct: [80, 90, 100]
+  strike_step: 0.05                      # in the quote asset per XCH
+  # An unsold contract whose strike has drifted this far from its slot is
+  # cancelled so its collateral can back a current one.
+  strike_drift_pct: 25
+
+  # Offers. A new offer does NOT withdraw the old one, so the lifetime is the
+  # real limit on how long a stale price stays takeable.
+  offer_ttl_seconds: 900
+  refresh_before_seconds: 180            # re-post this long before an offer expires
+  reprice_pct: 2                         # re-post when the ask has moved this much
+  # Withdrawing. If the ask has RISEN by this much of the contract's notional,
+  # a cheaper offer is still out, and the only way to kill it is to spend the
+  # option coin: an on-chain transaction. It is kept rare:
+  withdraw_pct: 2.0                      # how far behind an offer must be to be worth it
+  withdraw_min_life_seconds: 180         # ...and it must have this long left; a withdrawal
+                                         # takes a block or two, so anything nearer its end
+                                         # runs out first
+  withdraw_cooldown_seconds: 300         # after one, that contract is not quoted for this long
+  max_withdrawals_per_hour: 6            # across the whole book. Once used up, a contract
+                                         # that would need one is not re-quoted until its
+                                         # stale offer has run out. 0 = never withdraw.
+  stop_before_expiry_seconds: 21600      # stop offering, and cancel, this long before expiry
+  # How long a transaction has to confirm. A mint, a cancel and a clawback
+  # carry this as a deadline the chain enforces: unconfirmed by then it never
+  # can be, so it is given up, its coins are free, and it is made again: a mint
+  # at the current strike, a clawback as it was. "By then" is judged on the
+  # chain's own clock read 32 blocks below the peak (about ten minutes), so a
+  # reorganisation cannot bring the old one back beside its replacement. A
+  # withdrawal's deadline is the end of the offer it kills.
+  confirm_timeout_seconds: 1800
+  # The fee each transaction pays: a number of mojos, or "auto". With auto each
+  # one is priced from its own cost and never above limits.max_fee_mojos:
+  #   - nothing while the wallet's node estimates nothing (the mempool has room);
+  #   - once it shows any pressure, 5.5 mojos per unit of cost, the rate a full
+  #     mempool admits plus a tenth, because the estimate itself runs far short
+  #     of that (the engine's fee controller measured 13 times short);
+  #   - and at least double what the last mint, cancel or clawback to run out
+  #     paid, a rate that is remembered and fades over hours without another
+  #     failure. (A withdrawal that runs out teaches nothing: it has only as
+  #     long as the offer it kills.)
+  fee_mojos: auto
+  upload_offers: true                    # list each offer on xchoptions.com
+
+  # Splash!, Dexie's peer-to-peer offer network (github.com/dexie-space/splash).
+  # When enabled, each new offer is ALSO handed to a Splash daemon you run
+  # beside the book, which gossips it to its peers:
+  #     splash --listen-offer-submission 127.0.0.1:4000      (add --testnet on testnet11)
+  # This is publishing only, and independent of upload_offers above.
+  #   - The daemon's "yes" means it took the offer, not that anyone heard it;
+  #     it says the same with no peers connected.
+  #   - Nothing can be taken back once gossiped, exactly as with the site:
+  #     only spending the option coin (withdraw-all) ends an offer.
+  #   - The network keeps no history. Each offer is announced once when made,
+  #     and offers are re-made every offer_ttl_seconds less
+  #     refresh_before_seconds (12 minutes as shipped), so that is how often
+  #     each contract is heard. An offer the daemon did not take is tried
+  #     again while it stands; the offer itself is valid either way.
+  #   - Who lists what it hears is up to them. Dexie indexes the network, but
+  #     is not known to show option offers.
+  splash:
+    enabled: false                       # [OPTIONAL, default: false]
+    submit_url: "http://127.0.0.1:4000"  # the daemon's --listen-offer-submission address
+
+  pricing:
+    rate: 0.0                            # risk-free rate in the model
+    sigma_markup: 0.02                   # volatility points added for the ask
+    lock_rate: 0.10                      # yearly return charged on locked collateral
+    markup_fraction: 0.03                # of the model value
+    min_premium: 0.01                    # per XCH; floor for far out-of-the-money asks
+    # Steering: at a lean of steer_scale_xch (net delta of what has been sold),
+    # markups move by steer_strength towards rebalancing. 0 turns it off.
+    steer_strength: 0.25
+    steer_scale_xch: 100
+
+  # [SAFETY] No defaults. A limit left unset refuses every mint; it is not read
+  # as "no limit". Write "unlimited" to mean that.
+  limits:
+    max_locked_xch: null                 # XCH locked in calls, sold or not
+    max_locked_quote: null               # quote asset locked in puts
+    max_contracts: null                  # contracts alive at once
+    max_contracts_per_expiry: null
+    # The most any one transaction may pay. 1000000000 is 0.001 XCH, enough for
+    # the costliest of them (a cancel) when the mempool is full. 0 = never pay.
+    max_fee_mojos: 1000000000
+
+  # Quotes stop when the price view is stale, the Dexie book cannot fill the
+  # hedge size, is wider than max_spread_pct, or does not contain the external
+  # spot (the sign of a quote-asset depeg). max_age_seconds is measured from
+  # the time the price feed says the spot was observed, not from when it was
+  # fetched.
+  market:
+    max_age_seconds: 600
+    max_spread_pct: 10
+    require_book: true
+    hedge_size_xch: 20
+
+  # Reading the chain. The wallet does not track option coins, so the book
+  # reads them from a full node. It asks as little as it can: what is settled
+  # is kept in the database and never asked for again, and what can still
+  # change is asked for in one request, only when something may have happened.
+  #
+  # If you run a full node, name it here and coinset.org is never contacted.
+  # The certificate pair is the node's own:
+  #   <CHIA_ROOT>/config/ssl/full_node/private_full_node.crt and .key
+  node:
+    host: localhost
+    port: 8555                           # the full node's rpc_port
+    cert_path: ""                        # [OPTIONAL] blank = no node; coinset is used
+    key_path: ""
+    # The node's own certificate authority: its config/ssl/ca/private_ca.crt.
+    # With it the node's certificate is checked. REQUIRED when host is another
+    # machine: the book settles transactions on what the node says, and
+    # unchecked, anyone between the two could answer in its place.
+    ca_cert_path: ""
+  coinset_url: ""                        # [OPTIONAL] blank = network default; unused with a node
+  # The chain is looked at when the wallet's own coins change (a payment came
+  # in, a transaction of ours confirmed), when a contract reaches expiry, and:
+  chain_poll_seconds: 30                 # ...this often while a transaction of ours is waiting
+  chain_refresh_seconds: 3600            # ...this often otherwise. Each look is one request.
+  database_path: "data/options_jobs.db"

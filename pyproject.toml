@@ -9,8 +9,9 @@ name = "xop-trader"
 version = "0.10.47"
 description = "CHIA DEX market maker — Avellaneda-Stoikov / GLFT strategy engine"
 # XOPTrader itself is WTFPL. The package also carries code ported from
-# warp.green (MIT), Pieter Wuille's bech32 (MIT) and Chia (Apache-2.0), which
-# keeps its own license: see THIRD_PARTY_NOTICES.md.
+# warp.green (MIT), Pieter Wuille's bech32 (MIT), Chia (Apache-2.0) and the
+# Sage wallet (Apache-2.0), which keeps its own license: see
+# THIRD_PARTY_NOTICES.md.
 license = "WTFPL AND MIT AND Apache-2.0"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.11,<4"
@@ -46,6 +47,11 @@ gui = [
     "clvm>=0.9.10,<1",
     "chia_rs>=0.47,<1",
     "websocket-client>=1.7,<2",
+    # Option contracts (gui/services/options). Imported lazily, like the warp
+    # stack. One abi3 wheel per platform and no dependencies of its own. The
+    # API moves between 0.x releases and the option flows are tested against
+    # this exact line, so the range is deliberately one minor wide.
+    "chia-wallet-sdk>=0.38,<0.39",
 ]
 dev = [
     "pytest>=8.0,<9",
@@ -66,4 +72,4 @@ ignore = ["S101"]  # allow assert in tests
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests", "gui/services/warp/tests", "gui/services/permuto/tests", "gui/services/consolidate/tests"]
+testpaths = ["tests", "gui/services/warp/tests", "gui/services/permuto/tests", "gui/services/consolidate/tests", "gui/services/options/tests"]

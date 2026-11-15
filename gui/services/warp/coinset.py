@@ -191,6 +191,47 @@ class CoinsetClient:
         peak = state.get("peak") or {}
         return int(peak.get("height", 0) or 0)
 
+    def get_chain_time(self, depth: int = 0) -> Optional[int]:
+        """The chain's clock as it stood ``depth`` blocks below the node's peak.
+
+        That is the timestamp of the last transaction block at or below
+        ``peak - depth``: the clock timelocks are judged by. Only transaction
+        blocks carry a timestamp, so a block that is not one is followed to the
+        block it names as its previous transaction block (one more request).
+
+        ``depth`` is what makes the answer safe to act on. Transaction-block
+        timestamps only have to increase, by no particular step, so a single
+        block at the tip can carry the clock minutes forward and then be
+        reorganised away. A time read ``depth`` blocks down was already the
+        chain's time that many blocks ago (see ``kExpiredRetireDepthBlocks`` in
+        cpp/include/xop/execution/offer_expiry.hpp, which uses 32).
+
+        ``None`` while the node has no peak, is not synced, or is not that deep
+        into the chain: a node that is behind must not be believed about what
+        time it is.
+        """
+        state = self.get_blockchain_state()
+        peak = state.get("peak") or {}
+        if not peak or not (state.get("sync") or {}).get("synced", False):
+            return None
+        record = peak
+        if depth > 0:
+            height = int(peak.get("height", 0) or 0) - int(depth)
+            if height <= 0:
+                return None
+            record = self._block_record(height)
+        if record.get("timestamp") is not None:
+            return int(record["timestamp"])
+        before = record.get("prev_transaction_block_height")
+        if before is None:
+            return None
+        stamp = self._block_record(int(before)).get("timestamp")
+        return int(stamp) if stamp is not None else None
+
+    def _block_record(self, height: int) -> dict:
+        data = self._post("get_block_record_by_height", {"height": int(height)}) or {}
+        return data.get("block_record") or {}
+
     def get_coin_record_by_name(self, name: str) -> Optional[CoinRecord]:
         """The coin record, or ``None`` when the coin is not on chain yet.
 
@@ -207,6 +248,25 @@ class CoinsetClient:
             return None
         record = data.get("coin_record")
         return _coin_record(record) if record else None
+
+    def get_coin_records_by_names(
+        self, names: Sequence[str], *, include_spent: bool = True
+    ) -> list[CoinRecord]:
+        """Records for any number of coins in ONE request.
+
+        A name the node does not know is simply absent from the answer -- a
+        normal success, on coinset and on a real full node alike -- so a caller
+        that needs the state of several coins should prefer this to a loop over
+        :meth:`get_coin_record_by_name`. The records carry no name; a caller
+        matches them up by the coin id it computes from each ``coin``.
+        """
+        if not names:
+            return []
+        data = self._post(
+            "get_coin_records_by_names",
+            {"names": [_0x(n) for n in names], "include_spent_coins": bool(include_spent)},
+        ) or {}
+        return [_coin_record(r) for r in (data.get("coin_records") or [])]
 
     def get_coin_records_by_puzzle_hash(
         self,

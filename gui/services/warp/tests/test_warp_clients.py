@@ -109,6 +109,129 @@ def test_coinset_coin_record_missing_is_none():
     assert c.get_coin_record_by_name("00") is None
 
 
+def test_coinset_records_by_names_asks_for_all_in_one_request():
+    poster = FakePoster(
+        {
+            "get_coin_records_by_names": {
+                "success": True,
+                "coin_records": [
+                    {
+                        "coin": {"parent_coin_info": "0x01", "puzzle_hash": "0xAB", "amount": 7},
+                        "confirmed_block_index": 10,
+                        "spent_block_index": 12,
+                    },
+                    {
+                        "coin": {"parent_coin_info": "0x02", "puzzle_hash": "0xcd", "amount": 9},
+                        "confirmed_block_index": 11,
+                        "spent_block_index": 0,
+                        "spent": False,
+                    },
+                ],
+            }
+        }
+    )
+    c = CoinsetClient("https://api.coinset.org", poster=poster)
+
+    # Three asked for, two known: the unknown one is simply absent, not an error.
+    recs = c.get_coin_records_by_names(["aa", "0xBB", "cc"])
+
+    assert [(r.coin.parent_coin_info, r.coin.amount, r.spent) for r in recs] == [
+        ("01", 7, True),
+        ("02", 9, False),
+    ]
+    assert len(poster.calls) == 1
+    body = poster.body_for("get_coin_records_by_names")
+    assert body == {"names": ["0xaa", "0xbb", "0xcc"], "include_spent_coins": True}
+    assert c.get_coin_records_by_names([]) == [] and len(poster.calls) == 1  # nothing to ask
+
+
+def test_coinset_chain_time_is_the_latest_transaction_block_s():
+    synced = {"sync_mode": False, "synced": True}
+    # The peak is a transaction block: its own timestamp, in one request.
+    poster = FakePoster(
+        {
+            "get_blockchain_state": {
+                "success": True,
+                "blockchain_state": {"sync": synced, "peak": {"height": 9, "timestamp": 1700}},
+            }
+        }
+    )
+    c = CoinsetClient("https://api.coinset.org", poster=poster)
+    assert c.get_chain_time() == 1700 and len(poster.calls) == 1
+
+    # The peak is not: the block it names as its previous transaction block is read.
+    poster = FakePoster(
+        {
+            "get_blockchain_state": {
+                "success": True,
+                "blockchain_state": {
+                    "sync": synced,
+                    "peak": {"height": 9, "timestamp": None, "prev_transaction_block_height": 6},
+                },
+            },
+            "get_block_record_by_height": {
+                "success": True,
+                "block_record": {"height": 6, "timestamp": 1650},
+            },
+        }
+    )
+    c = CoinsetClient("https://api.coinset.org", poster=poster)
+    assert c.get_chain_time() == 1650
+    assert poster.body_for("get_block_record_by_height") == {"height": 6}
+
+
+def test_coinset_chain_time_can_be_read_some_blocks_below_the_peak():
+    synced = {"sync_mode": False, "synced": True}
+    asked = []
+
+    def record(body):
+        asked.append(body["height"])
+        # Height 68 is not a transaction block; it points at 66, which is.
+        if body["height"] == 68:
+            return {
+                "success": True,
+                "block_record": {
+                    "height": 68,
+                    "timestamp": None,
+                    "prev_transaction_block_height": 66,
+                },
+            }
+        return {"success": True, "block_record": {"height": 66, "timestamp": 1500}}
+
+    poster = FakePoster(
+        {
+            "get_blockchain_state": {
+                "success": True,
+                "blockchain_state": {"sync": synced, "peak": {"height": 100, "timestamp": 1900}},
+            },
+            "get_block_record_by_height": record,
+        }
+    )
+    c = CoinsetClient("https://api.coinset.org", poster=poster)
+
+    # The clock as it stood 32 blocks ago, not the tip's 1900.
+    assert c.get_chain_time(32) == 1500
+    assert asked == [68, 66]
+    # A node not that deep into the chain has no such time to give.
+    assert c.get_chain_time(100) is None and c.get_chain_time(500) is None
+
+
+def test_coinset_chain_time_is_not_given_by_a_node_that_is_behind_or_empty():
+    behind = {
+        "success": True,
+        "blockchain_state": {
+            "sync": {"sync_mode": True, "synced": False},
+            "peak": {"height": 9, "timestamp": 1700},
+        },
+    }
+    empty = {"success": True, "blockchain_state": {"sync": {"synced": True}, "peak": None}}
+    for state in (behind, empty):
+        c = CoinsetClient(
+            "https://api.coinset.org", poster=FakePoster({"get_blockchain_state": state})
+        )
+        assert c.get_chain_time() is None
+
+
 def test_coinset_records_by_puzzle_hash_passes_filters():
     poster = FakePoster(
         {

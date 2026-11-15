@@ -33,5 +33,8 @@ eth-account>=0.13,<0.14
 clvm>=0.9.10,<1
 chia_rs>=0.47,<1
 websocket-client>=1.7,<2
+# Option contracts (gui/services/options) — imported lazily. One abi3 wheel per
+# platform, no dependencies. Tested against exactly this 0.x line.
+chia-wallet-sdk>=0.38,<0.39
 # Receive-address QR (Base Wallet page); pure Python, BSD-3.
 segno>=1.6,<2
