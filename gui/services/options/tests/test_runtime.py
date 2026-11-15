@@ -1000,7 +1000,7 @@ def test_the_monitor_sends_the_coingecko_key_and_checks_the_price_s_age(
 
     monkeypatch.setattr(market_module, "MarketSource", Source)
     monkeypatch.setattr(monitor_module, "DeskMonitor", Watcher)
-    monkeypatch.setattr(desk_module, "DeskClient", lambda: object())
+    monkeypatch.setattr(desk_module, "DeskClient", object)
     monkeypatch.setattr(cli, "chain_reader", lambda _cfg: world.sim)
 
     assert cli._monitor(cfg, 0) == 0
