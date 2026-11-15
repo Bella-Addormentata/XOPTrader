@@ -16,12 +16,13 @@ would look like an unexplained outflow and could trip the drawdown breaker.
 SHARING IT ANYWAY. ``wallet.share_trading_wallet: true`` (off by default) lets
 the book use the trading wallet's daemon and key on the understanding that the
 engine is STOPPED for as long as the book has contracts open. It lifts only the
-port and fingerprint checks, and adds three in their place: the book must name
-the engine's own key (a step logs the wallet in, and another key would switch
-it under the engine); it must name its address (a blank one takes the wallet's
-current address, where the engine's self-sends land); and every command that
-signs first checks that the engine is not running (:mod:`engine_guard`) and
-refuses if it is, or if it cannot tell.
+port and fingerprint checks, and adds four in their place: the book must name
+the engine's own key, and the engine's key must be set (a step logs the wallet
+in, and another key would switch it under the engine); it must name its
+address (a blank one takes the wallet's current address, where the engine's
+self-sends land); the wallet must be on this machine, where the engine check
+can see; and every signature and push first checks that the engine is not
+running (:mod:`engine_guard`), refusing if it is or if it cannot tell.
 """
 
 from __future__ import annotations
@@ -357,15 +358,26 @@ def parse(root: Any) -> OptionsConfig | None:
             "A second daemon on the same key spends the same coins the engine's offers do; "
             "a dedicated wallet has a key of its own."
         )
-    other_key = fingerprint is None or (trading_key and trading_key != str(fingerprint))
-    if share and same_daemon and other_key:
-        # Every step logs the wallet in to options.wallet.fingerprint, and with
-        # none set it uses whichever key is open. On the engine's own daemon
-        # either could switch the key under the engine.
+    if share and not ({ours, theirs} <= _THIS_MACHINE):
+        # The check that the engine is stopped looks at this machine: its
+        # metrics port and its process list. A wallet, or an engine's view of
+        # one, on another machine is out of its sight, and it would report an
+        # engine there as not running.
         raise OptionsConfigError(
-            "options.wallet.share_trading_wallet: on the trading wallet's daemon "
-            "options.wallet.fingerprint is required and must be the engine's key "
-            "(chia.wallet_fingerprint); a step logs the wallet in to it"
+            "options.wallet.share_trading_wallet needs the wallet on this machine: "
+            "options.wallet.host and chia.wallet_host must both be localhost, 127.0.0.1 or ::1. "
+            "The check that the engine is stopped can only see this machine."
+        )
+    if share and (fingerprint is None or not trading_key or trading_key != str(fingerprint)):
+        # Every step, dry runs included, logs the wallet in to
+        # options.wallet.fingerprint, and with none set it uses whichever key
+        # is open. On the engine's daemon either would switch the key under
+        # the engine, and one daemon can be named by more than one host, so
+        # this is required whatever the host and port say.
+        raise OptionsConfigError(
+            "options.wallet.share_trading_wallet: options.wallet.fingerprint is required and "
+            "must be the engine's key, chia.wallet_fingerprint, which must be set too: a step "
+            "logs the wallet in to it, and another key would be switched in under the engine"
         )
     address = str(wallet_raw.get("address") or "").strip()
     if share and not address:

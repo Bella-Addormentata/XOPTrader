@@ -81,11 +81,37 @@ def test_on_the_engine_s_daemon_it_must_name_the_engine_s_key(wallet) -> None:
         _parse(wallet)
 
 
-def test_with_no_trading_key_configured_a_key_is_still_required() -> None:
+def test_with_no_trading_key_configured_sharing_is_refused() -> None:
+    # Without chia.wallet_fingerprint nothing says which key the engine uses,
+    # so any key named here could be the wrong one and be logged in under it.
     chia = {"wallet_port": 9256}
-    with pytest.raises(config.OptionsConfigError, match="fingerprint is required"):
-        _parse(_shared(fingerprint=None), chia=chia)
-    assert _parse(_shared(fingerprint=99), chia=chia).wallet.fingerprint == 99
+    for fingerprint in (None, 99):
+        with pytest.raises(config.OptionsConfigError, match="which must be set too"):
+            _parse(_shared(fingerprint=fingerprint), chia=chia)
+
+
+@pytest.mark.parametrize("port", [9256, 9357])
+def test_the_key_must_match_whatever_the_host_and_port_say(port) -> None:
+    # One daemon can be named by more than one host or port forward: a key
+    # check that ran only when the host and port matched could be stepped round,
+    # and a dry-run step, which logs in, would switch the engine's key.
+    with pytest.raises(config.OptionsConfigError, match="must be the engine's key"):
+        _parse(_shared(fingerprint=12345, host="127.0.0.1", port=port))
+    assert _parse(_shared(host="127.0.0.1", port=port)).wallet.port == port
+
+
+@pytest.mark.parametrize(
+    ("wallet_host", "trading_host"),
+    [("10.0.0.5", "localhost"), ("localhost", "10.0.0.5"), ("wallet-box", "wallet-box")],
+)
+def test_sharing_needs_the_wallet_on_this_machine(wallet_host, trading_host) -> None:
+    # The engine check sees this machine's metrics port and process list only;
+    # an engine elsewhere would read as not running.
+    chia = {**TRADING, "wallet_host": trading_host}
+    with pytest.raises(config.OptionsConfigError, match="needs the wallet on this machine"):
+        _parse(_shared(host=wallet_host), chia=chia)
+    for local in ("localhost", "127.0.0.1", "::1", "[::1]"):
+        assert _parse(_shared(host=local), chia={**TRADING, "wallet_host": "localhost"})
 
 
 @pytest.mark.parametrize("raw", ["true", "yes", 1])
@@ -199,3 +225,68 @@ def test_the_http_probe_against_a_real_closed_port() -> None:
         port = sock.getsockname()[1]
     found, detail = engine_guard._probe_http(f"http://127.0.0.1:{port}/metrics")
     assert found is False, detail
+
+
+# -- EngineCheckedWallet: asked at every signature and push ----------------------
+
+_DOWN = engine_guard.EngineState(running=False, certain=True, detail="nothing there")
+_UP = engine_guard.EngineState(running=True, certain=True, detail="xop_trader.exe process 1")
+_UNSURE = engine_guard.EngineState(running=False, certain=False, detail="tasklist failed")
+
+
+class _Wallet:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def sign(self, coin_spends):
+        self.calls.append("sign")
+        return b"sig"
+
+    def push(self, coin_spends, signature):
+        self.calls.append("push")
+        return b"id"
+
+    def not_ready(self, *, select_key: bool = True):
+        self.calls.append("not_ready")
+        return None
+
+
+def test_the_checked_wallet_asks_before_every_sign_and_push(monkeypatch) -> None:
+    states = iter([_DOWN, _DOWN, _UP, _DOWN])
+    asked: list[str] = []
+
+    def state(url):
+        asked.append(url)
+        return next(states)
+
+    monkeypatch.setattr(engine_guard, "engine_state", state)
+    inner = _Wallet()
+    wallet = engine_guard.EngineCheckedWallet(inner, "http://localhost:19090/metrics")
+
+    assert wallet.sign([]) == b"sig" and wallet.push([], b"sig") == b"id"
+    # The engine came up between two operations of one step: the next is refused.
+    with pytest.raises(engine_guard.EngineRunningError, match="refused, trading engine up"):
+        wallet.sign([])
+    assert wallet.push([], b"sig") == b"id"  # and allowed again once it is down
+    assert inner.calls == ["sign", "push", "push"]
+    assert asked == ["http://localhost:19090/metrics"] * 4
+
+
+@pytest.mark.parametrize("state", [_UP, _UNSURE])
+def test_the_checked_wallet_refuses_while_the_engine_may_be_up(monkeypatch, state) -> None:
+    monkeypatch.setattr(engine_guard, "engine_state", lambda url: state)
+    inner = _Wallet()
+    wallet = engine_guard.EngineCheckedWallet(inner, "u")
+    for call in (lambda: wallet.sign([]), lambda: wallet.push([], b"s")):
+        with pytest.raises(engine_guard.EngineRunningError):
+            call()
+    assert inner.calls == []
+    # Reads pass straight through: they spend nothing.
+    assert wallet.not_ready() is None and inner.calls == ["not_ready"]
+
+
+def test_a_refusal_is_a_signing_error_so_the_book_reports_it_per_action() -> None:
+    from gui.services.options import signing
+
+    assert issubclass(engine_guard.EngineRunningError, signing.SigningError)
+    assert issubclass(engine_guard.EngineRunningError, RuntimeError)  # the CLI's catch-all

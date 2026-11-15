@@ -1668,8 +1668,11 @@ options:
     # the collateral and premiums change its balances behind its back, which its
     # drawdown guard can read as a loss. With this on:
     #   - the port and fingerprint checks above are lifted, and fingerprint is
-    #     REQUIRED and must be chia.wallet_fingerprint (a step logs the wallet
-    #     in to it; another key would be switched in under the engine);
+    #     REQUIRED and must be chia.wallet_fingerprint, which must be set too
+    #     (a step logs the wallet in to it; another key would be switched in
+    #     under the engine);
+    #   - host and chia.wallet_host must be this machine (localhost, 127.0.0.1
+    #     or ::1): the engine check below can only see this machine;
     #   - address is REQUIRED. Blank would take the wallet's current address,
     #     which is where the engine sends its own coins to itself and spends
     #     them from. Pick an address of this key that holds funds, e.g. one a
@@ -1677,7 +1680,9 @@ options:
     #   - status and every step print a warning, and whether the engine is up;
     #   - a live step, withdraw-all and every live-test spend are REFUSED while
     #     the engine runs, or while that cannot be told: its metrics endpoint
-    #     answers, or an xop_trader process exists. A dry-run step is allowed.
+    #     answers, or an xop_trader process exists. It is asked again before
+    #     every signature and every push, so an engine started part way through
+    #     a step is caught at the next one. A dry-run step is allowed.
     share_trading_wallet: false
     # [OPTIONAL] Where a running engine answers, for the check above.
     # Default: http://localhost:<monitoring.prometheus_port>/metrics

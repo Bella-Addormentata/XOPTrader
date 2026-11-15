@@ -13,7 +13,14 @@ open (see :mod:`config`). This module checks that condition, two ways:
 
 Either one finding the engine means it is running. Either one failing to give
 an answer means "cannot tell", which the caller treats as running: the guard
-fails closed. Nothing here touches the wallet.
+fails closed.
+
+Both checks see this machine only, so :mod:`config` allows sharing only when
+the wallet, and the engine's view of it, are on this machine.
+
+:class:`EngineCheckedWallet` asks again before every signature and every push,
+not just once a step: an engine started part way through a step, between a
+mint and an offer, is caught at the next one.
 """
 
 from __future__ import annotations
@@ -23,7 +30,10 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from typing import Any
+
+from gui.services.options import signing
 
 #: The engine's executable, without ``.exe``. The GUI (``xop_trader_gui``) is
 #: not the engine and is not matched.
@@ -125,3 +135,44 @@ def engine_state(
     return EngineState(
         running=running, certain=certain, detail="; ".join(text for _, text in answers)
     )
+
+
+class EngineRunningError(signing.SigningError):
+    """A signature or push refused because the trading engine may be running.
+
+    A SigningError, so every place the book signs or pushes already reports it
+    as that action not being taken, and nothing else in the step is held up.
+    """
+
+
+class EngineCheckedWallet:
+    """A wallet whose ``sign`` and ``push`` first make sure the engine is down.
+
+    Everything else (log-in, sync status, keys, fee estimates) passes straight
+    through: none of it spends, and the book needs it to say what it would do.
+    The engine is asked afresh each time; ``engine_state`` is looked up when
+    called, so it can be replaced in tests.
+    """
+
+    def __init__(self, wallet: Any, metrics_url: str) -> None:
+        self._wallet = wallet
+        self._metrics_url = metrics_url
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wallet, name)
+
+    def _require_engine_down(self, what: str) -> None:
+        state = engine_state(self._metrics_url)
+        if not state.clear:
+            raise EngineRunningError(
+                f"refused, trading engine up: {what} from the wallet it trades through, and "
+                f"the engine is {state.describe()}"
+            )
+
+    def sign(self, coin_spends: Sequence[Any]) -> bytes:
+        self._require_engine_down("signing")
+        return self._wallet.sign(coin_spends)
+
+    def push(self, coin_spends: Sequence[Any], aggregated_signature: bytes) -> bytes:
+        self._require_engine_down("sending")
+        return self._wallet.push(coin_spends, aggregated_signature)

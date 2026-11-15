@@ -26,9 +26,11 @@ clawback after expiry.
     wallet itself with `options.wallet.share_trading_wallet: true` and the
     trading engine **stopped** for as long as any contract is open. See the
     comment beside it in `config.example.yaml`. `status` and every step then
-    print a warning and whether the engine is up, and a live step,
-    `withdraw-all` and every `live-test` spend are refused while it is (or
-    while that cannot be told). `options.wallet.address` is required then:
+    print a warning and whether the engine is up, and every signature and push
+    is refused while it is (or while that cannot be told), checked afresh
+    each time. The wallet must be on this machine, since that is all the
+    check can see, and `options.wallet.fingerprint` and
+    `chia.wallet_fingerprint` must both be set and equal. `options.wallet.address` is required then:
     the wallet's current address is where the engine's self-sends land, and
     on the first mainnet run the engine spent the coin there within minutes.
     An address a Dexie trade paid into works, and needs nothing sent first.

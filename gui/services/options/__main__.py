@@ -34,6 +34,7 @@ from gui.services.options.runtime import (
     build,
     chain_reader,
     chain_source,
+    shared_wallet_guard,
     wallet_rpc,
 )
 from gui.services.options.service import pack_bundle, unpack_bundle
@@ -547,11 +548,16 @@ def _live_test(
     """
     rpc = wallet_rpc(cfg)
     reader = chain_reader(cfg)
-    wallet = ReferenceWallet(
-        rpc,
-        agg_sig_me_additional_data=_ADDITIONAL_DATA[cfg.network],
-        address_prefix=cfg.address_prefix,
-        fingerprint=cfg.wallet.fingerprint,
+    # Checked for a running engine at every sign and push when shared,
+    # the offer's signature included, not only before each spend's prompt.
+    wallet = shared_wallet_guard(
+        cfg,
+        ReferenceWallet(
+            rpc,
+            agg_sig_me_additional_data=_ADDITIONAL_DATA[cfg.network],
+            address_prefix=cfg.address_prefix,
+            fingerprint=cfg.wallet.fingerprint,
+        ),
     )
     why = wallet.not_ready()
     if why is not None:

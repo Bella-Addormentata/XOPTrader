@@ -53,14 +53,20 @@ daemon and key are not wanted. The engine must stay stopped while any
 contract is open: its offers pick coins from the whole wallet, and the
 book's collateral and premiums change balances behind its back. With it on:
 
-- `options.wallet.fingerprint` must be the engine's key, and
-  `options.wallet.address` must be set. A blank address takes the wallet's
+- `options.wallet.fingerprint` and `chia.wallet_fingerprint` must both be
+  set and equal, whatever the host and port say: a step logs the wallet in,
+  and another key would be switched in under the engine.
+- The wallet must be on this machine (`localhost`, `127.0.0.1` or `::1`),
+  since the engine check can only see this machine.
+- `options.wallet.address` must be set. A blank address takes the wallet's
   current address, which is where the engine sends coins to itself; on
   the first mainnet run the engine spent the coin there within minutes.
 - `status` and every step say so, and whether the engine is up.
-- A live step, `withdraw-all` and every `live-test` spend are refused while
-  the engine runs, or while that cannot be told: its metrics endpoint
-  answers, or an `xop_trader` process exists. A dry-run step still runs.
+- Every signature and every push is refused while the engine runs, or
+  while that cannot be told: its metrics endpoint answers, or an
+  `xop_trader` process exists. It is asked afresh each time, so an engine
+  started part way through a step is caught at the next signature. A
+  dry-run step still runs.
 
 `run` also prints the time before each step.
 
