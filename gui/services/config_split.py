@@ -320,7 +320,9 @@ def _dump_plain(path: Path, data: dict[str, Any]) -> None:
     )
     _atomic_write_text(path, text, newline=_detect_newline(path))
 
-# Top-level section → set of keys that belong in secrets.yaml.
+# Top-level section → set of keys that belong in secrets.yaml.  A key with
+# dots in it names a value further down: "wallet.cert_path" is
+# <section>.wallet.cert_path.
 SECRET_KEYS: dict[str, set[str]] = {
     "chia": {
         "wallet_fingerprint",
@@ -335,6 +337,18 @@ SECRET_KEYS: dict[str, set[str]] = {
     "wallet_link": {"sage_cert_path", "sage_key_path"},
     "monitoring": {"telegram_bot_token", "telegram_chat_id"},
     "coingecko": {"api_key"},
+    # The options book's own wallet daemon and full node
+    # (gui/services/options): machine-specific paths and the key's
+    # fingerprint, kept with the chia ones for the same reason.  Nested, so
+    # the rest of options.wallet (host, port, mode, address) stays public.
+    "options": {
+        "wallet.cert_path",
+        "wallet.key_path",
+        "wallet.fingerprint",
+        "node.cert_path",
+        "node.key_path",
+        "node.ca_cert_path",
+    },
     "database": {"path"},
     # warp bridge hot-wallet key material, DPAPI-encrypted
     # (gui/services/warp/keystore.py). retired_keys carries the archived
@@ -428,6 +442,24 @@ def load_merged(config_path: Path) -> dict[str, Any]:
     return data
 
 
+def _drop_emptied(mapping: dict, parents: list[str]) -> None:
+    """Remove the mappings along *parents* that moving a secret out emptied.
+
+    Only that chain is touched: an empty mapping the file already had is
+    the user's, and a save must not change it.
+    """
+    chain = [mapping]
+    for part in parents:
+        child = chain[-1].get(part)
+        if not isinstance(child, dict):
+            return
+        chain.append(child)
+    for depth in range(len(parents), 0, -1):
+        if chain[depth]:
+            return
+        del chain[depth - 1][parents[depth - 1]]
+
+
 def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
     """Write public fields to *config_path*, secrets to sibling secrets.yaml.
 
@@ -446,18 +478,28 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
         if section not in public:
             continue
         src = public[section]
+        if not isinstance(src, dict):
+            continue
         managed = WALLET_MANAGED_KEYS.get(section, set())
         for k in list(keys):
-            if k not in src:
+            *parents, leaf = k.split(".")
+            holder: Any = src
+            for part in parents:
+                holder = holder.get(part) if isinstance(holder, dict) else None
+            if not isinstance(holder, dict) or leaf not in holder:
                 continue
             if k in managed:
                 # Strip from public (never leak to config.yaml) but do NOT
                 # carry the possibly-stale snapshot value into the secrets
                 # overlay: the on-disk secrets.yaml already holds the truth,
                 # written by BaseWallet, and must win.
-                src.pop(k)
+                holder.pop(leaf)
                 continue
-            secrets.setdefault(section, {})[k] = src.pop(k)
+            target = secrets.setdefault(section, {})
+            for part in parents:
+                target = target.setdefault(part, {})
+            target[leaf] = holder.pop(leaf)
+            _drop_emptied(src, parents)
         # Remove the section from public if it became empty.
         if not src:
             del public[section]

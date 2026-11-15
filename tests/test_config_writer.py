@@ -205,3 +205,90 @@ def test_live_config_round_trips_byte_identical():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# Secrets further down a section (options.wallet.cert_path and the like)
+# ---------------------------------------------------------------------------
+
+_OPTIONS_YAML = """\
+options:
+  enabled: true      # the options book
+  wallet:
+    mode: dedicated
+    port: 9356       # its own daemon
+    cert_path: /c.crt
+    key_path: /k.key
+    fingerprint: 42
+  node:
+    cert_path: /n.crt
+    key_path: /n.key
+    ca_cert_path: /ca.crt
+  database_path: data/options_jobs.db
+"""
+
+
+@requires_ruamel
+def test_nested_secrets_go_to_secrets_yaml_and_the_rest_stays(tmp_path):
+    """A Settings save loads config.yaml and secrets.yaml merged, then splits
+    them again. The options book's certificate paths and fingerprint are two
+    levels down; they must land in secrets.yaml, not in the tracked file."""
+    path = tmp_path / "config.yaml"
+    path.write_text(_OPTIONS_YAML, encoding="utf-8")
+
+    split_and_save(path, yaml.safe_load(_OPTIONS_YAML))
+
+    public = yaml.safe_load(path.read_text(encoding="utf-8"))
+    secrets = yaml.safe_load((tmp_path / "secrets.yaml").read_text(encoding="utf-8"))
+    assert public["options"]["wallet"] == {"mode": "dedicated", "port": 9356}
+    # A mapping left with nothing in it is not left behind as {}.
+    assert "node" not in public["options"]
+    assert public["options"]["database_path"] == "data/options_jobs.db"
+    assert secrets["options"] == {
+        "wallet": {"cert_path": "/c.crt", "key_path": "/k.key", "fingerprint": 42},
+        "node": {"cert_path": "/n.crt", "key_path": "/n.key", "ca_cert_path": "/ca.crt"},
+    }
+    # The comments on what stays are kept.
+    assert "# its own daemon" in path.read_text(encoding="utf-8")
+    # And read back together, nothing was lost.
+    assert config_split.load_merged(path) == yaml.safe_load(_OPTIONS_YAML)
+
+
+@requires_ruamel
+def test_secrets_already_in_secrets_yaml_stay_there_through_a_save(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("options:\n  enabled: false\n  wallet:\n    port: 9356\n", encoding="utf-8")
+    secrets_path = tmp_path / "secrets.yaml"
+    secrets_path.write_text(
+        "options:\n  wallet:\n    cert_path: /c.crt\n    key_path: /k.key\n"
+        "coingecko:\n  api_key: CG\n",
+        encoding="utf-8",
+    )
+    before = path.read_bytes()
+
+    split_and_save(path, config_split.load_merged(path))
+
+    assert path.read_bytes() == before  # nothing copied into the tracked file
+    secrets = yaml.safe_load(secrets_path.read_text(encoding="utf-8"))
+    assert secrets["options"]["wallet"] == {"cert_path": "/c.crt", "key_path": "/k.key"}
+    assert secrets["coingecko"] == {"api_key": "CG"}
+
+
+@requires_ruamel
+def test_an_empty_mapping_the_user_wrote_is_left_alone(tmp_path):
+    """Only what a moved secret emptied is removed."""
+    text = "options:\n  enabled: false\n  pricing: {}\n  node:\n    port: 8555\n"
+    path = tmp_path / "config.yaml"
+    path.write_text(text, encoding="utf-8")
+
+    split_and_save(path, yaml.safe_load(text))
+
+    assert yaml.safe_load(path.read_text(encoding="utf-8")) == yaml.safe_load(text)
+    assert not (tmp_path / "secrets.yaml").exists()
+
+
+def test_every_secret_key_names_a_real_place():
+    # A dotted key is walked one level per dot; an empty part would never match.
+    for section, keys in config_split.SECRET_KEYS.items():
+        for key in keys:
+            assert all(key.split(".")), (section, key)

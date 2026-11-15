@@ -296,3 +296,21 @@ def test_an_ipv6_host_in_brackets_is_still_this_machine() -> None:
     section = _section(wallet={"host": "[::1]", "port": 9256, "cert_path": "c", "key_path": "k"})
     with pytest.raises(config.OptionsConfigError, match="trading wallet's RPC port"):
         config.parse({"options": section, "chia": {"wallet_host": "::1", "wallet_port": 9256}})
+
+
+def test_certificate_paths_have_their_home_expanded(monkeypatch) -> None:
+    # The TLS libraries the paths go to do not expand ~ themselves.
+    monkeypatch.setenv("HOME", "/home/someone")
+    wallet = {"port": 9356, "cert_path": "~/w.crt", "key_path": " ~/w.key "}
+    node = {"cert_path": "~/n.crt", "key_path": "/abs/n.key", "ca_cert_path": "~/ca.crt"}
+    parsed = _parse(wallet=wallet, node=node)
+    assert (parsed.wallet.cert_path, parsed.wallet.key_path) == (
+        "/home/someone/w.crt",
+        "/home/someone/w.key",
+    )
+    assert (parsed.node.cert_path, parsed.node.key_path, parsed.node.ca_cert_path) == (
+        "/home/someone/n.crt",
+        "/abs/n.key",
+        "/home/someone/ca.crt",
+    )
+    assert _parse().node.ca_cert_path == ""

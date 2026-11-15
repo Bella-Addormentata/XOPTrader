@@ -1644,18 +1644,17 @@ options:
   # and pointing this at the trading wallet's port is refused.
   # mode: trading is parsed and refused: the engine does not yet keep option
   # coins out of its own offers or book option events.
-  # Every step first selects the fingerprint below on that wallet and asks
-  # whether it is synced; until it is, the step does nothing and says why.
-  # These keys, like the rest of this file, can be given in secrets.yaml.
+  # Every step first selects the wallet's fingerprint and asks whether it is
+  # synced; until it is, the step does nothing and says why.
+  # Its certificate pair and fingerprint go in secrets.yaml, like the chia
+  # ones (options.wallet.cert_path, key_path, fingerprint: see
+  # secrets.example.yaml). The cert pair is REQUIRED; the fingerprint is
+  # RECOMMENDED (without it, whichever key the wallet has open is used).
+  # A Settings save moves them there if they are written here.
   wallet:
     mode: dedicated
     host: localhost
     port: 9356                           # [REQUIRED] the dedicated wallet's rpc_port
-    cert_path: ""                        # [REQUIRED] its config/ssl/wallet/private_wallet.crt
-    key_path: ""                         # [REQUIRED] its config/ssl/wallet/private_wallet.key
-    fingerprint: null                    # [RECOMMENDED] the key to use. The wallet is
-                                         # logged in to it before each step. Blank =
-                                         # whichever key the wallet has open.
     # The one address used as creator, owner and change. Blank asks the wallet
     # for its current address the first time and keeps to it from then on (it
     # is remembered in the options database). ONLY coins at this address are
@@ -1773,18 +1772,15 @@ options:
   # change is asked for in one request, only when something may have happened.
   #
   # If you run a full node, name it here and coinset.org is never contacted.
-  # The certificate pair is the node's own:
-  #   <CHIA_ROOT>/config/ssl/full_node/private_full_node.crt and .key
+  # Its certificate pair (options.node.cert_path and key_path) and its
+  # certificate authority (options.node.ca_cert_path) go in secrets.yaml:
+  # see secrets.example.yaml. With no certificate pair there is no node and
+  # coinset is used. The authority is REQUIRED when host is another machine:
+  # the book settles transactions on what the node says, and unchecked,
+  # anyone between the two could answer in its place.
   node:
     host: localhost
     port: 8555                           # the full node's rpc_port
-    cert_path: ""                        # [OPTIONAL] blank = no node; coinset is used
-    key_path: ""
-    # The node's own certificate authority: its config/ssl/ca/private_ca.crt.
-    # With it the node's certificate is checked. REQUIRED when host is another
-    # machine: the book settles transactions on what the node says, and
-    # unchecked, anyone between the two could answer in its place.
-    ca_cert_path: ""
   coinset_url: ""                        # [OPTIONAL] blank = network default; unused with a node
   # The chain is looked at when the wallet's own coins change (a payment came
   # in, a transaction of ours confirmed), when a contract reaches expiry, and:

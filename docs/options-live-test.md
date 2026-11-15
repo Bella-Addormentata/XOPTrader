@@ -14,21 +14,24 @@ stops at the first thing that does not match.
 - A second wallet daemon with its own key. One daemon serves one key at a time,
   so it cannot share the trading wallet's daemon. Give it its own `CHIA_ROOT`
   and its own ports, start only the wallet service, and let it sync.
-- That wallet's RPC port and its `config/ssl/wallet/private_wallet.crt` and
-  `.key`, entered under `options.wallet` in `config.yaml` (or in `secrets.yaml`
-  beside it, which is laid over `config.yaml` as everywhere else in the app).
-  Enter the key's `fingerprint` too: the wallet is logged in to it before every
-  step, and nothing is done while the wallet reports itself still syncing.
+- That wallet's RPC port, under `options.wallet` in `config.yaml`, and its
+  `config/ssl/wallet/private_wallet.crt` and `.key`, under `options.wallet` in
+  `secrets.yaml` (see `secrets.example.yaml`; `~` is expanded). `secrets.yaml`
+  is laid over `config.yaml` as everywhere else in the app, and a Settings
+  save in the GUI keeps these keys there.
+  Enter the key's `fingerprint` there too: the wallet is logged in to it before
+  every step, and nothing is done while the wallet reports itself still syncing.
   `status` prints whether it is ready.
 - A few thousand mojos of XCH sent to the address `status` prints. Only coins
   at that one address are used. With `options.wallet.address` blank the book
   asks the wallet for its current address once and keeps to it from then on,
   whatever the wallet's current address later becomes.
-- Optional: a full node of your own. Enter its RPC port and its
-  `config/ssl/full_node/private_full_node.crt` and `.key` under `options.node`
-  and the chain is read from it; coinset.org is then never contacted. If the
-  node is on another machine, `options.node.ca_cert_path` is required too (the
-  node's `config/ssl/ca/private_ca.crt`): the node's certificate is then
+- Optional: a full node of your own. Enter its RPC port under `options.node`
+  in `config.yaml`, and its `config/ssl/full_node/private_full_node.crt` and
+  `.key` under `options.node` in `secrets.yaml`, and the chain is read from it;
+  coinset.org is then never contacted. If the node is on another machine,
+  `options.node.ca_cert_path` is required too, in `secrets.yaml` (the node's
+  `config/ssl/ca/private_ca.crt`): the node's certificate is then
   checked against it, so nobody between the two can answer in its place. Without
   it the chain is read from coinset.org, sparingly (see "How often the chain is
   asked" below). `status` prints which of the two is in use.
