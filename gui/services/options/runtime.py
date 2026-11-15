@@ -62,6 +62,7 @@ class WalletCoinSource:
         prefix: str = "xch",
         clock: Callable[[], float] = time.time,
         memory: Any = None,
+        fingerprint: int | None = None,
     ) -> None:
         self._rpc = rpc
         self._chain = chain_reader
@@ -69,19 +70,27 @@ class WalletCoinSource:
         self._configured = address
         self._clock = clock
         self._memory = memory  # the book's store: recall(key) / remember(key, value)
+        # An address belongs to a key, so it is remembered under the key's name.
+        self._address_key = _ADDRESS_KEY if fingerprint is None else f"{_ADDRESS_KEY}:{fingerprint}"
         self._puzzle_hash: bytes | None = None
         self._cat_wallets: dict[bytes, int] = {}
         self._cat_wallets_at: float | None = None
 
+    def known_address(self) -> str:
+        """The address set in the config or used before, or "" if neither. Asks nobody."""
+        if self._configured:
+            return self._configured
+        if self._memory is None:
+            return ""
+        return str(self._memory.recall(self._address_key) or "")
+
     def puzzle_hash(self) -> bytes:
         if self._puzzle_hash is None:
-            address = self._configured
-            if not address and self._memory is not None:
-                # The address this book has used before. The wallet's current
-                # address moves on whenever anything asks it for a new one, and
-                # a book that followed it would leave its funds, and the keys
-                # to its own options, behind.
-                address = str(self._memory.recall(_ADDRESS_KEY) or "")
+            # The address this book has used before, if any. The wallet's
+            # current address moves on whenever anything asks it for a new one,
+            # and a book that followed it would leave its funds, and the keys
+            # to its own options, behind.
+            address = self.known_address()
             if not address:
                 answer = self._rpc(
                     "get_next_address", {"wallet_id": _XCH_WALLET_ID, "new_address": False}
@@ -97,8 +106,8 @@ class WalletCoinSource:
                     f"{self._prefix}"
                 )
             self._puzzle_hash = bytes(decoded.puzzle_hash)
-            if self._memory is not None and self._memory.recall(_ADDRESS_KEY) != address:
-                self._memory.remember(_ADDRESS_KEY, address)
+            if self._memory is not None and self._memory.recall(self._address_key) != address:
+                self._memory.remember(self._address_key, address)
         return self._puzzle_hash
 
     def address(self) -> str:
@@ -152,13 +161,19 @@ class WalletCoinSource:
         return frozenset(ids)
 
 
+def _url_host(host: str) -> str:
+    """``host`` as it must appear in a URL: an IPv6 address goes in brackets."""
+    host = host.strip()
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
 def wallet_rpc(cfg: config.OptionsConfig) -> WalletRpc:
     """The dedicated wallet's RPC as an ``(endpoint, body)`` callable."""
     from gui.services.warp.wallet import WalletClient
 
     client = WalletClient(
         {
-            "host": cfg.wallet.host,
+            "host": _url_host(cfg.wallet.host),
             "port": cfg.wallet.port,
             "fingerprint": cfg.wallet.fingerprint,
             "cert_path": cfg.wallet.cert_path,
@@ -241,7 +256,8 @@ def chain_source(cfg: config.OptionsConfig) -> str:
     """Where chain reads go, for the operator to see."""
     if cfg.node.enabled:
         checked = "certificate checked" if cfg.node.ca_cert_path else "on this machine"
-        return f"your full node at {cfg.node.host}:{cfg.node.port} ({checked}; coinset is not used)"
+        where = f"{_url_host(cfg.node.host)}:{cfg.node.port}"
+        return f"your full node at {where} ({checked}; coinset is not used)"
     return f"coinset ({cfg.coinset_url or _COINSET[cfg.network]})"
 
 
@@ -256,7 +272,7 @@ def chain_reader(cfg: config.OptionsConfig) -> chain.NodeChainReader:
 
     if cfg.node.enabled:
         client = CoinsetClient(
-            f"https://{cfg.node.host}:{cfg.node.port}",
+            f"https://{_url_host(cfg.node.host)}:{cfg.node.port}",
             poster=_node_poster(cfg.node.cert_path, cfg.node.key_path, 30.0, cfg.node.ca_cert_path),
         )
     else:
@@ -291,6 +307,7 @@ def build(
         prefix=cfg.address_prefix,
         clock=clock,
         memory=book_store,
+        fingerprint=cfg.wallet.fingerprint,
     )
     if market_reader is None:
         market_reader = market.MarketSource(

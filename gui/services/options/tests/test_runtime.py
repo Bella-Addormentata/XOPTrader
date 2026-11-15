@@ -1007,3 +1007,91 @@ def test_the_monitor_sends_the_coingecko_key_and_checks_the_price_s_age(
 
     assert made["source"]["coingecko_api_key"] == "CG-secret"
     assert made["watcher"]["max_spot_age_seconds"] == 321
+
+
+# ---------------------------------------------------------------------------
+# Review round 4
+# ---------------------------------------------------------------------------
+
+
+def test_status_does_not_take_an_address_from_another_key(tmp_path, monkeypatch, capsys) -> None:
+    # A fresh database, no address set, and the wallet open on some other key.
+    # Asking for "the current address" now would be that key's, and it would be
+    # kept for good.
+    world = World()
+    maker = world.party(3)
+    usd = world.issue_cat(world.party(1), 5)
+    wallet = {"port": 9356, "cert_path": "c", "key_path": "k", "fingerprint": 42}
+    cfg = _config(tmp_path, usd, wallet=wallet)
+    rpc = WalletRpc(world, maker)
+    rpc.logged_in = 7
+    monkeypatch.setattr(
+        cli, "build", lambda _cfg: runtime.build(cfg, rpc=rpc, reader=world.sim, clock=world.now)
+    )
+
+    assert cli._status(cfg) == 0
+
+    out = capsys.readouterr().out
+    assert "another key open (7)" in out
+    assert "options address: not chosen yet" in out
+    assert "get_next_address" not in rpc.endpoints()
+    book = store.OptionStore(cfg.database_path)
+    assert book.recall("options_address:42") is None and book.recall("options_address") is None
+    book.close()
+
+    # On the right key it is asked, shown, and kept under that key's name.
+    rpc.logged_in = 42
+    assert cli._status(cfg) == 0
+    assert "options address txch1" in capsys.readouterr().out
+    book = store.OptionStore(cfg.database_path)
+    assert book.recall("options_address:42") == sdk.Address(maker.puzzle_hash, "txch").encode()
+    book.close()
+
+
+def test_an_address_kept_for_one_key_is_not_used_for_another(tmp_path) -> None:
+    world = World()
+    first, second = world.party(5), world.party(1)
+    rpc = WalletRpc(world, first)
+    book = store.OptionStore(tmp_path / "options_jobs.db")
+    one = runtime.WalletCoinSource(rpc, world.sim, prefix="txch", memory=book, fingerprint=42)
+    assert one.puzzle_hash() == first.puzzle_hash
+
+    rpc.party = second  # the wallet is now on the other key
+    other = runtime.WalletCoinSource(rpc, world.sim, prefix="txch", memory=book, fingerprint=43)
+
+    assert other.known_address() == ""
+    assert other.puzzle_hash() == second.puzzle_hash
+    again = runtime.WalletCoinSource(rpc, world.sim, prefix="txch", memory=book, fingerprint=42)
+    assert again.puzzle_hash() == first.puzzle_hash
+
+
+def test_an_ipv6_host_is_put_in_brackets_in_the_address_it_is_reached_at(
+    tmp_path, monkeypatch
+) -> None:
+    world = World()
+    usd = world.issue_cat(world.party(1), 5)
+    asked: list[str] = []
+
+    def poster(cert: str, key: str, timeout: float, ca: str = ""):
+        def post(url: str, body: dict) -> dict:
+            asked.append(url)
+            return {"success": True, "coin_records": []}
+
+        return post
+
+    monkeypatch.setattr(runtime, "_node_poster", poster)
+    cfg = _config(
+        tmp_path,
+        usd,
+        node={"host": "::1", "cert_path": "c", "key_path": "k"},
+        wallet={"host": "::1", "port": 9356, "cert_path": "c", "key_path": "k"},
+    )
+
+    runtime.chain_reader(cfg).coin_state(b"\x01" * 32)
+
+    assert asked == ["https://[::1]:8555/get_coin_records_by_names"]
+    assert "your full node at [::1]:8555" in runtime.chain_source(cfg)
+    # The wallet's RPC is reached the same way.
+    assert runtime.wallet_rpc(cfg).__self__._base == "https://[::1]:9356"  # noqa: SLF001
+    for host, written in (("localhost", "localhost"), ("10.0.0.9", "10.0.0.9"), ("[::1]", "[::1]")):
+        assert runtime._url_host(host) == written

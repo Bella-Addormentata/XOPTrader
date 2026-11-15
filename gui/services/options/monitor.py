@@ -47,6 +47,15 @@ TAKEN = "taken"
 WITHDRAWN = "withdrawn"
 EXPIRED = "expired"
 
+#: An offer is called expired once the chain's clock, read this many blocks
+#: below the peak, has passed its end (the depth the book uses for its own).
+_EXPIRY_DEPTH_BLOCKS = 32
+#: About how long that depth takes; the clock is not asked sooner than this
+#: after an offer's end by our own clock.
+_EXPIRY_AFTER_SECONDS = 600
+#: ...nor more often than this. Each read costs the node up to three requests.
+_EXPIRY_CLOCK_SECONDS = 900
+
 
 @dataclasses.dataclass
 class ScanReport:
@@ -90,6 +99,8 @@ class DeskMonitor:
         self._additional_data = bytes(agg_sig_me_additional_data)
         self._clock = clock
         self._max_spot_age = max_spot_age_seconds
+        self._expiry_proof: int | None = None  # this scan: the time expiry is judged by
+        self._clock_asked_at: int | None = None
         self._max_new = int(max_new_per_scan)
 
     def _terms(self, loaded: chain.LoadedOption) -> tuple[str, float, float] | None:
@@ -171,7 +182,13 @@ class DeskMonitor:
         if dead:
             # Kept, so it is not fetched again every scan, but closed at once
             # and never valued: it is not a price anybody can trade at.
-            outcome = self._outcome(list(bundle.coin_spends)) or EXPIRED
+            outcome = self._outcome(list(bundle.coin_spends))
+            if outcome is None and self._expired(
+                seen.expires_at_seconds, loaded.terms.expiration_seconds
+            ):
+                outcome = EXPIRED
+            # Otherwise it is by this machine's clock only that it has run out.
+            # It stays open, unvalued, and is judged again once it is delisted.
             report.problems.append(f"{offer_id[:8]}: {dead}")
         listing = store.Listing(
             offer_id=offer_id,
@@ -198,19 +215,59 @@ class DeskMonitor:
         coin_spends = list(_sdk().SpendBundle.from_bytes(listing.bundle).coin_spends)
         outcome = self._outcome(coin_spends)
         if outcome is None:
-            ran_out = listing.offer_expires is not None and listing.offer_expires <= now
             # The contract's own expiry ends an offer that carries none.
-            lapsed = listing.expiration is not None and listing.expiration <= now
-            if not (ran_out or lapsed):
+            if not self._expired(listing.offer_expires, listing.expiration):
                 return  # delisted but still takeable; look again next scan
             outcome = EXPIRED
         self._store.close_listing(listing.offer_id, outcome, now)
         report.closed[listing.offer_id] = outcome
 
+    def _expired(self, offer_expires: int | None, expiration: int | None) -> bool:
+        """Whether an offer is out of time by the clock that decides it.
+
+        An offer's end is enforced by the chain against the chain's own clock,
+        which runs behind this machine's. Calling one expired by local time
+        closes it for good while it can still be taken, and its fill is then
+        never seen. So the verdict waits for :meth:`_prove_expiry`.
+        """
+        proof = self._expiry_proof
+        if proof is None:
+            return False
+        ends = [end for end in (offer_expires, expiration) if end is not None]
+        return any(end <= proof for end in ends)
+
+    def _prove_expiry(self, now: int, delisted: list[store.Listing]) -> None:
+        """Read the chain's clock, if some delisted offer may have run out.
+
+        Read 32 blocks below the peak, as the book does for its own
+        transactions, and BEFORE the look that finds the offer's coin unspent:
+        only in that order is "unspent" proof that it expired untaken. Asked
+        no more than once a quarter of an hour, and not before an offer is ten
+        minutes past its end by our clock, which is about when that deep clock
+        gets there. A reader with no clock to ask leaves this machine's.
+        """
+        self._expiry_proof = None
+        if not self._chain.tells_time:
+            self._expiry_proof = now
+            return
+        ends = [
+            min(end for end in (item.offer_expires, item.expiration) if end is not None)
+            for item in delisted
+            if item.offer_expires is not None or item.expiration is not None
+        ]
+        due = any(end + _EXPIRY_AFTER_SECONDS <= now for end in ends)
+        asked = self._clock_asked_at
+        if not due or (asked is not None and now - asked < _EXPIRY_CLOCK_SECONDS):
+            return
+        self._clock_asked_at = now
+        try:
+            self._expiry_proof = self._chain.chain_time(_EXPIRY_DEPTH_BLOCKS)
+        except chain.ChainError:
+            self._expiry_proof = None  # undecided this scan; asked again later
+
     def scan(self) -> ScanReport:
         report = ScanReport()
         asked = self._chain.requests
-        self._chain.begin()
         self._scan(report)
         report.chain_requests = self._chain.requests - asked
         return report
@@ -241,6 +298,9 @@ class DeskMonitor:
 
         known = {item.offer_id: item for item in self._store.listings(open_only=True)}
         judged = self._store.closed_listing_ids()
+        gone = set(listing.offer_ids)
+        self._prove_expiry(now, [item for key, item in known.items() if key not in gone])
+        self._chain.begin()  # after the clock: see _prove_expiry
         fresh = 0
         for offer_id in listing.offer_ids:
             if offer_id in known:

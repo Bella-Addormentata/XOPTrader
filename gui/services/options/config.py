@@ -210,7 +210,7 @@ class NodeConfig:
 
     @property
     def local(self) -> bool:
-        return self.host.strip().lower() in _THIS_MACHINE
+        return self.host.strip().strip("[]").lower() in _THIS_MACHINE
 
 
 @dataclasses.dataclass(frozen=True)
@@ -310,8 +310,8 @@ def parse(root: Any) -> OptionsConfig | None:
     coingecko = root.get("coingecko") if isinstance(root.get("coingecko"), dict) else {}
     trading_host = str(chia.get("wallet_host") or "localhost").strip().lower()
     host = str(wallet_raw.get("host") or "localhost").strip()
-    local = {"localhost", "127.0.0.1", "::1"}
-    same_host = host.lower() == trading_host or {host.lower(), trading_host} <= local
+    ours, theirs = host.lower().strip("[]"), trading_host.strip("[]")
+    same_host = ours == theirs or {ours, theirs} <= _THIS_MACHINE
     if same_host and port == int(chia.get("wallet_port") or 9256):
         raise OptionsConfigError(
             "options.wallet points at the trading wallet's RPC port. A dedicated wallet is "

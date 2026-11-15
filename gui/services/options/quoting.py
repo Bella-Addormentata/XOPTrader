@@ -102,6 +102,11 @@ def _wanted(
     quote_mojos = int(round(strike * size_xch * config.quote_unit_mojos))
     if quote_mojos < 1:
         return None
+    # The strike the contract will really have, once its quote leg is a whole
+    # number of mojos. For a small contract that is not the grid's strike, and
+    # a target that kept the grid's would see its own contract as having
+    # drifted, retire it, and mint the same one again, for ever.
+    strike = quote_mojos / config.quote_unit_mojos / size_xch
     xch = Asset(None, config.contract_xch_mojos)
     quote = Asset(config.quote_asset_id, quote_mojos)
     return Wanted(

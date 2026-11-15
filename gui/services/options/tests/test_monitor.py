@@ -9,7 +9,13 @@ import pytest
 sdk = pytest.importorskip("chia_wallet_sdk")
 
 from gui.services.options import builder, desk, market, monitor, store  # noqa: E402
-from gui.services.options.tests.sim_world import ADDITIONAL_DATA, CAT, XCH, World  # noqa: E402
+from gui.services.options.tests.sim_world import (  # noqa: E402
+    ADDITIONAL_DATA,
+    CAT,
+    XCH,
+    SimChain,
+    World,
+)
 
 DAY = 86400
 
@@ -363,3 +369,80 @@ def test_a_freshly_fetched_stale_price_values_nothing() -> None:
     report = rig.monitor.scan()
     assert report.market_error == ""
     assert report.new[0].our_value is not None
+
+
+class Clocked(SimChain):
+    """The simulator's chain, noting each time its clock is asked and how deep."""
+
+    def __init__(self, sim: Any) -> None:
+        super().__init__(sim)
+        self.asked: list[int] = []
+
+    def chain_time(self, depth: int = 0) -> int:
+        self.asked.append(depth)
+        return super().chain_time(depth)
+
+
+def _ahead(rig: Rig, seconds: int) -> Clocked:
+    """Give the rig a monitor whose machine clock runs ahead of the chain's."""
+    reader = Clocked(rig.world.sim)  # a reader that can tell the chain's time
+    rig.monitor = monitor.DeskMonitor(
+        desk_client=rig.board,
+        chain_reader=reader,
+        market=rig.read_market,
+        book_store=rig.store,
+        quote_asset_id=rig.usd,
+        quote_unit_mojos=CAT,
+        agg_sig_me_additional_data=ADDITIONAL_DATA,
+        clock=lambda: rig.world.now() + seconds,
+    )
+    return reader
+
+
+def test_an_offer_is_not_called_expired_while_the_chain_can_still_take_it() -> None:
+    # An offer's end is judged by the chain against the chain's own clock,
+    # which runs behind this machine's. Closing it by local time would record
+    # it as expired for good, and the fill that follows would never be seen.
+    rig = Rig()
+    _ahead(rig, 300)
+    _, text = rig.list_call("offerA", ttl=900)
+    rig.monitor.scan()
+    assert len(rig.store.listings(open_only=True)) == 1
+
+    rig.world.advance(700)  # 200 s left by the chain's clock; 100 s past by ours
+    del rig.board.offers["offerA"]
+    report = rig.monitor.scan()
+    assert report.closed == {} and len(rig.store.listings(open_only=True)) == 1
+
+    rig.world.take(rig.taker, text)  # and it is taken after all
+    report = rig.monitor.scan()
+    assert report.closed == {"offerA": monitor.TAKEN}
+
+
+def test_an_untaken_offer_is_closed_once_the_chain_s_clock_is_past_its_end() -> None:
+    rig = Rig()
+    reader = _ahead(rig, 0)
+    rig.list_call("offerA", ttl=900)
+    rig.monitor.scan()
+    del rig.board.offers["offerA"]
+
+    # Just past its end: the clock 32 blocks down is not there yet, and is not
+    # even asked.
+    rig.world.advance(1000)
+    assert rig.monitor.scan().closed == {} and reader.asked == []
+
+    # Ten minutes past, it is asked, 32 blocks down, says so, and the offer is closed.
+    rig.world.advance(700)
+    assert rig.monitor.scan().closed == {"offerA": monitor.EXPIRED}
+    assert reader.asked == [32]
+
+    # Another offer runs out straight after: the clock is not asked again for a
+    # quarter of an hour, and the offer waits for it.
+    rig.list_call("offerB", ttl=60)
+    rig.monitor.scan()
+    del rig.board.offers["offerB"]
+    rig.world.advance(700)
+    assert rig.monitor.scan().closed == {} and reader.asked == [32]
+    rig.world.advance(300)
+    assert rig.monitor.scan().closed == {"offerB": monitor.EXPIRED}
+    assert reader.asked == [32, 32]

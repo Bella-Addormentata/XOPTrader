@@ -268,3 +268,19 @@ def test_a_contract_too_small_to_strike_blocks_minting_instead_of_failing() -> N
     was = quoting.plan(_config(), _market(), [], NOW).mint[0]
     plan = quoting.plan(cfg, _market(), [_contract(was, store.OPEN, 1)], NOW)
     assert plan.retire == () and list(plan.asks) == [bytes([1]) * 32]
+
+
+def test_a_small_contract_s_target_is_the_strike_it_will_really_have() -> None:
+    # 0.001 XCH at 0.70 is 0.7 thousandths of the quote asset, which rounds to
+    # one: a strike of 1.00. A target that kept 0.70 would see its own contract
+    # as 43% adrift, retire it and mint it again, without end.
+    cfg = _config(contract_xch=0.001, call_strikes_pct=[100], put_strikes_pct=[], expiries=[FAR])
+    view = _market(0.70)
+
+    (wanted,) = quoting.plan(cfg, view, [], NOW).mint
+    assert wanted.strike_asset.amount == 1 and wanted.strike == pytest.approx(1.0)
+
+    minted = _contract(wanted, store.OPEN, 1)
+    plan = quoting.plan(cfg, view, [minted], NOW)
+    assert plan.retire == () and plan.mint == ()
+    assert list(plan.asks) == [minted.launcher_id]

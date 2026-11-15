@@ -98,7 +98,8 @@ def _status(cfg: config.OptionsConfig) -> int:
         if cfg.wallet.fingerprint is not None
         else "no fingerprint set, so whichever key it has open"
     )
-    print(f"wallet: {book.wallet_not_ready() or f'synced ({key})'}")
+    not_ready = book.wallet_not_ready()
+    print(f"wallet: {not_ready or f'synced ({key})'}")
     print(f"chain is read from {chain_source(cfg)}")
     if cfg.fee_auto:
         print(
@@ -116,12 +117,19 @@ def _status(cfg: config.OptionsConfig) -> int:
         )
     else:
         print("splash: off")
-    print(f"options address {coins.address()}")
-    xch = sum(int(coin.amount) for coin in coins.xch_coins())
-    quote = sum(int(cat.coin.amount) for cat in coins.cats(cfg.quote_asset_id))
-    print(
-        f"  spendable there: {xch / config.XCH_MOJOS:g} XCH, {quote / cfg.quote_unit_mojos:g} quote"
-    )
+    if not_ready is not None and not coins.known_address():
+        # Asking now could take, and keep, the address of whichever key the
+        # wallet happens to have open. The first step asks, once it has the
+        # right key selected.
+        print("options address: not chosen yet; the first step takes it from the wallet")
+    else:
+        print(f"options address {coins.address()}")
+        xch = sum(int(coin.amount) for coin in coins.xch_coins())
+        quote = sum(int(cat.coin.amount) for cat in coins.cats(cfg.quote_asset_id))
+        print(
+            f"  spendable there: {xch / config.XCH_MOJOS:g} XCH, "
+            f"{quote / cfg.quote_unit_mojos:g} quote"
+        )
     contracts = book_store.contracts()
     print(f"{len(contracts)} contract(s)")
     for item in contracts:

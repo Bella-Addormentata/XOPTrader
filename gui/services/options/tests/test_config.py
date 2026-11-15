@@ -286,3 +286,13 @@ def test_a_node_on_another_machine_needs_its_certificate_authority() -> None:
     assert far.ca_cert_path == "/n/private_ca.crt" and not far.local
     # With no node configured there is nothing to check.
     assert not _parse(node={"host": "10.0.0.9"}).node.enabled
+
+
+def test_an_ipv6_host_in_brackets_is_still_this_machine() -> None:
+    pair = {"cert_path": "c", "key_path": "k"}
+    assert _parse(node={"host": "[::1]", **pair}).node.local
+    assert _parse(node={"host": "::1", **pair}).node.local
+    # ...and still the trading wallet's machine, for the port check.
+    section = _section(wallet={"host": "[::1]", "port": 9256, "cert_path": "c", "key_path": "k"})
+    with pytest.raises(config.OptionsConfigError, match="trading wallet's RPC port"):
+        config.parse({"options": section, "chia": {"wallet_host": "::1", "wallet_port": 9256}})
