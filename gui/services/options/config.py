@@ -310,6 +310,13 @@ def parse(root: Any) -> OptionsConfig | None:
         fingerprint = None if fingerprint_raw in (None, "") else int(fingerprint_raw)
     except (TypeError, ValueError) as exc:
         raise OptionsConfigError("options.wallet.fingerprint must be a number") from exc
+    trading_key = str(chia.get("wallet_fingerprint") or "").strip()
+    if fingerprint is not None and trading_key == str(fingerprint):
+        raise OptionsConfigError(
+            "options.wallet.fingerprint is the trading wallet's key (chia.wallet_fingerprint). "
+            "A second daemon on the same key spends the same coins the engine's offers do; "
+            "a dedicated wallet has a key of its own."
+        )
     wallet = WalletConfig(
         mode=mode,
         host=host,

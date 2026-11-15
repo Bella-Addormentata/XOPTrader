@@ -273,17 +273,20 @@ class CachedChain:
         clock: Callable[[], float] = time.time,
         final_after_seconds: float = 900.0,
         batch_size: int = 200,
+        retry_after_seconds: float = 10.0,
     ) -> None:
         self._inner = inner
         self._facts: FactStore = _Memory() if facts is None else facts
         self._clock = clock
         self._final_after = float(final_after_seconds)
         self._batch = max(1, int(batch_size))
+        self._retry_after = float(retry_after_seconds)
         self._final: dict[bytes, Any] = {}  # coin id -> a final store.ChainFact
         self._spent: dict[bytes, Any] = {}  # coin id -> a fact not yet final
         self._seen: dict[bytes, Any] = {}  # this look: coin id -> state, or None
         self._asked: set[bytes] = set()  # coins not final that were asked about this look
         self._due: set[bytes] = set()  # to fetch together at the next lookup
+        self._failed: tuple[float, Exception] | None = None  # the last lookup that failed
         self.requests = 0
 
     @classmethod
@@ -413,8 +416,20 @@ class CachedChain:
             return self._state(fact)
         self._asked.add(coin_id)
         if coin_id not in self._seen:
+            # A node that has just failed is not asked again for each coin in
+            # turn: the rest of this step gets the same answer, for nothing.
+            if self._failed is not None and self._clock() - self._failed[0] < self._retry_after:
+                self._due.add(coin_id)
+                raise ChainError(str(self._failed[1])) from self._failed[1]
             due, self._due = self._due | {coin_id}, set()
-            self._fetch(due)
+            try:
+                self._fetch(due)
+            except Exception as exc:
+                # They still travel together when the node is asked again.
+                self._due |= {item for item in due if item not in self._seen}
+                self._failed = (self._clock(), exc)
+                raise
+            self._failed = None
             fact = self._final.get(coin_id)
             if fact is not None:  # this very read made it final
                 return self._state(fact)

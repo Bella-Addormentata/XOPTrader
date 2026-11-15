@@ -534,3 +534,36 @@ def test_six_hours_of_a_book_with_a_sale_cost_a_few_dozen_requests() -> None:
     assert len(desk.contracts(store.OPEN)) == 2  # the slot was refilled
     # 360 steps. Before the cache each took about ten requests per contract.
     assert desk.node.requests - asked <= 60
+
+
+def test_a_failed_lookup_is_not_repeated_coin_by_coin_and_keeps_its_batch() -> None:
+    world, maker, _, usd = _setup()
+    _, minted = _mint_call(world, maker, usd)
+    node, reader, now = _reader(world)
+    coins = [bytes([n]) * 32 for n in (1, 2, 3)]
+    reader.want(coins)
+    working = node.coin_states
+
+    def failing(coin_ids: Any) -> dict[bytes, Any]:
+        node.log.append(("states", len(list(coin_ids))))
+        raise chain.ChainError("coinset is not answering")
+
+    node.coin_states = failing  # type: ignore[method-assign]
+    with pytest.raises(chain.ChainError, match="not answering"):
+        reader.coin_state(coins[0])
+    assert node.log == [("states", 3)]
+
+    # The rest of the step gets the same answer without the node being asked.
+    for coin in coins:
+        with pytest.raises(chain.ChainError, match="not answering"):
+            reader.coin_state(coin)
+    assert node.log == [("states", 3)]
+
+    # Asked again later, everything still travels together, in one request.
+    node.coin_states = working  # type: ignore[method-assign]
+    now[0] += 60
+    assert reader.coin_state(coins[1]) is None
+    assert node.log == [("states", 3), ("states", 3)]
+    assert reader.coin_state(coins[0]) is None and reader.coin_state(coins[2]) is None
+    assert len(node.log) == 2
+    assert _load(reader, world, minted.launcher_id).status is chain.OptionStatus.LIVE

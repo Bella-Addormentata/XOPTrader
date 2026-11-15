@@ -59,7 +59,7 @@ class SimWallet:
         self.rate_asked = 0
         self.unready: str | None = None  # why it cannot be relied on, if it cannot
 
-    def not_ready(self) -> str | None:
+    def not_ready(self, *, select_key: bool = True) -> str | None:
         return self.unready
 
     def fee_rate(self) -> int | None:
@@ -89,18 +89,21 @@ class SimWallet:
 class SimCoins:
     def __init__(self, party: Party) -> None:
         self.party = party
+        self.down: str | None = None  # the wallet will not list its coins
 
     def puzzle_hash(self) -> bytes:
         return self.party.puzzle_hash
 
     def xch_coins(self) -> list[Any]:
+        if self.down is not None:
+            raise RuntimeError(self.down)
         return self.party.xch_coins()
 
     def cats(self, asset_id: bytes) -> list[Any]:
         return self.party.cats(asset_id)
 
     def held(self, asset_ids: Any) -> frozenset[bytes]:
-        ids = {bytes(coin.coin_id()) for coin in self.party.xch_coins()}
+        ids = {bytes(coin.coin_id()) for coin in self.xch_coins()}
         for asset_id in asset_ids:
             wrapped = sdk.cat_puzzle_hash(asset_id, self.party.puzzle_hash)
             ids.update(
@@ -154,6 +157,7 @@ class Rig:
         self.wallet = SimWallet(self.world, self.maker)
         self.desk = FakeDesk()
         self.splash = FakeSplash()
+        self.coins = SimCoins(self.maker)
         self.store = store.OptionStore(":memory:")
         self.expiry = self.world.now() + 14 * DAY
         self.config = self.make_config(**overrides)
@@ -197,7 +201,7 @@ class Rig:
             self.config,
             book_store=self.store,
             wallet=self.wallet,
-            coins=SimCoins(self.maker),
+            coins=self.coins,
             chain_reader=self.reader,
             market=self.read_market,
             desk=self.desk,
@@ -1540,3 +1544,88 @@ def test_a_dry_run_sends_nothing_to_splash() -> None:
     rig = Rig(dry_run=True, **SPLASH_ON)
     rig.steps(3)
     assert rig.splash.asked == 0
+
+
+# ---------------------------------------------------------------------------
+# Second review pass
+# ---------------------------------------------------------------------------
+
+
+def test_a_withdrawal_that_runs_out_teaches_nothing_about_fees() -> None:
+    # It has only as long as the offer it kills. Missing that is ordinary.
+    rig = _auto_fee(put_strikes_pct=[])
+    rig.steps(3)
+    rig.wallet.push = _unheard()  # type: ignore[method-assign]
+    rig.spot = 1.25
+    rig.steps(1)  # a withdrawal no node hears
+    assert [row.kind for row in rig.store.unresolved()] == [store.WITHDRAW]
+
+    rig.world.advance(1600)
+    (report,) = rig.steps(1)
+
+    assert any("back on offer" in action for action in report.actions)
+    assert rig.store.recall("fee_rate") is None
+    assert not any("fee rate raised" in problem for problem in report.problems)
+
+
+def test_a_lapse_while_the_wallet_has_no_node_teaches_nothing_about_fees() -> None:
+    rig = _auto_fee(put_strikes_pct=[], confirm_timeout_seconds=600)
+    rig.wallet.push = _unheard()  # type: ignore[method-assign]
+    rig.steps(1)  # a mint no node hears
+    rig.wallet.rate = None  # the wallet cannot estimate: it has no node to ask
+
+    rig.world.advance(1300)
+    (report,) = rig.steps(1)
+
+    assert any("did not confirm in time" in problem for problem in report.problems)
+    assert any("not taken as a sign of low fees" in problem for problem in report.problems)
+    assert rig.store.recall("fee_rate") is None
+
+
+def test_a_wallet_that_will_not_list_its_coins_costs_a_mint_not_the_step() -> None:
+    rig = Rig(call_strikes_pct=[110, 120])
+    rig.steps(2)  # one call open and on offer, a second minting
+    first = rig.contracts(store.OPEN)[0]
+    before = rig.live_offer(first)
+
+    rig.coins.down = "get_spendable_coins timed out"
+    rig.world.advance(800)  # the offer is due to be made again
+    (report,) = rig.steps(1)
+
+    # The mint that needed the coin list is not built, and says why...
+    assert any(
+        "cannot mint" in problem and "could not list the wallet's XCH coins" in problem
+        for problem in report.problems
+    )
+    # ...and the offers were still kept fresh.
+    assert rig.live_offer(first).id != before.id
+    rig.world.take(rig.taker, rig.live_offer(first).offer_text)
+
+
+def test_a_clawback_that_runs_out_leaves_an_unsold_contract_unsold() -> None:
+    rig = Rig(put_strikes_pct=[], limits={"max_contracts": 1}, confirm_timeout_seconds=600)
+    rig.steps(3)
+    call = _by_side(rig, "call", store.OPEN)
+    rig.world.advance(14 * DAY)  # nobody bought it
+    rig.wallet.push = _unheard()  # type: ignore[method-assign]
+    rig.steps(1)  # its clawback is signed; no node hears it
+    assert [row.kind for row in rig.store.unresolved()] == [store.CLAWBACK]
+
+    rig.wallet.fail_signing = True  # ...and the next one cannot be signed yet
+    rig.world.advance(1300)
+    rig.steps(1)
+
+    assert rig.store.contract(call.launcher_id).status == store.OPEN
+    assert rig.events("sold") == []
+
+
+def test_a_clawback_that_runs_out_leaves_a_sold_contract_sold() -> None:
+    rig = Rig(put_strikes_pct=[], limits={"max_contracts": 1}, confirm_timeout_seconds=600)
+    call = _sold_and_expired(rig)
+    rig.wallet.push = _unheard()  # type: ignore[method-assign]
+    rig.steps(1)
+    rig.wallet.fail_signing = True
+    rig.world.advance(1300)
+    rig.steps(1)
+
+    assert rig.store.contract(call.launcher_id).status == store.SOLD

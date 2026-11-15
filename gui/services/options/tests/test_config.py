@@ -257,3 +257,14 @@ def test_splash_is_off_unless_switched_on() -> None:
 def test_a_bad_splash_section_is_refused(raw, why) -> None:
     with pytest.raises(config.OptionsConfigError, match=why):
         _parse(splash=raw)
+
+
+def test_the_dedicated_wallet_must_not_be_the_trading_wallet_s_key() -> None:
+    # A second daemon on another port passes the port check, but on the same
+    # key it spends the very coins the engine's offers are made of.
+    section = _section(wallet={"port": 9356, "cert_path": "c", "key_path": "k", "fingerprint": 77})
+    for trading in (77, "77"):
+        with pytest.raises(config.OptionsConfigError, match="the trading wallet's key"):
+            config.parse({"options": section, "chia": {"wallet_fingerprint": trading}})
+    parsed = config.parse({"options": section, "chia": {"wallet_fingerprint": 78}})
+    assert parsed is not None and parsed.wallet.fingerprint == 77

@@ -603,6 +603,34 @@ def test_status_prints_the_book(tmp_path, monkeypatch, capsys) -> None:
     rpc.sync = {"synced": False, "syncing": True}
     assert cli._status(cfg) == 0
     assert "wallet: the options wallet is still syncing" in capsys.readouterr().out
+    # Looking is all status does: the wallet's key is never selected by it.
+    assert "log_in" not in rpc.endpoints()
+
+
+def test_status_reports_a_wallet_on_another_key_without_switching_it(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    world = World()
+    maker = world.party(3)
+    usd = world.issue_cat(world.party(1), 5)
+    wallet = {"port": 9356, "cert_path": "c", "key_path": "k", "fingerprint": 42}
+    cfg = _config(tmp_path, usd, wallet=wallet)
+    rpc = WalletRpc(world, maker)
+    rpc.logged_in = 7  # the operator has another key open
+    monkeypatch.setattr(
+        cli, "build", lambda _cfg: runtime.build(cfg, rpc=rpc, reader=world.sim, clock=world.now)
+    )
+
+    assert cli._status(cfg) == 0
+
+    out = capsys.readouterr().out
+    assert "wallet: the options wallet has another key open (7)" in out
+    assert "log_in" not in rpc.endpoints() and rpc.logged_in == 7
+
+    rpc.logged_in = 42
+    assert cli._status(cfg) == 0
+    assert "wallet: synced (logged in to 42)" in capsys.readouterr().out
+    assert "log_in" not in rpc.endpoints()
 
 
 def test_status_says_where_offers_are_announced_and_how_many_were_taken(

@@ -1705,8 +1705,10 @@ options:
   #   - once it shows any pressure, 5.5 mojos per unit of cost, the rate a full
   #     mempool admits plus a tenth, because the estimate itself runs far short
   #     of that (the engine's fee controller measured 13 times short);
-  #   - and at least double what the last transaction to run out paid, a rate
-  #     that is remembered and fades over hours without another failure.
+  #   - and at least double what the last mint, cancel or clawback to run out
+  #     paid, a rate that is remembered and fades over hours without another
+  #     failure. (A withdrawal that runs out teaches nothing: it has only as
+  #     long as the offer it kills.)
   fee_mojos: auto
   upload_offers: true                    # list each offer on xchoptions.com
 

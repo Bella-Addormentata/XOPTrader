@@ -146,7 +146,7 @@ class ReferenceWallet:
 
     # -- readiness ----------------------------------------------------------
 
-    def not_ready(self) -> str | None:
+    def not_ready(self, *, select_key: bool = True) -> str | None:
         """Why the wallet should not be acted on right now, or None if it can be.
 
         The daemon answers for whichever key is logged in, and another client
@@ -155,10 +155,21 @@ class ReferenceWallet:
         must call itself synced: one that is behind lists coins already spent
         and misses ones that have arrived. With no fingerprint configured the
         key in use is whichever is logged in.
+
+        ``select_key=False`` is for looking without touching: the key is not
+        changed, and a wallet open on another one is reported instead.
         """
         try:
-            if self._fingerprint is not None:
+            if self._fingerprint is not None and select_key:
                 self._call("log_in", {"fingerprint": int(self._fingerprint)})
+            elif self._fingerprint is not None:
+                answer = self._call("get_logged_in_fingerprint", {})
+                if answer.get("fingerprint") != int(self._fingerprint):
+                    return (
+                        f"the options wallet has another key open "
+                        f"({answer.get('fingerprint')}); the next step will select "
+                        f"{self._fingerprint}"
+                    )
             status = self._call("get_sync_status", {})
         except SigningError as exc:
             return f"the options wallet is not answering ({exc})"

@@ -151,6 +151,10 @@ class FakeWallet:
         self.logged_in = int(body["fingerprint"])
         return {"fingerprint": self.logged_in}
 
+    def _get_logged_in_fingerprint(self, body: dict) -> dict:
+        assert body == {}
+        return {"fingerprint": self.logged_in}
+
     def _get_sync_status(self, body: dict) -> dict:
         assert body == {}
         return dict(self.sync)
@@ -341,6 +345,22 @@ def test_a_synced_wallet_on_the_configured_key_is_ready() -> None:
     # The key is selected before the wallet is asked anything about itself.
     assert wallet.endpoints() == ["log_in", "get_sync_status"]
     assert wallet.logged_in == 1234567890
+
+
+def test_a_wallet_can_be_looked_at_without_its_key_being_changed() -> None:
+    world = World()
+    wallet = FakeWallet(world, world.party(1))
+    wallet.logged_in = 999  # open on another key
+    reference = ReferenceWallet(wallet, agg_sig_me_additional_data=ADDITIONAL_DATA, fingerprint=7)
+
+    answer = reference.not_ready(select_key=False)
+
+    assert answer is not None and "another key open (999)" in answer and "select 7" in answer
+    assert "log_in" not in wallet.endpoints() and wallet.logged_in == 999
+
+    wallet.logged_in = 7
+    assert reference.not_ready(select_key=False) is None
+    assert "log_in" not in wallet.endpoints()
 
 
 def test_with_no_fingerprint_the_logged_in_key_is_left_alone() -> None:

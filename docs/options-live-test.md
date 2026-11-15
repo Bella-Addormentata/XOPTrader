@@ -247,12 +247,18 @@ each transaction is priced from its own cost, never above
   measured it 13 times short on this project's own wallet, and found that above
   the admission rate a spend confirms promptly whatever it paid, while below it
   it does not confirm at all.
-- **What failure taught.** A transaction of ours that ran out unconfirmed is
-  proof its fee was too low, so the rate is raised to at least double what it
-  paid (5.5 if it paid nothing). The raised rate is kept in the database, used
-  for everything after, and halves every six hours without another failure.
-  Because a lapsed transaction is always made again, this is also how a stuck
-  one gets a better fee. `step` reports each raise, and `status` shows the rate.
+- **What failure taught.** A mint, cancel or clawback of ours that ran out
+  unconfirmed most likely paid too little, so the rate is raised to at least
+  double what it paid (5.5 if it paid nothing). The raised rate is kept in the
+  database, used for everything after, and halves every six hours without
+  another failure. Because a lapsed transaction is always made again, this is
+  also how a stuck one gets a better fee. `step` reports each raise, and
+  `status` shows the rate. Two lapses teach nothing, because they say little
+  about fees: a withdrawal's, which has only as long as the offer it kills,
+  and any while the wallet cannot give an estimate at all (it has no node to
+  ask). A lapse for some other reason, such as the wallet's node having been
+  unreachable for a while, is still read as a low fee; what that costs is
+  bounded by `limits.max_fee_mojos` and gone within a day.
 
 A mint costs about 55 to 90 million cost units, a withdrawal about 35 to 45
 million, a cancel about 140 to 170 million and a clawback 15 to 40 million. At

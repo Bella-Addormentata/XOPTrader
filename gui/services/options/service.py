@@ -156,8 +156,12 @@ class Wallet(Protocol):
     def push(self, coin_spends: Any, aggregated_signature: bytes) -> bytes:
         """Hand a signed bundle to a node. No verdict comes back."""
 
-    def not_ready(self) -> str | None:
-        """Why the wallet cannot be relied on right now, or None."""
+    def not_ready(self, *, select_key: bool = True) -> str | None:
+        """Why the wallet cannot be relied on right now, or None.
+
+        Selects the configured key first unless ``select_key`` is False, in
+        which case a wallet on another key is simply reported.
+        """
 
     def fee_rate(self) -> int | None:
         """Mojos per unit of cost for prompt inclusion, or None if it cannot say."""
@@ -403,12 +407,26 @@ class OptionsBook:
                 taken.add(bytes(spend.coin.coin_id()))
         return taken
 
+    def _listed(self, what: str, asset_id: bytes | None = None) -> list[Any]:
+        """The wallet's coins, or :class:`builder.OptionBuildError` if it will not say.
+
+        A wallet call that fails half way through a step is one transaction not
+        built. It must not take the rest of the step with it: the offers still
+        have to be kept fresh.
+        """
+        try:
+            return self._coins.xch_coins() if asset_id is None else self._coins.cats(asset_id)
+        except (RuntimeError, OSError, ValueError) as exc:
+            raise builder.OptionBuildError(
+                f"could not list the wallet's {what} coins: {exc}"
+            ) from exc
+
     def _xch(self, needed: int) -> list[Coin]:
         """The fewest spendable XCH coins that cover ``needed`` mojos."""
-        reserved = self._reserved()
-        coins = [coin for coin in self._coins.xch_coins() if bytes(coin.coin_id()) not in reserved]
         if needed <= 0:
             return []
+        reserved = self._reserved()
+        coins = [coin for coin in self._listed("XCH") if bytes(coin.coin_id()) not in reserved]
         chosen: list[Coin] = []
         total = 0
         for coin in sorted(coins, key=lambda item: int(item.amount), reverse=True):
@@ -425,7 +443,9 @@ class OptionsBook:
     def _cats(self, asset_id: bytes, needed: int) -> list[Cat]:
         reserved = self._reserved()
         cats = [
-            cat for cat in self._coins.cats(asset_id) if bytes(cat.coin.coin_id()) not in reserved
+            cat
+            for cat in self._listed("quote asset", asset_id)
+            if bytes(cat.coin.coin_id()) not in reserved
         ]
         chosen: list[Cat] = []
         total = 0
@@ -504,8 +524,24 @@ class OptionsBook:
         return max(fees.pressure_rate(self._estimate(now, report)), self._learned_rate(now))
 
     def _learn_from_failure(self, row: store.Broadcast, now: int, report: StepReport) -> None:
-        """A transaction ran out unconfirmed: its fee was too low. Pay more next time."""
+        """A transaction ran out unconfirmed: most likely its fee was too low. Pay more.
+
+        Two lapses say little about fees and teach nothing. A withdrawal has
+        only as long as the offer it kills, which can be three minutes: missing
+        that is ordinary. And when the wallet cannot give an estimate at all it
+        has no node to ask, which is reason enough for a bundle not to arrive.
+        Anything else counts even while the estimate reads nothing, because an
+        estimate is the thing a failure calls into doubt.
+        """
         if not self._config.fee_auto or self._config.limits.max_fee_mojos <= 0:
+            return
+        if row.kind == store.WITHDRAW:
+            return
+        if self._estimate(now, report) is None:
+            report.problem(
+                f"the {row.kind} that ran out is not taken as a sign of low fees: "
+                "the wallet has no node to ask"
+            )
             return
         try:
             cost = fees.bundle_cost(unpack_bundle(row.bundle)[0])
@@ -675,7 +711,10 @@ class OptionsBook:
                 if same and other.kind in (store.CANCEL, store.CLAWBACK):
                     rival = other
             if rival is None:
-                back = store.SOLD if row.kind == store.CLAWBACK else store.OPEN
+                # Where it stood before. A clawback follows a sale, or an expiry
+                # nobody bought: only the first of those was ever sold.
+                sold = any(event.kind == "sold" for event in self._store.events(row.launcher_id))
+                back = store.SOLD if row.kind == store.CLAWBACK and sold else store.OPEN
         self._store.settle_broadcast(
             row.id,
             "conflict",
@@ -702,6 +741,7 @@ class OptionsBook:
         unresolved = self._store.unresolved()
         busy = {row.launcher_id for row in unresolved}
         clawing = {row.launcher_id for row in unresolved if row.kind == store.CLAWBACK}
+        ours = self._ours()
         for contract in self._store.contracts((store.OPEN, store.SOLD, store.CLOSING)):
             name = contract.launcher_id.hex()[:10]
             try:
@@ -724,7 +764,7 @@ class OptionsBook:
                     self._clawback(contract, loaded, now, report, act=act)
                 continue
 
-            mine = loaded.owner_puzzle_hash in self._ours()
+            mine = loaded.owner_puzzle_hash in ours
             if contract.status == store.OPEN and not mine:
                 if loaded.option is None and contract.launcher_id in busy:
                     continue  # melted, perhaps by our own cancel; its broadcast says which
@@ -953,6 +993,9 @@ class OptionsBook:
             except builder.OptionBuildError as exc:
                 report.problem(f"cannot mint {wanted.slot}: {exc}")
                 continue
+            except signing.SigningError as exc:  # the wallet would not give the key
+                report.problem(f"cannot mint {wanted.slot}: {exc}")
+                return
             except safety.SafetyError as exc:
                 report.problem(f"mint of {wanted.slot} refused by the safety check: {exc}")
                 return
@@ -1188,8 +1231,8 @@ class OptionsBook:
         return report
 
     def wallet_not_ready(self) -> str | None:
-        """Why the wallet cannot be relied on right now, or None. For display."""
-        return self._wallet.not_ready()
+        """Why the wallet cannot be relied on right now, or None. Changes nothing."""
+        return self._wallet.not_ready(select_key=False)
 
     def _wallet_ready(self, report: StepReport) -> bool:
         """Select the configured key and see that the wallet is synced.
