@@ -1670,6 +1670,10 @@ options:
     #   - the port and fingerprint checks above are lifted, and fingerprint is
     #     REQUIRED and must be chia.wallet_fingerprint (a step logs the wallet
     #     in to it; another key would be switched in under the engine);
+    #   - address is REQUIRED. Blank would take the wallet's current address,
+    #     which is where the engine sends its own coins to itself and spends
+    #     them from. Pick an address of this key that holds funds, e.g. one a
+    #     Dexie trade paid into;
     #   - status and every step print a warning, and whether the engine is up;
     #   - a live step, withdraw-all and every live-test spend are REFUSED while
     #     the engine runs, or while that cannot be told: its metrics endpoint

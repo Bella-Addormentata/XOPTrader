@@ -11,6 +11,7 @@ from gui.services.options import config, engine_guard
 from gui.services.options.tests.test_config import _section
 
 TRADING = {"wallet_host": "localhost", "wallet_port": 9256, "wallet_fingerprint": 481655774}
+ADDRESS = "xch1kxxd76v9kwsxrcxgndn3mylnxjhd7klgdns7083zjl247ffge32sr5rsy2"
 
 
 def _shared(**wallet) -> dict:
@@ -20,6 +21,7 @@ def _shared(**wallet) -> dict:
         "key_path": "k",
         "fingerprint": 481655774,
         "share_trading_wallet": True,
+        "address": ADDRESS,
         **wallet,
     }
 
@@ -51,6 +53,14 @@ def test_switched_on_it_allows_the_trading_wallet_s_daemon_and_key() -> None:
     assert (parsed.wallet.port, parsed.wallet.fingerprint) == (9256, 481655774)
     # And the default wallet port, with chia.wallet_port unset.
     assert _parse(_shared(), chia={"wallet_fingerprint": 481655774}).wallet.port == 9256
+
+
+@pytest.mark.parametrize("address", [None, "", "   "])
+def test_switched_on_it_needs_an_address_of_its_own(address) -> None:
+    # Blank takes the wallet's current address: where the engine's self-sends land.
+    with pytest.raises(config.OptionsConfigError, match="needs options.wallet.address"):
+        _parse(_shared(address=address))
+    assert _parse(_shared()).wallet.address == ADDRESS
 
 
 def test_it_does_not_make_trading_mode_acceptable() -> None:

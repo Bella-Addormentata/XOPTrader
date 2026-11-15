@@ -20,7 +20,10 @@ stops at the first thing that does not match.
     comment beside it in `config.example.yaml`. `status` and every step then
     print a warning and whether the engine is up, and a live step,
     `withdraw-all` and every `live-test` spend are refused while it is (or
-    while that cannot be told).
+    while that cannot be told). `options.wallet.address` is required then:
+    the wallet's current address is where the engine's self-sends land, and
+    on the first mainnet run the engine spent the coin there within minutes.
+    An address a Dexie trade paid into works, and needs nothing sent first.
 - That wallet's RPC port, under `options.wallet` in `config.yaml`, and its
   `config/ssl/wallet/private_wallet.crt` and `.key`, under `options.wallet` in
   `secrets.yaml` (see `secrets.example.yaml`; `~` is expanded). `secrets.yaml`

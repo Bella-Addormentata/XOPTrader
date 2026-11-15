@@ -406,10 +406,14 @@ _DOWN = cli.engine_guard.EngineState(running=False, certain=True, detail="nothin
 _UNSURE = cli.engine_guard.EngineState(running=False, certain=False, detail="tasklist failed")
 
 
+def _shared_wallet(maker: Party) -> dict:
+    return {**_SHARED_WALLET, "address": sdk.Address(maker.puzzle_hash, "txch").encode()}
+
+
 def _shared_live(tmp_path, monkeypatch):
     world, maker, _, rpc = _live(tmp_path, monkeypatch)
     usd = world.issue_cat(world.party(1), 5)
-    return world, maker, _config(tmp_path, usd, wallet=dict(_SHARED_WALLET)), rpc
+    return world, maker, _config(tmp_path, usd, wallet=_shared_wallet(maker)), rpc
 
 
 @pytest.mark.parametrize("engine", [_UP, _UNSURE])
@@ -482,10 +486,10 @@ def test_a_shared_wallet_step_rehearses_with_the_engine_up_but_does_not_act(
         lambda *a, **k: type("NoFeed", (), {"read": staticmethod(_no_feed)})(),
     )
 
-    rehearsal = _config(tmp_path, usd, dry_run=True, wallet=dict(_SHARED_WALLET))
+    rehearsal = _config(tmp_path, usd, dry_run=True, wallet=_shared_wallet(maker))
     assert cli._step(rehearsal) == 0 and stepped == [True]
 
-    live = _config(tmp_path, usd, dry_run=False, wallet=dict(_SHARED_WALLET))
+    live = _config(tmp_path, usd, dry_run=False, wallet=_shared_wallet(maker))
     assert cli._step(live) == 3 and stepped == [True]  # refused: no step was taken
     assert cli._withdraw_all(live) == 3
     out = capsys.readouterr().out

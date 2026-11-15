@@ -16,10 +16,12 @@ would look like an unexplained outflow and could trip the drawdown breaker.
 SHARING IT ANYWAY. ``wallet.share_trading_wallet: true`` (off by default) lets
 the book use the trading wallet's daemon and key on the understanding that the
 engine is STOPPED for as long as the book has contracts open. It lifts only the
-port and fingerprint checks, and adds two in their place: the book must name
+port and fingerprint checks, and adds three in their place: the book must name
 the engine's own key (a step logs the wallet in, and another key would switch
-it under the engine), and every command that signs first checks that the engine
-is not running (:mod:`engine_guard`) and refuses if it is, or if it cannot tell.
+it under the engine); it must name its address (a blank one takes the wallet's
+current address, where the engine's self-sends land); and every command that
+signs first checks that the engine is not running (:mod:`engine_guard`) and
+refuses if it is, or if it cannot tell.
 """
 
 from __future__ import annotations
@@ -365,6 +367,17 @@ def parse(root: Any) -> OptionsConfig | None:
             "options.wallet.fingerprint is required and must be the engine's key "
             "(chia.wallet_fingerprint); a step logs the wallet in to it"
         )
+    address = str(wallet_raw.get("address") or "").strip()
+    if share and not address:
+        # A blank address takes the wallet's current one, which is the newest
+        # it has derived: where the engine sends its own coins to itself, and
+        # spends them from. Seen on mainnet: an engine self-send made a coin
+        # there and the engine spent it minutes later.
+        raise OptionsConfigError(
+            "options.wallet.share_trading_wallet needs options.wallet.address set to an address "
+            "of this wallet's key that the engine does not send to itself: a blank address takes "
+            "the wallet's current address, which is where the engine's own self-sends land"
+        )
     metrics_url = str(wallet_raw.get("engine_metrics_url") or "").strip()
     if share and not metrics_url:
         monitoring = root.get("monitoring") if isinstance(root.get("monitoring"), dict) else {}
@@ -383,7 +396,7 @@ def parse(root: Any) -> OptionsConfig | None:
         cert_path=cert_path,
         key_path=key_path,
         fingerprint=fingerprint,
-        address=str(wallet_raw.get("address") or "").strip(),
+        address=address,
         share_trading_wallet=share,
         engine_metrics_url=metrics_url,
     )
