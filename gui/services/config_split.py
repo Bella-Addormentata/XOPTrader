@@ -390,6 +390,25 @@ SECRET_KEYS: dict[str, set[str]] = {
 # later Save would otherwise round-trip a STALE pre-rotation key blob back
 # over the fresh one on disk -- destroying the only persisted copy of the
 # rotated funds key. The on-disk secrets.yaml is authoritative for these.
+# The subset of SECRET_KEYS that nothing in the app edits: no Settings
+# widget shows them and no other writer sets them. Every caller of
+# split_and_save hands over a copy loaded earlier, so for these that copy is
+# only ever stale, never newer. They are therefore taken from the files on
+# disk at save time: one already in secrets.yaml stays exactly as it is (an
+# edit made there since the page loaded survives, and one deleted there is
+# not put back), and one still in config.yaml is moved across, without
+# replacing what secrets.yaml has.
+FILE_OWNED_KEYS: dict[str, set[str]] = {
+    "options": {
+        "wallet.cert_path",
+        "wallet.key_path",
+        "wallet.fingerprint",
+        "node.cert_path",
+        "node.key_path",
+        "node.ca_cert_path",
+    },
+}
+
 WALLET_MANAGED_KEYS: dict[str, set[str]] = {
     "warp": {
         "evm_private_key_dpapi",
@@ -460,6 +479,39 @@ def _drop_emptied(mapping: dict, parents: list[str]) -> None:
         del chain[depth - 1][parents[depth - 1]]
 
 
+def _fill_missing(target: dict, source: dict) -> None:
+    """Copy into *target* what it lacks from *source*; never replace a value."""
+    for key, value in source.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _fill_missing(target[key], value)
+        elif key not in target:
+            target[key] = copy.deepcopy(value)
+
+
+def _leaf(mapping: Any, parts: list[str]) -> Any:
+    """The value at ``parts`` below *mapping*, or ``_MISSING``."""
+    for part in parts:
+        if not isinstance(mapping, dict) or part not in mapping:
+            return _MISSING
+        mapping = mapping[part]
+    return mapping
+
+
+def _set_leaf(mapping: dict, parts: list[str], value: Any) -> None:
+    for part in parts[:-1]:
+        mapping = mapping.setdefault(part, {})
+    mapping[parts[-1]] = value
+
+
+def _read_public(config_path: Path) -> Any:
+    """config.yaml as it is on disk now, or None if it is missing or unreadable."""
+    try:
+        with open(config_path, "r", encoding="utf-8") as fh:
+            return yaml.safe_load(fh)
+    except (OSError, yaml.YAMLError):
+        return None
+
+
 def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
     """Write public fields to *config_path*, secrets to sibling secrets.yaml.
 
@@ -481,6 +533,7 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
         if not isinstance(src, dict):
             continue
         managed = WALLET_MANAGED_KEYS.get(section, set())
+        file_owned = FILE_OWNED_KEYS.get(section, set())
         for k in list(keys):
             *parents, leaf = k.split(".")
             holder: Any = src
@@ -495,6 +548,11 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
                 # written by BaseWallet, and must win.
                 holder.pop(leaf)
                 continue
+            if k in file_owned:
+                # Stripped from public; its value is read from disk below.
+                holder.pop(leaf)
+                _drop_emptied(src, parents)
+                continue
             target = secrets.setdefault(section, {})
             for part in parents:
                 target = target.setdefault(part, {})
@@ -504,9 +562,26 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
         if not src:
             del public[section]
 
-    # Write public config (comments in the existing file are preserved).
-    dump_preserving(config_path, public)
+    # FILE_OWNED_KEYS still sitting in config.yaml move to secrets.yaml. They
+    # are read from the file as it is now; with no readable file (a first
+    # write) the caller's copy is all there is.
+    on_disk = _read_public(config_path)
+    source = on_disk if isinstance(on_disk, dict) else full
+    moving: dict[str, Any] = {}
+    for section, keys in FILE_OWNED_KEYS.items():
+        for k in keys:
+            parts = [section, *k.split(".")]
+            value = _leaf(source, parts)
+            if value is not _MISSING:
+                _set_leaf(moving, parts, value)
 
+    # Secrets are written FIRST. Were config.yaml written first and the
+    # secrets write then fail (an unreadable secrets.yaml is refused below),
+    # a value being moved would already be gone from config.yaml and not yet
+    # in secrets.yaml: lost from both. This way a failed save changes
+    # neither file, and a save interrupted between the two leaves a value in
+    # both, which reads back the same.
+    #
     # Write secrets — preserve any keys the user added manually. The whole
     # read-existing / merge / write runs under the per-file lock so a
     # concurrent BaseWallet key write cannot land between our read and write
@@ -518,7 +593,7 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
     # blobs it still holds as text. A save must never destroy what it could
     # not read; the operator fixes the file, then saves.
     secrets_path = config_path.parent / "secrets.yaml"
-    if secrets:
+    if secrets or moving:
         with file_transaction(secrets_path):
             if secrets_path.is_file():
                 existing = None
@@ -541,4 +616,9 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
                     )
                 deep_merge(existing, secrets)
                 secrets = existing
+            # What secrets.yaml already has wins over what is moved in.
+            _fill_missing(secrets, moving)
             dump_preserving(secrets_path, secrets)
+
+    # Then public config (comments in the existing file are preserved).
+    dump_preserving(config_path, public)
