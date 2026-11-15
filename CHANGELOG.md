@@ -25,7 +25,19 @@ checklist for a first run.
 First run on mainnet, 2026-11-15, from Windows against a 2.7.4 wallet
 daemon: `status`, a dry-run `run`, and `live-test` (mint, offer,
 withdrawal, cancel of a 0.0001 XCH contract), each spend confirmed and
-the wallet down by exactly the three fees.
+the wallet down by exactly the three fees. Then `run` live with two
+0.5 XCH calls: both mints confirmed, and xchoptions.com accepted and
+listed the offers, which the book re-made every 12 minutes.
+
+Two things that run turned up are fixed:
+
+- **An ask on the minimum premium was sometimes one unit high.** Float
+  error made 5 quote mojos 5.000000000000001, and rounding up listed the
+  contract at 0.006 wUSDC.b instead of 0.005. The ask then flipped
+  between the two and re-quoted each time.
+- **The XCH price was rounded to the cent.** CoinGecko's simple price
+  answers 1.15 for 1.1512 unless asked for full precision, so the book's
+  spot moved in steps of about 0.9%. It now asks for full precision.
 
 ### The options book's secrets stay in secrets.yaml (#229)
 
