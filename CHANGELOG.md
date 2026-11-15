@@ -5,6 +5,53 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Options book: covered calls and puts on xchoptions.com from a reference wallet (#228)
+
+`gui/services/options` writes option contracts (CHIP-0045) from a Chia
+reference wallet and offers them on xchoptions.com. It builds the spends
+with `chia-wallet-sdk` and has the wallet sign them through its signer
+RPCs (chia-blockchain 2.4.3 or newer). It is off unless `options.enabled`
+is true, rehearses (`dry_run`) by default, and refuses to mint while any
+of its caps is unset.
+
+It runs from a terminal only, from a source checkout:
+`python -m gui.services.options --config config.yaml <command>`, with
+`status`, `step`, `run`, `withdraw-all`, `monitor` and `live-test`. The
+installed app has no page for it yet. `docs/options-live-test.md` is the
+checklist for a first run.
+
+First run on mainnet, 2026-11-15, from Windows against a 2.7.4 wallet
+daemon: `status`, a dry-run `run`, and `live-test` (mint, offer,
+withdrawal, cancel of a 0.0001 XCH contract), each spend confirmed and
+the wallet down by exactly the three fees.
+
+### The options book's secrets stay in secrets.yaml (#229)
+
+The options wallet's certificate paths and fingerprint, and the options
+node's, are kept in `secrets.yaml` when the Settings page saves, and the
+option-contract tests are left out of the release bundle.
+
+### The options book can share the trading wallet while the engine is stopped
+
+`options.wallet.share_trading_wallet` (off by default) lets the book sign
+from the engine's own wallet daemon and key, for a machine where a second
+daemon and key are not wanted. The engine must stay stopped while any
+contract is open: its offers pick coins from the whole wallet, and the
+book's collateral and premiums change balances behind its back. With it on:
+
+- `options.wallet.fingerprint` must be the engine's key, and
+  `options.wallet.address` must be set. A blank address takes the wallet's
+  current address, which is where the engine sends coins to itself; on
+  the first mainnet run the engine spent the coin there within minutes.
+- `status` and every step say so, and whether the engine is up.
+- A live step, `withdraw-all` and every `live-test` spend are refused while
+  the engine runs, or while that cannot be told: its metrics endpoint
+  answers, or an `xop_trader` process exists. A dry-run step still runs.
+
+`run` also prints the time before each step.
+
 ## [0.10.47] — 2026-11-08 — ratio modes switch on when a pair drifts 10 points
 
 ### Apply on the Wallet tab caps each pair's ratio entry band at 0.10 (#223)
