@@ -99,6 +99,8 @@ def test_read_combines_the_feed_and_the_book() -> None:
     # As old as the observation, not as the request that fetched it.
     assert view.as_of == 4940.0
     assert any("include_last_updated_at=true" in url for url in feeds.calls)
+    # Without it CoinGecko rounds the price to the cent: 1.15 for 1.1512.
+    assert any("simple/price" in url and "precision=full" in url for url in feeds.calls)
     view.require_usable(now=5000.0, max_age_seconds=600, max_spread_pct=10, require_book=True)
 
 

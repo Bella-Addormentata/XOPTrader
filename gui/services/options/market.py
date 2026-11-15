@@ -185,9 +185,12 @@ class MarketSource:
 
     def _spot(self, now: float) -> tuple[float, float]:
         """The spot price and the time the feed observed it."""
+        # precision=full: without it the price comes back to the cent (1.15 for
+        # 1.1512...), steps of about 0.9% that move strikes and premiums in jumps.
+        # Seen on the first live run, 2026-11-15.
         data = self._json(
             f"{self._coingecko}/simple/price?ids=chia&vs_currencies=usd"
-            "&include_last_updated_at=true",
+            "&include_last_updated_at=true&precision=full",
             self._coingecko_headers,
         )
         try:
