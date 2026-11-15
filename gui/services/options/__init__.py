@@ -17,7 +17,8 @@ do the same work against the wallet it already trades through:
 * :mod:`chain` reads an option, or the outcome of a broadcast, back from chain.
 * :mod:`pricing`, :mod:`market` and :mod:`quoting` decide what to offer and at
   what price; :mod:`fees` sizes each transaction's fee from its cost;
-  :mod:`desk` talks to xchoptions.com; :mod:`store` is the durable
+  :mod:`desk` talks to xchoptions.com and :mod:`splash` hands offers to a
+  Splash! daemon, when one is configured; :mod:`store` is the durable
   record; :mod:`service` is the loop that ties them together and
   :mod:`monitor` is its read-only counterpart for other makers' offers.
 * :mod:`runtime` and ``python -m gui.services.options`` wire it to a real

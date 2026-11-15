@@ -107,6 +107,15 @@ def _status(cfg: config.OptionsConfig) -> int:
         )
     else:
         print(f"fees: {cfg.fee_mojos} mojos a transaction")
+    if cfg.splash.enabled:
+        live = book_store.offers(status="live")
+        taken = sum(offer.splash_at is not None for offer in live)
+        print(
+            f"splash: new offers are handed to the daemon at {cfg.splash.submit_url} "
+            f"({taken} of {len(live)} live offers taken by it)"
+        )
+    else:
+        print("splash: off")
     print(f"options address {coins.address()}")
     xch = sum(int(coin.amount) for coin in coins.xch_coins())
     quote = sum(int(cat.coin.amount) for cat in coins.cats(cfg.quote_asset_id))

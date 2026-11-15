@@ -1710,6 +1710,26 @@ options:
   fee_mojos: auto
   upload_offers: true                    # list each offer on xchoptions.com
 
+  # Splash!, Dexie's peer-to-peer offer network (github.com/dexie-space/splash).
+  # When enabled, each new offer is ALSO handed to a Splash daemon you run
+  # beside the book, which gossips it to its peers:
+  #     splash --listen-offer-submission 127.0.0.1:4000      (add --testnet on testnet11)
+  # This is publishing only, and independent of upload_offers above.
+  #   - The daemon's "yes" means it took the offer, not that anyone heard it;
+  #     it says the same with no peers connected.
+  #   - Nothing can be taken back once gossiped, exactly as with the site:
+  #     only spending the option coin (withdraw-all) ends an offer.
+  #   - The network keeps no history. Each offer is announced once when made,
+  #     and offers are re-made every offer_ttl_seconds less
+  #     refresh_before_seconds (12 minutes as shipped), so that is how often
+  #     each contract is heard. An offer the daemon did not take is tried
+  #     again while it stands; the offer itself is valid either way.
+  #   - Who lists what it hears is up to them. Dexie indexes the network, but
+  #     is not known to show option offers.
+  splash:
+    enabled: false                       # [OPTIONAL, default: false]
+    submit_url: "http://127.0.0.1:4000"  # the daemon's --listen-offer-submission address
+
   pricing:
     rate: 0.0                            # risk-free rate in the model
     sigma_markup: 0.02                   # volatility points added for the ask

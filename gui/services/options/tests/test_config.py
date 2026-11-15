@@ -235,3 +235,25 @@ def test_the_app_s_coingecko_key_is_carried_but_never_printed() -> None:
     assert parsed is not None and parsed.coingecko_api_key == "CG-secret"
     assert "CG-secret" not in repr(parsed)
     assert _parse().coingecko_api_key == ""
+
+
+def test_splash_is_off_unless_switched_on() -> None:
+    assert _parse().splash == config.SplashConfig(False, "http://127.0.0.1:4000")
+    on = _parse(splash={"enabled": True}).splash
+    assert on.enabled and on.submit_url == "http://127.0.0.1:4000"
+    there = _parse(splash={"enabled": True, "submit_url": " http://10.0.0.5:4000 "}).splash
+    assert there.submit_url == "http://10.0.0.5:4000"
+
+
+@pytest.mark.parametrize(
+    ("raw", "why"),
+    [
+        ({"enabled": "true"}, "enabled must be true or false"),
+        ({"enabled": True, "submit_url": "127.0.0.1:4000"}, "submit_url is not an http address"),
+        ({"submit_url": "http://user:pw@host:4000"}, "must not carry a user name"),
+        ("on", "options.splash must be a mapping"),
+    ],
+)
+def test_a_bad_splash_section_is_refused(raw, why) -> None:
+    with pytest.raises(config.OptionsConfigError, match=why):
+        _parse(splash=raw)

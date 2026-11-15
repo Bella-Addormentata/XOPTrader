@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS offers (
     offer_text    TEXT NOT NULL,
     desk_offer_id TEXT,
     status        TEXT NOT NULL CHECK (status IN ('live', 'taken', 'dead')),
-    created_at    INTEGER NOT NULL
+    created_at    INTEGER NOT NULL,
+    splash_at     INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_offers_launcher ON offers (launcher_id, status);
 
@@ -192,6 +193,7 @@ class OfferRow:
     desk_offer_id: str | None
     status: str
     created_at: int
+    splash_at: int | None = None  # when a Splash daemon took it; None = not yet
 
 
 @dataclasses.dataclass(frozen=True)
@@ -290,6 +292,10 @@ class OptionStore:
             for column in ("valid_until", "fee"):
                 if column not in columns:
                     self._db.execute(f"ALTER TABLE broadcasts ADD COLUMN {column} INTEGER")
+            # ...and from before offers could be handed to a Splash daemon.
+            columns = {row["name"] for row in self._db.execute("PRAGMA table_info(offers)")}
+            if "splash_at" not in columns:
+                self._db.execute("ALTER TABLE offers ADD COLUMN splash_at INTEGER")
         self._lock: sqlite3.Connection | None = None
         self._lock_depth = 0
 
@@ -565,6 +571,7 @@ class OptionStore:
             desk_offer_id=row["desk_offer_id"],
             status=row["status"],
             created_at=int(row["created_at"]),
+            splash_at=None if row["splash_at"] is None else int(row["splash_at"]),
         )
 
     def offers(self, launcher_id: bytes | None = None, status: str | None = None) -> list[OfferRow]:
@@ -583,11 +590,20 @@ class OptionStore:
         return [self._offer(row) for row in rows]
 
     def set_offer(
-        self, offer_id: int, *, status: str | None = None, desk_offer_id: str | None = None
+        self,
+        offer_id: int,
+        *,
+        status: str | None = None,
+        desk_offer_id: str | None = None,
+        splash_at: int | None = None,
     ) -> None:
         with self._write() as db:
             if status is not None:
                 db.execute("UPDATE offers SET status = ? WHERE id = ?", (status, int(offer_id)))
+            if splash_at is not None:
+                db.execute(
+                    "UPDATE offers SET splash_at = ? WHERE id = ?", (int(splash_at), int(offer_id))
+                )
             if desk_offer_id is not None:
                 db.execute(
                     "UPDATE offers SET desk_offer_id = ? WHERE id = ?",

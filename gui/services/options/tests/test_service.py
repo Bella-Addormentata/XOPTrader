@@ -27,6 +27,7 @@ from gui.services.options import (  # noqa: E402
     market,
     quoting,
     signing,
+    splash,
     store,
 )
 from gui.services.options.service import OptionsBook, unpack_bundle  # noqa: E402
@@ -122,6 +123,21 @@ class FakeDesk:
         )
 
 
+class FakeSplash:
+    """A Splash daemon: takes offers, or does not."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.asked = 0
+        self.down: str | None = None
+
+    def broadcast(self, offer: str) -> None:
+        self.asked += 1
+        if self.down is not None:
+            raise splash.SplashError(self.down)
+        self.sent.append(offer)
+
+
 class Rig:
     def __init__(self, reader: Any = None, **overrides: Any) -> None:
         self.world = World()
@@ -137,6 +153,7 @@ class Rig:
         self.market_error: str | None = None
         self.wallet = SimWallet(self.world, self.maker)
         self.desk = FakeDesk()
+        self.splash = FakeSplash()
         self.store = store.OptionStore(":memory:")
         self.expiry = self.world.now() + 14 * DAY
         self.config = self.make_config(**overrides)
@@ -184,6 +201,7 @@ class Rig:
             chain_reader=self.reader,
             market=self.read_market,
             desk=self.desk,
+            splash=self.splash if self.config.splash.enabled else None,
             clock=self.world.now,
         )
 
@@ -1422,3 +1440,103 @@ def test_the_kill_switch_does_not_wait_for_the_wallet() -> None:
     for offer in offers:
         with pytest.raises(RejectedError, match="DoubleSpend"):
             rig.world.take(rig.taker, offer.offer_text)
+
+
+# ---------------------------------------------------------------------------
+# Splash: each offer is also handed to a daemon that gossips it
+# ---------------------------------------------------------------------------
+
+SPLASH_ON = {"splash": {"enabled": True}}
+
+
+def test_nothing_goes_to_splash_unless_it_is_switched_on() -> None:
+    rig = Rig()
+    rig.steps(4)
+    assert len(rig.store.offers(status="live")) == 2
+    assert rig.splash.asked == 0
+    assert all(offer.splash_at is None for offer in rig.store.offers())
+
+
+def test_each_offer_is_handed_to_splash_once_when_it_is_made() -> None:
+    rig = Rig(**SPLASH_ON)
+    rig.steps(4)
+    live = rig.store.offers(status="live")
+
+    assert sorted(rig.splash.sent) == sorted(offer.offer_text for offer in live)
+    assert all(offer.splash_at is not None for offer in live)
+
+    # While they stand they are not sent again: the daemon was told once.
+    rig.steps(3)
+    assert rig.splash.asked == 2
+
+
+def test_an_offer_made_again_before_it_runs_out_is_announced_in_its_turn() -> None:
+    rig = Rig(**SPLASH_ON)
+    rig.steps(4)
+    call = _by_side(rig, "call", store.OPEN)
+    first = rig.live_offer(call)
+
+    rig.world.advance(800)  # inside the last three minutes of a 15 minute offer
+    rig.steps(1)
+
+    second = rig.live_offer(call)
+    assert second.id != first.id and second.offer_text in rig.splash.sent
+    # This is how a network with no memory hears of each contract again.
+    assert len(rig.splash.sent) == 4
+
+
+def test_a_splash_daemon_that_is_down_costs_one_request_a_step_and_no_offer() -> None:
+    rig = Rig(**SPLASH_ON)
+    rig.splash.down = "no answer from the Splash daemon at http://127.0.0.1:4000"
+    reports = rig.steps(4)
+
+    # The offers were made, are on the site and can be taken: Splash is extra.
+    live = rig.store.offers(status="live")
+    assert len(live) == 2 and len(rig.desk.uploads) == 2
+    assert all(offer.splash_at is None for offer in live)
+    for report in reports:
+        said = [text for text in report.problems if "Splash" in text]
+        assert len(said) <= 1  # one line a step, not one for every contract
+    assert "not announced on Splash: no answer from the Splash daemon" in reports[-1].problems[0]
+    assert "tried again while the offer stands" in reports[-1].problems[0]
+    # One try on each step that had an offer to send, however many were waiting.
+    asked = rig.splash.asked
+    rig.steps(1)
+    assert rig.splash.asked == asked + 1
+
+    # The daemon comes back: both standing offers are handed over, once.
+    rig.splash.down = None
+    (report,) = rig.steps(1)
+    assert sorted(rig.splash.sent) == sorted(offer.offer_text for offer in live)
+    assert not any("Splash" in text for text in report.problems)
+    rig.steps(2)
+    assert len(rig.splash.sent) == 2
+
+    call = _by_side(rig, "call", store.OPEN)
+    rig.world.take(rig.taker, rig.live_offer(call).offer_text)
+
+
+def test_an_offer_the_ask_has_left_behind_is_never_announced() -> None:
+    rig = Rig(**SPLASH_ON)
+    rig.splash.down = "refused"
+    rig.steps(4)
+    call = _by_side(rig, "call", store.OPEN)
+    old = rig.live_offer(call)
+
+    # A small move: a dearer offer is posted beside the old one, which is left
+    # to run out. The daemon is back, and must hear of the new one only.
+    rig.spot = 1.115
+    rig.splash.down = None
+    rig.steps(2)
+
+    new = rig.live_offer(call)
+    assert new.id != old.id and new.offer_text in rig.splash.sent
+    assert old.offer_text not in rig.splash.sent
+    (kept,) = [offer for offer in rig.store.offers(call.launcher_id) if offer.id == old.id]
+    assert kept.status == "live" and kept.splash_at is None
+
+
+def test_a_dry_run_sends_nothing_to_splash() -> None:
+    rig = Rig(dry_run=True, **SPLASH_ON)
+    rig.steps(3)
+    assert rig.splash.asked == 0

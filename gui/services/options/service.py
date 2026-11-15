@@ -109,6 +109,7 @@ from gui.services.options import builder, chain, fees, quoting, safety, signing,
 from gui.services.options.config import OptionsConfig
 from gui.services.options.desk import DeskError
 from gui.services.options.market import Market, MarketError
+from gui.services.options.splash import SplashError
 
 if TYPE_CHECKING:
     from chia_wallet_sdk import Cat, Coin, CoinSpend, PublicKey
@@ -189,6 +190,13 @@ class Desk(Protocol):
         """List an offer; returns a record with an ``offer_id``."""
 
 
+class Splash(Protocol):
+    """A Splash! daemon offers are handed to. ``SplashClient`` provides it."""
+
+    def broadcast(self, offer: str) -> None:
+        """Hand one offer over; raises ``SplashError`` if it was not taken."""
+
+
 @dataclasses.dataclass
 class StepReport:
     """What one step saw and did, for the log and the GUI."""
@@ -250,6 +258,7 @@ class OptionsBook:
         chain_reader: chain.ChainReader,
         market: Callable[[], Market],
         desk: Desk | None = None,
+        splash: Splash | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._config = config
@@ -259,6 +268,8 @@ class OptionsBook:
         self._chain = chain.CachedChain.over(chain_reader, book_store, clock=clock)
         self._market = market
         self._desk = desk
+        self._splash = splash
+        self._splash_down = False  # the daemon failed once this step: ask no more
         self._clock = clock
         self._keys: dict[bytes, Any] = {}
         self._loaded: dict[bytes, chain.LoadedOption] = {}
@@ -1032,6 +1043,9 @@ class OptionsBook:
             )
             moved = abs(ask - newest.price_amount) / newest.price_amount * 100.0
             if fresh and moved < self._config.reprice_pct:
+                # It stands. If the Splash daemon has not taken it yet, try again.
+                if newest.splash_at is None:
+                    self._announce(newest.id, newest.offer_text, contract, now, report)
                 return
         address = self._address()
         try:
@@ -1070,6 +1084,35 @@ class OptionsBook:
             except DeskError as exc:
                 # The offer is valid without the site; it just is not advertised.
                 report.problem(f"offer for {contract.slot} ({name}) not listed: {exc}")
+        self._announce(offer_id, text, contract, now, report)
+
+    def _announce(
+        self, offer_id: int, text: str, contract: store.Contract, now: int, report: StepReport
+    ) -> None:
+        """Hand an offer to the Splash daemon, if one is configured.
+
+        Once per offer: the network keeps no history, but each offer is re-made
+        before it runs out and the new one is announced in its turn. Only the
+        offer that currently stands for a contract is ever sent, never one the
+        ask has left behind. An offer the daemon did not take is tried again on
+        later steps while it stands; after one failure nothing more is sent in
+        the same step, so a daemon that is down costs one request, not one for
+        every contract.
+        """
+        if self._splash is None or self._splash_down:
+            return
+        try:
+            self._splash.broadcast(text)
+        except SplashError as exc:
+            self._splash_down = True
+            # The offer is valid without it; it just is not announced there.
+            name = contract.launcher_id.hex()[:10]
+            report.problem(
+                f"offer for {contract.slot} ({name}) not announced on Splash: {exc}. "
+                "It will be tried again while the offer stands"
+            )
+            return
+        self._store.set_offer(offer_id, splash_at=now)
 
     def _withdraw(
         self,
@@ -1162,6 +1205,7 @@ class OptionsBook:
 
     def _step(self, now: int, report: StepReport) -> None:
         act = not self._config.dry_run
+        self._splash_down = False
         if not self._wallet_ready(report):
             report.problem("nothing done this step")
             return

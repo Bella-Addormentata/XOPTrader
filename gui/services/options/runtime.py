@@ -16,7 +16,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from gui.services.options import chain, config, desk, market, signing, store
+from gui.services.options import chain, config, desk, market, signing, splash, store
 from gui.services.options.reference_wallet import ReferenceWallet, WalletRpc, coin_from_json
 from gui.services.options.service import OptionsBook, OptionsError
 
@@ -217,6 +217,7 @@ def build(
     rpc: WalletRpc | None = None,
     reader: chain.ChainReader | None = None,
     market_reader: Callable[[], market.Market] | None = None,
+    splash_client: Any = None,
     clock: Callable[[], float] = time.time,
 ) -> tuple[OptionsBook, store.OptionStore, WalletCoinSource]:
     """Assemble the book from config. The network-facing parts can be injected."""
@@ -241,6 +242,11 @@ def build(
         ).read
     # The site lists mainnet options only.
     listing = desk.DeskClient() if cfg.network == config.MAINNET else None
+    # Splash has a network of its own for each chain; which one the daemon is
+    # on is the daemon's --testnet flag, not something it can be asked.
+    announcer = None
+    if cfg.splash.enabled:
+        announcer = splash_client or splash.SplashClient(cfg.splash.submit_url)
     book = OptionsBook(
         cfg,
         book_store=book_store,
@@ -249,6 +255,7 @@ def build(
         chain_reader=reader,
         market=market_reader,
         desk=listing,
+        splash=announcer,
         clock=clock,
     )
     return book, book_store, coins

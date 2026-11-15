@@ -450,3 +450,47 @@ def test_everything_survives_a_restart(tmp_path) -> None:
     assert reopened.contract(LAUNCHER).slot == "C110@1000"
     assert len(reopened.broadcasts()) == 1
     assert reopened.events()[0].detail == {"text": "hello"}
+
+
+def test_an_offer_records_when_a_splash_daemon_took_it() -> None:
+    book = store.OptionStore(":memory:")
+    _add(book)
+    offer_id = _offer(book, 900)
+    assert book.offers()[0].splash_at is None
+
+    book.set_offer(offer_id, splash_at=1234)
+
+    (row,) = book.offers()
+    assert row.splash_at == 1234 and row.status == "live"
+
+
+def test_a_database_from_before_splash_is_brought_up_to_date(tmp_path) -> None:
+    path = tmp_path / "options_jobs.db"
+    book = store.OptionStore(path)
+    _add(book)
+    _offer(book, 900)
+    book.close()
+    # Put the offers table back as it was before the column existed.
+    old = sqlite3.connect(path)
+    old.executescript(
+        """
+        ALTER TABLE offers RENAME TO offers_new;
+        CREATE TABLE offers (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            launcher_id TEXT NOT NULL REFERENCES contracts (launcher_id), price_asset TEXT,
+            price_amount INTEGER NOT NULL, expires_at INTEGER, bundle BLOB NOT NULL,
+            offer_text TEXT NOT NULL, desk_offer_id TEXT, status TEXT NOT NULL,
+            created_at INTEGER NOT NULL);
+        INSERT INTO offers SELECT id, launcher_id, price_asset, price_amount, expires_at,
+            bundle, offer_text, desk_offer_id, status, created_at FROM offers_new;
+        DROP TABLE offers_new;
+        """
+    )
+    old.commit()
+    old.close()
+
+    book = store.OptionStore(path)
+
+    (row,) = book.offers()
+    assert (row.price_amount, row.splash_at) == (900, None)
+    book.set_offer(row.id, splash_at=77)
+    assert book.offers()[0].splash_at == 77

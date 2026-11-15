@@ -17,7 +17,7 @@ sdk = pytest.importorskip("chia_wallet_sdk")
 yaml = pytest.importorskip("yaml")
 
 from gui.services.options import __main__ as cli  # noqa: E402
-from gui.services.options import chain, config, market, runtime, store  # noqa: E402
+from gui.services.options import chain, config, market, runtime, splash, store  # noqa: E402
 from gui.services.options.service import OptionsError  # noqa: E402
 from gui.services.options.tests.sim_world import CAT, XCH, Party, World  # noqa: E402
 from gui.services.options.tests.test_reference_wallet import FakeWallet, _hex  # noqa: E402
@@ -219,6 +219,25 @@ def test_build_wires_a_book_that_reaches_the_dry_run(tmp_path) -> None:
     report = book.step()
     assert report.dry_run and report.market_error == "no feed in this test"
     assert (tmp_path / "options_jobs.db").exists()
+
+
+def test_build_gives_the_book_a_splash_daemon_only_when_switched_on(tmp_path) -> None:
+    world = World()
+    maker = world.party(100)
+    usd = world.issue_cat(maker, 500)
+
+    def built(**overrides):
+        cfg = _config(tmp_path, usd, **overrides)
+        book, _, _ = runtime.build(
+            cfg, rpc=WalletRpc(world, maker, usd), reader=world.sim, clock=world.now
+        )
+        return book._splash  # noqa: SLF001 - the wiring is what is under test
+
+    assert built() is None
+    assert built(splash={"submit_url": "http://127.0.0.1:4000"}) is None  # an address is not a yes
+    client = built(splash={"enabled": True, "submit_url": "http://127.0.0.1:4321"})
+    assert isinstance(client, splash.SplashClient)
+    assert client.submit_url == "http://127.0.0.1:4321"
 
 
 DUST = 10**8  # 0.0001 XCH, the live test's default size
@@ -579,7 +598,57 @@ def test_status_prints_the_book(tmp_path, monkeypatch, capsys) -> None:
     assert "chain is read from coinset" in out
     assert "fees: 0 mojos a transaction" in out
     assert "wallet: synced (no fingerprint set, so whichever key it has open)" in out
+    assert "splash: off" in out
 
     rpc.sync = {"synced": False, "syncing": True}
     assert cli._status(cfg) == 0
     assert "wallet: the options wallet is still syncing" in capsys.readouterr().out
+
+
+def test_status_says_where_offers_are_announced_and_how_many_were_taken(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    world = World()
+    maker = world.party(3)
+    usd = world.issue_cat(world.party(1), 5)
+    cfg = _config(tmp_path, usd, splash={"enabled": True, "submit_url": "http://127.0.0.1:4321"})
+    rpc = WalletRpc(world, maker)
+    monkeypatch.setattr(
+        cli, "build", lambda _cfg: runtime.build(cfg, rpc=rpc, reader=world.sim, clock=world.now)
+    )
+    book_store = store.OptionStore(cfg.database_path)
+    book_store.add_contract(
+        launcher_id=b"\x11" * 32,
+        slot="C110@5",
+        side="call",
+        underlying_asset=None,
+        underlying_amount=1,
+        strike_asset=usd,
+        strike_amount=1,
+        expiration=5,
+        creator_puzzle_hash=maker.puzzle_hash,
+        bundle=b"x",
+        deadline=9,
+    )
+    ids = [
+        book_store.add_offer(
+            launcher_id=b"\x11" * 32,
+            price_asset=usd,
+            price_amount=price,
+            expires_at=None,
+            bundle=b"o",
+            offer_text=f"offer1{price}",
+            now=1,
+        )
+        for price in (5, 6, 7)
+    ]
+    book_store.set_offer(ids[0], splash_at=2)
+    book_store.set_offer(ids[1], splash_at=2)
+    book_store.set_offer(ids[1], status="dead")  # no longer live: not counted
+    book_store.close()
+
+    assert cli._status(cfg) == 0
+
+    out = capsys.readouterr().out
+    assert "splash: new offers are handed to the daemon at http://127.0.0.1:4321" in out
+    assert "(1 of 2 live offers taken by it)" in out

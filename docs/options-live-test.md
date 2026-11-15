@@ -116,6 +116,52 @@ Two things to know once contracts are out:
   beside it reports "another process is acting" and does nothing. `status` and
   `monitor` are not affected.
 
+## Announcing offers on Splash (optional)
+
+[Splash!](https://github.com/dexie-space/splash) is Dexie's peer-to-peer
+network for Chia offers. With `options.splash.enabled: true`, each offer the
+book makes is also handed to a Splash daemon you run on the same machine, which
+gossips it to its peers. It is off by default and independent of the upload to
+the site.
+
+1. Download the daemon for your system from the project's releases page
+   (`splash-amd64.exe` on Windows) and check it against the `.sha256` file
+   published beside it.
+2. Start it with its offer-submission API on this machine only:
+
+   ```bash
+   splash --listen-offer-submission 127.0.0.1:4000
+   ```
+
+   Add `--testnet` when `options.network` is `testnet11`: the two chains have
+   separate Splash networks, and the book cannot ask the daemon which it is on.
+   It prints `Connected to peer: ...` as it finds peers. It needs outbound
+   connections only.
+3. Set `options.splash.enabled: true`. `status` then shows the address offers
+   are handed to and how many of the live ones the daemon has taken.
+
+What to expect:
+
+- **The daemon's "yes" is not delivery.** It answers before it has published
+  and says yes with no peers at all, so watch its own output for peers. An
+  offer it refuses or cannot be reached for is reported by `step` ("not
+  announced on Splash") and tried again on later steps while that offer
+  stands. The offer is valid either way.
+- **Nothing can be taken back.** As with the site, only spending the option
+  coin ends an offer; `withdraw-all` does that.
+- **The network has no memory.** A listener hears an offer only if it is
+  connected when the offer is sent. Each offer is announced once; the book
+  re-makes offers every 12 minutes by default, and each new one is announced.
+- **Who shows what they hear is up to them.** Dexie indexes the network but is
+  not known to show option offers, and the options site documents only its own
+  upload. Treat this as extra reach where someone is listening, not as a
+  replacement for the upload.
+- The daemon's peers see its network address. The offers are public anyway.
+
+Checked against the real daemon (0.3.0), two nodes on one machine: an offer
+made by the book went in through one node and came out of the other's hook
+unchanged. Not checked: the public network, and Windows.
+
 ## How often the chain is asked
 
 The wallet does not track option coins, so the book reads them from a full

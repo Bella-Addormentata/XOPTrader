@@ -21,6 +21,8 @@ import datetime
 import math
 from typing import Any
 
+from gui.services.options import splash
+
 XCH_MOJOS = 10**12
 
 MAINNET = "mainnet"
@@ -178,6 +180,14 @@ class MarketConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class SplashConfig:
+    """A Splash! daemon each new offer is also handed to. Off unless enabled."""
+
+    enabled: bool = False
+    submit_url: str = splash.DEFAULT_SUBMIT_URL
+
+
+@dataclasses.dataclass(frozen=True)
 class NodeConfig:
     """The operator's own full node, read instead of coinset when it is given."""
 
@@ -225,6 +235,7 @@ class OptionsConfig:
     chain_poll_seconds: int
     chain_refresh_seconds: int
     database_path: str
+    splash: SplashConfig = dataclasses.field(default_factory=SplashConfig)
     #: The app's CoinGecko key (``coingecko.api_key``, kept in secrets.yaml).
     #: Not an options setting; carried here so the price feed can send it.
     coingecko_api_key: str = dataclasses.field(default="", repr=False)
@@ -338,14 +349,26 @@ def parse(root: Any) -> OptionsConfig | None:
     limits_raw = section.get("limits") or {}
     market_raw = section.get("market") or {}
     node_raw = section.get("node") or {}
+    splash_raw = section.get("splash") or {}
     for name, value in (
         ("pricing", pricing_raw),
         ("limits", limits_raw),
         ("market", market_raw),
         ("node", node_raw),
+        ("splash", splash_raw),
     ):
         if not isinstance(value, dict):
             raise OptionsConfigError(f"options.{name} must be a mapping")
+
+    try:
+        splash_config = SplashConfig(
+            enabled=_flag(splash_raw, "enabled", False),
+            submit_url=splash.check_submit_url(
+                splash_raw.get("submit_url") or splash.DEFAULT_SUBMIT_URL
+            ),
+        )
+    except ValueError as exc:
+        raise OptionsConfigError(f"options.splash.submit_url is {exc}") from exc
 
     node = NodeConfig(
         host=str(node_raw.get("host") or "localhost").strip(),
@@ -421,5 +444,6 @@ def parse(root: Any) -> OptionsConfig | None:
         chain_poll_seconds=chain_poll,
         chain_refresh_seconds=chain_refresh,
         database_path=str(section.get("database_path") or "data/options_jobs.db").strip(),
+        splash=splash_config,
         coingecko_api_key=str(coingecko.get("api_key") or "").strip(),
     )
