@@ -301,6 +301,7 @@ def test_an_ipv6_host_in_brackets_is_still_this_machine() -> None:
 def test_certificate_paths_have_their_home_expanded(monkeypatch) -> None:
     # The TLS libraries the paths go to do not expand ~ themselves.
     monkeypatch.setenv("HOME", "/home/someone")
+    monkeypatch.setenv("USERPROFILE", "/home/someone")  # what Windows expands ~ from
     wallet = {"port": 9356, "cert_path": "~/w.crt", "key_path": " ~/w.key "}
     node = {"cert_path": "~/n.crt", "key_path": "/abs/n.key", "ca_cert_path": "~/ca.crt"}
     parsed = _parse(wallet=wallet, node=node)

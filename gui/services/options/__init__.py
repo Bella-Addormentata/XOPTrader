@@ -29,6 +29,9 @@ is no GUI page, and ``wallet.mode: trading`` is refused: the engine does not yet
 keep option coins out of its own offers or book option events, and nothing in
 the engine reads this package's ``events`` table. It is off unless config.yaml
 has ``options.enabled: true``, and it rehearses (``dry_run``) by default.
+``wallet.share_trading_wallet`` (off by default) lets it sign from the trading
+wallet while the engine is stopped; :mod:`engine_guard` checks that before
+every signature.
 
 What has been checked, and what has not:
 

@@ -14,6 +14,13 @@ stops at the first thing that does not match.
 - A second wallet daemon with its own key. One daemon serves one key at a time,
   so it cannot share the trading wallet's daemon. Give it its own `CHIA_ROOT`
   and its own ports, start only the wallet service, and let it sync.
+  - Or, on a machine where a second daemon and key are not wanted, the trading
+    wallet itself with `options.wallet.share_trading_wallet: true` and the
+    trading engine **stopped** for as long as any contract is open. See the
+    comment beside it in `config.example.yaml`. `status` and every step then
+    print a warning and whether the engine is up, and a live step,
+    `withdraw-all` and every `live-test` spend are refused while it is (or
+    while that cannot be told).
 - That wallet's RPC port, under `options.wallet` in `config.yaml`, and its
   `config/ssl/wallet/private_wallet.crt` and `.key`, under `options.wallet` in
   `secrets.yaml` (see `secrets.example.yaml`; `~` is expanded). `secrets.yaml`
@@ -286,6 +293,10 @@ one flat fee per spend, sized for its costliest.
 
 - **Dedicated wallet only.** `wallet.mode: trading` is refused until the engine
   keeps option coins out of its own offers and books option events.
+  `wallet.share_trading_wallet` is not that: it is the operator undertaking to
+  keep the engine stopped, checked before every signature, and nothing more.
+  Starting the engine while contracts are open is not prevented, only
+  reported; the engine then counts collateral and premiums as its own.
 - **The wallet reports no verdict on a broadcast.** Outcomes are read from the
   chain, so a rejected transaction shows up as one that never confirms. It is
   pushed again on every step. While it is unresolved its coins stay set aside
