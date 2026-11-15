@@ -89,10 +89,19 @@ def contract_strike(contract: store.Contract, quote_unit_mojos: int) -> float:
     return (quote / quote_unit_mojos) / contract_size_xch(contract)
 
 
-def _wanted(config: OptionsConfig, side: str, percent: int, expiration: int, spot: float) -> Wanted:
+def _wanted(
+    config: OptionsConfig, side: str, percent: int, expiration: int, spot: float
+) -> Wanted | None:
+    """The contract a slot should hold, or None if it is too small to strike.
+
+    The quote leg is a whole number of the quote asset's mojos. A contract so
+    small that its strike rounds to none of them cannot be written at all.
+    """
     strike = strike_for(spot, percent, config.strike_step)
     size_xch = config.contract_xch_mojos / XCH_MOJOS
     quote_mojos = int(round(strike * size_xch * config.quote_unit_mojos))
+    if quote_mojos < 1:
+        return None
     xch = Asset(None, config.contract_xch_mojos)
     quote = Asset(config.quote_asset_id, quote_mojos)
     return Wanted(
@@ -172,15 +181,18 @@ def plan(config: OptionsConfig, market: Market, contracts: list[store.Contract],
     lean = max(-1.0, min(1.0, delta_xch / config.pricing.steer_scale_xch))
 
     targets: dict[str, Wanted] = {}
+    too_small: set[str] = set()
     for expiration in config.expiries:
         if expiration - now <= config.stop_before_expiry_seconds:
             continue
-        for percent in config.call_strikes_pct:
-            wanted = _wanted(config, CALL, percent, expiration, market.spot)
-            targets[wanted.slot] = wanted
-        for percent in config.put_strikes_pct:
-            wanted = _wanted(config, PUT, percent, expiration, market.spot)
-            targets[wanted.slot] = wanted
+        sides = [(CALL, percent) for percent in config.call_strikes_pct]
+        sides += [(PUT, percent) for percent in config.put_strikes_pct]
+        for side, percent in sides:
+            wanted = _wanted(config, side, percent, expiration, market.spot)
+            if wanted is None:
+                too_small.add(slot_name(side, percent, expiration))
+            else:
+                targets[wanted.slot] = wanted
 
     retire: list[bytes] = []
     filled: set[str] = set()
@@ -188,9 +200,12 @@ def plan(config: OptionsConfig, market: Market, contracts: list[store.Contract],
     for contract in unsold:
         target = targets.get(contract.slot)
         strike = contract_strike(contract, config.quote_unit_mojos)
-        stale = target is None or (
-            abs(strike - target.strike) / target.strike * 100.0 > config.strike_drift_pct
-        )
+        if target is None:
+            # No longer in the grid: retire it. One whose slot merely cannot be
+            # struck at today's contract size is left as it is.
+            stale = contract.slot not in too_small
+        else:
+            stale = abs(strike - target.strike) / target.strike * 100.0 > config.strike_drift_pct
         if contract.status == store.OPEN and stale:
             retire.append(contract.launcher_id)
             continue
@@ -207,6 +222,11 @@ def plan(config: OptionsConfig, market: Market, contracts: list[store.Contract],
         limits.max_contracts_per_expiry,
     ):
         blocked = "a limit under options.limits is not set; nothing will be minted"
+    elif too_small:
+        blocked = (
+            "options.contract_xch is too small: at these strikes a contract comes to less than "
+            "one mojo of the quote asset, so nothing will be minted"
+        )
 
     locked_xch = sum(item.underlying_amount for item in active if item.side == CALL)
     locked_quote = sum(item.underlying_amount for item in active if item.side == PUT)

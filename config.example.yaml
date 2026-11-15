@@ -1657,7 +1657,9 @@ options:
                                          # logged in to it before each step. Blank =
                                          # whichever key the wallet has open.
     # The one address used as creator, owner and change. Blank asks the wallet
-    # for its current address. ONLY coins at this address are used: fund it.
+    # for its current address the first time and keeps to it from then on (it
+    # is remembered in the options database). ONLY coins at this address are
+    # used: fund it.
     address: ""
 
   # The asset options are struck and paid in: Base-bridged wUSDC.b.
@@ -1778,6 +1780,11 @@ options:
     port: 8555                           # the full node's rpc_port
     cert_path: ""                        # [OPTIONAL] blank = no node; coinset is used
     key_path: ""
+    # The node's own certificate authority: its config/ssl/ca/private_ca.crt.
+    # With it the node's certificate is checked. REQUIRED when host is another
+    # machine: the book settles transactions on what the node says, and
+    # unchecked, anyone between the two could answer in its place.
+    ca_cert_path: ""
   coinset_url: ""                        # [OPTIONAL] blank = network default; unused with a node
   # The chain is looked at when the wallet's own coins change (a payment came
   # in, a transaction of ours confirmed), when a contract reaches expiry, and:

@@ -163,12 +163,15 @@ def _monitor(cfg: config.OptionsConfig, interval: float) -> int:
         desk_client=desk.DeskClient(),
         chain_reader=chain_reader(cfg),
         market=market.MarketSource(
-            cfg.quote_asset_id, hedge_size_xch=cfg.market.hedge_size_xch
+            cfg.quote_asset_id,
+            hedge_size_xch=cfg.market.hedge_size_xch,
+            coingecko_api_key=cfg.coingecko_api_key,
         ).read,
         book_store=store.OptionStore(cfg.database_path),
         quote_asset_id=cfg.quote_asset_id,
         quote_unit_mojos=cfg.quote_unit_mojos,
         rate=cfg.pricing.rate,
+        max_spot_age_seconds=cfg.market.max_age_seconds,
     )
 
     def number(value: float | None) -> str:
@@ -249,6 +252,30 @@ class _LiveTest:
     def deadline(self) -> int:
         return self.now() + self.cfg.confirm_timeout_seconds
 
+    def valid_until(self) -> int | None:
+        """The time a spend signed now stops being valid, as the book sets it.
+
+        Unconfirmed by then it never can be, so it is given up (and teaches the
+        fee rate) instead of holding its coins for ever. None when the chain's
+        time cannot be read, since such a spend could never be seen to lapse.
+        """
+        return self.deadline() if self.reader.tells_time else None
+
+    def free_xch(self) -> list[Any]:
+        """The address's XCH coins that no transaction still waiting already spends.
+
+        The wallet lists a coin as spendable until its spend confirms, and it
+        does not know about bundles pushed through it. Funding the test from a
+        coin a waiting mint of the book's is counting on would knock that mint
+        out.
+        """
+        reserved = {
+            bytes(spend.coin.coin_id())
+            for row in self.book_store.unresolved()
+            for spend in unpack_bundle(row.bundle)[0]
+        }
+        return [coin for coin in self.coins.xch_coins() if bytes(coin.coin_id()) not in reserved]
+
     def settle(self) -> None:
         """Bring the stored book up to date with the chain. Sends nothing."""
         for problem in self.book.refresh().problems:
@@ -312,13 +339,15 @@ def _cancel_stage(test: _LiveTest, contract: store.Contract) -> None:
     loaded = chain.load_option(test.reader, contract.launcher_id, now_seconds=test.now())
     fee = test.fee
     amount = contract.underlying_amount
+    valid_until = test.valid_until()
     cancel = builder.build_cancel(
         loaded.option,
         loaded.underlying,
         loaded.locked,
-        builder.Funding(test.address, xch=test.coins.xch_coins()),
+        builder.Funding(test.address, xch=test.free_xch()),
         test.custody,
         fee=fee,
+        valid_until_seconds=valid_until,
     )
 
     def record(bundle: bytes) -> None:
@@ -328,6 +357,8 @@ def _cancel_stage(test: _LiveTest, contract: store.Contract) -> None:
             bundle=bundle,
             deadline=test.deadline(),
             contract_status=store.CLOSING,
+            valid_until=valid_until,
+            fee=fee,
             now=test.now(),
         )
 
@@ -350,13 +381,18 @@ def _clawback_stage(test: _LiveTest, contract: store.Contract) -> None:
     loaded = chain.load_option(test.reader, contract.launcher_id, now_seconds=test.now())
     fee = test.fee
     amount = contract.underlying_amount
+    valid_until = test.valid_until()
+    # XCH collateral pays its own fee when it can. The test's dust collateral
+    # is smaller than a fee under pressure, and then other coins make it up.
+    extra = test.free_xch() if fee >= amount else []
     clawback = builder.build_clawback(
         loaded.underlying,
         loaded.locked,
         test.key,
-        builder.Funding(change_puzzle_hash=test.address),  # XCH collateral pays its own fee
+        builder.Funding(change_puzzle_hash=test.address, xch=extra),
         test.custody,
         fee=fee,
+        valid_until_seconds=valid_until,
     )
 
     def record(bundle: bytes) -> None:
@@ -366,6 +402,8 @@ def _clawback_stage(test: _LiveTest, contract: store.Contract) -> None:
             bundle=bundle,
             deadline=test.deadline(),
             contract_status=store.CLOSING,
+            valid_until=valid_until,
+            fee=fee,
             now=test.now(),
         )
 
@@ -392,6 +430,15 @@ def _finish_live_test(test: _LiveTest, contract: store.Contract) -> None:
     for row in test.book_store.unresolved():
         if row.launcher_id != launcher_id or (row.kind == store.CANCEL and expired):
             continue
+        if row.valid_until is not None and test.now() >= row.valid_until:
+            # Settled above if the chain already shows it out of time; if not,
+            # it soon will, and pushing it again cannot help.
+            raise SystemExit(
+                f"  its {row.kind} ran out of time unconfirmed and can no longer confirm. It is "
+                "given up once the chain is 32 blocks past its deadline, about a quarter of an "
+                "hour after it: run live-test again then, and it is made afresh at the fee "
+                "rate that failure taught."
+            )
         coin_spends, signature = unpack_bundle(row.bundle)
         print(f"  its {row.kind} was signed but has not confirmed; sending it again")
         test.wallet.push(coin_spends, signature)
@@ -490,21 +537,27 @@ def _run_live_test(test: _LiveTest, amount_xch: float) -> int:
     coins, address, custody = test.coins, test.address, test.custody
     amount = int(round(amount_xch * config.XCH_MOJOS))
     fee = test.fee
-    xch = coins.xch_coins()
+    xch = test.free_xch()
     have = sum(int(coin.amount) for coin in xch)
     # Three fees, or one spare mojo when there is no fee: the cancel needs an
     # XCH coin to start from, and a fee-less mint could use the address's last.
     need = amount + builder.OPTION_COIN_AMOUNT + max(3 * fee, 1)
-    print(f"spendable at that address: {have} mojos; the test needs {need}")
+    print(f"free at that address: {have} mojos; the test needs {need}")
     if have < need:
-        raise SystemExit("send a little XCH to the options address and wait for it to confirm")
+        raise SystemExit(
+            "send a little XCH to the options address and wait for it to confirm "
+            "(coins a transaction still waiting already spends are not counted)"
+        )
 
     print(f"2. minting a contract over {amount_xch:g} XCH, expiring in 24 hours")
     expiry = test.now() + 24 * 3600
     terms = builder.OptionTerms(
         builder.Asset(None, amount), builder.Asset(None, amount), expiry, address
     )
-    minted = builder.build_mint(terms, builder.Funding(address, xch=xch), custody, fee=fee)
+    mint_until = test.valid_until()
+    minted = builder.build_mint(
+        terms, builder.Funding(address, xch=xch), custody, fee=fee, valid_until_seconds=mint_until
+    )
     launcher_id = bytes(minted.launcher_id)
     lock = bytes(minted.underlying.puzzle_hash())
     print(f"  launcher id {launcher_id.hex()}")
@@ -522,6 +575,8 @@ def _run_live_test(test: _LiveTest, amount_xch: float) -> int:
             creator_puzzle_hash=address,
             bundle=bundle,
             deadline=test.deadline(),
+            valid_until=mint_until,
+            fee=fee,
             now=test.now(),
         )
 
@@ -573,12 +628,14 @@ def _run_live_test(test: _LiveTest, amount_xch: float) -> int:
     print("  to test a take, paste it into another wallet now; otherwise carry on")
 
     print("4. withdrawing the offer by moving the option to our own address")
+    withdraw_until = test.valid_until()
     moved = builder.build_transfer(
         loaded.option,
         address,
-        builder.Funding(address, xch=coins.xch_coins()[:1] if fee else []),
+        builder.Funding(address, xch=test.free_xch() if fee else []),
         custody,
         fee=fee,
+        valid_until_seconds=withdraw_until,
     )
 
     def record_withdrawal(bundle: bytes) -> None:
@@ -587,6 +644,8 @@ def _run_live_test(test: _LiveTest, amount_xch: float) -> int:
             kind=store.WITHDRAW,
             bundle=bundle,
             deadline=test.deadline(),
+            valid_until=withdraw_until,
+            fee=fee,
             now=test.now(),
         )
 

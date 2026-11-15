@@ -251,3 +251,20 @@ def test_ask_scales_with_size_and_rounds_up() -> None:
     assert quoting.contract_size_xch(contract) == 20
     assert quoting.contract_strike(contract, 1000) == pytest.approx(1.10)
     assert isinstance(ask, int) and ask > 20 * 1000 * 0.03  # well above a few cents per XCH
+
+
+def test_a_contract_too_small_to_strike_blocks_minting_instead_of_failing() -> None:
+    # 0.0001 XCH at a strike near 1.10 is 0.11 thousandths of the quote asset:
+    # no whole number of its mojos. That used to raise from inside the plan and
+    # take the whole step with it, offers and all.
+    cfg = _config(contract_xch=0.0001)
+
+    plan = quoting.plan(cfg, _market(), [], NOW)
+
+    assert plan.mint == () and "contract_xch is too small" in plan.blocked
+
+    # A contract already in such a slot, written when the size was larger, is
+    # not retired for it, and still gets its ask.
+    was = quoting.plan(_config(), _market(), [], NOW).mint[0]
+    plan = quoting.plan(cfg, _market(), [_contract(was, store.OPEN, 1)], NOW)
+    assert plan.retire == () and list(plan.asks) == [bytes([1]) * 32]

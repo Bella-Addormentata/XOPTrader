@@ -226,6 +226,9 @@ class FactStore(Protocol):
     def remember_chain_fact(self, fact: Any) -> None:
         """Keep a fact, replacing any kept before for the same coin."""
 
+    def forget_chain_fact(self, coin_id: bytes) -> None:
+        """Drop what is kept about a spend that is not final."""
+
 
 class _Memory:
     """A :class:`FactStore` that lasts as long as the process."""
@@ -238,6 +241,11 @@ class _Memory:
 
     def remember_chain_fact(self, fact: Any) -> None:
         self._facts[bytes(fact.coin_id)] = fact
+
+    def forget_chain_fact(self, coin_id: bytes) -> None:
+        kept = self._facts.get(bytes(coin_id))
+        if kept is not None and not kept.final:
+            del self._facts[bytes(coin_id)]
 
 
 class CachedChain:
@@ -258,8 +266,16 @@ class CachedChain:
     ``facts`` and never requested again, by this process or the next. Until
     then it is re-read with everything else at each look, which costs nothing
     extra, and a spend that moved to another height is read again. How a coin
-    was spent is kept from the first time it is read, so even an unsettled
-    spend is fetched once.
+    was spent is kept from the first time it is read, so an unsettled spend is
+    not fetched at every look.
+
+    REORGS. A height says when a coin was spent, not how, and a reorganised
+    block can put a different spend of the same coin at the same height. So
+    two things are never carried across one. A coin seen unspent again has
+    whatever was kept about its spend dropped, in ``facts`` as well as here.
+    And when a spend becomes final, how it was spent is read once more: what
+    is kept for good is what the chain held then, not what it held at first
+    sight.
 
     ``requests`` counts the round trips actually made, so a caller can report
     them and a test can hold them to a number.
@@ -286,6 +302,7 @@ class CachedChain:
         self._seen: dict[bytes, Any] = {}  # this look: coin id -> state, or None
         self._asked: set[bytes] = set()  # coins not final that were asked about this look
         self._due: set[bytes] = set()  # to fetch together at the next lookup
+        self._cleared: set[bytes] = set()  # seen unspent: nothing stale is kept in ``facts``
         self._failed: tuple[float, Exception] | None = None  # the last lookup that failed
         self.requests = 0
 
@@ -371,9 +388,14 @@ class CachedChain:
 
         self._seen[coin_id] = state
         if state is None or state.spent_height is None:
-            # Unspent, or gone. Whatever was kept about a spend no longer stands;
-            # it is overwritten if the coin is ever seen spent again.
-            self._spent.pop(coin_id, None)
+            # Unspent, or gone. Whatever was kept about a spend no longer
+            # stands, here or in ``facts``: left there, a different spend that
+            # later landed at the same height would inherit its solution and
+            # its age. Asked of ``facts`` once for each coin, and again
+            # whenever a spend had been seen since.
+            if self._spent.pop(coin_id, None) is not None or coin_id not in self._cleared:
+                self._cleared.add(coin_id)
+                self._facts.forget_chain_fact(coin_id)
             return
         height = int(state.spent_height)
         fact = self._spent.get(coin_id) or self._facts.chain_fact(coin_id)
@@ -390,7 +412,9 @@ class CachedChain:
             )
             self._keep(fact)
         elif now - fact.seen_at >= self._final_after:
-            self._keep(dataclasses.replace(fact, final=True))
+            # Final, but how it was spent is read again before it is kept for
+            # good: a reorg can have swapped the spend without moving it.
+            self._keep(dataclasses.replace(fact, final=True, puzzle_reveal=None, solution=None))
         else:
             self._spent[coin_id] = fact
 

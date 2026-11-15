@@ -817,6 +817,11 @@ class OptionStore:
             solution=None if solution is None else bytes(solution),
         )
 
+    def forget_chain_fact(self, coin_id: bytes) -> None:
+        """Drop what was kept about a spend that is not final: the chain took it back."""
+        with self._write() as db:
+            db.execute("DELETE FROM chain_facts WHERE coin_id = ? AND final = 0", (_hex(coin_id),))
+
     def remember_chain_fact(self, fact: ChainFact) -> None:
         """Keep what was read about a spent coin. Writing it again replaces it."""
         with self._write() as db:

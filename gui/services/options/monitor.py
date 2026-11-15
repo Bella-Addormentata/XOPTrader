@@ -78,6 +78,7 @@ class DeskMonitor:
         agg_sig_me_additional_data: bytes = signing.MAINNET_AGG_SIG_ME_ADDITIONAL_DATA,
         clock: Callable[[], float] = time.time,
         max_new_per_scan: int = 40,
+        max_spot_age_seconds: float | None = None,
     ) -> None:
         self._desk = desk_client
         self._chain = chain.CachedChain.over(chain_reader, book_store, clock=clock)
@@ -88,6 +89,7 @@ class DeskMonitor:
         self._rate = float(rate)
         self._additional_data = bytes(agg_sig_me_additional_data)
         self._clock = clock
+        self._max_spot_age = max_spot_age_seconds
         self._max_new = int(max_new_per_scan)
 
     def _terms(self, loaded: chain.LoadedOption) -> tuple[str, float, float] | None:
@@ -229,6 +231,13 @@ class DeskMonitor:
         except MarketError as exc:
             view = None
             report.market_error = str(exc)
+        else:
+            # A feed can hand over, freshly fetched, a price observed hours
+            # ago. Valuing offers from it would record them as mispriced.
+            age = now - view.as_of
+            if self._max_spot_age is not None and age > self._max_spot_age:
+                view = None
+                report.market_error = f"the spot price is {int(age)} s old"
 
         known = {item.offer_id: item for item in self._store.listings(open_only=True)}
         judged = self._store.closed_listing_ids()

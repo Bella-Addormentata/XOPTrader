@@ -38,6 +38,10 @@ class OptionsConfigError(ValueError):
     """The ``options:`` section is unusable. Nothing starts."""
 
 
+#: Host names that mean the machine the book runs on.
+_THIS_MACHINE = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
 def _number(section: dict, key: str, default: float | None, *, minimum: float = 0.0) -> float:
     raw = section.get(key, default)
     if raw is None:
@@ -195,10 +199,18 @@ class NodeConfig:
     port: int
     cert_path: str
     key_path: str
+    #: The node's own certificate authority (its config/ssl/ca/private_ca.crt).
+    #: With it the node's certificate is checked; required for a node on
+    #: another machine.
+    ca_cert_path: str = ""
 
     @property
     def enabled(self) -> bool:
         return bool(self.cert_path)
+
+    @property
+    def local(self) -> bool:
+        return self.host.strip().lower() in _THIS_MACHINE
 
 
 @dataclasses.dataclass(frozen=True)
@@ -382,9 +394,19 @@ def parse(root: Any) -> OptionsConfig | None:
         port=int(_number(node_raw, "port", 8555, minimum=1)),
         cert_path=str(node_raw.get("cert_path") or "").strip(),
         key_path=str(node_raw.get("key_path") or "").strip(),
+        ca_cert_path=str(node_raw.get("ca_cert_path") or "").strip(),
     )
     if bool(node.cert_path) != bool(node.key_path):
         raise OptionsConfigError("options.node needs both cert_path and key_path, or neither")
+    if node.enabled and not node.local and not node.ca_cert_path:
+        # The client certificate proves who we are to the node. It proves
+        # nothing about the node, and the book settles transactions on what
+        # the node says.
+        raise OptionsConfigError(
+            "options.node.ca_cert_path is required for a node on another machine: without it "
+            "the node's certificate is not checked, and anyone between the two could answer "
+            "in its place. It is that node's config/ssl/ca/private_ca.crt."
+        )
     chain_poll = int(_number(section, "chain_poll_seconds", 30))
     chain_refresh = int(_number(section, "chain_refresh_seconds", 3600))
     if chain_refresh < chain_poll:

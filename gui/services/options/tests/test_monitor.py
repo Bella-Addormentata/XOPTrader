@@ -328,3 +328,38 @@ def test_an_offer_whose_signature_is_bad_is_a_problem() -> None:
 
     assert report.new == []
     assert any("signature does not verify" in problem for problem in report.problems)
+
+
+def test_a_freshly_fetched_stale_price_values_nothing() -> None:
+    # A feed can hand over a price observed hours ago. The book refuses to
+    # quote from one; the monitor must not record valuations from one either.
+    rig = Rig()
+    rig.monitor = monitor.DeskMonitor(
+        desk_client=rig.board,
+        chain_reader=rig.world.sim,
+        market=rig.read_market,
+        book_store=rig.store,
+        quote_asset_id=rig.usd,
+        quote_unit_mojos=CAT,
+        agg_sig_me_additional_data=ADDITIONAL_DATA,
+        clock=rig.world.now,
+        max_spot_age_seconds=600,
+    )
+    rig.view = market.Market(
+        spot=1.10, sigma=0.86, bid=1.08, ask=1.12, as_of=rig.world.now() - 7200
+    )
+    rig.list_call("offerA")
+
+    report = rig.monitor.scan()
+
+    assert report.market_error.startswith("the spot price is 72") and "s old" in report.market_error
+    (seen,) = report.new
+    assert seen.ask == pytest.approx(1.5)  # still recorded...
+    assert seen.our_value is None and seen.edge is None  # ...but not valued
+
+    # A price that is recent enough is used as before.
+    rig.view = market.Market(spot=1.10, sigma=0.86, bid=1.08, ask=1.12, as_of=rig.world.now() - 60)
+    rig.list_call("offerB")
+    report = rig.monitor.scan()
+    assert report.market_error == ""
+    assert report.new[0].our_value is not None

@@ -229,7 +229,64 @@ def test_a_spend_a_reorg_moved_is_read_again_and_its_clock_restarts() -> None:
     asked = len(node.log)
     assert reader.coin_state(coin_id).spent_height == 103
     assert bytes(reader.coin_spend(coin_id).solution) == b"\x01"
+    # Settled: how it was spent is read once more, then kept for good.
+    assert node.log[asked:] == ["spend"]
+    reader.begin()
+    asked = len(node.log)
+    assert bytes(reader.coin_spend(coin_id).solution) == b"\x01"
     assert node.log[asked:] == []
+
+
+def test_a_spend_swapped_at_the_same_height_is_not_kept_for_good() -> None:
+    # A height says when a coin was spent, not how. A reorganised block can
+    # hold a different spend of the same coin at the same height, and nothing
+    # in the coin's state shows it.
+    coin = sdk.Coin(b"\x01" * 32, b"\x02" * 32, 5)
+    coin_id = bytes(coin.coin_id())
+    node, now = Scripted(), [1_000.0]
+    reader = chain.CachedChain(node, clock=lambda: now[0], final_after_seconds=900)
+    node.states[coin_id] = sdk.CoinState(coin, 100, 90)
+    node.spends[coin_id, 100] = sdk.CoinSpend(coin, b"\x01", b"\x80")  # our cancel, say
+    assert bytes(reader.coin_spend(coin_id).solution) == b"\x80"
+
+    node.spends[coin_id, 100] = sdk.CoinSpend(coin, b"\x01", b"\x01")  # a taker's, after a reorg
+    now[0] += 1_000
+    reader.begin()
+
+    # What is kept from here on is what the chain holds once the spend is final.
+    assert bytes(reader.coin_spend(coin_id).solution) == b"\x01"
+    asked = len(node.log)
+    reader.begin()
+    assert bytes(reader.coin_spend(coin_id).solution) == b"\x01"
+    assert node.log[asked:] == []
+
+
+def test_a_spend_a_reorg_undid_is_forgotten_in_the_database_too() -> None:
+    coin = sdk.Coin(b"\x01" * 32, b"\x02" * 32, 5)
+    coin_id = bytes(coin.coin_id())
+    facts = store.OptionStore(":memory:")
+    node, now = Scripted(), [1_000.0]
+    reader = chain.CachedChain(node, facts, clock=lambda: now[0], final_after_seconds=900)
+    node.states[coin_id] = sdk.CoinState(coin, 100, 90)
+    node.spends[coin_id, 100] = sdk.CoinSpend(coin, b"\x01", b"\x80")
+    assert bytes(reader.coin_spend(coin_id).solution) == b"\x80"
+    assert facts.chain_fact(coin_id) is not None
+
+    node.states[coin_id] = sdk.CoinState(coin, None, 90)  # the reorg took the spend back
+    reader.begin()
+    assert reader.coin_state(coin_id).spent_height is None
+    assert facts.chain_fact(coin_id) is None
+
+    # A different spend lands at the very same height, and a new process looks
+    # at it a day later. Nothing of the old one is left to mistake it for.
+    node.states[coin_id] = sdk.CoinState(coin, 100, 90)
+    node.spends[coin_id, 100] = sdk.CoinSpend(coin, b"\x01", b"\x01")
+    now[0] += 86_400
+    later = chain.CachedChain(node, facts, clock=lambda: now[0], final_after_seconds=900)
+
+    assert bytes(later.coin_spend(coin_id).solution) == b"\x01"
+    kept = facts.chain_fact(coin_id)
+    assert kept is not None and not kept.final and kept.seen_at == int(now[0])
 
 
 def test_a_spend_a_reorg_undid_is_forgotten() -> None:
@@ -342,13 +399,17 @@ def test_a_step_with_nothing_to_notice_asks_the_chain_nothing() -> None:
     assert len(desk.store.offers()) > 2
     looks = [report for report in reports if report.chain_looked]
     assert {report.chain_looked for report in looks} == {"routine"} and len(looks) == 2
-    # A routine look is one request, however many coins are watched. The first
-    # still re-reads the mints' coins; by the second they have settled and only
-    # each contract's option coin and collateral are left to watch.
-    assert [report.chain_requests for report in looks] == [1, 1]
-    first, second = desk.node.log[asked:]
-    assert first[0] == second[0] == "states" and first[1] > second[1] == 4
-    assert sum(report.chain_requests for report in reports) == 2
+    # A routine look is one request for every coin watched, together. On the
+    # first the mints' spends have settled, and how each was spent is read once
+    # more before it is kept for good. By the second only each contract's
+    # option coin and collateral are left to watch, and that is all it costs.
+    log = desk.node.log[asked:]
+    first, second = [entry for entry in log if entry[0] == "states"]
+    reread = [entry for entry in log if entry[0] == "spend"]
+    assert len(log) == 2 + len(reread) and first[1] > second[1] == 4
+    assert [report.chain_requests for report in looks] == [1 + len(reread), 1]
+    assert 0 < len(reread) <= first[1] - second[1]  # once for each spend that settled
+    assert sum(report.chain_requests for report in reports) == 2 + len(reread)
 
 
 def test_a_sale_is_noticed_in_the_next_step_from_the_wallet_alone() -> None:
@@ -489,7 +550,7 @@ def test_the_wallet_being_away_does_not_stop_the_chain_being_read() -> None:
     (report,) = desk.run(1)
 
     assert any("could not list the wallet's coins" in problem for problem in report.problems)
-    assert report.chain_looked == "routine" and report.chain_requests == 1
+    assert report.chain_looked == "routine" and report.chain_requests >= 1
 
 
 def test_refresh_and_the_kill_switch_always_look() -> None:
@@ -512,10 +573,10 @@ def test_a_restarted_book_reads_the_chain_once_and_carries_on() -> None:
     rest = desk.run(5)
 
     assert first.chain_looked == "first look"
-    # How each coin was spent is in the database from its first reading, so the
-    # new process asks only whether those spends still stand, and never again
-    # for the spends themselves.
-    assert {kind for kind, _ in desk.node.log} == {"states"}
+    # The new process asks whether the spends it knew of still stand. They
+    # have by now settled, so how each was spent is read once more and kept
+    # for good; after that nothing about them is asked again.
+    assert {kind for kind, _ in desk.node.log} == {"states", "spend"}
     assert sum(report.chain_requests for report in rest) == 0
     assert len(desk.contracts(store.OPEN)) == 2
 

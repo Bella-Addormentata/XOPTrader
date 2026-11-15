@@ -8,7 +8,13 @@ simulator standing in for the chain.
 
 from __future__ import annotations
 
+import http.server
+import json
 import math
+import shutil
+import ssl
+import subprocess
+import threading
 from typing import Any
 
 import pytest
@@ -17,9 +23,17 @@ sdk = pytest.importorskip("chia_wallet_sdk")
 yaml = pytest.importorskip("yaml")
 
 from gui.services.options import __main__ as cli  # noqa: E402
-from gui.services.options import chain, config, market, runtime, splash, store  # noqa: E402
+from gui.services.options import (  # noqa: E402
+    builder,
+    chain,
+    config,
+    market,
+    runtime,
+    splash,
+    store,
+)
 from gui.services.options.service import OptionsError  # noqa: E402
-from gui.services.options.tests.sim_world import CAT, XCH, Party, World  # noqa: E402
+from gui.services.options.tests.sim_world import CAT, XCH, Party, SimChain, World  # noqa: E402
 from gui.services.options.tests.test_reference_wallet import FakeWallet, _hex  # noqa: E402
 
 
@@ -162,10 +176,10 @@ def test_the_chain_is_read_from_the_operator_s_node_when_one_is_configured(
             ],
         }
 
-    certs: list[tuple[str, str]] = []
+    certs: list[tuple[str, str, str]] = []
 
-    def poster(cert: str, key: str, timeout: float):
-        certs.append((cert, key))
+    def poster(cert: str, key: str, timeout: float, ca: str = ""):
+        certs.append((cert, key, ca))
         return node
 
     monkeypatch.setattr(runtime, "_node_poster", poster)
@@ -174,11 +188,23 @@ def test_the_chain_is_read_from_the_operator_s_node_when_one_is_configured(
     reader = runtime.chain_reader(cfg)
     state = reader.coin_state(coin.coin_id())
 
-    assert certs == [("/n/c.crt", "/n/k")]
+    assert certs == [("/n/c.crt", "/n/k", "")]
     assert [url for url, _ in asked] == ["https://localhost:8666/get_coin_records_by_names"]
     assert state.spent_height is None and state.created_height == 7
-    assert "your full node at localhost:8666" in runtime.chain_source(cfg)
+    assert "your full node at localhost:8666 (on this machine" in runtime.chain_source(cfg)
     assert "coinset is not used" in runtime.chain_source(cfg)
+
+    # A node on another machine is reached with its certificate authority.
+    away = {
+        "host": "10.0.0.9",
+        "cert_path": "/n/c.crt",
+        "key_path": "/n/k",
+        "ca_cert_path": "/n/ca",
+    }
+    far = _config(tmp_path, usd, node=away)
+    runtime.chain_reader(far)
+    assert certs[-1] == ("/n/c.crt", "/n/k", "/n/ca")
+    assert "your full node at 10.0.0.9:8555 (certificate checked" in runtime.chain_source(far)
     assert runtime.chain_source(_config(tmp_path, usd)).startswith("coinset (https://testnet11.")
 
 
@@ -680,3 +706,304 @@ def test_status_says_where_offers_are_announced_and_how_many_were_taken(
     out = capsys.readouterr().out
     assert "splash: new offers are handed to the daemon at http://127.0.0.1:4321" in out
     assert "(1 of 2 live offers taken by it)" in out
+
+
+# ---------------------------------------------------------------------------
+# The node's certificate, over real TLS
+# ---------------------------------------------------------------------------
+
+
+def _openssl(folder, *args: str) -> None:
+    # A fixed command over files this test made, found on PATH like any tool.
+    command = ["openssl", *args]
+    subprocess.run(command, cwd=folder, check=True, capture_output=True)  # noqa: S603
+
+
+def _authority(folder, name: str) -> None:
+    """A certificate authority, and a certificate it issued to "Chia", as Chia's are."""
+    key = ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes"]
+    _openssl(
+        folder, "req", "-x509", *key, "-keyout", f"{name}_ca.key", "-out", f"{name}_ca.crt",
+        "-subj", f"/CN={name} CA", "-days", "2", "-addext", "basicConstraints=critical,CA:TRUE",
+    )  # fmt: skip
+    for who in ("node", "client"):
+        _openssl(
+            folder, "req", *key, "-keyout", f"{name}_{who}.key", "-out", f"{name}_{who}.csr",
+            "-subj", "/CN=Chia",
+        )  # fmt: skip
+        _openssl(
+            folder, "x509", "-req", "-in", f"{name}_{who}.csr", "-CA", f"{name}_ca.crt",
+            "-CAkey", f"{name}_ca.key", "-CAcreateserial", "-out", f"{name}_{who}.crt",
+            "-days", "2",
+        )  # fmt: skip
+
+
+class _Rpc(http.server.BaseHTTPRequestHandler):
+    def do_POST(self) -> None:  # noqa: N802 - the name http.server looks for
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        body = json.dumps({"success": True, "peak": 7}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args: Any) -> None:
+        pass
+
+
+def _serve(folder, name: str, clients: str):
+    """A node RPC on loopback presenting ``name``'s certificate, wanting ``clients``' one."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(folder / f"{name}_node.crt", folder / f"{name}_node.key")
+    context.verify_mode = ssl.CERT_REQUIRED  # as a Chia node does
+    context.load_verify_locations(folder / f"{clients}_ca.crt")
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Rpc)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="needs the openssl command")
+def test_a_node_s_certificate_is_checked_against_its_own_authority(tmp_path) -> None:
+    requests = pytest.importorskip("requests")
+    _authority(tmp_path, "ours")
+    _authority(tmp_path, "theirs")
+    cert, key = str(tmp_path / "ours_client.crt"), str(tmp_path / "ours_client.key")
+    ours = str(tmp_path / "ours_ca.crt")
+    node = _serve(tmp_path, "ours", clients="ours")
+    # Someone in between: any certificate will do for a caller that does not look.
+    between = _serve(tmp_path, "theirs", clients="ours")
+    try:
+        real = f"https://127.0.0.1:{node.server_address[1]}/get_blockchain_state"
+        fake = f"https://127.0.0.1:{between.server_address[1]}/get_blockchain_state"
+        checked = runtime._node_poster(cert, key, 10.0, ours)
+
+        # The node's certificate is issued to "Chia", not to 127.0.0.1, and is
+        # accepted all the same: it is the authority that is checked.
+        assert checked(real, {}) == {"success": True, "peak": 7}
+        with pytest.raises(requests.exceptions.SSLError):
+            checked(fake, {})
+
+        # Unchecked, as is allowed for a node on this machine only, the
+        # impostor is believed. That is what the authority is for.
+        unchecked = runtime._node_poster(cert, key, 10.0)
+        assert unchecked(fake, {}) == {"success": True, "peak": 7}
+    finally:
+        node.shutdown()
+        between.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Review round 3
+# ---------------------------------------------------------------------------
+
+
+def _waiting_mint(cfg: config.OptionsConfig, world: World, maker: Party) -> None:
+    """Put a book mint on record that spends every coin the maker has, unconfirmed."""
+    address = maker.puzzle_hash
+    terms = builder.OptionTerms(
+        builder.Asset(None, 1000), builder.Asset(None, 1000), world.now() + 86400, address
+    )
+    minted = builder.build_mint(
+        terms, builder.Funding(address, xch=maker.xch_coins()), maker.custody()
+    )
+    book = store.OptionStore(cfg.database_path)
+    book.add_contract(
+        launcher_id=bytes(minted.launcher_id),
+        slot="C110@1",
+        side="call",
+        underlying_asset=None,
+        underlying_amount=1000,
+        strike_asset=None,
+        strike_amount=1000,
+        expiration=world.now() + 86400,
+        creator_puzzle_hash=address,
+        bundle=cli.pack_bundle(minted.coin_spends, bytes([0xC0]) + bytes(95)),
+        deadline=world.now() + 1800,
+        now=world.now(),
+    )
+    book.close()
+
+
+def test_live_test_leaves_alone_the_coins_a_waiting_transaction_spends(
+    tmp_path, monkeypatch
+) -> None:
+    # The wallet lists a coin as spendable until its spend confirms. A book
+    # mint still waiting is counting on its coin; the test must not take it.
+    world, maker, cfg, rpc = _live(tmp_path, monkeypatch)
+    _waiting_mint(cfg, world, maker)
+
+    with pytest.raises(SystemExit, match="still waiting already spends are not counted"):
+        cli._live_test(cfg, 0.0001, True, 60.0)
+
+    assert "push_tx" not in rpc.endpoints()
+    assert "execute_signing_instructions" not in rpc.endpoints()
+
+
+def _timed(tmp_path, monkeypatch, **overrides):
+    """As ``_live``, over a chain reader that can tell the chain's time."""
+    world, maker, _, rpc = _live(tmp_path, monkeypatch)
+    usd = world.issue_cat(world.party(1), 5)
+    cfg = _config(tmp_path, usd, **overrides)
+    monkeypatch.setattr(cli, "chain_reader", lambda _cfg: SimChain(world.sim))
+    return world, maker, cfg, rpc
+
+
+def test_live_test_spends_carry_a_deadline_and_their_fee_on_record(tmp_path, monkeypatch) -> None:
+    world, maker, cfg, rpc = _timed(
+        tmp_path, monkeypatch, fee_mojos="auto", limits={"max_fee_mojos": 10**9}
+    )
+    rpc.fee_per_cost = 1
+    flat = math.ceil(170_000_000 * 5.5)
+
+    assert cli._live_test(cfg, 0.0001, True, 60.0) == 0
+
+    book, (contract,) = _test_contracts(cfg)
+    rows = book.broadcasts(None)
+    assert [row.kind for row in rows] == [store.MINT, store.WITHDRAW, store.CANCEL]
+    for row in rows:
+        assert row.valid_until == row.created_at + cfg.confirm_timeout_seconds
+        assert row.fee == flat
+    assert contract.status == store.CLOSED
+
+
+def test_a_live_test_mint_that_runs_out_is_given_up_and_made_again(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    world, maker, cfg, rpc = _timed(tmp_path, monkeypatch, confirm_timeout_seconds=600)
+    before = maker.balance()
+    rpc._push_tx = lambda body: {}  # no node hears the mint
+    with pytest.raises(SystemExit, match="did not confirm in 60 s"):
+        cli._live_test(cfg, 0.0001, True, 60.0)
+
+    # Past its deadline, but the chain is not yet 32 blocks past it: nothing is
+    # pushed again, and the operator is told when to come back.
+    world.advance(700)
+    with pytest.raises(SystemExit, match="ran out of time unconfirmed"):
+        cli._live_test(cfg, 0.0001, True, 60.0)
+
+    # Later it is given up from the chain's clock, and the test starts afresh.
+    del rpc._push_tx
+    world.advance(700)
+    capsys.readouterr()
+    assert cli._live_test(cfg, 0.0001, True, 60.0) == 0
+
+    book, contracts = _test_contracts(cfg)
+    lapsed = [event.detail for event in book.events() if event.kind == "mint_failed"]
+    assert lapsed == [{"reason": "lapsed"}]
+    assert [item.status for item in contracts][-1] == store.CLOSED
+    assert book.unresolved() == []
+    assert maker.balance() == before
+
+
+def test_a_live_test_clawback_pays_a_fee_larger_than_its_collateral(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    # Under pressure the flat fee is 935 million mojos; the test's collateral
+    # is 100 million. The clawback must draw the difference from other coins.
+    world, maker, _, rpc = _live(tmp_path, monkeypatch)
+    usd = world.issue_cat(world.party(1), 5)
+    cfg = _config(tmp_path, usd, fee_mojos="auto", limits={"max_fee_mojos": 10**9})
+    rpc.fee_per_cost = 1
+    flat = math.ceil(170_000_000 * 5.5)
+    assert flat > DUST
+    taker = world.party(1)
+    before = maker.balance()
+
+    def take_it_first(prompt: str, assume_yes: bool) -> None:
+        if "withdrawal" in prompt:
+            book = store.OptionStore(cfg.database_path)
+            world.take(taker, book.offers()[-1].offer_text)
+            book.close()
+
+    monkeypatch.setattr(cli, "_confirm", take_it_first)
+    assert cli._live_test(cfg, 0.0001, True, 60.0) == 0  # sold before it could be withdrawn
+    monkeypatch.setattr(cli, "_confirm", lambda prompt, assume_yes: None)
+
+    world.advance(24 * 3600 + 60)
+    capsys.readouterr()
+    cli._live_test(cfg, 0.0001, True, 60.0)
+
+    assert "clawing it back" in capsys.readouterr().out
+    book, contracts = _test_contracts(cfg)
+    assert contracts[0].status == store.CLOSED
+    assert [e.detail["by"] for e in book.events() if e.kind == "collateral_returned"][0] == (
+        store.CLAWBACK
+    )
+    # Collateral and premium are home, less the option coin the buyer keeps and
+    # five fees: the mint's, the clawback's, and the three of the fresh test
+    # that ran once the old contract was dealt with.
+    assert maker.balance() == before + DUST - 1 - 5 * flat
+
+
+def test_the_options_address_is_the_book_s_own_across_restarts(tmp_path) -> None:
+    world = World()
+    maker, other = world.party(5), world.party(1)
+    rpc = WalletRpc(world, maker)
+    book = store.OptionStore(tmp_path / "options_jobs.db")
+
+    first = runtime.WalletCoinSource(rpc, world.sim, prefix="txch", memory=book)
+    assert first.puzzle_hash() == maker.puzzle_hash
+    assert len(first.xch_coins()) == 1
+
+    # The wallet's current address moves on (something asked it for a new one).
+    rpc.party = other
+    rpc.calls.clear()
+    again = runtime.WalletCoinSource(rpc, world.sim, prefix="txch", memory=book)
+
+    # A new process still uses the address its funds and its options are at,
+    # and does not ask the wallet which address is current.
+    assert again.puzzle_hash() == maker.puzzle_hash
+    assert "get_next_address" not in rpc.endpoints()
+
+    # An address set in the config wins, and is what is remembered from then on.
+    chosen = sdk.Address(other.puzzle_hash, "txch").encode()
+    set_ = runtime.WalletCoinSource(rpc, world.sim, address=chosen, prefix="txch", memory=book)
+    assert set_.puzzle_hash() == other.puzzle_hash
+    assert book.recall("options_address") == chosen
+
+
+def test_the_monitor_sends_the_coingecko_key_and_checks_the_price_s_age(
+    tmp_path, monkeypatch
+) -> None:
+    from gui.services.options import desk as desk_module
+    from gui.services.options import market as market_module
+    from gui.services.options import monitor as monitor_module
+
+    world = World()
+    usd = world.issue_cat(world.party(1), 5)
+    section = {
+        "enabled": True,
+        "wallet": {"port": 9356, "cert_path": "c", "key_path": "k"},
+        "quote_asset_id": usd.hex(),
+        "contract_xch": 20,
+        "database_path": str(tmp_path / "options_jobs.db"),
+        "market": {"max_age_seconds": 321},
+    }
+    cfg = config.parse({"options": section, "coingecko": {"api_key": "CG-secret"}})
+    assert cfg is not None
+    made: dict[str, Any] = {}
+
+    class Source:
+        def __init__(self, asset_id: bytes, **kwargs: Any) -> None:
+            made["source"] = kwargs
+
+        def read(self) -> Any:
+            raise market_module.MarketError("not asked in this test")
+
+    class Watcher:
+        def __init__(self, **kwargs: Any) -> None:
+            made["watcher"] = kwargs
+
+        def scan(self) -> Any:
+            return monitor_module.ScanReport()
+
+    monkeypatch.setattr(market_module, "MarketSource", Source)
+    monkeypatch.setattr(monitor_module, "DeskMonitor", Watcher)
+    monkeypatch.setattr(desk_module, "DeskClient", lambda: object())
+    monkeypatch.setattr(cli, "chain_reader", lambda _cfg: world.sim)
+
+    assert cli._monitor(cfg, 0) == 0
+
+    assert made["source"]["coingecko_api_key"] == "CG-secret"
+    assert made["watcher"]["max_spot_age_seconds"] == 321

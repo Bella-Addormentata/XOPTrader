@@ -21,10 +21,15 @@ stops at the first thing that does not match.
   step, and nothing is done while the wallet reports itself still syncing.
   `status` prints whether it is ready.
 - A few thousand mojos of XCH sent to the address `status` prints. Only coins
-  at that one address are used.
+  at that one address are used. With `options.wallet.address` blank the book
+  asks the wallet for its current address once and keeps to it from then on,
+  whatever the wallet's current address later becomes.
 - Optional: a full node of your own. Enter its RPC port and its
   `config/ssl/full_node/private_full_node.crt` and `.key` under `options.node`
-  and the chain is read from it; coinset.org is then never contacted. Without
+  and the chain is read from it; coinset.org is then never contacted. If the
+  node is on another machine, `options.node.ca_cert_path` is required too (the
+  node's `config/ssl/ca/private_ca.crt`): the node's certificate is then
+  checked against it, so nobody between the two can answer in its place. Without
   it the chain is read from coinset.org, sparingly (see "How often the chain is
   asked" below). `status` prints which of the two is in use.
 
@@ -184,7 +189,10 @@ Every `step` ends with a line such as `chain requests this step: 1 (routine)`,
 so the cost is visible. For scale: a book of six open contracts stepped once a
 minute used to make about 90,000 requests a day. It now makes 24 on a quiet
 day (one an hour), about 7 when it mints a contract, and about 5 when one
-sells. Lowering `chain_refresh_seconds` from 3600 to 900 makes the quiet-day
+sells. Each of those is followed, once, by 2 to 4 more at the first look after
+the spends have settled: how each coin was spent is read again before it is
+kept for good, because a reorganised block can hold a different spend at the
+same height. Lowering `chain_refresh_seconds` from 3600 to 900 makes the quiet-day
 figure 96 and shortens the wait described below to a quarter of an hour. A
 transaction that runs out of time adds a few: from ten minutes after its
 deadline the chain's clock is read at most once a minute (counted as three

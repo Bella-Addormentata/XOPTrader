@@ -33,6 +33,7 @@ _ADDITIONAL_DATA = {
 _XCH_WALLET_ID = 1
 _CAT_WALLET_TYPE = 6
 _WALLET_LIST_SECONDS = 300
+_ADDRESS_KEY = "options_address"
 
 
 def _sdk() -> Any:
@@ -60,12 +61,14 @@ class WalletCoinSource:
         address: str = "",
         prefix: str = "xch",
         clock: Callable[[], float] = time.time,
+        memory: Any = None,
     ) -> None:
         self._rpc = rpc
         self._chain = chain_reader
         self._prefix = prefix
         self._configured = address
         self._clock = clock
+        self._memory = memory  # the book's store: recall(key) / remember(key, value)
         self._puzzle_hash: bytes | None = None
         self._cat_wallets: dict[bytes, int] = {}
         self._cat_wallets_at: float | None = None
@@ -73,6 +76,12 @@ class WalletCoinSource:
     def puzzle_hash(self) -> bytes:
         if self._puzzle_hash is None:
             address = self._configured
+            if not address and self._memory is not None:
+                # The address this book has used before. The wallet's current
+                # address moves on whenever anything asks it for a new one, and
+                # a book that followed it would leave its funds, and the keys
+                # to its own options, behind.
+                address = str(self._memory.recall(_ADDRESS_KEY) or "")
             if not address:
                 answer = self._rpc(
                     "get_next_address", {"wallet_id": _XCH_WALLET_ID, "new_address": False}
@@ -88,6 +97,8 @@ class WalletCoinSource:
                     f"{self._prefix}"
                 )
             self._puzzle_hash = bytes(decoded.puzzle_hash)
+            if self._memory is not None and self._memory.recall(_ADDRESS_KEY) != address:
+                self._memory.remember(_ADDRESS_KEY, address)
         return self._puzzle_hash
 
     def address(self) -> str:
@@ -158,37 +169,79 @@ def wallet_rpc(cfg: config.OptionsConfig) -> WalletRpc:
     return client._post  # noqa: SLF001 - WalletClient's one generic call
 
 
-def _node_poster(cert: str, key: str, timeout: float) -> Callable[[str, dict], dict]:
-    """HTTPS with the node's client certificate, as the wallet RPC is reached.
+def _node_poster(cert: str, key: str, timeout: float, ca: str = "") -> Callable[[str, dict], dict]:
+    """HTTPS to a Chia full node's RPC, with our client certificate.
 
-    ``verify=False`` because Chia's RPC certificate is issued by its own private
-    CA to "Chia", not to the host name; the connection is still mutually
-    authenticated by the client certificate.
+    The client certificate proves who we are to the node. Whether the node is
+    who it should be is a separate question, answered by ``ca``: the node's own
+    certificate authority (``config/ssl/ca/private_ca.crt``). With it, the
+    node's certificate must be signed by that authority and by nothing else.
+    The host name is not compared, because Chia issues every certificate to
+    "Chia" and never to a host; this is how Chia's own clients check each other.
+
+    Without ``ca`` the node's certificate is not checked at all, which
+    ``config`` allows only for a node on this machine, where nothing stands
+    between the two.
     """
     import requests  # lazy: only when a real network call is made
-    import urllib3
 
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     session = requests.Session()
+    if not ca:
+        import urllib3
 
-    def post(url: str, body: dict) -> dict:
-        response = session.post(
-            url,
-            json=body,
-            cert=(cert, key),
-            verify=False,  # noqa: S501 - private CA; see the docstring
-            timeout=timeout,
-        )
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        def post(url: str, body: dict) -> dict:
+            response = session.post(
+                url,
+                json=body,
+                cert=(cert, key),
+                verify=False,  # noqa: S501 - this machine only; see the docstring
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            return response.json()
+
+        return post
+
+    import ssl
+
+    from requests.adapters import HTTPAdapter
+
+    # Only this authority: a context made with a cafile loads no system roots.
+    context = ssl.create_default_context(cafile=ca)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_REQUIRED
+    # Chia's authority certificate carries no key-usage extension, which the
+    # strict checking Python 3.13 turns on by default refuses outright. Chia's
+    # own clients do not check strictly either; the signature still has to be
+    # that authority's.
+    context.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    context.load_cert_chain(cert, key)
+
+    class _PrivateCa(HTTPAdapter):
+        def init_poolmanager(self, *args: Any, **kwargs: Any) -> Any:
+            kwargs["ssl_context"] = context
+            kwargs["assert_hostname"] = False
+            return super().init_poolmanager(*args, **kwargs)
+
+    session.mount("https://", _PrivateCa())
+
+    def checked(url: str, body: dict) -> dict:
+        # verify names the same file, so that nothing else is added to what
+        # the context trusts.
+        response = session.post(url, json=body, verify=ca, timeout=timeout)
         response.raise_for_status()
         return response.json()
 
-    return post
+    return checked
 
 
 def chain_source(cfg: config.OptionsConfig) -> str:
     """Where chain reads go, for the operator to see."""
     if cfg.node.enabled:
-        return f"your full node at {cfg.node.host}:{cfg.node.port} (coinset is not used)"
+        checked = "certificate checked" if cfg.node.ca_cert_path else "on this machine"
+        return f"your full node at {cfg.node.host}:{cfg.node.port} ({checked}; coinset is not used)"
     return f"coinset ({cfg.coinset_url or _COINSET[cfg.network]})"
 
 
@@ -204,7 +257,7 @@ def chain_reader(cfg: config.OptionsConfig) -> chain.NodeChainReader:
     if cfg.node.enabled:
         client = CoinsetClient(
             f"https://{cfg.node.host}:{cfg.node.port}",
-            poster=_node_poster(cfg.node.cert_path, cfg.node.key_path, 30.0),
+            poster=_node_poster(cfg.node.cert_path, cfg.node.key_path, 30.0, cfg.node.ca_cert_path),
         )
     else:
         client = CoinsetClient(cfg.coinset_url or _COINSET[cfg.network])
@@ -232,7 +285,12 @@ def build(
         fingerprint=cfg.wallet.fingerprint,
     )
     coins = WalletCoinSource(
-        rpc, reader, address=cfg.wallet.address, prefix=cfg.address_prefix, clock=clock
+        rpc,
+        reader,
+        address=cfg.wallet.address,
+        prefix=cfg.address_prefix,
+        clock=clock,
+        memory=book_store,
     )
     if market_reader is None:
         market_reader = market.MarketSource(

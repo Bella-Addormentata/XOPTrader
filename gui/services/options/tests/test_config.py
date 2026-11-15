@@ -159,7 +159,13 @@ def test_the_chain_is_read_from_coinset_unless_a_node_is_given() -> None:
     assert (parsed.chain_poll_seconds, parsed.chain_refresh_seconds) == (30, 3600)
 
     own = _parse(
-        node={"host": "10.0.0.5", "port": 8666, "cert_path": "/n/c.crt", "key_path": "/n/k"}
+        node={
+            "host": "10.0.0.5",
+            "port": 8666,
+            "cert_path": "/n/c.crt",
+            "key_path": "/n/k",
+            "ca_cert_path": "/n/ca.crt",
+        }
     )
     assert own.node.enabled
     assert (own.node.host, own.node.port, own.node.cert_path) == ("10.0.0.5", 8666, "/n/c.crt")
@@ -268,3 +274,15 @@ def test_the_dedicated_wallet_must_not_be_the_trading_wallet_s_key() -> None:
             config.parse({"options": section, "chia": {"wallet_fingerprint": trading}})
     parsed = config.parse({"options": section, "chia": {"wallet_fingerprint": 78}})
     assert parsed is not None and parsed.wallet.fingerprint == 77
+
+
+def test_a_node_on_another_machine_needs_its_certificate_authority() -> None:
+    pair = {"cert_path": "c", "key_path": "k"}
+    for host in ("localhost", "127.0.0.1", "::1", "LOCALHOST"):
+        assert _parse(node={"host": host, **pair}).node.ca_cert_path == ""
+    with pytest.raises(config.OptionsConfigError, match="ca_cert_path is required"):
+        _parse(node={"host": "10.0.0.9", **pair})
+    far = _parse(node={"host": "10.0.0.9", "ca_cert_path": " /n/private_ca.crt ", **pair}).node
+    assert far.ca_cert_path == "/n/private_ca.crt" and not far.local
+    # With no node configured there is nothing to check.
+    assert not _parse(node={"host": "10.0.0.9"}).node.enabled

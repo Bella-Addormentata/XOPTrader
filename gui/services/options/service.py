@@ -856,8 +856,10 @@ class OptionsBook:
         valid_until = self._valid_until(now + self._config.confirm_timeout_seconds)
 
         def build(fee: int) -> tuple[list[CoinSpend], safety.Expected]:
-            # An XCH underlying pays its own fee; a CAT needs an XCH coin for one.
-            funding_xch = self._xch(fee) if contract.underlying_asset is not None else []
+            # An XCH underlying pays its own fee, unless the fee is the larger
+            # of the two; a CAT always needs an XCH coin for one.
+            other = contract.underlying_asset is not None or fee >= amount
+            funding_xch = self._xch(fee) if other else []
             coin_spends = builder.build_clawback(
                 loaded.underlying,
                 locked,
@@ -1096,7 +1098,9 @@ class OptionsBook:
                 loaded.option,
                 builder.Asset(self._config.quote_asset_id, ask),
                 address,
-                self._custody(),
+                # The key of whichever of our addresses holds the option: after
+                # options.wallet.address is changed, that is the old one.
+                self._custody(loaded.owner_puzzle_hash),
                 expires_at_seconds=now + self._config.offer_ttl_seconds,
             )
             self._check(
@@ -1188,7 +1192,7 @@ class OptionsBook:
                 option,
                 address,
                 builder.Funding(address, xch=self._xch(fee)),
-                self._custody(),
+                self._custody(loaded.owner_puzzle_hash),
                 fee=fee,
                 valid_until_seconds=valid_until,
             )
