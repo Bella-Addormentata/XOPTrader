@@ -19,6 +19,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import math
+import os
 from typing import Any
 
 from gui.services.options import splash
@@ -55,6 +56,15 @@ def _number(section: dict, key: str, default: float | None, *, minimum: float = 
     if not math.isfinite(value) or value < minimum:
         raise OptionsConfigError(f"options: {key} must be a finite number >= {minimum}")
     return value
+
+
+def _path(section: dict, key: str) -> str:
+    """A file path, with ``~`` expanded as the chia section's paths are. "" if unset.
+
+    The TLS libraries the paths go to do not expand it themselves.
+    """
+    raw = str(section.get(key) or "").strip()
+    return os.path.expanduser(raw) if raw else ""
 
 
 def _flag(section: dict, key: str, default: bool) -> bool:
@@ -290,8 +300,8 @@ def parse(root: Any) -> OptionsConfig | None:
         )
     if mode != "dedicated":
         raise OptionsConfigError("options.wallet.mode must be dedicated")
-    cert_path = str(wallet_raw.get("cert_path") or "").strip()
-    key_path = str(wallet_raw.get("key_path") or "").strip()
+    cert_path = _path(wallet_raw, "cert_path")
+    key_path = _path(wallet_raw, "key_path")
     if not cert_path or not key_path:
         raise OptionsConfigError(
             "options.wallet.cert_path and key_path are required: the dedicated wallet's "
@@ -392,9 +402,9 @@ def parse(root: Any) -> OptionsConfig | None:
     node = NodeConfig(
         host=str(node_raw.get("host") or "localhost").strip(),
         port=int(_number(node_raw, "port", 8555, minimum=1)),
-        cert_path=str(node_raw.get("cert_path") or "").strip(),
-        key_path=str(node_raw.get("key_path") or "").strip(),
-        ca_cert_path=str(node_raw.get("ca_cert_path") or "").strip(),
+        cert_path=_path(node_raw, "cert_path"),
+        key_path=_path(node_raw, "key_path"),
+        ca_cert_path=_path(node_raw, "ca_cert_path"),
     )
     if bool(node.cert_path) != bool(node.key_path):
         raise OptionsConfigError("options.node needs both cert_path and key_path, or neither")
