@@ -147,7 +147,14 @@ class NodeChainReader:
         return self.coin_states([coin_id]).get(bytes(coin_id))
 
     def spend_at(self, coin: Coin, spent_height: int) -> Any:
-        """How a coin known to be spent at ``spent_height`` was spent. One request."""
+        """How a coin known to be spent at ``spent_height`` was spent. One request.
+
+        Asked while that block is still being added, a full node can already
+        report the coin spent and still fail this lookup (chia-blockchain 2.7.4
+        logs an AssertionError in ``get_puzzle_and_solution``; seen on mainnet
+        on 2026-11-15, 0.6 s before the block finished). It is a ChainError
+        like any other, and callers ask again on their next look.
+        """
         try:
             solution = self._client.get_puzzle_and_solution(
                 bytes(coin.coin_id()).hex(), int(spent_height)

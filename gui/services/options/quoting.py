@@ -171,7 +171,18 @@ def ask_mojos(
     strength = min(max(config.pricing.steer_strength, 0.0), 0.9)
     steered = quote.model + quote.carry + quote.markup * _steer(contract.side, lean, strength)
     per_xch = max(floor, steered)
-    return max(1, math.ceil(per_xch * contract_size_xch(contract) * config.quote_unit_mojos))
+    return quote_units(per_xch, contract_size_xch(contract), config.quote_unit_mojos)
+
+
+def quote_units(per_xch: float, size_xch: float, unit_mojos: int) -> int:
+    """``per_xch`` for a contract of ``size_xch``, in quote-asset mojos, rounded up.
+
+    Rounded to 9 places first: an ask that sits exactly on ``min_premium`` comes
+    back from the float sums as, say, 5.000000000000001 mojos, and rounding that
+    up made it 6. With mojos of 0.001 wUSDC.b that was a 20% higher ask, which
+    then flipped back and forth as the model drifted, re-quoting each time.
+    """
+    return max(1, math.ceil(round(per_xch * size_xch * unit_mojos, 9)))
 
 
 def _over(cap: int, value: int) -> bool:

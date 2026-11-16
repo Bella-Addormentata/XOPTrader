@@ -16,7 +16,16 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from gui.services.options import chain, config, desk, market, signing, splash, store
+from gui.services.options import (
+    chain,
+    config,
+    desk,
+    engine_guard,
+    market,
+    signing,
+    splash,
+    store,
+)
 from gui.services.options.reference_wallet import ReferenceWallet, WalletRpc, coin_from_json
 from gui.services.options.service import OptionsBook, OptionsError
 
@@ -280,6 +289,13 @@ def chain_reader(cfg: config.OptionsConfig) -> chain.NodeChainReader:
     return chain.NodeChainReader(client)
 
 
+def shared_wallet_guard(cfg: config.OptionsConfig, wallet: Any) -> Any:
+    """``wallet``, checked for a running engine at every sign and push when shared."""
+    if not cfg.wallet.share_trading_wallet:
+        return wallet
+    return engine_guard.EngineCheckedWallet(wallet, cfg.wallet.engine_metrics_url)
+
+
 def build(
     cfg: config.OptionsConfig,
     *,
@@ -294,11 +310,14 @@ def build(
     book_store = store.OptionStore(cfg.database_path)
     # One cache for the book and the coin source, kept in the book's database.
     reader = chain.CachedChain.over(reader or chain_reader(cfg), book_store, clock=clock)
-    wallet = ReferenceWallet(
-        rpc,
-        agg_sig_me_additional_data=_ADDITIONAL_DATA[cfg.network],
-        address_prefix=cfg.address_prefix,
-        fingerprint=cfg.wallet.fingerprint,
+    wallet = shared_wallet_guard(
+        cfg,
+        ReferenceWallet(
+            rpc,
+            agg_sig_me_additional_data=_ADDITIONAL_DATA[cfg.network],
+            address_prefix=cfg.address_prefix,
+            fingerprint=cfg.wallet.fingerprint,
+        ),
     )
     coins = WalletCoinSource(
         rpc,

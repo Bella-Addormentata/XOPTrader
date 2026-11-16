@@ -8,12 +8,32 @@ not been run against a live wallet daemon and had broadcast nothing.
 This checklist is that first run. It uses dust amounts on a throwaway key and
 stops at the first thing that does not match.
 
+It was first followed on 2026-11-15, on Windows against a 2.7.4 wallet daemon on
+mainnet, using the trading wallet with the engine stopped
+(`options.wallet.share_trading_wallet`). Stage 2's `live-test` passed: all
+three spends confirmed and the wallet lost exactly the fees. The book then ran
+live: its mints confirmed and xchoptions.com accepted and listed its offers.
+Still to be seen live: another wallet taking an offer, an exercise, and a
+clawback after expiry.
+
 ## What you need
 
 - chia-blockchain 2.4.3 or newer (the signer RPCs it relies on arrived there).
 - A second wallet daemon with its own key. One daemon serves one key at a time,
   so it cannot share the trading wallet's daemon. Give it its own `CHIA_ROOT`
   and its own ports, start only the wallet service, and let it sync.
+  - Or, on a machine where a second daemon and key are not wanted, the trading
+    wallet itself with `options.wallet.share_trading_wallet: true` and the
+    trading engine **stopped** for as long as any contract is open. See the
+    comment beside it in `config.example.yaml`. `status` and every step then
+    print a warning and whether the engine is up, and every signature and push
+    is refused while it is (or while that cannot be told), checked afresh
+    each time. The wallet must be on this machine, since that is all the
+    check can see, and `options.wallet.fingerprint` and
+    `chia.wallet_fingerprint` must both be set and equal. `options.wallet.address` is required then:
+    the wallet's current address is where the engine's self-sends land, and
+    on the first mainnet run the engine spent the coin there within minutes.
+    An address a Dexie trade paid into works, and needs nothing sent first.
 - That wallet's RPC port, under `options.wallet` in `config.yaml`, and its
   `config/ssl/wallet/private_wallet.crt` and `.key`, under `options.wallet` in
   `secrets.yaml` (see `secrets.example.yaml`; `~` is expanded). `secrets.yaml`
@@ -272,10 +292,13 @@ each transaction is priced from its own cost, never above
   bounded by `limits.max_fee_mojos` and gone within a day.
 
 A mint costs about 55 to 90 million cost units, a withdrawal about 35 to 45
-million, a cancel about 140 to 170 million and a clawback 15 to 40 million. At
-5.5 mojos per unit that is roughly 0.0003 to 0.0005 XCH for a mint and 0.0009
-for a cancel, which the example's cap of 0.001 XCH covers; `step` says so when
-a fee is held down by the cap. The estimate comes from the wallet
+million, a cancel about 90 to 170 million and a clawback 15 to 40 million. At
+5.5 mojos per unit that is roughly 0.0003 to 0.0005 XCH for a mint and 0.0005
+to 0.0009 for a cancel, which the example's cap of 0.001 XCH covers; `step`
+says so when a fee is held down by the cap. Measured on mainnet on 2026-11-15:
+a book mint about 55 million (fee 300,671,718 mojos), and the `live-test`
+cancel 89.8 million. The mempool was 93 to 99% full that afternoon, so the
+5.5 rate was the one that confirmed promptly. The estimate comes from the wallet
 (`get_fee_estimate`, in chia-blockchain 2.7.5); an older wallet without it
 gives none, and the book then goes by what failures taught it alone. This is a
 small-scale form of what the engine's `fees:` controller does, not a share of
@@ -286,6 +309,10 @@ one flat fee per spend, sized for its costliest.
 
 - **Dedicated wallet only.** `wallet.mode: trading` is refused until the engine
   keeps option coins out of its own offers and books option events.
+  `wallet.share_trading_wallet` is not that: it is the operator undertaking to
+  keep the engine stopped, checked before every signature, and nothing more.
+  Starting the engine while contracts are open is not prevented, only
+  reported; the engine then counts collateral and premiums as its own.
 - **The wallet reports no verdict on a broadcast.** Outcomes are read from the
   chain, so a rejected transaction shows up as one that never confirms. It is
   pushed again on every step. While it is unresolved its coins stay set aside
@@ -297,9 +324,12 @@ one flat fee per spend, sized for its costliest.
 - **The price feed must say when its price was observed.** Spot comes from
   CoinGecko with its `last_updated_at` time, and `market.max_age_seconds` is
   measured from that. If the feed's price is older than the limit, or carries
-  no time, the book does not quote. This has only been run against scripted
-  answers; if the first dry-run `step` reports the spot as too old, compare the
-  age it prints with `max_age_seconds` before raising the limit.
+  no time, the book does not quote. Run against the live feed on 2026-11-15:
+  the time is there and the check passes. The price is asked for with
+  `precision=full`; without it CoinGecko rounds to the cent (1.15 for 1.1512),
+  which moved the book's spot in steps of about 0.9%. If a dry-run `step`
+  reports the spot as too old, compare the age it prints with
+  `max_age_seconds` before raising the limit.
 - **No hedging.** The book steers its asks by the net delta of what it has
   sold. It places no spot trades.
 - **No taking.** It writes and sells. It does not buy other makers' offers.

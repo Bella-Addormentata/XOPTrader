@@ -5,6 +5,71 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Options book: covered calls and puts on xchoptions.com from a reference wallet (#228)
+
+`gui/services/options` writes option contracts (CHIP-0045) from a Chia
+reference wallet and offers them on xchoptions.com. It builds the spends
+with `chia-wallet-sdk` and has the wallet sign them through its signer
+RPCs (chia-blockchain 2.4.3 or newer). It is off unless `options.enabled`
+is true, rehearses (`dry_run`) by default, and refuses to mint while any
+of its caps is unset.
+
+It runs from a terminal only, from a source checkout:
+`python -m gui.services.options --config config.yaml <command>`, with
+`status`, `step`, `run`, `withdraw-all`, `monitor` and `live-test`. The
+installed app has no page for it yet. `docs/options-live-test.md` is the
+checklist for a first run.
+
+First run on mainnet, 2026-11-15, from Windows against a 2.7.4 wallet
+daemon: `status`, a dry-run `run`, and `live-test` (mint, offer,
+withdrawal, cancel of a 0.0001 XCH contract), each spend confirmed and
+the wallet down by exactly the three fees. Then `run` live with two
+0.5 XCH calls: both mints confirmed, and xchoptions.com accepted and
+listed the offers, which the book re-made every 12 minutes.
+
+Two things that run turned up are fixed:
+
+- **An ask on the minimum premium was sometimes one unit high.** Float
+  error made 5 quote mojos 5.000000000000001, and rounding up listed the
+  contract at 0.006 wUSDC.b instead of 0.005. The ask then flipped
+  between the two and re-quoted each time.
+- **The XCH price was rounded to the cent.** CoinGecko's simple price
+  answers 1.15 for 1.1512 unless asked for full precision, so the book's
+  spot moved in steps of about 0.9%. It now asks for full precision.
+
+### The options book's secrets stay in secrets.yaml (#229)
+
+The options wallet's certificate paths and fingerprint, and the options
+node's, are kept in `secrets.yaml` when the Settings page saves, and the
+option-contract tests are left out of the release bundle.
+
+### The options book can share the trading wallet while the engine is stopped
+
+`options.wallet.share_trading_wallet` (off by default) lets the book sign
+from the engine's own wallet daemon and key, for a machine where a second
+daemon and key are not wanted. The engine must stay stopped while any
+contract is open: its offers pick coins from the whole wallet, and the
+book's collateral and premiums change balances behind its back. With it on:
+
+- `options.wallet.fingerprint` and `chia.wallet_fingerprint` must both be
+  set and equal, whatever the host and port say: a step logs the wallet in,
+  and another key would be switched in under the engine.
+- The wallet must be on this machine (`localhost`, `127.0.0.1` or `::1`),
+  since the engine check can only see this machine.
+- `options.wallet.address` must be set. A blank address takes the wallet's
+  current address, which is where the engine sends coins to itself; on
+  the first mainnet run the engine spent the coin there within minutes.
+- `status` and every step say so, and whether the engine is up.
+- Every signature and every push is refused while the engine runs, or
+  while that cannot be told: its metrics endpoint answers, or an
+  `xop_trader` process exists. It is asked afresh each time, so an engine
+  started part way through a step is caught at the next signature. A
+  dry-run step still runs.
+
+`run` also prints the time before each step.
+
 ## [0.10.47] — 2026-11-08 — ratio modes switch on when a pair drifts 10 points
 
 ### Apply on the Wallet tab caps each pair's ratio entry band at 0.10 (#223)

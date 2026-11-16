@@ -27,13 +27,14 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from gui.services.options import builder, chain, config, fees, safety, store
+from gui.services.options import builder, chain, config, engine_guard, fees, safety, store
 from gui.services.options.reference_wallet import ReferenceWallet
 from gui.services.options.runtime import (
     _ADDITIONAL_DATA,
     build,
     chain_reader,
     chain_source,
+    shared_wallet_guard,
     wallet_rpc,
 )
 from gui.services.options.service import pack_bundle, unpack_bundle
@@ -82,6 +83,46 @@ def _print_report(report: Any) -> None:
     print(f"chain requests this step: {report.chain_requests}{looked}")
 
 
+def _shared_wallet_banner(
+    cfg: config.OptionsConfig, book_store: store.OptionStore | None
+) -> engine_guard.EngineState | None:
+    """With ``share_trading_wallet`` on: say so, loudly, and whether the engine is up.
+
+    None when the opt-in is off. Printed by ``status`` and before every step.
+    """
+    if not cfg.wallet.share_trading_wallet:
+        return None
+    state = engine_guard.engine_state(cfg.wallet.engine_metrics_url)
+    print(
+        "WARNING: options.wallet.share_trading_wallet is ON. This book signs from the "
+        f"trading engine's wallet ({cfg.wallet.host}:{cfg.wallet.port}, key "
+        f"{cfg.wallet.fingerprint}). The engine must stay STOPPED while any contract is open."
+    )
+    print(f"  trading engine: {state.describe()}")
+    open_contracts = book_store.contracts(store.ACTIVE) if book_store is not None else []
+    if open_contracts and not state.clear:
+        locked = sum(
+            item.underlying_amount for item in open_contracts if item.underlying_asset is None
+        )
+        print(
+            f"  WARNING: {len(open_contracts)} contract(s) open with {locked / config.XCH_MOJOS:g} "
+            "XCH locked while the engine may be running: its balances include collateral and "
+            "premiums it must not count, and its offers can spend coins at the options address"
+        )
+    return state
+
+
+def _engine_refusal(state: engine_guard.EngineState | None, what: str) -> str | None:
+    """Why ``what``, which signs, must not run now; None if it may."""
+    if state is None or state.clear:
+        return None
+    return (
+        f"refused, trading engine up: {what} would sign from the wallet the engine trades "
+        f"through, and the engine is {state.describe()}. Stop the engine and keep it stopped "
+        "while contracts are open, then try again."
+    )
+
+
 def _learned_rate(book_store: store.OptionStore) -> float:
     """The fee rate the book has learned from transactions that ran out, as last stored."""
     try:
@@ -93,6 +134,7 @@ def _learned_rate(book_store: store.OptionStore) -> float:
 def _status(cfg: config.OptionsConfig) -> int:
     book, book_store, coins = build(cfg)
     print(f"network {cfg.network}   dry_run {cfg.dry_run}")
+    _shared_wallet_banner(cfg, book_store)
     key = (
         f"logged in to {cfg.wallet.fingerprint}"
         if cfg.wallet.fingerprint is not None
@@ -140,19 +182,32 @@ def _status(cfg: config.OptionsConfig) -> int:
     return 0
 
 
-def _step(cfg: config.OptionsConfig) -> int:
-    book, _, _ = build(cfg)
+def _guarded_step(cfg: config.OptionsConfig, book: Any, book_store: store.OptionStore) -> bool:
+    """One step, unless the shared-wallet guard forbids it. False if refused."""
+    state = _shared_wallet_banner(cfg, book_store)
+    # A dry-run step signs nothing, so only a live one needs the engine down.
+    refusal = None if cfg.dry_run else _engine_refusal(state, "a live step")
+    if refusal is not None:
+        print(f"  note: {refusal}")
+        return False
     _print_report(book.step())
-    return 0
+    return True
+
+
+def _step(cfg: config.OptionsConfig) -> int:
+    book, book_store, _ = build(cfg)
+    return 0 if _guarded_step(cfg, book, book_store) else 3
 
 
 def _run(cfg: config.OptionsConfig, interval: float) -> int:
-    book, _, _ = build(cfg)
+    book, book_store, _ = build(cfg)
     print(f"stepping every {interval:g} s; Ctrl-C to stop (offers already out expire on their own)")
     try:
         while True:
+            # A log of a long run is read by time; nothing in the report says when.
+            print(f"--- step at {time.strftime('%Y-%m-%d %H:%M:%S %z')}", flush=True)
             try:
-                _print_report(book.step())
+                _guarded_step(cfg, book, book_store)
             except Exception as exc:  # noqa: BLE001 - keep the loop alive; the next step retries
                 logging.getLogger(__name__).exception("step failed: %s", exc)
             time.sleep(interval)
@@ -218,7 +273,12 @@ def _monitor(cfg: config.OptionsConfig, interval: float) -> int:
 
 
 def _withdraw_all(cfg: config.OptionsConfig) -> int:
-    book, _, _ = build(cfg)
+    book, book_store, _ = build(cfg)
+    state = _shared_wallet_banner(cfg, book_store)
+    refusal = None if cfg.dry_run else _engine_refusal(state, "withdraw-all")
+    if refusal is not None:
+        print(f"  note: {refusal}")
+        return 3
     _print_report(book.withdraw_all())
     return 0
 
@@ -335,6 +395,10 @@ class _LiveTest:
         print(f"  the {what} does this: {effect.describe()}")
         safety.require(effect, expected)
         _confirm(f"  sign and send the {what}?", self.assume_yes)
+        # Asked again at every spend: the engine may have been started since.
+        refusal = _engine_refusal(_shared_wallet_banner(self.cfg, None), f"the {what}")
+        if refusal is not None:
+            raise SystemExit(f"{refusal} Nothing was signed; run live-test again to carry on.")
         signature = self.wallet.sign(coin_spends)
         record(pack_bundle(coin_spends, signature))
         self.wallet.push(coin_spends, signature)
@@ -484,16 +548,24 @@ def _live_test(
     """
     rpc = wallet_rpc(cfg)
     reader = chain_reader(cfg)
-    wallet = ReferenceWallet(
-        rpc,
-        agg_sig_me_additional_data=_ADDITIONAL_DATA[cfg.network],
-        address_prefix=cfg.address_prefix,
-        fingerprint=cfg.wallet.fingerprint,
+    # Checked for a running engine at every sign and push when shared,
+    # the offer's signature included, not only before each spend's prompt.
+    wallet = shared_wallet_guard(
+        cfg,
+        ReferenceWallet(
+            rpc,
+            agg_sig_me_additional_data=_ADDITIONAL_DATA[cfg.network],
+            address_prefix=cfg.address_prefix,
+            fingerprint=cfg.wallet.fingerprint,
+        ),
     )
     why = wallet.not_ready()
     if why is not None:
         raise SystemExit(f"{why}; run the test again once it is ready")
     book, book_store, coins = build(cfg, rpc=rpc, reader=reader, clock=time.time)
+    refusal = _engine_refusal(_shared_wallet_banner(cfg, book_store), "live-test")
+    if refusal is not None:
+        raise SystemExit(refusal)
     address = coins.puzzle_hash()
     print(f"network {cfg.network}; options address {coins.address()}")
     print(f"chain is read from {chain_source(cfg)}")

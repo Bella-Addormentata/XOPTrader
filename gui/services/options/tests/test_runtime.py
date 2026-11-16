@@ -77,7 +77,7 @@ class WalletRpc(FakeWallet):
         return {"asset_id": self.cat_asset.hex(), "wallet_id": body["wallet_id"]}
 
 
-def _config(tmp_path, usd: bytes, **overrides) -> config.OptionsConfig:
+def _config(tmp_path, usd: bytes, chia: dict | None = None, **overrides) -> config.OptionsConfig:
     section = {
         "enabled": True,
         "dry_run": False,
@@ -88,7 +88,7 @@ def _config(tmp_path, usd: bytes, **overrides) -> config.OptionsConfig:
         "database_path": str(tmp_path / "options_jobs.db"),
     }
     section.update(overrides)
-    parsed = config.parse({"options": section})
+    parsed = config.parse({"options": section, **({"chia": chia} if chia else {})})
     assert parsed is not None
     return parsed
 
@@ -375,6 +375,185 @@ def test_an_interrupted_live_test_is_picked_up_by_the_next_run(
     assert [item.status for item in contracts] == [store.CLOSED, store.CLOSED]
     assert maker.balance() == before
     assert book.unresolved() == []
+
+
+# -- options.wallet.share_trading_wallet --------------------------------------
+
+_SHARED_WALLET = {
+    "port": 9256,
+    "cert_path": "c",
+    "key_path": "k",
+    "fingerprint": 1234567890,
+    "share_trading_wallet": True,
+}
+
+
+def _engine(monkeypatch, *states: cli.engine_guard.EngineState) -> list[str]:
+    """Make the engine check answer ``states`` in turn (the last one repeats)."""
+    asked: list[str] = []
+    answers = list(states)
+
+    def state(url: str) -> cli.engine_guard.EngineState:
+        asked.append(url)
+        return answers.pop(0) if len(answers) > 1 else answers[0]
+
+    monkeypatch.setattr(cli.engine_guard, "engine_state", state)
+    return asked
+
+
+_UP = cli.engine_guard.EngineState(running=True, certain=True, detail="xop_trader.exe process 1")
+_DOWN = cli.engine_guard.EngineState(running=False, certain=True, detail="nothing there")
+_UNSURE = cli.engine_guard.EngineState(running=False, certain=False, detail="tasklist failed")
+
+
+def _shared_wallet(maker: Party) -> dict:
+    return {**_SHARED_WALLET, "address": sdk.Address(maker.puzzle_hash, "txch").encode()}
+
+
+_TRADING = {"wallet_host": "localhost", "wallet_port": 9256, "wallet_fingerprint": 1234567890}
+
+
+def _shared_live(tmp_path, monkeypatch):
+    world, maker, _, rpc = _live(tmp_path, monkeypatch)
+    usd = world.issue_cat(world.party(1), 5)
+    return world, maker, _config(tmp_path, usd, chia=_TRADING, wallet=_shared_wallet(maker)), rpc
+
+
+@pytest.mark.parametrize("engine", [_UP, _UNSURE])
+def test_a_shared_wallet_live_test_signs_nothing_while_the_engine_may_be_up(
+    tmp_path, monkeypatch, capsys, engine
+) -> None:
+    world, maker, cfg, rpc = _shared_live(tmp_path, monkeypatch)
+    before = maker.balance()
+    asked = _engine(monkeypatch, engine)
+
+    with pytest.raises(SystemExit, match="refused, trading engine up: live-test"):
+        cli._live_test(cfg, 0.0001, True, 60.0)
+
+    assert asked == ["http://localhost:9090/metrics"]
+    assert "push_tx" not in rpc.endpoints() and "gather_signing_info" not in rpc.endpoints()
+    assert maker.balance() == before
+    assert "share_trading_wallet is ON" in capsys.readouterr().out
+
+
+def test_a_shared_wallet_live_test_runs_with_the_engine_down_and_asks_at_every_spend(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    world, maker, cfg, rpc = _shared_live(tmp_path, monkeypatch)
+    before = maker.balance()
+    asked = _engine(monkeypatch, _DOWN)
+
+    assert cli._live_test(cfg, 0.0001, True, 60.0) == 0
+
+    assert maker.balance() == before
+    # Once at the start; before each of the three spends' prompts; and at every
+    # signature (three spends and the offer) and every push (at least three).
+    assert len(asked) >= 1 + 3 + 4 + 3
+    out = capsys.readouterr().out
+    assert out.count("share_trading_wallet is ON") == 4
+    assert "trading engine: not running (nothing there)" in out
+
+
+def test_an_engine_started_part_way_through_a_shared_live_test_stops_the_next_signature(
+    tmp_path, monkeypatch
+) -> None:
+    world, maker, cfg, rpc = _shared_live(tmp_path, monkeypatch)
+
+    def state(url: str) -> cli.engine_guard.EngineState:
+        # Up as soon as the mint has gone out: before the offer is signed.
+        return _UP if rpc.endpoints().count("push_tx") else _DOWN
+
+    monkeypatch.setattr(cli.engine_guard, "engine_state", state)
+
+    with pytest.raises(cli.engine_guard.EngineRunningError, match="refused, trading engine up"):
+        cli._live_test(cfg, 0.0001, True, 60.0)
+
+    assert rpc.endpoints().count("push_tx") == 1  # the mint only
+    _, (contract,) = _test_contracts(cfg)
+    assert contract.status == store.OPEN  # on record, for the next run to finish
+    assert _test_contracts(cfg)[0].offers() == []  # the offer was never signed
+
+
+def test_build_checks_for_the_engine_at_every_signature_only_when_shared(tmp_path) -> None:
+    world = World()
+    maker = world.party(1)
+    usd = world.issue_cat(maker, 5)
+    rpc = WalletRpc(world, maker, usd)
+
+    def wallet_of(cfg: config.OptionsConfig) -> Any:
+        book, _, _ = runtime.build(cfg, rpc=rpc, reader=world.sim, clock=world.now)
+        return book._wallet  # noqa: SLF001 - the wiring is what is under test
+
+    shared = _config(tmp_path, usd, chia=_TRADING, wallet=_shared_wallet(maker))
+    assert isinstance(wallet_of(shared), cli.engine_guard.EngineCheckedWallet)
+    assert not isinstance(wallet_of(_config(tmp_path, usd)), cli.engine_guard.EngineCheckedWallet)
+
+
+def test_a_shared_wallet_step_rehearses_with_the_engine_up_but_does_not_act(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    world = World()
+    maker = world.party(100)
+    usd = world.issue_cat(maker, 500)
+    rpc = WalletRpc(world, maker, usd)
+    monkeypatch.setattr(runtime, "wallet_rpc", lambda _cfg: rpc)
+    monkeypatch.setattr(runtime, "chain_reader", lambda _cfg: world.sim)
+    _engine(monkeypatch, _UP)
+    stepped: list[bool] = []
+    monkeypatch.setattr(
+        cli,
+        "_print_report",
+        lambda report: stepped.append(report.dry_run),
+    )
+    monkeypatch.setattr(
+        runtime.market,
+        "MarketSource",
+        lambda *a, **k: type("NoFeed", (), {"read": staticmethod(_no_feed)})(),
+    )
+
+    rehearsal = _config(tmp_path, usd, chia=_TRADING, dry_run=True, wallet=_shared_wallet(maker))
+    assert cli._step(rehearsal) == 0 and stepped == [True]
+
+    live = _config(tmp_path, usd, chia=_TRADING, dry_run=False, wallet=_shared_wallet(maker))
+    assert cli._step(live) == 3 and stepped == [True]  # refused: no step was taken
+    assert cli._withdraw_all(live) == 3
+    out = capsys.readouterr().out
+    assert "refused, trading engine up: a live step" in out
+    assert "refused, trading engine up: withdraw-all" in out
+    assert "push_tx" not in rpc.endpoints()
+
+
+def _no_feed() -> market.Market:
+    raise market.MarketError("no feed in this test")
+
+
+def test_run_stamps_each_step_with_the_time_and_stops_cleanly(tmp_path, monkeypatch, capsys):
+    usd = b"\x07" * 32
+    cfg = _config(tmp_path, usd, dry_run=True)
+    monkeypatch.setattr(cli, "build", lambda _cfg: (object(), None, None))
+    steps: list[int] = []
+    monkeypatch.setattr(cli, "_guarded_step", lambda *_: steps.append(1) or True)
+
+    def sleep(seconds: float) -> None:
+        if len(steps) >= 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", sleep)
+
+    assert cli._run(cfg, 60.0) == 0
+
+    out = capsys.readouterr().out
+    assert len(steps) == 2 and out.count("--- step at 20") == 2 and out.endswith("stopped\n")
+
+
+def test_without_the_opt_in_the_engine_is_never_asked_about(tmp_path, monkeypatch, capsys) -> None:
+    world, maker, cfg, rpc = _live(tmp_path, monkeypatch)
+    asked = _engine(monkeypatch, _UP)
+
+    assert cli._live_test(cfg, 0.0001, True, 60.0) == 0
+
+    assert asked == []
+    assert "share_trading_wallet" not in capsys.readouterr().out
 
 
 def test_a_live_test_whose_mint_never_confirms_is_picked_up(tmp_path, monkeypatch, capsys) -> None:

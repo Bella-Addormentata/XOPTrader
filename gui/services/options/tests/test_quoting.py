@@ -243,6 +243,40 @@ def test_steering_never_discounts_the_minimum_premium() -> None:
     assert dearer > floor
 
 
+def test_an_ask_on_the_floor_is_not_pushed_a_whole_unit_up_by_float_error() -> None:
+    # Seen live on 2026-11-15: a 0.5 XCH call at 1.40 with spot 1.15, two days
+    # out, sat on min_premium 0.01. The sums came to 0.010000000000000002 per
+    # XCH, 5.000000000000001 mojos, and rounding up listed it at 6 (0.006
+    # wUSDC.b) instead of 5, flipping between the two and re-quoting each time.
+    assert 0.010000000000000002 * 0.5 * 1000 > 5  # the float error itself
+    assert quoting.quote_units(0.010000000000000002, 0.5, 1000) == 5
+    # A real fraction of a mojo is still rounded up, never down.
+    assert quoting.quote_units(0.0100001, 0.5, 1000) == 6
+    assert quoting.quote_units(0.0000001, 0.5, 1000) == 1  # never free
+
+
+def test_the_floor_ask_stays_put_as_the_model_drifts() -> None:
+    from gui.services.options import pricing
+
+    expiry, start = 1794924000, 1794776500
+    asks = set()
+    for now in range(start, start + 3600, 60):
+        quote = pricing.ask_price(
+            1.15,
+            1.40,
+            expiry - now,
+            call=True,
+            sigma=0.99,
+            sigma_markup=0.02,
+            lock_rate=0.10,
+            markup_fraction=0.03,
+            min_premium=0.01,
+        )
+        per_xch = max(quote.model + quote.carry, 0.01, quote.model + quote.carry + quote.markup)
+        asks.add(quoting.quote_units(per_xch, 0.5, 1000))
+    assert asks == {5}
+
+
 def test_ask_scales_with_size_and_rounds_up() -> None:
     cfg = _config()
     wanted = quoting.plan(cfg, _market(), [], NOW).mint[0]

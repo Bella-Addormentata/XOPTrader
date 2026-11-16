@@ -29,6 +29,9 @@ is no GUI page, and ``wallet.mode: trading`` is refused: the engine does not yet
 keep option coins out of its own offers or book option events, and nothing in
 the engine reads this package's ``events`` table. It is off unless config.yaml
 has ``options.enabled: true``, and it rehearses (``dry_run``) by default.
+``wallet.share_trading_wallet`` (off by default) lets it sign from the trading
+wallet while the engine is stopped; :mod:`engine_guard` checks that before
+every signature.
 
 What has been checked, and what has not:
 
@@ -46,12 +49,16 @@ What has been checked, and what has not:
   site shows, and :func:`signing.verify` accepted the signatures of four live
   offers, which have the same structure as the offers built here.
 * The desk client and monitor were run read-only against the live site.
-* NOT checked: a live wallet daemon over its HTTPS RPC, any broadcast to
-  mainnet, xchoptions.com accepting an offer built here, the wallet's full sync
-  loop meeting an option mint against a live node, and the CoinGecko feed in
-  :mod:`market` (tested against scripted answers only). ``docs/options-live-test.md``
-  is the checklist for the first of these; follow it on a throwaway key with
-  dust amounts before trusting this with funds.
+* First run on mainnet, 2026-11-15, from Windows against a chia-blockchain
+  2.7.4 wallet daemon over its HTTPS RPC (``docs/options-live-test.md``):
+  ``status``; ``live-test``'s mint, offer, withdrawal and cancel, each
+  confirmed, the wallet down by exactly the fees and its log clean around the
+  mint; then ``run`` live, whose mints confirmed and whose offers
+  xchoptions.com accepted and listed, re-made every 12 minutes. The CoinGecko
+  feed's ``last_updated_at`` was read and passed the freshness check.
+* NOT yet checked live: a sale to another wallet, an exercise, a clawback after
+  expiry, a withdrawal the book decides on, and the cancel it makes before
+  expiry.
 
 One thing to know before wiring this in: the wallet's ``push_tx`` reports no
 verdict. A bundle its node refuses looks the same to the caller as one it
