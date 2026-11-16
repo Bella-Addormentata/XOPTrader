@@ -22,7 +22,10 @@ The other direction, the engine waiting for the book, is
 :func:`engine_start_window`: EngineBridge holds it while it checks and
 launches the engine. It covers every book this process has run, not just the
 one config.yaml names now, since Settings can switch config.yaml under a book
-that is still running or still has contracts open.
+that is still running or still has contracts open. A book holds the engine
+while it is Live, while it is in the middle of a step, and while it has
+contracts open; with ``options.wallet.engine_beside_open_contracts``, only
+while its own transactions are still in flight instead of the last.
 
 The book's SQLite store belongs to the thread that opened it, so everything the
 GUI shows is copied into the snapshot on that thread, after each step.
@@ -201,12 +204,49 @@ def _open_reason(still_open: list[store.Contract]) -> str | None:
     )
 
 
-def _read_open(cfg: config.OptionsConfig) -> list[store.Contract]:
+def _in_flight_reason(book_store: store.OptionStore) -> str | None:
+    """Why the engine must wait for the book's own transactions, or None.
+
+    Read for a book with ``options.wallet.engine_beside_open_contracts``: its
+    open contracts do not hold the engine, but a transaction it has sent and
+    the chain has not ruled on does. The book pushes bundles it built itself,
+    so the wallet does not know their coins are being spent and could hand them
+    to an engine offer. Every unresolved one (pending or stalled) holds the
+    engine until a step records its verdict -- confirmed, overtaken, or lapsed,
+    which the book decides only from the chain's own clock read 32 blocks deep
+    (``service._settle_broadcasts``), never from this machine's. A dry-run step
+    records verdicts too, so Rehearse is enough to settle them.
+    """
+    waiting = book_store.unresolved()
+    if not waiting:
+        return None
+    kinds = ", ".join(sorted({row.kind for row in waiting}))
+    return (
+        f"the options book has {len(waiting)} transaction(s) waiting to confirm ({kinds}). "
+        "The engine waits so that its offers cannot pick the same coins: leave the book on "
+        "(Live or Rehearse) until its record shows them settled, then start the engine."
+    )
+
+
+def _hold_reason(cfg: config.OptionsConfig, book_store: store.OptionStore) -> str | None:
+    """Why this shared-wallet book holds the engine, from its record; None if it does not.
+
+    By default every open contract does. With
+    ``options.wallet.engine_beside_open_contracts`` only the book's
+    transactions still in flight do; being Live and stepping are checked by
+    the callers.
+    """
+    if cfg.wallet.engine_beside_open_contracts:
+        return _in_flight_reason(book_store)
+    return _open_reason(book_store.contracts(store.ACTIVE))
+
+
+def _read_hold(cfg: config.OptionsConfig) -> str | None:
     if not Path(cfg.database_path).exists():
-        return []
+        return None
     book_store = store.OptionStore(cfg.database_path)
     try:
-        return book_store.contracts(store.ACTIVE)
+        return _hold_reason(cfg, book_store)
     finally:
         book_store.close()
 
@@ -229,7 +269,7 @@ def engine_start_blocker(config_path: Path) -> str | None:
                 "Options page first"
             )
         try:
-            why = _open_reason(_read_open(cfg))
+            why = _read_hold(cfg)
         except Exception as exc:  # noqa: BLE001 - fail closed
             why = (
                 "the options book shares the trading wallet and its record could not be read "
@@ -248,7 +288,9 @@ def engine_start_window(config_path: Path) -> Iterator[str | None]:
     step takes) is held from the check to the end of the ``with`` block, so no
     step can mint between "nothing is open" and the engine being up. A book in
     the middle of a step is a reason to wait. By the time the lock is let go
-    the engine's process exists, and the next step sees it and holds.
+    the engine's process exists, and the next step sees it and holds. With
+    ``engine_beside_open_contracts`` the lock is taken all the same: open
+    contracts no longer hold the engine, but a step in progress still does.
     """
     with contextlib.ExitStack() as held:
         reason: str | None = None
@@ -271,7 +313,7 @@ def engine_start_window(config_path: Path) -> Iterator[str | None]:
                 book_store = store.OptionStore(cfg.database_path)
                 held.callback(book_store.close)
                 held.enter_context(book_store.acting())
-                reason = _open_reason(book_store.contracts(store.ACTIVE))
+                reason = _hold_reason(cfg, book_store)
             except store.BusyError:
                 reason = (
                     "the options book is in the middle of a step; start the engine again in "

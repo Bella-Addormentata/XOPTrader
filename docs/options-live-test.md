@@ -146,6 +146,31 @@ switch on while the engine runs. Run the book either from the page or from a
 terminal, not both: they share one database, and the second one to act is
 refused ("another process is acting").
 
+With `options.wallet.engine_beside_open_contracts: true` (and
+`fund_from_wallet: true`, which it needs) the engine is held only while the
+book acts, not for as long as contracts are open. A day with contracts out then
+goes:
+
+1. Stop the engine, switch the book to Live, and let it mint, list or cancel.
+   A stop that keeps the engine's offers leaves their coins locked: if the
+   book reports it cannot find a coin it needs (a cancel of a call struck in
+   the quote asset needs one of that asset), stop the engine with its offers
+   cancelled instead.
+2. Switch the book Off once it has done what you wanted. If it sent anything,
+   leave it Live (or on Rehearse) until its record shows the transaction
+   settled: the engine waits for every transaction of the book's until a step
+   has recorded its verdict from the chain, which a Rehearse step does too.
+3. Start the engine. It trades beside the open contracts; collateral stays
+   locked in them, and a sale or an exercise only adds to the wallet.
+4. After expiry, repeat 1 and 2 to claw the collateral back.
+
+The engine can spend the loose coins at the options address while it runs,
+which is why the book must be able to pay from the rest of the wallet. At
+launch the engine starts before the Options page takes up its remembered
+mode, so a book left Live when the app closed comes back Live only if
+something else still holds the engine; otherwise the page says it was not
+resumed, and step 1 starts it again.
+
 Two things to know once contracts are out:
 
 - **Setting `dry_run: true` again stops all spending**, housekeeping included.
@@ -327,8 +352,10 @@ one flat fee per spend, sized for its costliest.
   keeps option coins out of its own offers and books option events.
   `wallet.share_trading_wallet` is not that: it is the operator undertaking to
   keep the engine stopped, checked before every signature, and nothing more.
-  Starting the engine while contracts are open is not prevented, only
-  reported; the engine then counts collateral and premiums as its own.
+  The app will not start the engine while contracts are open (with
+  `engine_beside_open_contracts`, while the book acts), but an engine started
+  some other way, from a terminal or a service manager, is only reported; the
+  engine then counts premiums and returned collateral as its own.
 - **The wallet reports no verdict on a broadcast.** Outcomes are read from the
   chain, so a rejected transaction shows up as one that never confirms. It is
   pushed again on every step. While it is unresolved its coins stay set aside

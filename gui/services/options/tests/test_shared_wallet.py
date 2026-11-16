@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import types
 import urllib.error
 
 import pytest
@@ -120,6 +121,74 @@ def test_only_a_real_true_switches_it_on(raw) -> None:
         config.OptionsConfigError, match="share_trading_wallet must be true or false"
     ):
         _parse(_shared(share_trading_wallet=raw))
+
+
+# -- options.wallet.engine_beside_open_contracts -------------------------------------
+
+
+def test_the_engine_beside_open_contracts_is_off_by_default() -> None:
+    assert not _parse(_shared()).wallet.engine_beside_open_contracts
+    assert not _parse(_shared(fund_from_wallet=True)).wallet.engine_beside_open_contracts
+
+
+def test_the_engine_beside_open_contracts_needs_funding_from_the_whole_wallet() -> None:
+    # A running engine can spend the coins at the options address; the book's
+    # next cancel or clawback must be able to pay from elsewhere.
+    with pytest.raises(config.OptionsConfigError, match="needs options.wallet.fund_from_wallet"):
+        _parse(_shared(engine_beside_open_contracts=True))
+    with pytest.raises(config.OptionsConfigError, match="needs options.wallet.fund_from_wallet"):
+        _parse(_shared(engine_beside_open_contracts=True, fund_from_wallet=False))
+    parsed = _parse(_shared(engine_beside_open_contracts=True, fund_from_wallet=True))
+    assert parsed.wallet.engine_beside_open_contracts and parsed.wallet.fund_from_wallet
+
+
+def test_the_engine_beside_open_contracts_means_nothing_on_a_wallet_of_its_own() -> None:
+    # A dedicated wallet never holds the engine, so there is nothing to relax
+    # and nothing to refuse.
+    dedicated = _parse(
+        {"port": 9356, "cert_path": "c", "key_path": "k", "engine_beside_open_contracts": True}
+    )
+    assert not dedicated.wallet.share_trading_wallet
+
+
+@pytest.mark.parametrize("raw", ["true", "yes", 1])
+def test_only_a_real_true_lets_the_engine_beside_open_contracts(raw) -> None:
+    with pytest.raises(
+        config.OptionsConfigError, match="engine_beside_open_contracts must be true or false"
+    ):
+        _parse(_shared(engine_beside_open_contracts=raw, fund_from_wallet=True))
+
+
+def test_the_command_line_says_which_rule_holds_the_engine(monkeypatch, capsys) -> None:
+    cli = pytest.importorskip("gui.services.options.__main__")
+    up = engine_guard.EngineState(running=True, certain=True, detail="xop_trader.exe process 1")
+    down = engine_guard.EngineState(running=False, certain=True, detail="nothing there")
+    monkeypatch.setattr(cli.engine_guard, "engine_state", lambda url: up)
+    strict = _parse(_shared(fund_from_wallet=True))
+    beside = _parse(_shared(engine_beside_open_contracts=True, fund_from_wallet=True))
+
+    class Book:  # one 0.5 XCH call open
+        def contracts(self, statuses):
+            return [types.SimpleNamespace(underlying_amount=500_000_000_000, underlying_asset=None)]
+
+    cli._shared_wallet_banner(strict, Book())
+    out = capsys.readouterr().out
+    assert "share_trading_wallet is ON" in out
+    assert "must stay STOPPED while any contract is open" in out
+    assert "WARNING: 1 contract(s) open with 0.5 XCH locked" in out
+
+    cli._shared_wallet_banner(beside, Book())
+    out = capsys.readouterr().out
+    assert "share_trading_wallet is ON" in out
+    assert "may run while contracts sit open" in out and "STOPPED while this book acts" in out
+    assert "note: 1 contract(s) open with 0.5 XCH locked beside the engine" in out
+    assert "WARNING: 1 contract(s)" not in out
+
+    # A live step is refused either way; only the advice differs.
+    assert "keep it stopped while contracts are open" in cli._engine_refusal(up, "a step", strict)
+    refusal = cli._engine_refusal(up, "a step", beside)
+    assert refusal.startswith("refused, trading engine up") and "while the book acts" in refusal
+    assert cli._engine_refusal(down, "a step", beside) is None
 
 
 def test_the_engine_is_looked_for_at_its_metrics_port() -> None:

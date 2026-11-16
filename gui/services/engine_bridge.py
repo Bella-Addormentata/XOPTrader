@@ -668,11 +668,13 @@ class EngineBridge(QObject):
     def _auto_start_engine(self) -> None:
         """Launch-time start: the engine binary beside the GUI, unless one answers.
 
-        [OPTIONS] Not while an options book sharing the trading wallet has
-        contracts open. On 2026-11-15 this start, at the first launch of a new
-        version, brought the engine up under two open contracts, and it spent
-        the book's coins within minutes. Unlike start_engine() it ran no check
-        at all, so the check is here as well.
+        [OPTIONS] Not while an options book sharing the trading wallet holds
+        the engine: it has contracts open (by default), is Live, is in the
+        middle of a step, or -- with options.wallet.engine_beside_open_contracts
+        -- has a transaction still in flight. On 2026-11-15 this start, at the
+        first launch of a new version, brought the engine up under two open
+        contracts, and it spent the book's coins within minutes. Unlike
+        start_engine() it ran no check at all, so the check is here as well.
         """
         if self._is_engine_reachable():
             return
@@ -721,9 +723,10 @@ class EngineBridge(QObject):
 
         With ``options.wallet.share_trading_wallet`` the engine and the options
         book use one wallet, and the engine has to stay stopped while the book
-        has contracts open (see gui/services/options/runner.py). Options not
-        set up, or on a wallet of their own, never block. A check that fails
-        blocks: an engine started over open contracts spends the book's coins.
+        has contracts open, or with ``engine_beside_open_contracts`` only while
+        the book acts (see gui/services/options/runner.py). Options not set up,
+        or on a wallet of their own, never block. A check that fails blocks:
+        an engine started over open contracts spends the book's coins.
         """
         try:
             from gui.services.options.runner import engine_start_blocker

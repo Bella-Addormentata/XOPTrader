@@ -32,6 +32,19 @@ book owns still lands at the options address (all change, returned
 collateral, premiums), and the funding coins' addresses count as ours in the
 safety check, so it stays exact. ``live-test`` still funds itself from the
 options address only.
+
+THE ENGINE BESIDE OPEN CONTRACTS. ``wallet.engine_beside_open_contracts: true``
+(off by default, read only with ``share_trading_wallet``) narrows "the engine
+is STOPPED while contracts are open" to "the engine is stopped while the book
+acts". Contracts that sit open do not hold the engine: their collateral is
+locked in the contract, which the wallet does not spend, and their offers spend
+only the option coin. What still holds it: the book being Live, a step in
+progress, and a transaction the book has sent that could still confirm (the
+wallet does not know those coins are being spent, so an engine offer could pick
+them). A running engine can spend the loose coins at the options address, so
+this needs ``fund_from_wallet``: the book then pays from the rest of the wallet
+when it next acts. Every signature and push still checks that the engine is
+stopped, as above.
 """
 
 from __future__ import annotations
@@ -192,6 +205,9 @@ class WalletConfig:
     #: Fund collateral, fees and a cancel's seed coin from the rest of the
     #: wallet when the options address runs short. Off by default.
     fund_from_wallet: bool = False
+    #: With ``share_trading_wallet``: open contracts do not hold the engine,
+    #: only the book acting does. Off by default; needs ``fund_from_wallet``.
+    engine_beside_open_contracts: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -413,6 +429,17 @@ def parse(root: Any) -> OptionsConfig | None:
                 "options.wallet.engine_metrics_url"
             ) from exc
         metrics_url = f"http://localhost:{metrics_port}/metrics"
+    fund = _flag(wallet_raw, "fund_from_wallet", False)
+    beside = _flag(wallet_raw, "engine_beside_open_contracts", False)
+    if share and beside and not fund:
+        # A running engine's offers pick coins from the whole wallet, those at
+        # the options address included. The book's next cancel or clawback
+        # must not depend on them still being there.
+        raise OptionsConfigError(
+            "options.wallet.engine_beside_open_contracts needs options.wallet.fund_from_wallet: "
+            "true. The engine may spend the coins at the options address while contracts are "
+            "open, so the book must be able to pay from the rest of the wallet when it acts"
+        )
     wallet = WalletConfig(
         mode=mode,
         host=host,
@@ -423,7 +450,8 @@ def parse(root: Any) -> OptionsConfig | None:
         address=address,
         share_trading_wallet=share,
         engine_metrics_url=metrics_url,
-        fund_from_wallet=_flag(wallet_raw, "fund_from_wallet", False),
+        fund_from_wallet=fund,
+        engine_beside_open_contracts=beside,
     )
 
     quote_decimals = int(_number(section, "quote_asset_decimals", 3))
