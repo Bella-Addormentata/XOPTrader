@@ -563,3 +563,30 @@ def parse(root: Any) -> OptionsConfig | None:
         splash=splash_config,
         coingecko_api_key=str(coingecko.get("api_key") or "").strip(),
     )
+
+
+def resolve_database_path(
+    cfg: OptionsConfig, config_path: str | os.PathLike[str], *, cwd: str | None = None
+) -> OptionsConfig:
+    """``database_path`` made absolute, read beside config.yaml. One rule for every entry point.
+
+    The command line used to read a relative path against the folder it was
+    run from, and the app's Options page and its engine check read it beside
+    config.yaml: run from another folder, the two looked at different books,
+    and the check could pass an engine start over open contracts. Both read it
+    beside config.yaml now. A book found only where the old rule put it is not
+    silently replaced by a new, empty one: that is refused, saying where it is.
+    """
+    if cfg.database_path == ":memory:" or os.path.isabs(cfg.database_path):
+        return cfg
+    beside = os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(config_path)), cfg.database_path)
+    )
+    here = os.path.abspath(os.path.join(cwd or os.getcwd(), cfg.database_path))
+    if here != beside and os.path.exists(here) and not os.path.exists(beside):
+        raise OptionsConfigError(
+            f"options.database_path {cfg.database_path!r} is read beside config.yaml ({beside}), "
+            f"but the book is at {here}, where it was read against the folder the command ran "
+            "from. Move it beside config.yaml, or set options.database_path to its absolute path."
+        )
+    return dataclasses.replace(cfg, database_path=beside)

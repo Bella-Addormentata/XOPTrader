@@ -59,7 +59,8 @@ def _load(path: str) -> config.OptionsConfig:
     parsed = config.parse(root)
     if parsed is None:
         raise SystemExit(f"{path}: options are not enabled (options.enabled: true to turn on)")
-    return parsed
+    # Read beside config.yaml, as the app's Options page and its engine check do.
+    return config.resolve_database_path(parsed, path)
 
 
 def _print_report(report: Any) -> None:

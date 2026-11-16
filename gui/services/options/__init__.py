@@ -24,8 +24,8 @@ do the same work against the wallet it already trades through:
 * :mod:`runtime` and ``python -m gui.services.options`` wire it to a real
   wallet and run it from a terminal.
 
-STATUS: runs from the command line against a DEDICATED reference wallet. There
-is no GUI page, and ``wallet.mode: trading`` is refused: the engine does not yet
+STATUS: runs from the app's Options page (:mod:`runner`, ``gui/widgets/options.py``)
+or the command line. ``wallet.mode: trading`` is refused: the engine does not yet
 keep option coins out of its own offers or book option events, and nothing in
 the engine reads this package's ``events`` table. It is off unless config.yaml
 has ``options.enabled: true``, and it rehearses (``dry_run``) by default.

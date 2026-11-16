@@ -542,6 +542,7 @@ def test_page_constants_match_the_sidebar_order(qapp):
         "Warp": mw._PAGE_WARP,
         "Base": mw._PAGE_BASE_WALLET,
         "Permuto": mw._PAGE_PERMUTO,
+        "Options": mw._PAGE_OPTIONS,
         "Settings": mw._PAGE_SETTINGS,
     }
     labels = [label for label, _icon in _NAV_ITEMS]

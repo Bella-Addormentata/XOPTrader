@@ -1,0 +1,525 @@
+"""The options book on a background thread, for the GUI's Options switch.
+
+``python -m gui.services.options run`` steps the book in a terminal. This runs
+the same loop inside the GUI process instead, so the installed app can switch
+it Off, to Rehearse (``dry_run``: builds and checks, signs nothing) or to Live,
+with no terminal and no command. Nothing here imports Qt: the GUI starts and
+stops a :class:`OptionsRunner` and reads its :class:`Snapshot` on a timer.
+
+What runs is what the command line runs:
+
+* the book from :func:`runtime.build`, over ``config.yaml`` with
+  ``secrets.yaml`` laid over it, as the GUI and the engine read them, with a
+  relative ``database_path`` read beside config.yaml
+  (:func:`config.resolve_database_path`, the command line's rule too);
+* ``dry_run`` set by the switch, whatever ``options.dry_run`` says: Rehearse is
+  always a rehearsal, and Live is live only because the operator chose it;
+* with ``options.wallet.share_trading_wallet``, the engine check before every
+  step and every signature (:mod:`engine_guard`). A live step is refused while
+  the engine runs, and Live cannot be switched on while it does.
+
+The other direction, the engine waiting for the book, is
+:func:`engine_start_window`: EngineBridge holds it while it checks and
+launches the engine. It covers every book this process has run, not just the
+one config.yaml names now, since Settings can switch config.yaml under a book
+that is still running or still has contracts open.
+
+The book's SQLite store belongs to the thread that opened it, so everything the
+GUI shows is copied into the snapshot on that thread, after each step.
+"""
+
+from __future__ import annotations
+
+import collections
+import contextlib
+import dataclasses
+import enum
+import logging
+import os
+import threading
+import time
+from collections.abc import Callable, Iterator
+from pathlib import Path
+from typing import Any
+
+from gui.services.options import config, engine_guard, runtime, store
+
+log = logging.getLogger(__name__)
+
+#: Seconds between steps, as ``run --interval 60`` on the command line.
+DEFAULT_INTERVAL = 60.0
+#: How long a switch from the GUI waits for a step in progress before it says
+#: "try again" rather than hold the window. Closing the app waits longer.
+SWITCH_WAIT = 2.0
+#: Lines of recent activity kept for the panel.
+_HISTORY = 200
+
+
+class Mode(enum.StrEnum):
+    OFF = "off"
+    REHEARSE = "rehearse"
+    LIVE = "live"
+
+
+class RunnerError(RuntimeError):
+    """The switch cannot be moved as asked; the message says why."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ContractView:
+    slot: str
+    status: str
+    launcher_id: str  # hex
+    expiration: int
+    underlying_amount: int
+    #: The collateral in its own asset: "0.5 XCH", or "100 quote" for a put.
+    collateral: str
+    live_offers: int
+
+
+@dataclasses.dataclass(frozen=True)
+class Snapshot:
+    """What the panel shows. Plain values, safe to read from any thread."""
+
+    mode: Mode = Mode.OFF
+    running: bool = False
+    #: Switched off, with the step in progress still finishing.
+    stopping: bool = False
+    steps: int = 0
+    last_step_at: float | None = None
+    #: The engine check's last answer when the wallet is shared, else "".
+    engine: str = ""
+    #: Why the last step did nothing, if it was refused or failed.
+    held: str = ""
+    market: str = ""
+    contracts: tuple[ContractView, ...] = ()
+    fees_paid_mojos: int = 0
+    recent: tuple[str, ...] = ()
+    #: Lines of activity ever written, so a reader can tell what is new once
+    #: ``recent`` is full and stops growing.
+    recent_count: int = 0
+
+    @property
+    def open_contracts(self) -> int:
+        return sum(item.status in store.ACTIVE for item in self.contracts)
+
+
+# -- config ----------------------------------------------------------------------
+
+
+def load_options(config_path: Path) -> config.OptionsConfig:
+    """The ``options:`` section of config.yaml with secrets.yaml over it, or RunnerError."""
+    from gui.services.config_split import load_merged
+
+    try:
+        root = load_merged(Path(config_path))
+    except Exception as exc:  # noqa: BLE001 - missing file, OSError, or a yaml.YAMLError
+        raise RunnerError(f"config.yaml could not be read: {exc}") from exc
+    try:
+        parsed = config.parse(root)
+        if parsed is None:
+            raise RunnerError("options are not set up: options.enabled is not true in config.yaml")
+        return config.resolve_database_path(parsed, config_path)
+    except config.OptionsConfigError as exc:
+        raise RunnerError(f"options config: {exc}") from exc
+
+
+# -- the engine waits for the book -------------------------------------------------
+
+#: Every config.yaml this process has run a book on, and whether that run is
+#: Live now. Settings can switch config.yaml under a running book, and a book
+#: switched off can still have contracts open; the engine check looks at all.
+_BOOKS: dict[str, bool] = {}
+_BOOKS_LOCK = threading.Lock()
+
+
+def _book_key(config_path: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(config_path)))
+
+
+def _set_book(config_path: Path, live: bool) -> None:
+    with _BOOKS_LOCK:
+        _BOOKS[_book_key(config_path)] = live
+
+
+def _books(config_path: Path) -> list[tuple[Path, bool]]:
+    """The book at ``config_path`` and every other this process has run, with Live flags."""
+    key = _book_key(config_path)
+    with _BOOKS_LOCK:
+        known = dict(_BOOKS)
+    paths = {key: known.get(key, False), **known}
+    return [(Path(path), live) for path, live in paths.items()]
+
+
+def _shared_book(config_path: Path) -> tuple[str | None, config.OptionsConfig | None]:
+    """(why the engine must wait, None) or (None, the book's config if it shares the wallet).
+
+    No config.yaml, no options section, options switched off, or a book on a
+    wallet of its own: (None, None), nothing to wait for. An enabled book that
+    shares the trading wallet but cannot be read is a reason to wait: its
+    contracts cannot be checked.
+    """
+    from gui.services.config_split import load_merged
+
+    path = Path(config_path)
+    if not path.exists():
+        return None, None
+    try:
+        root = load_merged(path)
+    except Exception as exc:  # noqa: BLE001 - fail closed: nothing says no book is there
+        return f"config.yaml could not be read to check the options book ({exc})", None
+    section = root.get("options") if isinstance(root, dict) else None
+    if not isinstance(section, dict) or section.get("enabled") is not True:
+        return None, None
+    wallet = section.get("wallet")
+    if not isinstance(wallet, dict) or wallet.get("share_trading_wallet") is not True:
+        return None, None
+    try:
+        parsed = config.parse(root)
+        assert parsed is not None
+        return None, config.resolve_database_path(parsed, path)
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        return (
+            "the options book shares the trading wallet, but its settings could not be read "
+            f"({exc}); the engine stays stopped until they can be and its contracts checked"
+        ), None
+
+
+def _open_reason(still_open: list[store.Contract]) -> str | None:
+    if not still_open:
+        return None
+    locked = sum(item.underlying_amount for item in still_open if item.underlying_asset is None)
+    quote = sum(1 for item in still_open if item.underlying_asset is not None)
+    held = f"{locked / config.XCH_MOJOS:g} XCH locked" + (
+        f", {quote} put(s) holding the quote asset" if quote else ""
+    )
+    return (
+        f"the options book shares the trading wallet and has {len(still_open)} contract(s) "
+        f"open ({held}). The engine must stay stopped until they are closed: its offers would "
+        "spend the book's coins. Close them first (the options book cancels unsold contracts "
+        "before expiry, and claws back after it)."
+    )
+
+
+def _read_open(cfg: config.OptionsConfig) -> list[store.Contract]:
+    if not Path(cfg.database_path).exists():
+        return []
+    book_store = store.OptionStore(cfg.database_path)
+    try:
+        return book_store.contracts(store.ACTIVE)
+    finally:
+        book_store.close()
+
+
+def engine_start_blocker(config_path: Path) -> str | None:
+    """Why the trading engine must not start now, or None. For display: takes no lock.
+
+    The engine start itself goes through :func:`engine_start_window`, which
+    holds each book's acting lock while the engine is launched.
+    """
+    for path, live in _books(Path(config_path)):
+        why, cfg = _shared_book(path)
+        if why:
+            return why
+        if cfg is None:
+            continue
+        if live:
+            return (
+                "the options book is Live on the trading wallet; switch it off on the "
+                "Options page first"
+            )
+        try:
+            why = _open_reason(_read_open(cfg))
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            why = (
+                "the options book shares the trading wallet and its record could not be read "
+                f"({exc}); the engine stays stopped until it can be"
+            )
+        if why:
+            return why
+    return None
+
+
+@contextlib.contextmanager
+def engine_start_window(config_path: Path) -> Iterator[str | None]:
+    """Yield why the engine must not start, or None, holding the books still while it launches.
+
+    For each book sharing the trading wallet, its acting lock (the one every
+    step takes) is held from the check to the end of the ``with`` block, so no
+    step can mint between "nothing is open" and the engine being up. A book in
+    the middle of a step is a reason to wait. By the time the lock is let go
+    the engine's process exists, and the next step sees it and holds.
+    """
+    with contextlib.ExitStack() as held:
+        reason: str | None = None
+        for path, live in _books(Path(config_path)):
+            why, cfg = _shared_book(path)
+            if why or cfg is None:
+                reason = why
+                if reason:
+                    break
+                continue
+            if live:
+                reason = (
+                    "the options book is Live on the trading wallet; switch it off on the "
+                    "Options page first"
+                )
+                break
+            if not Path(cfg.database_path).exists():
+                continue
+            try:
+                book_store = store.OptionStore(cfg.database_path)
+                held.callback(book_store.close)
+                held.enter_context(book_store.acting())
+                reason = _open_reason(book_store.contracts(store.ACTIVE))
+            except store.BusyError:
+                reason = (
+                    "the options book is in the middle of a step; start the engine again in "
+                    "a moment"
+                )
+            except Exception as exc:  # noqa: BLE001 - fail closed
+                reason = (
+                    "the options book shares the trading wallet and its record could not be "
+                    f"read ({exc}); the engine stays stopped until it can be"
+                )
+            if reason:
+                break
+        yield reason
+
+
+# -- the runner ------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class _Run:
+    thread: threading.Thread
+    stop: threading.Event
+    mode: Mode
+
+
+class OptionsRunner:
+    """Steps the book on its own thread until stopped. One per GUI page."""
+
+    def __init__(
+        self,
+        config_path: Path,
+        *,
+        interval: float = DEFAULT_INTERVAL,
+        build: Callable[..., tuple[Any, Any, Any]] = runtime.build,
+        engine_state: Callable[[str], engine_guard.EngineState] | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._config_path = Path(config_path)
+        self._interval = max(0.01, float(interval))
+        self._build = build
+        self._engine_state = engine_state
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._run: _Run | None = None
+        self._snapshot = Snapshot()
+        self._recent: collections.deque[str] = collections.deque(maxlen=_HISTORY)
+
+    @property
+    def config_path(self) -> Path:
+        return self._config_path
+
+    # -- control (any thread) ------------------------------------------------
+
+    @property
+    def mode(self) -> Mode:
+        with self._lock:
+            return self._snapshot.mode
+
+    def snapshot(self) -> Snapshot:
+        with self._lock:
+            return self._snapshot
+
+    def start(self, mode: Mode) -> None:
+        """Run the book in ``mode`` (Rehearse or Live), stopping a run in another mode first.
+
+        Raises RunnerError, and changes nothing, when it cannot: options not set
+        up, Live asked for while the engine shares the wallet and may be up, or
+        the previous run still finishing a step.
+        """
+        mode = Mode(mode)
+        if mode is Mode.OFF:
+            self.stop()
+            return
+        cfg = load_options(self._config_path)
+        if mode is Mode.LIVE and cfg.wallet.share_trading_wallet:
+            state = self._engine(cfg)
+            if not state.clear:
+                raise RunnerError(
+                    "Live refused: the options book shares the trading wallet and the trading "
+                    f"engine is {state.describe()}. Stop the engine first."
+                )
+        current = self._run
+        if current is not None and current.thread.is_alive():
+            if current.mode is mode and not current.stop.is_set():
+                return
+            # Two runs must never overlap, and the GUI thread must not hang on
+            # a slow step: a short wait, then a refusal to try again.
+            if not current.stop.is_set():
+                self.stop(timeout=SWITCH_WAIT)
+            if self._run is not None:
+                raise RunnerError(
+                    "the previous run is still finishing its step; try again in a moment"
+                )
+        cfg = dataclasses.replace(cfg, dry_run=mode is not Mode.LIVE)
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=self._loop, args=(cfg, mode, stop), name=f"options-{mode.value}", daemon=True
+        )
+        self._run = _Run(thread=thread, stop=stop, mode=mode)
+        _set_book(self._config_path, live=mode is Mode.LIVE)
+        with self._lock:
+            self._snapshot = dataclasses.replace(
+                self._snapshot, mode=mode, running=True, stopping=False, held="", steps=0
+            )
+        self._note(f"switched to {mode.value}")
+        thread.start()
+
+    def stop(self, timeout: float = 30.0) -> None:
+        """Stop after the step in progress, if any. Safe at any time.
+
+        Offers already out expire on their own (15 minutes by default), and
+        collateral waits for the next step after expiry to be clawed back. A
+        step that outlives ``timeout`` is left to finish: the run stays tracked
+        (``stopping``) until it does, and nothing new starts beside it.
+        """
+        current = self._run
+        if current is None:
+            return
+        _set_book(self._config_path, live=False)  # still watched: contracts may stay open
+        current.stop.set()
+        if current.thread is not threading.current_thread():
+            current.thread.join(timeout)
+        finished = not current.thread.is_alive()
+        if finished and self._run is current:
+            self._run = None
+        with self._lock:
+            was = self._snapshot.mode
+            self._snapshot = dataclasses.replace(
+                self._snapshot, mode=Mode.OFF, running=not finished, stopping=not finished
+            )
+        if was is not Mode.OFF:
+            self._note("switched off" if finished else "switching off after the step in progress")
+
+    # -- the loop (its own thread) -------------------------------------------
+
+    def _engine(self, cfg: config.OptionsConfig) -> engine_guard.EngineState:
+        check = self._engine_state or engine_guard.engine_state
+        return check(cfg.wallet.engine_metrics_url)
+
+    def _note(self, text: str) -> None:
+        stamp = time.strftime("%H:%M:%S", time.localtime(self._clock()))
+        with self._lock:
+            self._recent.append(f"{stamp}  {text}")
+            self._snapshot = dataclasses.replace(
+                self._snapshot,
+                recent=tuple(self._recent),
+                recent_count=self._snapshot.recent_count + 1,
+            )
+
+    def _loop(self, cfg: config.OptionsConfig, mode: Mode, stop: threading.Event) -> None:
+        try:
+            try:
+                book, book_store, _coins = self._build(cfg)
+            except Exception as exc:  # noqa: BLE001 - reported, and the switch goes back to off
+                log.exception("options: the book could not be started")
+                self._note(f"could not start: {exc}")
+                _set_book(self._config_path, live=False)
+                with self._lock:
+                    self._snapshot = dataclasses.replace(
+                        self._snapshot, mode=Mode.OFF, held=f"could not start: {exc}"
+                    )
+                return
+            try:
+                while not stop.is_set():
+                    self._one_step(cfg, mode, book, book_store)
+                    stop.wait(self._interval)
+            finally:
+                try:
+                    book_store.close()
+                except Exception as exc:  # noqa: BLE001 - closing is best effort
+                    log.debug("options: closing the book's store failed: %s", exc)
+        finally:
+            # This run is over: whoever was waiting on it can start the next.
+            with self._lock:
+                self._snapshot = dataclasses.replace(self._snapshot, running=False, stopping=False)
+            current = self._run
+            if current is not None and current.stop is stop:
+                self._run = None
+
+    def _one_step(self, cfg: config.OptionsConfig, mode: Mode, book: Any, book_store: Any) -> None:
+        engine, held = "", ""
+        if cfg.wallet.share_trading_wallet:
+            state = self._engine(cfg)
+            engine = state.describe()
+            if mode is Mode.LIVE and not state.clear:
+                held = (
+                    "refused, trading engine up: a live step would sign from the wallet the "
+                    f"engine trades through, and the engine is {engine}"
+                )
+        report = None
+        if not held:
+            try:
+                report = book.step()
+            except Exception as exc:  # noqa: BLE001 - keep the loop alive, as `run` does
+                log.exception("options: step failed")
+                held = f"step failed: {exc}"
+        self._record(cfg, book_store, report, engine, held)
+
+    def _record(
+        self, cfg: config.OptionsConfig, book_store: Any, report: Any, engine: str, held: str
+    ) -> None:
+        if held:
+            self._note(held)
+        if report is not None:
+            for action in report.actions:
+                self._note(action)
+            for problem in report.problems:
+                self._note(f"note: {problem}")
+
+        def collateral(item: Any) -> str:
+            if item.underlying_asset is None:
+                return f"{int(item.underlying_amount) / config.XCH_MOJOS:g} XCH"
+            return f"{int(item.underlying_amount) / cfg.quote_unit_mojos:g} quote"
+
+        try:
+            contracts = tuple(
+                ContractView(
+                    slot=item.slot,
+                    status=item.status,
+                    launcher_id=item.launcher_id.hex(),
+                    expiration=int(item.expiration),
+                    underlying_amount=int(item.underlying_amount),
+                    collateral=collateral(item),
+                    live_offers=len(book_store.offers(item.launcher_id, "live")),
+                )
+                for item in book_store.contracts()
+            )
+            fees = sum(int(row.fee or 0) for row in book_store.broadcasts("confirmed"))
+        except Exception as exc:  # noqa: BLE001 - the panel keeps what it had
+            log.warning("options: could not read the book's record: %s", exc)
+            contracts, fees = self.snapshot().contracts, self.snapshot().fees_paid_mojos
+        market = ""
+        if report is not None and report.market is not None:
+            view = report.market
+            book_text = (
+                "no book"
+                if view.bid is None or view.ask is None
+                else f"{view.bid:.4f}/{view.ask:.4f}"
+            )
+            market = f"spot {view.spot:.4f}  sigma {view.sigma:.2f}  dexie {book_text}"
+        with self._lock:
+            self._snapshot = dataclasses.replace(
+                self._snapshot,
+                steps=self._snapshot.steps + 1,
+                last_step_at=self._clock(),
+                engine=engine,
+                held=held,
+                market=market or self._snapshot.market,
+                contracts=contracts,
+                fees_paid_mojos=fees,
+            )
