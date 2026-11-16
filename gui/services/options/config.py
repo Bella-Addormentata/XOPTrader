@@ -23,6 +23,15 @@ address (a blank one takes the wallet's current address, where the engine's
 self-sends land); the wallet must be on this machine, where the engine check
 can see; and every signature and push first checks that the engine is not
 running (:mod:`engine_guard`), refusing if it is or if it cannot tell.
+
+FUNDING FROM THE WALLET. ``wallet.fund_from_wallet: true`` (off by default)
+lets what the options address is short of, in XCH or the quote asset, come
+from the wallet's other addresses: collateral, fees, and the seed coins a
+cancel starts from (one of the strike asset, one of XCH for the fee). What the
+book owns still lands at the options address (all change, returned
+collateral, premiums), and the funding coins' addresses count as ours in the
+safety check, so it stays exact. ``live-test`` still funds itself from the
+options address only.
 """
 
 from __future__ import annotations
@@ -180,6 +189,9 @@ class WalletConfig:
     #: Where a running engine answers (its Prometheus endpoint), asked before
     #: anything is signed while ``share_trading_wallet`` is on.
     engine_metrics_url: str = ""
+    #: Fund collateral, fees and a cancel's seed coin from the rest of the
+    #: wallet when the options address runs short. Off by default.
+    fund_from_wallet: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -411,6 +423,7 @@ def parse(root: Any) -> OptionsConfig | None:
         address=address,
         share_trading_wallet=share,
         engine_metrics_url=metrics_url,
+        fund_from_wallet=_flag(wallet_raw, "fund_from_wallet", False),
     )
 
     quote_decimals = int(_number(section, "quote_asset_decimals", 3))

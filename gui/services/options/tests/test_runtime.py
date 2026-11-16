@@ -45,6 +45,7 @@ class WalletRpc(FakeWallet):
         self.party = party
         self.cat_asset = cat_asset
         self.stranger_coins: list[Any] = []
+        self.asset_prefix = "0x"
 
     def _get_next_address(self, body: dict) -> dict:
         assert body == {"wallet_id": 1, "new_address": False}
@@ -74,7 +75,11 @@ class WalletRpc(FakeWallet):
 
     def _cat_get_asset_id(self, body: dict) -> dict:
         assert self.cat_asset is not None
-        return {"asset_id": self.cat_asset.hex(), "wallet_id": body["wallet_id"]}
+        # As chia-blockchain 2.7.4 answers on mainnet (seen 2026-11-15): 0x-prefixed.
+        return {
+            "asset_id": self.asset_prefix + self.cat_asset.hex(),
+            "wallet_id": body["wallet_id"],
+        }
 
 
 def _config(tmp_path, usd: bytes, chia: dict | None = None, **overrides) -> config.OptionsConfig:
@@ -111,6 +116,44 @@ def test_coin_source_lists_only_coins_at_the_options_address(tmp_path) -> None:
     (cat,) = source.cats(usd)
     assert int(cat.coin.amount) == 40 * CAT and cat.lineage_proof is not None
     assert source.cats(b"\x09" * 32) == []  # no wallet for that asset
+
+
+@pytest.mark.parametrize("prefix", ["0x", "0X", ""])
+def test_the_quote_asset_s_wallet_is_found_however_its_id_is_written(prefix) -> None:
+    # The wallet answered "0x..." and bytes.fromhex refused it: the book never
+    # found its quote asset's wallet, so showed 0 quote and could not seed a
+    # cancel of a call struck in it.
+    world = World()
+    maker, other = world.party(1), world.party(1)
+    usd = world.issue_cat(other, 500)
+    world.send_cat(other, maker.puzzle_hash, usd, 7 * CAT)
+    rpc = WalletRpc(world, maker, usd)
+    rpc.asset_prefix = prefix
+    source = runtime.WalletCoinSource(rpc, world.sim, prefix="txch")
+
+    (cat,) = source.cats(usd)
+
+    assert int(cat.coin.amount) == 7 * CAT
+
+
+def test_coin_source_lists_the_whole_wallet_only_when_asked_to(tmp_path) -> None:
+    world = World()
+    maker, other = world.party(100), world.party(5)
+    usd = world.issue_cat(other, 500)
+    world.send_cat(other, maker.puzzle_hash, usd, 40 * CAT)
+    rpc = WalletRpc(world, maker, usd)
+    rpc.stranger_coins = other.xch_coins()  # elsewhere in the same wallet
+    source = runtime.WalletCoinSource(rpc, world.sim, prefix="txch")
+
+    mine = {bytes(c.coin_id()) for c in source.xch_coins()}
+    everything = {bytes(c.coin_id()) for c in source.wallet_xch_coins()}
+
+    assert mine == {bytes(c.coin_id()) for c in maker.xch_coins()}
+    assert everything == mine | {bytes(c.coin_id()) for c in other.xch_coins()}
+    (raw,) = source.wallet_cat_coins(usd)  # the CAT wallet's coins, before any chain read
+    cat = source.cat_of(raw)
+    assert int(cat.coin.amount) == 40 * CAT and cat.lineage_proof is not None
+    assert source.wallet_cat_coins(b"\x09" * 32) == []  # no wallet for that asset
 
 
 def test_coin_source_lists_coins_without_the_chain_and_reads_a_cat_s_parent_once() -> None:

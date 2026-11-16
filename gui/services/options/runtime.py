@@ -131,6 +131,10 @@ class WalletCoinSource:
         mine = self.puzzle_hash()
         return [coin for coin in self._spendable(_XCH_WALLET_ID) if bytes(coin.puzzle_hash) == mine]
 
+    def wallet_xch_coins(self) -> list[Any]:
+        """Every spendable XCH coin of the wallet, at any address (``fund_from_wallet``)."""
+        return self._spendable(_XCH_WALLET_ID)
+
     def _cat_wallet(self, asset_id: bytes) -> int | None:
         asset_id = bytes(asset_id)
         now = self._clock()
@@ -145,7 +149,10 @@ class WalletCoinSource:
                 try:
                     wallet_id = int(wallet["id"])
                     found = self._rpc("cat_get_asset_id", {"wallet_id": wallet_id})
-                    self._cat_wallets[bytes.fromhex(str(found["asset_id"]))] = wallet_id
+                    # chia-blockchain 2.7.4 answers "0x"-prefixed, which
+                    # bytes.fromhex refuses: the asset's wallet was never found.
+                    asset_hex = str(found["asset_id"]).strip().lower().removeprefix("0x")
+                    self._cat_wallets[bytes.fromhex(asset_hex)] = wallet_id
                 except (KeyError, TypeError, ValueError):
                     continue
         return self._cat_wallets.get(asset_id)
@@ -161,6 +168,15 @@ class WalletCoinSource:
         # The wallet already knows the coin; only its parent's spend, which is
         # settled and so read once, is needed from the chain.
         return [chain.load_cat_coin(self._chain, coin) for coin in self._cat_coins(asset_id)]
+
+    def wallet_cat_coins(self, asset_id: bytes) -> list[Any]:
+        """Every spendable coin of one CAT in the wallet, any address, no lineage yet."""
+        wallet_id = self._cat_wallet(asset_id)
+        return [] if wallet_id is None else self._spendable(wallet_id)
+
+    def cat_of(self, coin: Any) -> Any:
+        """One coin from :meth:`wallet_cat_coins`, with its lineage (one settled read)."""
+        return chain.load_cat_coin(self._chain, coin)
 
     def held(self, asset_ids: Any) -> frozenset[bytes]:
         """Ids of the spendable coins at the address. The chain is not asked."""

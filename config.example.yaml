@@ -1687,6 +1687,16 @@ options:
     # [OPTIONAL] Where a running engine answers, for the check above.
     # Default: http://localhost:<monitoring.prometheus_port>/metrics
     engine_metrics_url: ""
+    # [OPTIONAL, default: false] Pay from the whole wallet, not just `address`.
+    # What the options address is short of, in XCH or the quote asset --
+    # collateral, a fee, the seed coins a cancel starts from (a call struck in
+    # the quote asset needs one coin of it) -- comes from the wallet's other
+    # addresses: the smallest single coin that covers it, else the largest
+    # first. Coins the wallet holds for resting offers are not used.
+    # Everything the book owns still lands at `address`: all change, returned
+    # collateral and premiums. Bounded by the limits like any mint.
+    # live-test's funding still comes from `address` only.
+    fund_from_wallet: false
 
   # The asset options are struck and paid in: Base-bridged wUSDC.b.
   quote_asset_id: "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"
