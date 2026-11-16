@@ -12,7 +12,9 @@ This page runs it inside the GUI instead, through
 * **Live** steps it for real, after a confirmation. With
   ``options.wallet.share_trading_wallet`` it cannot be switched on while the
   trading engine runs, and the engine cannot be started while the book has
-  contracts open (``EngineBridge._options_blocker``).
+  contracts open (``EngineBridge._options_blocker``) -- or, with
+  ``options.wallet.engine_beside_open_contracts``, while the book is Live or
+  has a transaction still in flight.
 
 The choice is remembered (QSettings ``options/mode``) and taken up again when
 the app starts; Live again only if the engine is down by then.
@@ -181,7 +183,7 @@ class OptionsWidget(QWidget):
             self._runner = None
             self._held.setText(
                 f"Switched to {new_path}; the book on {old_path} was switched off "
-                "(its open contracts still hold the engine)."
+                "(the engine-start check still covers it)."
             )
         self._config_path = new_path
         if self._runner is None:
@@ -216,6 +218,27 @@ class OptionsWidget(QWidget):
             self._start(mode, confirm=mode is Mode.LIVE, why="")
         self.refresh()
 
+    def _engine_rule(self) -> str:
+        """What going Live means for the trading engine, for the confirmation."""
+        try:
+            wallet = options_runner.load_options(self._config_path).wallet
+        except options_runner.RunnerError:
+            wallet = None
+        if (
+            wallet is not None
+            and wallet.share_trading_wallet
+            and wallet.engine_beside_open_contracts
+        ):
+            return (
+                "With the trading wallet shared, the trading engine stays stopped while the "
+                "book is Live. Once the book is switched off and its transactions have "
+                "confirmed, the engine can run beside the open contracts."
+            )
+        return (
+            "With the trading wallet shared, the trading engine stays stopped while "
+            "contracts are open."
+        )
+
     def _start(self, mode: Mode, *, confirm: bool, why: str) -> None:
         if confirm:
             reply = QMessageBox.question(
@@ -223,9 +246,7 @@ class OptionsWidget(QWidget):
                 "Options: go Live",
                 "Go Live? The options book will mint option contracts with XCH from this "
                 "wallet, lock it as collateral and offer the contracts on xchoptions.com, "
-                "within the limits in config.yaml.\n\n"
-                "With the trading wallet shared, the trading engine stays stopped while "
-                "contracts are open.",
+                "within the limits in config.yaml.\n\n" + self._engine_rule(),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )

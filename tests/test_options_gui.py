@@ -65,7 +65,9 @@ def own_settings(monkeypatch):
     QSettings("XOP-tests-options", options_page._SETTINGS_APP).clear()
 
 
-def _config(folder: Path, *, options: bool = True, shared: bool = False) -> Path:
+def _config(
+    folder: Path, *, options: bool = True, shared: bool = False, beside: bool = False
+) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     wallet = {"port": 9356, "cert_path": "c", "key_path": "k"}
     chia = {"wallet_host": "localhost", "wallet_port": 9256}
@@ -79,6 +81,8 @@ def _config(folder: Path, *, options: bool = True, shared: bool = False) -> Path
             "address": "xch1kxxd76v9kwsxrcxgndn3mylnxjhd7klgdns7083zjl247ffge32sr5rsy2",
         }
         chia["wallet_fingerprint"] = 42
+    if beside:
+        wallet.update(engine_beside_open_contracts=True, fund_from_wallet=True)
     root: dict = {"chia": chia}
     if options:
         root["options"] = {
@@ -326,6 +330,67 @@ def test_start_engine_is_refused_while_a_shared_book_has_contracts_open(app, tmp
     finally:
         bridge.deleteLater()
         app.processEvents()
+
+
+def _settle_mints(config_path: Path) -> None:
+    """Every mint the book sent has confirmed: its contracts sit open."""
+    book = store.OptionStore(str(config_path.parent / "data" / "options_jobs.db"))
+    try:
+        for row in book.unresolved():
+            book.settle_broadcast(row.id, "confirmed", contract_status=store.OPEN)
+    finally:
+        book.close()
+
+
+def test_start_engine_runs_beside_open_contracts_when_the_config_says_so(
+    app, tmp_path, monkeypatch
+):
+    config_path = _config(tmp_path, shared=True, beside=True)
+    _open_contract(config_path)
+    bridge, errors = _bridge(app, config_path)
+    try:
+        launched: list[int] = []
+        monkeypatch.setattr(bridge, "_start_engine_process", lambda: launched.append(1) or True)
+        monkeypatch.setattr(bridge, "_publish_retained_warp_store", lambda: None)
+
+        bridge.start_engine()  # the mint is still in flight: its coins are not settled
+        assert launched == []
+        assert errors and "waiting to confirm (mint)" in errors[-1]
+
+        _settle_mints(config_path)
+        bridge.start_engine()  # the contract sits open, and that no longer holds it
+        assert launched == [1]
+        assert options_runner.engine_start_blocker(config_path) is None
+    finally:
+        bridge.deleteLater()
+        app.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("beside", "said"),
+    [
+        (False, "stays stopped while contracts are open"),
+        (True, "the engine can run beside the open contracts"),
+    ],
+)
+def test_the_live_confirmation_says_what_it_means_for_the_engine(
+    app, tmp_path, monkeypatch, beside, said
+):
+    texts: list[str] = []
+
+    def question(parent, title, text, *args, **kwargs):
+        texts.append(text)
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(question))
+    runner = RunnerDouble()
+    page = _page(app, tmp_path, runner, config={"shared": True, "beside": beside})
+    try:
+        page._buttons[Mode.LIVE].click()
+        assert len(texts) == 1 and said in texts[0]
+        assert runner.starts == []
+    finally:
+        _close(page, app)
 
 
 def test_start_engine_waits_while_a_step_holds_the_book(app, tmp_path, monkeypatch):

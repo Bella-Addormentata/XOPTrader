@@ -5,6 +5,34 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### The engine can trade beside open option contracts (opt-in)
+
+With the trading wallet shared, 0.10.50 kept the engine stopped for as long
+as the options book had any contract open: in the first live run, two unsold
+calls kept it down from the evening of 2026-11-15 on. A new switch,
+`options.wallet.engine_beside_open_contracts` (off by default), narrows that
+to the times the book acts:
+
+- **What no longer holds the engine:** contracts that sit open. Their
+  collateral is locked in the contract, which the wallet does not spend, and
+  their offers spend only the option coin.
+- **What still does:** the book being Live, a step in progress (its acting
+  lock is still taken for the launch), and any transaction the book has sent
+  that could still confirm. The book pushes bundles it built itself, so the
+  wallet does not know those coins are being spent and could hand them to an
+  engine offer. A transaction stops holding the engine once its record shows
+  it settled, or at the latest 10 minutes past its `valid_until`, when it can
+  no longer confirm.
+- **Going Live still needs the engine stopped**, and every signature and push
+  still checks for it.
+- It needs `options.wallet.fund_from_wallet: true`, and says so if that is
+  off: a running engine can spend the loose coins at the options address, so
+  the book must be able to pay from the rest of the wallet when it next acts.
+- `status`, each step and the Options page's Live confirmation say which rule
+  is in force.
+
 ## [0.10.50] — 2026-11-16 — an Options page, and the engine waits for the book
 
 ### An Options page switches the options book Off, to Rehearse, or Live (#235)

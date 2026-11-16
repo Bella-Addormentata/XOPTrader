@@ -29,7 +29,14 @@ def no_books_from_other_tests():
         runner._BOOKS.clear()
 
 
-def _write(folder: Path, *, shared: bool = False, enabled: bool = True, db: str = "") -> Path:
+def _write(
+    folder: Path,
+    *,
+    shared: bool = False,
+    enabled: bool = True,
+    db: str = "",
+    wallet_extra: dict[str, Any] | None = None,
+) -> Path:
     wallet: dict[str, Any] = {"port": 9356, "cert_path": "c", "key_path": "k"}
     chia: dict[str, Any] = {}
     if shared:
@@ -42,6 +49,7 @@ def _write(folder: Path, *, shared: bool = False, enabled: bool = True, db: str 
             "address": "xch1kxxd76v9kwsxrcxgndn3mylnxjhd7klgdns7083zjl247ffge32sr5rsy2",
         }
         chia = {"wallet_host": "localhost", "wallet_port": 9256, "wallet_fingerprint": 42}
+    wallet.update(wallet_extra or {})
     root = {
         "chia": chia,
         "options": {
@@ -317,6 +325,119 @@ def test_a_book_on_a_config_left_behind_still_holds_the_engine(tmp_path) -> None
     _record_minting_contract(tmp_path / "a" / "data" / "options_jobs.db")
     why = runner.engine_start_blocker(second)
     assert why is not None and "contract(s) open" in why
+
+
+# -- options.wallet.engine_beside_open_contracts ------------------------------------
+
+BESIDE = {"engine_beside_open_contracts": True, "fund_from_wallet": True}
+
+
+def _record_open_contract(
+    db: Path, *, valid_until: int | None = None, verdict: str | None = "confirmed"
+) -> None:
+    """One minted contract; its mint ``verdict`` (None: the mint is still in flight)."""
+    db.parent.mkdir(parents=True, exist_ok=True)
+    book = store.OptionStore(str(db))
+    try:
+        mint = book.add_contract(
+            launcher_id=b"\x03" * 32,
+            slot="C110@1",
+            side="call",
+            underlying_asset=None,
+            underlying_amount=500_000_000_000,
+            strike_asset=bytes.fromhex(USD),
+            strike_amount=625,
+            expiration=2_000_000_000,
+            creator_puzzle_hash=b"\x02" * 32,
+            bundle=b"",
+            deadline=1,
+            valid_until=valid_until,
+            now=0,
+        )
+        if verdict is not None:
+            book.settle_broadcast(mint, verdict, contract_status=store.OPEN)
+    finally:
+        book.close()
+
+
+def test_beside_open_contracts_the_engine_may_start_while_contracts_sit_open(tmp_path) -> None:
+    db = tmp_path / "book.db"
+    _record_open_contract(db)
+    (tmp_path / "beside").mkdir()
+    beside = _write(tmp_path / "beside", shared=True, db=str(db), wallet_extra=BESIDE)
+    assert runner.engine_start_blocker(beside) is None
+    with runner.engine_start_window(beside) as why:
+        assert why is None
+    # The same record under the default rule still holds it.
+    (tmp_path / "strict").mkdir()
+    strict = _write(tmp_path / "strict", shared=True, db=str(db))
+    why = runner.engine_start_blocker(strict)
+    assert why is not None and "1 contract(s) open (0.5 XCH locked)" in why
+
+
+@pytest.mark.parametrize(
+    ("valid_for", "verdict", "holds"),
+    [
+        (3600, None, True),  # a mint still in flight
+        (3600, "stalled", True),  # stalled can still confirm
+        (None, None, True),  # no valid_until: only a verdict from the chain releases it
+        (-60, None, True),  # past valid_until, but block times can trail this clock
+        (-(runner.SETTLE_MARGIN + 60), None, False),  # can no longer confirm
+        (3600, "conflict", False),  # lost to another spend: settled
+    ],
+)
+def test_beside_open_contracts_the_book_s_transactions_in_flight_hold_the_engine(
+    tmp_path, valid_for, verdict, holds
+) -> None:
+    db = tmp_path / "book.db"
+    until = None if valid_for is None else int(time.time()) + valid_for
+    _record_open_contract(db, valid_until=until, verdict=verdict)
+    path = _write(tmp_path, shared=True, db=str(db), wallet_extra=BESIDE)
+    why = runner.engine_start_blocker(path)
+    with runner.engine_start_window(path) as in_window:
+        pass
+    if holds:
+        assert why is not None and "1 transaction(s) waiting to confirm (mint)" in why
+        assert in_window == why
+        assert ("at the latest until" in why) is (until is not None)
+    else:
+        assert why is None and in_window is None
+
+
+def test_beside_open_contracts_live_and_a_step_still_hold_the_engine(tmp_path) -> None:
+    db = tmp_path / "book.db"
+    _record_open_contract(db)
+    path = _write(tmp_path, shared=True, db=str(db), wallet_extra=BESIDE)
+    # A step in progress holds the acting lock: the engine must not launch under it.
+    stepping = store.OptionStore(str(db))
+    try:
+        with stepping.acting():
+            with runner.engine_start_window(path) as why:
+                assert why is not None and "in the middle of a step" in why
+    finally:
+        stepping.close()
+    # Live holds it, open contracts or not.
+    (tmp_path / "live").mkdir()
+    live = _write(tmp_path / "live", shared=True, db=":memory:", wallet_extra=BESIDE)
+    run = runner.OptionsRunner(
+        live, interval=0.02, build=_builder([]), engine_state=lambda url: DOWN
+    )
+    run.start(runner.Mode.LIVE)
+    try:
+        why = runner.engine_start_blocker(live)
+        assert why is not None and "is Live" in why
+    finally:
+        run.stop()
+
+
+def test_beside_open_contracts_live_is_still_refused_while_the_engine_runs(tmp_path) -> None:
+    db = tmp_path / "book.db"
+    _record_open_contract(db)
+    path = _write(tmp_path, shared=True, db=str(db), wallet_extra=BESIDE)
+    run = runner.OptionsRunner(path, interval=0.02, build=_builder([]), engine_state=lambda url: UP)
+    with pytest.raises(runner.RunnerError, match="Live refused"):
+        run.start(runner.Mode.LIVE)
+    assert run.mode is runner.Mode.OFF
 
 
 def test_a_stop_that_outlives_its_wait_keeps_the_run_and_blocks_a_new_one(tmp_path) -> None:
