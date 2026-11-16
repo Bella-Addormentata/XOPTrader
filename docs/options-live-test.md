@@ -152,6 +152,10 @@ book acts, not for as long as contracts are open. A day with contracts out then
 goes:
 
 1. Stop the engine, switch the book to Live, and let it mint, list or cancel.
+   A stop that keeps the engine's offers leaves their coins locked: if the
+   book reports it cannot find a coin it needs (a cancel of a call struck in
+   the quote asset needs one of that asset), stop the engine with its offers
+   cancelled instead.
 2. Switch the book Off once it has done what you wanted. If it sent anything,
    leave it Live (or on Rehearse) until its record shows the transaction
    settled: the engine waits for the book's transactions that could still
@@ -161,7 +165,11 @@ goes:
 4. After expiry, repeat 1 and 2 to claw the collateral back.
 
 The engine can spend the loose coins at the options address while it runs,
-which is why the book must be able to pay from the rest of the wallet.
+which is why the book must be able to pay from the rest of the wallet. At
+launch the engine starts before the Options page takes up its remembered
+mode, so a book left Live when the app closed comes back Live only if
+something else still holds the engine; otherwise the page says it was not
+resumed, and step 1 starts it again.
 
 Two things to know once contracts are out:
 

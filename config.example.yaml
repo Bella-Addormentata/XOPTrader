@@ -1719,7 +1719,10 @@ options:
     # coins at `address` while it runs (premiums, change), so this REQUIRES
     # fund_from_wallet: true -- the book then pays from the rest of the wallet
     # when it next acts. The engine sees the book's mints, cancels and
-    # clawbacks as balance changes made while it was stopped.
+    # clawbacks as balance changes made while it was stopped. At launch the
+    # engine starts before the Options page takes up its remembered mode, so
+    # a book left Live when the app closed comes back Live only if something
+    # else still holds the engine; otherwise the page says it was not resumed.
     engine_beside_open_contracts: false
 
   # The asset options are struck and paid in: Base-bridged wUSDC.b.
