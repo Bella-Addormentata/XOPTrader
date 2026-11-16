@@ -34,6 +34,12 @@ clawback after expiry.
     the wallet's current address is where the engine's self-sends land, and
     on the first mainnet run the engine spent the coin there within minutes.
     An address a Dexie trade paid into works, and needs nothing sent first.
+    With `options.wallet.fund_from_wallet: true` the book also pays from the
+    rest of the wallet when that address runs short, in XCH or the quote
+    asset, while everything it owns still lands at the address. On the first
+    run the engine's resting offers took the address's coins, and a cancel of
+    a call struck in wUSDC.b also needs a wUSDC.b coin to start from, which
+    the address had never held.
 - That wallet's RPC port, under `options.wallet` in `config.yaml`, and its
   `config/ssl/wallet/private_wallet.crt` and `.key`, under `options.wallet` in
   `secrets.yaml` (see `secrets.example.yaml`; `~` is expanded). `secrets.yaml`

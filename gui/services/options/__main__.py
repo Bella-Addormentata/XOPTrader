@@ -172,6 +172,18 @@ def _status(cfg: config.OptionsConfig) -> int:
             f"  spendable there: {xch / config.XCH_MOJOS:g} XCH, "
             f"{quote / cfg.quote_unit_mojos:g} quote"
         )
+        if cfg.wallet.fund_from_wallet:
+            here = coins.puzzle_hash()
+            rest = sum(
+                int(coin.amount)
+                for coin in coins.wallet_xch_coins()
+                if bytes(coin.puzzle_hash) != here
+            )
+            print(
+                f"  spendable elsewhere in the wallet: {rest / config.XCH_MOJOS:g} XCH "
+                "(fund_from_wallet: what the options address is short of comes from here; "
+                "change comes back to the options address)"
+            )
     contracts = book_store.contracts()
     print(f"{len(contracts)} contract(s)")
     for item in contracts:

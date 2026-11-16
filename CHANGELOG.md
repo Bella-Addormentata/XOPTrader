@@ -5,6 +5,40 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### The options book can pay from the whole wallet
+
+`options.wallet.fund_from_wallet` (off by default) lets the book draw what
+its address is short of, in XCH or the quote asset, from the wallet's other
+addresses: collateral, fees, and the seed coins a cancel starts from. On
+the first mainnet run the engine, started again with contracts open, put
+the address's only XCH coin into its own offers, and the address had never
+held the quote asset a cancel of a call struck in it needs, so the book
+could not cancel.
+
+- The options address's own coins are used first. What they leave short
+  comes from the smallest single coin elsewhere that covers it, so a large
+  trading coin is not swept into a fee, else from the largest first.
+- Coins the wallet holds for resting offers or pending transactions are
+  not used. A CAT coin's lineage is read only for the coins chosen.
+- Everything the book owns still lands at the options address: all change,
+  returned collateral and premiums.
+- The safety check counts the funding coins' addresses as the book's, so
+  it still refuses any bundle whose effect differs from what was declared.
+- `status` shows the XCH spendable elsewhere in the wallet.
+- `live-test`'s funding still comes from the options address only.
+
+### The options book finds its quote asset's wallet
+
+The reference wallet answers `cat_get_asset_id` with a `0x` prefix
+(chia-blockchain 2.7.4), which the book's lookup refused, so it never found
+the wallet for its quote asset. It showed 0 quote, would have noticed a sale
+only at its next hourly look instead of within a step, and could not find
+the quote-asset coin a cancel of a call struck in it starts from. Either
+form is read now; the test wallet answers with the prefix, as the real one
+does.
+
 ## [0.10.48] — 2026-11-15 — the options book, first run on mainnet
 
 ### Options book: covered calls and puts on xchoptions.com from a reference wallet (#228, #230)
