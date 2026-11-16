@@ -156,6 +156,8 @@ def test_a_cancel_starts_from_a_wallet_coin_when_the_address_has_none_free() -> 
     reports = rig.steps(4)
 
     assert [item.status for item in rig.contracts()] == [store.CLOSED]
+    closed = rig.store.contract(call.launcher_id)
+    assert closed is not None and closed.status == store.CLOSED  # this very contract
     assert any("retiring" in action for report in reports for action in report.actions)
     assert rig.wallet.rejected == []
     # A call struck in the quote asset needs a seed coin of it, and the options
