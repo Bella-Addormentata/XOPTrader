@@ -2224,6 +2224,12 @@ class MainWindow(QMainWindow):
             OptionsWidget, "Options"
         )
         self._stacked.addWidget(self._options_widget)
+        # The indices are positional; a page that lands anywhere else means a
+        # page was inserted above it without its constant moving with it.
+        landed = self._stacked.indexOf(self._options_widget)
+        if landed != _PAGE_OPTIONS:
+            _log.error("[Options] page landed at index %d, not _PAGE_OPTIONS (%d)",
+                       landed, _PAGE_OPTIONS)
         self._settings_widget = self._create_page_widget(SettingsWidget, "Settings")
         self._stacked.addWidget(self._settings_widget)              # index 11
         settings_page = self._unwrap(self._settings_widget)
