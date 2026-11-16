@@ -136,6 +136,16 @@ before `run`. `withdraw-all` takes every open offer off the market by spending
 its coin. Stopping `run` is safe: offers already out expire on their own and
 collateral waits to be reclaimed on the next `step` after expiry.
 
+In the app, the Options page does the same without a terminal: **Rehearse**
+steps the book as a dry run whatever `options.dry_run` says, **Live** steps it
+for real after a confirmation, and **Off** stops it after the step in
+progress. It reads the app's own `config.yaml`, so the options settings must be
+in that file (and `secrets.yaml` beside it). With the trading wallet shared,
+the engine will not start while the book has contracts open, and Live will not
+switch on while the engine runs. Run the book either from the page or from a
+terminal, not both: they share one database, and the second one to act is
+refused ("another process is acting").
+
 Two things to know once contracts are out:
 
 - **Setting `dry_run: true` again stops all spending**, housekeeping included.

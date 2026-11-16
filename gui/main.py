@@ -675,8 +675,21 @@ def _run_self_check() -> int:
                 raise FileNotFoundError(bundle_dir() / name)
         return _check_bundled
 
+    # [OPTIONS] The options book imports chia_wallet_sdk (a native wheel)
+    # only inside functions, and the Options page runs it in this process. A
+    # bundle without it would show the page and fail at the first step, so
+    # import it here, and build one option puzzle so the native module is
+    # exercised, not just found.
+    def _options_sdk() -> None:
+        import importlib
+        sdk = importlib.import_module("chia_wallet_sdk")
+        importlib.import_module("gui.services.options.runner")
+        sdk.Clvm()
+
     _emit(f"xop_trader_gui self-check (frozen={frozen}, bundle={bundle_dir()})")
     _check("warp puzzle reveals (gui.services.warp.drivers)", _warp_drivers,
+           optional_deps=True)
+    _check("options book (chia_wallet_sdk, gui.services.options.runner)", _options_sdk,
            optional_deps=True)
     _check("offer sizing calculator (scripts/offer_sizing.py)", _offer_sizing)
     _check(f"{_EXAMPLE_CONFIG_NAME}", _bundled(_EXAMPLE_CONFIG_NAME))

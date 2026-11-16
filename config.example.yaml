@@ -1621,12 +1621,16 @@ warp:
 # reference wallet, re-posting each offer before it expires, noticing sales and
 # exercises on chain, and reclaiming collateral at expiry.
 #
-# Run it from a terminal (there is no GUI page yet):
+# Run it from the app's Options page: Off / Rehearse (dry run, signs nothing) /
+# Live (after a confirmation). The choice is remembered and taken up again at
+# the next launch. Or from a terminal, from a source checkout:
 #   python -m gui.services.options --config config.yaml status
 #   python -m gui.services.options --config config.yaml live-test
 #   python -m gui.services.options --config config.yaml monitor --interval 300
 #   python -m gui.services.options --config config.yaml run
-# Read docs/options-live-test.md before the first live run.
+# The page reads this file (and secrets.yaml beside it), so the options
+# settings belong here, next to the engine's. A relative database_path is read
+# beside this file. Read docs/options-live-test.md before the first live run.
 options:
   enabled: false                         # [OPTIONAL, default: false] master switch
   # [SAFETY, default: true] Rehearsal. Each step builds the next mint, checks

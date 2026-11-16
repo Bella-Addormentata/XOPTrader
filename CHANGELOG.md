@@ -5,6 +5,44 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### An Options page switches the options book Off, to Rehearse, or Live
+
+The options book ran only from a terminal (`python -m gui.services.options
+run`), which the installed app cannot do. A new Options page runs it inside
+the app:
+
+- **Off / Rehearse / Live.** Rehearse is always a dry run, whatever
+  `options.dry_run` says: it builds and checks and signs nothing. Live asks
+  first. The choice is remembered and taken up again at the next launch;
+  Live again only if the engine is down by then.
+- **What it is doing:** the mode, steps and last step, the engine check,
+  anything holding it, the market it sees, the fees it has paid, its
+  contracts with their live offers, and its recent activity.
+- It reads `config.yaml` (with `secrets.yaml`) from the path the app loads,
+  so the options settings belong there. A relative `options.database_path`
+  is read beside that file, not the program's folder.
+
+### The engine does not start over an options book's open contracts
+
+With `options.wallet.share_trading_wallet`, the engine now refuses to start
+while the options book has contracts open, at launch and from Start,
+Restart or a venue switch, and says why. On 2026-11-15 the app's launch-time
+auto-start, which ran no checks at all, brought the engine up under two open
+contracts at the first launch of a new version, and the engine spent the
+book's coins within minutes. Live cannot be switched on while the engine
+runs either.
+
+Start Trading also no longer shows the engine running when the start was
+refused or failed.
+
+### The app's self-check covers the options book
+
+`--self-check` imports `chia_wallet_sdk` and the options runner and builds
+one puzzle with it, so a bundle without the options book's native
+dependency fails its build instead of failing at the first step.
+
 ## [0.10.49] — 2026-11-15 — the options book pays from the whole wallet
 
 ### The options book can pay from the whole wallet (#233)

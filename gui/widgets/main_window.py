@@ -117,6 +117,11 @@ try:
 except ImportError:
     PermutoWidget = None  # type: ignore[assignment,misc]
 
+try:
+    from gui.widgets.options import OptionsWidget
+except ImportError:
+    OptionsWidget = None  # type: ignore[assignment,misc]
+
 # ---------------------------------------------------------------------------
 # Theme constants -- sourced from the canonical CHIA palette singleton.
 # ---------------------------------------------------------------------------
@@ -176,7 +181,8 @@ _PAGE_REPORTS: Final[int] = 6
 _PAGE_WARP: Final[int] = 7
 _PAGE_BASE_WALLET: Final[int] = 8
 _PAGE_PERMUTO: Final[int] = 9
-_PAGE_SETTINGS: Final[int] = 10
+_PAGE_OPTIONS: Final[int] = 10
+_PAGE_SETTINGS: Final[int] = 11
 
 
 def _fmt_usd(value: float) -> str:
@@ -476,6 +482,17 @@ class MainWindow(QMainWindow):
         # sync instead, where the gates are real.
         if self._permuto_enabled:
             QTimer.singleShot(1500, self._apply_permuto_startup_state)
+        # [OPTIONS] The options page reads config.yaml (with secrets.yaml over
+        # it) from the path the bridge loaded, and takes up its remembered mode.
+        from pathlib import Path
+
+        options_page = self._unwrap(getattr(self, "_options_widget", None))
+        config_path = getattr(bridge.config_service, "path", None)
+        if options_page is not None and hasattr(options_page, "attach") and config_path:
+            try:
+                options_page.attach(Path(config_path))
+            except Exception:  # noqa: BLE001 - the page says why; the app goes on
+                _log.exception("[Options] page could not attach")
         # [PEGSUSPEND] Wire the Depeg tab's live peg panel to the metrics
         # service and the re-enable channel.
         settings_widget = self._unwrap(self._settings_widget)
@@ -2185,8 +2202,8 @@ class MainWindow(QMainWindow):
         )
         self._stacked.addWidget(self._base_wallet_widget)
         # [PERMUTO MASTER SWITCH] Index 9 is ALWAYS occupied, disabled or
-        # not. The page indices are positional -- _PAGE_SETTINGS is 10
-        # because Permuto is 9 -- and the last time that assumption slipped,
+        # not. The page indices are positional -- _PAGE_SETTINGS is 11
+        # because Permuto is 9 and Options 10 -- and the last time that assumption slipped,
         # the first-run "you have no config" redirect opened a key-generation
         # page instead of Settings. A placeholder holds the slot; what it
         # does not do is construct PermutoWidget, whose __init__ calls
@@ -2201,8 +2218,14 @@ class MainWindow(QMainWindow):
                 "Settings → Advanced → Subsystems"
             )
         self._stacked.addWidget(self._permuto_widget)
+        # [OPTIONS] The options book's Off / Rehearse / Live switch. Index 10,
+        # before Settings; inert until set_bridge() hands it config.yaml.
+        self._options_widget = self._create_page_widget(            # index 10
+            OptionsWidget, "Options"
+        )
+        self._stacked.addWidget(self._options_widget)
         self._settings_widget = self._create_page_widget(SettingsWidget, "Settings")
-        self._stacked.addWidget(self._settings_widget)              # index 10
+        self._stacked.addWidget(self._settings_widget)              # index 11
         settings_page = self._unwrap(self._settings_widget)
         if settings_page is not None and hasattr(
                 settings_page, "permuto_enabled_changed"):
@@ -3590,6 +3613,11 @@ class MainWindow(QMainWindow):
                     self._bridge.stop_engine()
             else:
                 self._bridge.start_engine()
+                if not getattr(self._bridge, "engine_running_locally", True):
+                    # Refused (the options book's open contracts, a warp store)
+                    # or failed: start_engine() has said why. Showing a running
+                    # engine that is not would invite a second Start.
+                    return
 
         # Toggle local state for immediate visual feedback.
         self._bot_running = not self._bot_running
@@ -3940,7 +3968,7 @@ class MainWindow(QMainWindow):
                 _log.exception("[Permuto] live session did not stop cleanly")
 
         for page in (self._wallet_balances, self._settings_widget,
-                     self._permuto_widget):
+                     self._permuto_widget, self._options_widget):
             widget = self._unwrap(page)
             if widget is not None and hasattr(widget, "stop_background_work"):
                 widget.stop_background_work()

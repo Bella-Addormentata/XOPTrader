@@ -383,12 +383,7 @@ class EngineBridge(QObject):
 
         # Step 1.5 -- Auto-start C++ engine if a co-located binary exists
         # and no engine is already responding on the metrics endpoint.
-        if not self._is_engine_reachable():
-            engine_ok = self._start_engine_process()
-            if engine_ok:
-                _log.info("C++ engine auto-started; waiting for metrics endpoint.")
-            else:
-                _log.info("C++ engine binary not found; GUI-only monitoring mode.")
+        self._auto_start_engine()
 
         # Step 2 -- Start metrics poller.  The URL may be overridden by
         # config if config loaded successfully.
@@ -650,6 +645,11 @@ class EngineBridge(QObject):
                 f"Engine not started: {blocked}; finish or close that work, or start "
                 "the engine on the config it was started under.")
             return
+        # [OPTIONS] Every Start, Restart and venue switch comes through here.
+        options_blocked = self._options_blocker()
+        if options_blocked:
+            self.error.emit(f"Engine not started: {options_blocked}")
+            return
         if self._start_engine_process():
             _log.info("Engine started via start_engine().")
             self.engine_launched.emit()
@@ -659,6 +659,48 @@ class EngineBridge(QObject):
                 + (".exe" if sys.platform == "win32" else "")
                 + " is in the same folder as the GUI."
             )
+
+    def _auto_start_engine(self) -> None:
+        """Launch-time start: the engine binary beside the GUI, unless one answers.
+
+        [OPTIONS] Not while an options book sharing the trading wallet has
+        contracts open. On 2026-11-15 this start, at the first launch of a new
+        version, brought the engine up under two open contracts, and it spent
+        the book's coins within minutes. Unlike start_engine() it ran no check
+        at all, so the check is here as well.
+        """
+        if self._is_engine_reachable():
+            return
+        options_blocked = self._options_blocker()
+        if options_blocked:
+            _log.warning("C++ engine not auto-started: %s", options_blocked)
+            # Said once the window is listening; the Options page says it too.
+            QTimer.singleShot(
+                2_000, lambda: self.error.emit(f"Engine not started: {options_blocked}")
+            )
+        elif self._start_engine_process():
+            _log.info("C++ engine auto-started; waiting for metrics endpoint.")
+        else:
+            _log.info("C++ engine binary not found; GUI-only monitoring mode.")
+
+    def _options_blocker(self) -> Optional[str]:
+        """[OPTIONS] Why the engine must stay stopped for the options book, or None.
+
+        With ``options.wallet.share_trading_wallet`` the engine and the options
+        book use one wallet, and the engine has to stay stopped while the book
+        has contracts open (see gui/services/options/runner.py). Options not
+        set up, or on a wallet of their own, never block. A check that fails
+        blocks: an engine started over open contracts spends the book's coins.
+        """
+        try:
+            from gui.services.options.runner import engine_start_blocker
+        except ImportError:
+            return None  # a build without the options package has no book to protect
+        try:
+            return engine_start_blocker(self._config_path)
+        except Exception as exc:  # noqa: BLE001 -- fail closed
+            _log.error("options: the engine-start check failed: %s", exc)
+            return f"the options book's state could not be checked ({exc})"
 
     def stop_engine(self, offers_policy: Optional[str] = None) -> None:
         """Gracefully stop the managed C++ engine subprocess.
