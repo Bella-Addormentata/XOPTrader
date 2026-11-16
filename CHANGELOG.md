@@ -5,9 +5,9 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.51] — 2026-11-16 — the engine can trade beside open option contracts
 
-### The engine can trade beside open option contracts (opt-in)
+### The engine can trade beside open option contracts (opt-in) (#237)
 
 With the trading wallet shared, 0.10.50 kept the engine stopped for as long
 as the options book had any contract open: in the first live run, two unsold
