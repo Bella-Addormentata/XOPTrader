@@ -5,9 +5,9 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.48] — 2026-11-15 — the options book, first run on mainnet
 
-### Options book: covered calls and puts on xchoptions.com from a reference wallet (#228)
+### Options book: covered calls and puts on xchoptions.com from a reference wallet (#228, #230)
 
 `gui/services/options` writes option contracts (CHIP-0045) from a Chia
 reference wallet and offers them on xchoptions.com. It builds the spends
@@ -39,13 +39,17 @@ Two things that run turned up are fixed:
   answers 1.15 for 1.1512 unless asked for full precision, so the book's
   spot moved in steps of about 0.9%. It now asks for full precision.
 
+Not yet seen live: another wallet taking one of its offers, an exercise,
+and a clawback after expiry. The first live contracts expire on
+2026-11-17.
+
 ### The options book's secrets stay in secrets.yaml (#229)
 
 The options wallet's certificate paths and fingerprint, and the options
 node's, are kept in `secrets.yaml` when the Settings page saves, and the
 option-contract tests are left out of the release bundle.
 
-### The options book can share the trading wallet while the engine is stopped
+### The options book can share the trading wallet while the engine is stopped (#230)
 
 `options.wallet.share_trading_wallet` (off by default) lets the book sign
 from the engine's own wallet daemon and key, for a machine where a second
@@ -69,6 +73,15 @@ book's collateral and premiums change balances behind its back. With it on:
   dry-run step still runs.
 
 `run` also prints the time before each step.
+
+### XOPTrader is licensed under the WTFPL v2 (#226)
+
+XOPTrader had no license. `LICENSE` now carries the WTFPL v2, and
+`README.md`, `docs/README.md`, `cpp/vcpkg.json` and two SPDX headers that
+said MIT or UNLICENSED now agree with it. `THIRD_PARTY_NOTICES.md` lists
+the third-party code in the repository with its license notices, and what
+the release builds bundle; the package's license field names WTFPL, MIT
+and Apache-2.0 for the code it carries.
 
 ## [0.10.47] — 2026-11-08 — ratio modes switch on when a pair drifts 10 points
 
