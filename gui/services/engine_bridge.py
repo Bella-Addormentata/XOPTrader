@@ -18,12 +18,14 @@ Compliant with:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Final, Optional
 
@@ -646,11 +648,14 @@ class EngineBridge(QObject):
                 "the engine on the config it was started under.")
             return
         # [OPTIONS] Every Start, Restart and venue switch comes through here.
-        options_blocked = self._options_blocker()
-        if options_blocked:
-            self.error.emit(f"Engine not started: {options_blocked}")
-            return
-        if self._start_engine_process():
+        # The check and the launch happen inside one window that holds the
+        # options book still, so no step can mint between the two.
+        with self._options_start_window() as options_blocked:
+            if options_blocked:
+                self.error.emit(f"Engine not started: {options_blocked}")
+                return
+            launched = self._start_engine_process()
+        if launched:
             _log.info("Engine started via start_engine().")
             self.engine_launched.emit()
         else:
@@ -671,17 +676,45 @@ class EngineBridge(QObject):
         """
         if self._is_engine_reachable():
             return
-        options_blocked = self._options_blocker()
-        if options_blocked:
-            _log.warning("C++ engine not auto-started: %s", options_blocked)
-            # Said once the window is listening; the Options page says it too.
-            QTimer.singleShot(
-                2_000, lambda: self.error.emit(f"Engine not started: {options_blocked}")
-            )
-        elif self._start_engine_process():
+        with self._options_start_window() as options_blocked:
+            if options_blocked:
+                _log.warning("C++ engine not auto-started: %s", options_blocked)
+                # Said once the window is listening; the Options page says it too.
+                QTimer.singleShot(
+                    2_000, lambda: self.error.emit(f"Engine not started: {options_blocked}")
+                )
+                return
+            launched = self._start_engine_process()
+        if launched:
             _log.info("C++ engine auto-started; waiting for metrics endpoint.")
         else:
             _log.info("C++ engine binary not found; GUI-only monitoring mode.")
+
+    @contextlib.contextmanager
+    def _options_start_window(self) -> Iterator[Optional[str]]:
+        """[OPTIONS] Yield why the engine must not start, holding the options book still.
+
+        Wraps gui/services/options/runner.py::engine_start_window: for a book
+        sharing the trading wallet, its acting lock (the one each step takes)
+        is held from the check until the engine has been launched, so a step
+        cannot mint in between. A check that fails blocks.
+        """
+        try:
+            from gui.services.options.runner import engine_start_window
+        except ImportError:
+            yield None  # a build without the options package has no book to protect
+            return
+        window = engine_start_window(self._config_path)
+        try:
+            reason = window.__enter__()
+        except Exception as exc:  # noqa: BLE001 -- fail closed
+            _log.error("options: the engine-start check failed: %s", exc)
+            yield f"the options book's state could not be checked ({exc})"
+            return
+        try:
+            yield reason
+        finally:
+            window.__exit__(None, None, None)
 
     def _options_blocker(self) -> Optional[str]:
         """[OPTIONS] Why the engine must stay stopped for the options book, or None.

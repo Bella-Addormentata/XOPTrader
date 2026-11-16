@@ -19,7 +19,8 @@ the app:
   Live again only if the engine is down by then.
 - **What it is doing:** the mode, steps and last step, the engine check,
   anything holding it, the market it sees, the fees it has paid, its
-  contracts with their live offers, and its recent activity.
+  contracts (collateral in its own asset) with their live offers, and its
+  recent activity.
 - It reads `config.yaml` (with `secrets.yaml`) from the path the app loads,
   so the options settings belong there. A relative `options.database_path`
   is read beside that file, not the program's folder.
@@ -27,12 +28,31 @@ the app:
 ### The engine does not start over an options book's open contracts
 
 With `options.wallet.share_trading_wallet`, the engine now refuses to start
-while the options book has contracts open, at launch and from Start,
-Restart or a venue switch, and says why. On 2026-11-15 the app's launch-time
-auto-start, which ran no checks at all, brought the engine up under two open
-contracts at the first launch of a new version, and the engine spent the
-book's coins within minutes. Live cannot be switched on while the engine
-runs either.
+while the options book has contracts open or is Live, at launch and from
+Start, Restart or a venue switch, and says why. On 2026-11-15 the app's
+launch-time auto-start, which ran no checks at all, brought the engine up
+under two open contracts at the first launch of a new version, and the
+engine spent the book's coins within minutes. Live cannot be switched on
+while the engine runs either.
+
+- The check and the launch hold the book's acting lock, the one every step
+  takes, so a step cannot mint between "nothing is open" and the engine
+  being up. A book in the middle of a step is a reason to try again.
+- It covers every book the app has run, not only the one config.yaml names
+  now: switching config.yaml in Settings stops the page's book and follows
+  the new file, and the old book's open contracts still hold the engine.
+- A book that shares the trading wallet but whose settings cannot be read
+  holds the engine: its contracts cannot be checked.
+- Switching the book off waits a moment for the step in progress, then
+  shows it as finishing; nothing new starts until it has.
+
+### One rule for where the options book's database is
+
+A relative `options.database_path` is now read beside `config.yaml` by the
+command line as well as the app. The command line used to read it against
+the folder it was run from, so the two could look at different books. A
+book found only where the old rule put it is refused with where it is, not
+replaced by a new, empty one.
 
 Start Trading also no longer shows the engine running when the start was
 refused or failed.

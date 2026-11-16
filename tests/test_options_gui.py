@@ -47,6 +47,16 @@ def app():
 
 
 @pytest.fixture(autouse=True)
+def no_books_from_other_tests():
+    """The engine check remembers every book this process ran; start each test without any."""
+    with options_runner._BOOKS_LOCK:
+        options_runner._BOOKS.clear()
+    yield
+    with options_runner._BOOKS_LOCK:
+        options_runner._BOOKS.clear()
+
+
+@pytest.fixture(autouse=True)
 def own_settings(monkeypatch):
     """The page's QSettings in a store of the tests' own, emptied before and after."""
     monkeypatch.setattr(options_page, "_SETTINGS_ORG", "XOP-tests-options")
@@ -118,7 +128,7 @@ class RunnerDouble:
         self.mode = mode
         self.snap = options_runner.Snapshot(mode=mode, running=True)
 
-    def stop(self) -> None:
+    def stop(self, timeout: float | None = None) -> None:
         self.stops += 1
         self.mode = Mode.OFF
         self.snap = options_runner.Snapshot()
@@ -248,6 +258,33 @@ def test_recent_activity_keeps_coming_once_the_runner_s_history_is_full(app, tmp
         _close(page, app)
 
 
+def test_a_new_config_from_settings_stops_the_old_book_and_follows_the_new_file(
+    app, tmp_path, monkeypatch
+):
+    class Bound(RunnerDouble):
+        def __init__(self, path):
+            super().__init__()
+            self.config_path = path
+
+    first = _config(tmp_path / "a")
+    old = Bound(first)
+    page = options_page.OptionsWidget(runner=old)
+    try:
+        page.attach(first)
+        _answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        page._buttons[Mode.LIVE].click()
+        assert old.starts == [Mode.LIVE]
+
+        second = _config(tmp_path / "b")
+        page.attach(second, resume=False)
+
+        assert old.stops == 1, "the book on the old config was stopped first"
+        assert page._runner is not old and page._config_path == second
+        assert "switched off" in page._held.text()
+    finally:
+        _close(page, app)
+
+
 def test_closing_the_app_stops_the_book(app, tmp_path):
     runner = RunnerDouble()
     page = _page(app, tmp_path, runner)
@@ -287,6 +324,29 @@ def test_start_engine_is_refused_while_a_shared_book_has_contracts_open(app, tmp
         assert launched == [1], "no second launch over an open contract"
         assert errors and "Engine not started" in errors[-1] and "contract(s) open" in errors[-1]
     finally:
+        bridge.deleteLater()
+        app.processEvents()
+
+
+def test_start_engine_waits_while_a_step_holds_the_book(app, tmp_path, monkeypatch):
+    # A Live step minting right now holds the acting lock: the engine must not
+    # launch between "nothing is open" and that mint landing.
+    config_path = _config(tmp_path, shared=True)
+    db = config_path.parent / "data" / "options_jobs.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    stepping = store.OptionStore(str(db))
+    bridge, errors = _bridge(app, config_path)
+    try:
+        launched: list[int] = []
+        monkeypatch.setattr(bridge, "_start_engine_process", lambda: launched.append(1) or True)
+        monkeypatch.setattr(bridge, "_publish_retained_warp_store", lambda: None)
+        with stepping.acting():
+            bridge.start_engine()
+        assert launched == [] and "in the middle of a step" in errors[-1]
+        bridge.start_engine()  # the step is done: it starts
+        assert launched == [1]
+    finally:
+        stepping.close()
         bridge.deleteLater()
         app.processEvents()
 

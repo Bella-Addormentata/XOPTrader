@@ -61,7 +61,7 @@ _CONTRACT_COLUMNS: Final[tuple[str, ...]] = (
     "Contract",
     "Status",
     "Expires (UTC)",
-    "Collateral XCH",
+    "Collateral",
     "Live offers",
 )
 
@@ -167,8 +167,23 @@ class OptionsWidget(QWidget):
     # -- wiring -----------------------------------------------------------------
 
     def attach(self, config_path: Path, *, resume: bool = True) -> None:
-        """Point the page at config.yaml and take up the remembered mode."""
-        self._config_path = Path(config_path)
+        """Point the page at config.yaml and take up the remembered mode.
+
+        Called again when Settings switches config.yaml: a book running on the
+        old file is stopped first (after its step), and is still covered by the
+        engine-start check, which looks at every book this app has run.
+        """
+        new_path = Path(config_path)
+        old = self._runner
+        old_path = getattr(old, "config_path", None)
+        if old is not None and old_path is not None and Path(old_path) != new_path:
+            old.stop()
+            self._runner = None
+            self._held.setText(
+                f"Switched to {new_path}; the book on {old_path} was switched off "
+                "(its open contracts still hold the engine)."
+            )
+        self._config_path = new_path
         if self._runner is None:
             self._runner = options_runner.OptionsRunner(self._config_path)
         try:
@@ -194,7 +209,8 @@ class OptionsWidget(QWidget):
 
     def _on_choose(self, mode: Mode) -> None:
         if mode is Mode.OFF:
-            self._runner.stop()
+            # A short wait: a slow step finishes on its own, shown as stopping.
+            self._runner.stop(timeout=options_runner.SWITCH_WAIT)
             self._remember(Mode.OFF)
         else:
             self._start(mode, confirm=mode is Mode.LIVE, why="")
@@ -253,8 +269,9 @@ class OptionsWidget(QWidget):
             else "none yet"
         )
         state = {Mode.OFF: "Off", Mode.REHEARSE: "Rehearsing (signs nothing)", Mode.LIVE: "LIVE"}
+        shown = "Off (finishing the step in progress)" if snap.stopping else state[snap.mode]
         self._state.setText(
-            f"{state[snap.mode]}  ·  steps {snap.steps}  ·  last step {when}  ·  "
+            f"{shown}  ·  steps {snap.steps}  ·  last step {when}  ·  "
             f"{snap.open_contracts} contract(s) open"
         )
         colour = (
@@ -288,7 +305,7 @@ class OptionsWidget(QWidget):
                 item.slot,
                 item.status,
                 time.strftime("%Y-%m-%d %H:%M", time.gmtime(item.expiration)),
-                f"{item.underlying_amount / 1e12:g}",
+                item.collateral,  # in its own asset: XCH for a call, the quote asset for a put
                 str(item.live_offers),
             )
             for column, value in enumerate(values):

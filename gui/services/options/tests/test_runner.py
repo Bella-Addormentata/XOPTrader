@@ -19,6 +19,16 @@ DOWN = engine_guard.EngineState(running=False, certain=True, detail="nothing the
 UP = engine_guard.EngineState(running=True, certain=True, detail="xop_trader.exe process 7")
 
 
+@pytest.fixture(autouse=True)
+def no_books_from_other_tests():
+    """The engine check remembers every book this process ran; start each test without any."""
+    with runner._BOOKS_LOCK:
+        runner._BOOKS.clear()
+    yield
+    with runner._BOOKS_LOCK:
+        runner._BOOKS.clear()
+
+
 def _write(folder: Path, *, shared: bool = False, enabled: bool = True, db: str = "") -> Path:
     wallet: dict[str, Any] = {"port": 9356, "cert_path": "c", "key_path": "k"}
     chia: dict[str, Any] = {}
@@ -227,3 +237,162 @@ def test_the_engine_may_start_unless_a_shared_book_has_contracts_open(tmp_path) 
     _record_minting_contract(tmp_path / "shared" / "data" / "options_jobs.db")
     why = runner.engine_start_blocker(shared)
     assert why is not None and "1 contract(s) open (0.5 XCH locked)" in why
+    with runner.engine_start_window(shared) as why:
+        assert why is not None and "contract(s) open" in why
+
+
+# -- review of #235 ------------------------------------------------------------------
+
+
+def test_the_engine_waits_while_a_step_holds_the_book(tmp_path) -> None:
+    # A step that is minting holds the acting lock; the engine must not launch
+    # between "nothing is open" and that mint landing.
+    shared = _write(tmp_path, shared=True)
+    db = tmp_path / "data" / "options_jobs.db"
+    db.parent.mkdir(parents=True)
+    stepping = store.OptionStore(str(db))
+    try:
+        with stepping.acting():
+            with runner.engine_start_window(shared) as why:
+                assert why is not None and "in the middle of a step" in why
+        with runner.engine_start_window(shared) as why:
+            assert why is None  # nothing open, nobody stepping: it may launch...
+            with pytest.raises(store.BusyError):  # ...and no step can act until it has
+                with stepping.acting():
+                    pass
+    finally:
+        stepping.close()
+
+
+def test_a_live_book_on_the_shared_wallet_holds_the_engine_with_nothing_open_yet(
+    tmp_path,
+) -> None:
+    made: list[FakeBook] = []
+    path = _write(tmp_path, shared=True, db=":memory:")
+    run = runner.OptionsRunner(
+        path, interval=0.02, build=_builder(made), engine_state=lambda url: DOWN
+    )
+    run.start(runner.Mode.LIVE)
+    try:
+        why = runner.engine_start_blocker(path)
+        assert why is not None and "is Live" in why
+        with runner.engine_start_window(path) as why:
+            assert why is not None and "is Live" in why
+    finally:
+        run.stop()
+    assert runner.engine_start_blocker(path) is None  # off, and nothing open
+
+
+def test_a_shared_book_whose_settings_cannot_be_read_holds_the_engine(tmp_path) -> None:
+    path = _write(tmp_path, shared=True)
+    root = yaml.safe_load(path.read_text())
+    del root["options"]["wallet"]["cert_path"]  # e.g. secrets.yaml unreadable
+    path.write_text(yaml.safe_dump(root))
+    why = runner.engine_start_blocker(path)
+    assert why is not None and "could not be read" in why
+    # The same mistake on a book with a wallet of its own holds nothing.
+    other = tmp_path / "own"
+    other.mkdir()
+    own = _write(other)
+    root = yaml.safe_load(own.read_text())
+    del root["options"]["wallet"]["cert_path"]
+    own.write_text(yaml.safe_dump(root))
+    assert runner.engine_start_blocker(own) is None
+    # ...as does a book that is switched off.
+    off = tmp_path / "off"
+    off.mkdir()
+    assert runner.engine_start_blocker(_write(off, shared=True, enabled=False)) is None
+
+
+def test_a_book_on_a_config_left_behind_still_holds_the_engine(tmp_path) -> None:
+    # Settings switched config.yaml: the check must still see the book run on
+    # the old one, which kept its contracts.
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    first = _write(tmp_path / "a", shared=True)
+    second = _write(tmp_path / "b", enabled=False)
+    run = runner.OptionsRunner(first, interval=0.02, build=_builder([]))
+    run.start(runner.Mode.REHEARSE)
+    run.stop()
+    _record_minting_contract(tmp_path / "a" / "data" / "options_jobs.db")
+    why = runner.engine_start_blocker(second)
+    assert why is not None and "contract(s) open" in why
+
+
+def test_a_stop_that_outlives_its_wait_keeps_the_run_and_blocks_a_new_one(tmp_path) -> None:
+    release = threading.Event()
+    entered = threading.Event()
+
+    class SlowBook(FakeBook):
+        def step(self) -> StepReport:
+            entered.set()
+            release.wait(5)
+            return super().step()
+
+    made: list[FakeBook] = []
+
+    def build(cfg: Any) -> tuple[Any, Any, Any]:
+        book = SlowBook(cfg)
+        made.append(book)
+        return book, store.OptionStore(cfg.database_path), None
+
+    run = runner.OptionsRunner(_write(tmp_path, db=":memory:"), interval=0.02, build=build)
+    run.start(runner.Mode.LIVE)
+    assert entered.wait(5)
+    run.stop(timeout=0.05)  # the step is still running
+    snap = run.snapshot()
+    assert snap.mode is runner.Mode.OFF and snap.stopping and snap.running
+    with pytest.raises(runner.RunnerError, match="still finishing its step"):
+        run.start(runner.Mode.REHEARSE)
+    assert len(made) == 1  # no second run beside the first
+    release.set()
+    _wait(lambda: not run.snapshot().running)
+    run.start(runner.Mode.REHEARSE)  # now it may
+    _wait(lambda: len(made) == 2)
+    run.stop()
+
+
+def test_collateral_is_shown_in_its_own_asset(tmp_path) -> None:
+    class Contract:
+        def __init__(self, slot, asset, amount):
+            self.slot, self.status, self.launcher_id = slot, store.OPEN, b"\x01" * 32
+            self.expiration, self.underlying_asset, self.underlying_amount = 1, asset, amount
+
+    class FakeStore:
+        def contracts(self):
+            return [
+                Contract("C110", None, 500_000_000_000),
+                Contract("P90", bytes.fromhex(USD), 125_000),  # 125 quote, 3 decimals
+            ]
+
+        def offers(self, launcher_id, status):
+            return []
+
+        def broadcasts(self, status):
+            return []
+
+    run = runner.OptionsRunner(_write(tmp_path, db=":memory:"), build=_builder([]))
+    cfg = runner.load_options(_write(tmp_path, db=":memory:"))
+    run._record(cfg, FakeStore(), None, "", "")
+    assert [c.collateral for c in run.snapshot().contracts] == ["0.5 XCH", "125 quote"]
+
+
+def test_the_command_line_reads_a_relative_book_beside_config_yaml_too(
+    tmp_path, monkeypatch
+) -> None:
+    from gui.services.options import __main__ as cli
+    from gui.services.options import config
+
+    home = tmp_path / "home"
+    elsewhere = tmp_path / "elsewhere"
+    home.mkdir()
+    elsewhere.mkdir()
+    path = _write(home)
+    monkeypatch.chdir(elsewhere)
+    assert Path(cli._load(str(path)).database_path) == home / "data" / "options_jobs.db"
+    # A book only where the old rule put it (the folder the command ran from)
+    # is not silently replaced by a new one beside config.yaml.
+    (elsewhere / "data").mkdir()
+    (elsewhere / "data" / "options_jobs.db").write_bytes(b"")
+    with pytest.raises(config.OptionsConfigError, match="Move it beside config.yaml"):
+        cli._load(str(path))

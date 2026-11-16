@@ -637,6 +637,10 @@ class MainWindow(QMainWindow):
             self._settings_widget.config_saved.connect(
                 self._nudge_engine_config_reload
             )
+            # [OPTIONS] A different config.yaml means a different options book:
+            # the page stops the old one and follows the new file, without
+            # taking up a remembered mode (only a launch does that).
+            self._settings_widget.config_saved.connect(self._follow_options_config)
         # [LIVECFG] The engine's answer to that nudge, the one-click restart
         # for whatever it could not adopt, and the Appearance preferences.
         if hasattr(bridge, "config_reload_result"):
@@ -2523,6 +2527,18 @@ class MainWindow(QMainWindow):
         wallet = self._unwrap(self._wallet_balances)
         if wallet is not None and hasattr(wallet, "set_sizing_paths"):
             wallet.set_sizing_paths(cfg, db)
+
+    def _follow_options_config(self, new_path: Any = None) -> None:
+        """[OPTIONS] Settings saved a config: point the Options page at it."""
+        from pathlib import Path
+
+        options_page = self._unwrap(getattr(self, "_options_widget", None))
+        if options_page is None or not hasattr(options_page, "attach") or not new_path:
+            return
+        try:
+            options_page.attach(Path(str(new_path)), resume=False)
+        except Exception:  # noqa: BLE001 - the page says why; the app goes on
+            _log.exception("[Options] page could not follow the new config")
 
     @staticmethod
     def _create_page_widget(
