@@ -5,9 +5,24 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.48] — 2026-11-16 — the license and its notices ship with the app; an options book to run from source
 
-### Options book: covered calls and puts on xchoptions.com from a reference wallet (#228)
+### XOPTrader is licensed under the WTFPL v2, and every build carries its notices (#226)
+
+The repository had no license. It now has `LICENSE` (the WTFPL v2) and
+`THIRD_PARTY_NOTICES.md`, which lists the code from warp.green (MIT),
+Chia (Apache-2.0) and Pieter Wuille's bech32 (MIT). That code keeps its own
+license, and its notices have to travel with every copy, so both files now
+ship with every build:
+
+- The Windows installer puts them next to the app as `LICENSE.txt` and
+  `THIRD_PARTY_NOTICES.txt`, so a double-click opens them.
+- The Linux bundle has them beside the app.
+- The single-file GUI apps carry them inside.
+
+`--self-check` now checks that both are in the build.
+
+### Options book: covered calls and puts on xchoptions.com from a reference wallet (#228, #230)
 
 `gui/services/options` writes option contracts (CHIP-0045) from a Chia
 reference wallet and offers them on xchoptions.com. It builds the spends
@@ -45,7 +60,7 @@ The options wallet's certificate paths and fingerprint, and the options
 node's, are kept in `secrets.yaml` when the Settings page saves, and the
 option-contract tests are left out of the release bundle.
 
-### The options book can share the trading wallet while the engine is stopped
+### The options book can share the trading wallet while the engine is stopped (#230)
 
 `options.wallet.share_trading_wallet` (off by default) lets the book sign
 from the engine's own wallet daemon and key, for a machine where a second
