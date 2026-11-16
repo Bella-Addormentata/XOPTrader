@@ -5,9 +5,9 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.50] — 2026-11-16 — an Options page, and the engine waits for the book
 
-### An Options page switches the options book Off, to Rehearse, or Live
+### An Options page switches the options book Off, to Rehearse, or Live (#235)
 
 The options book ran only from a terminal (`python -m gui.services.options
 run`), which the installed app cannot do. A new Options page runs it inside
@@ -25,7 +25,7 @@ the app:
   so the options settings belong there. A relative `options.database_path`
   is read beside that file, not the program's folder.
 
-### The engine does not start over an options book's open contracts
+### The engine does not start over an options book's open contracts (#235)
 
 With `options.wallet.share_trading_wallet`, the engine now refuses to start
 while the options book has contracts open or is Live, at launch and from
@@ -46,7 +46,7 @@ while the engine runs either.
 - Switching the book off waits a moment for the step in progress, then
   shows it as finishing; nothing new starts until it has.
 
-### One rule for where the options book's database is
+### One rule for where the options book's database is (#235)
 
 A relative `options.database_path` is now read beside `config.yaml` by the
 command line as well as the app. The command line used to read it against
@@ -57,7 +57,7 @@ replaced by a new, empty one.
 Start Trading also no longer shows the engine running when the start was
 refused or failed.
 
-### The app's self-check covers the options book
+### The app's self-check covers the options book (#235)
 
 `--self-check` imports `chia_wallet_sdk` and the options runner and builds
 one puzzle with it, so a bundle without the options book's native
