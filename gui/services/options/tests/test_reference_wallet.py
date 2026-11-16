@@ -644,3 +644,51 @@ def test_a_wallet_coin_round_trips_into_a_spend() -> None:
     minted = builder.build_mint(terms, funding, _custody_from_wallet(reference, maker.puzzle_hash))
     reference.push(minted.coin_spends, reference.sign(minted.coin_spends))
     assert world.load(minted.launcher_id).status is OptionStatus.LIVE
+
+
+def _offers_wallet(records: Any) -> tuple[ReferenceWallet, list[tuple[str, dict]]]:
+    calls: list[tuple[str, dict]] = []
+
+    def rpc(endpoint: str, body: dict) -> dict:
+        calls.append((endpoint, body))
+        return {"success": True, "trade_records": records}
+
+    return ReferenceWallet(rpc, agg_sig_me_additional_data=ADDITIONAL_DATA), calls
+
+
+def test_the_wallet_lists_the_open_offers_it_made() -> None:
+    mine, also_mine, theirs = b"\x01" * 32, b"\x02" * 32, b"\x03" * 32
+    reference, calls = _offers_wallet(
+        [
+            {"trade_id": _hex(mine), "is_my_offer": True},
+            {"trade_id": also_mine.hex()},  # no flag: it was listed as ours
+            {"trade_id": _hex(theirs), "is_my_offer": False},  # one we took, still pending
+            "not a record",
+        ]
+    )
+
+    assert reference.open_offer_ids() == [mine, also_mine]
+    ((endpoint, body),) = calls
+    assert endpoint == "get_all_offers"
+    # Only offers still open: taken, cancelled and completed ones are not liquidity.
+    assert body["exclude_taken_offers"] is True and body["include_completed"] is False
+    assert body["exclude_my_offers"] is False
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        {"trade_id": "0x01"},  # not a list
+        [{"trade_id": 7}],  # an id that is not text
+        [{"trade_id": "0xnot-hex"}],
+    ],
+)
+def test_a_wallet_that_lists_offers_it_cannot_name_is_refused(records) -> None:
+    reference, _ = _offers_wallet(records)
+    with pytest.raises(signing.SigningError):
+        reference.open_offer_ids()
+
+
+def test_a_wallet_with_no_open_offers_lists_none() -> None:
+    reference, _ = _offers_wallet(None)
+    assert reference.open_offer_ids() == []

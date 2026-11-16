@@ -333,6 +333,9 @@ def build(
             cfg.quote_asset_id,
             hedge_size_xch=cfg.market.hedge_size_xch,
             coingecko_api_key=cfg.coingecko_api_key,
+            # The wallet's own offers (the engine's, on a shared wallet) are
+            # not liquidity the hedge could use: left out of the Dexie range.
+            own_offers=wallet.open_offer_ids,
         ).read
     # The site lists mainnet options only.
     listing = desk.DeskClient() if cfg.network == config.MAINNET else None

@@ -144,6 +144,51 @@ Two things to know once contracts are out:
   beside it reports "another process is acting" and does nothing. `status` and
   `monitor` are not affected.
 
+## Reviewing a run
+
+Three records say what the book did and why, so a run can be reviewed without
+having kept the terminal output:
+
+- **The log file**, beside the database and named after it
+  (`data/options_jobs.log` for `data/options_jobs.db`). Every command but
+  `status` and `report` writes to it, with the time on every line: the market
+  each step, every action and problem, and engine-guard changes. It is rotated
+  at 2 MB with three old files kept. `--log-file PATH` puts it elsewhere and
+  `--no-log-file` turns it off.
+- **The database's journals.** `quotes` keeps, beside each offer, the spot,
+  volatility, model value, carry, markup and minimum premium it was priced
+  from, and which of them set the price. `step_log` keeps the market each step
+  saw and its verdict: `quoting`, `not quoting: <reason>` (spot price too old,
+  Dexie book too thin, crossed or too wide, spot outside the Dexie range,
+  market data unavailable), `wallet not ready`, `step failed` (with the
+  error), or `refused: trading engine may be running`. It writes a row when
+  the verdict changes, when a price moves more than 0.5%, and otherwise every
+  15 minutes.
+  The `events` table carries the fee each confirmed transaction paid, and a
+  sale names the offer that was taken.
+- **`report`**, which reads the two:
+
+  ```
+  python -m gui.services.options --config config.yaml report --since 24h
+  python -m gui.services.options --config config.yaml report --since 2026-11-15 --csv book.csv
+  ```
+
+  It prints how long the book quoted and what held it back (and for how long,
+  in how many spells), how long it was not running, the offers made and how
+  many sat on the minimum premium, and for each contract the premium a sale
+  brought against the model value of the offer that was taken, the fees its
+  transactions paid and how long its collateral was locked. `--since` takes a
+  span (`90m`, `24h`, `7d`, `2w`), a date or time (UTC unless it says
+  otherwise) or `all`. It only reads, so it is safe while `run` is going.
+  Periods from before this release have no journal: they show contracts, fees
+  and sales, but no quoting time or price breakdown.
+
+`status` also says, for each unsold contract, whether it could be cancelled
+now. A cancel of a call pays its strike to the options address inside the same
+transaction, so it needs one coin of the quote asset there to start from (any
+amount; it comes back in full), and XCH there for a fee when one is due. A
+contract it cannot cancel is clawed back after expiry instead.
+
 ## Announcing offers on Splash (optional)
 
 [Splash!](https://github.com/dexie-space/splash) is Dexie's peer-to-peer

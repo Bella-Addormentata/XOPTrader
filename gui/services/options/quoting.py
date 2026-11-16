@@ -58,12 +58,44 @@ class Wanted:
 
 
 @dataclasses.dataclass(frozen=True)
+class AskQuote:
+    """How one ask was arrived at, kept beside the offer it priced.
+
+    Per-XCH figures are in the quote asset, as :func:`pricing.ask_price` gives
+    them; ``units`` is the ask itself, in quote-asset mojos for the whole
+    contract. ``set_by`` says what set it: ``"model"`` when value, carry and
+    markup came to more than ``pricing.min_premium``, ``"floor"`` when the
+    minimum premium was the higher. On the first live run (2026-11-15) every
+    ask was ``"floor"``, which nothing on record could show.
+    """
+
+    spot: float
+    sigma: float  # the market's volatility; the model used it plus sigma_markup
+    strike: float  # quote asset per XCH
+    seconds_to_expiry: int
+    model: float  # American value at sigma + sigma_markup
+    carry: float  # return forgone on the locked collateral
+    markup: float  # markup_fraction of the model value, after steering
+    floor: float  # pricing.min_premium
+    per_xch: float  # the ask per XCH
+    units: int  # the ask for the whole contract, in quote-asset mojos
+    set_by: str  # "model" or "floor"
+    delta: float  # of one long option
+    lean: float  # the book's lean, -1..1, that steered the markup
+
+    def as_record(self) -> dict[str, float | int | str]:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
 class Plan:
     mint: tuple[Wanted, ...]  # in priority order; empty when a limit blocks
     retire: tuple[bytes, ...]  # launcher ids of unsold contracts to cancel
     asks: dict[bytes, int]  # launcher id -> ask in quote-asset mojos, for unsold contracts
     blocked: str  # why nothing more is minted, or ""
     net_delta_xch: float
+    # launcher id -> how its ask was worked out, for the record kept with each offer
+    quotes: dict[bytes, AskQuote] = dataclasses.field(default_factory=dict)
 
 
 def slot_name(side: str, percent: int, expiration: int) -> str:
@@ -152,9 +184,17 @@ def ask_mojos(
     contract: store.Contract, market: Market, config: OptionsConfig, now: int, lean: float
 ) -> int:
     """The ask for one unsold contract, in quote-asset mojos, rounded up."""
+    return ask_quote(contract, market, config, now, lean).units
+
+
+def ask_quote(
+    contract: store.Contract, market: Market, config: OptionsConfig, now: int, lean: float
+) -> AskQuote:
+    """The ask for one unsold contract, with everything that went into it."""
+    strike = contract_strike(contract, config.quote_unit_mojos)
     quote = pricing.ask_price(
         market.spot,
-        contract_strike(contract, config.quote_unit_mojos),
+        strike,
         contract.expiration - now,
         call=contract.side == CALL,
         sigma=market.sigma,
@@ -169,9 +209,27 @@ def ask_mojos(
     # put back after steering.
     floor = max(quote.model + quote.carry, config.pricing.min_premium)
     strength = min(max(config.pricing.steer_strength, 0.0), 0.9)
-    steered = quote.model + quote.carry + quote.markup * _steer(contract.side, lean, strength)
+    factor = _steer(contract.side, lean, strength)
+    steered = quote.model + quote.carry + quote.markup * factor
     per_xch = max(floor, steered)
-    return quote_units(per_xch, contract_size_xch(contract), config.quote_unit_mojos)
+    # What ``ask_price`` added to reach the minimum premium is not markup. The
+    # record keeps the two apart, so it can say which of them set the price.
+    proper = config.pricing.markup_fraction * quote.model
+    return AskQuote(
+        spot=market.spot,
+        sigma=market.sigma,
+        strike=strike,
+        seconds_to_expiry=contract.expiration - now,
+        model=quote.model,
+        carry=quote.carry,
+        markup=proper * factor,
+        floor=config.pricing.min_premium,
+        per_xch=per_xch,
+        units=quote_units(per_xch, contract_size_xch(contract), config.quote_unit_mojos),
+        set_by="floor" if quote.markup - proper > 0.0 else "model",
+        delta=quote.delta,
+        lean=lean,
+    )
 
 
 def quote_units(per_xch: float, size_xch: float, unit_mojos: int) -> int:
@@ -213,6 +271,7 @@ def plan(config: OptionsConfig, market: Market, contracts: list[store.Contract],
     retire: list[bytes] = []
     filled: set[str] = set()
     asks: dict[bytes, int] = {}
+    quotes: dict[bytes, AskQuote] = {}
     for contract in unsold:
         target = targets.get(contract.slot)
         strike = contract_strike(contract, config.quote_unit_mojos)
@@ -227,7 +286,9 @@ def plan(config: OptionsConfig, market: Market, contracts: list[store.Contract],
             continue
         filled.add(contract.slot)
         if contract.status == store.OPEN and contract.expiration > now:
-            asks[contract.launcher_id] = ask_mojos(contract, market, config, now, lean)
+            quoted = ask_quote(contract, market, config, now, lean)
+            asks[contract.launcher_id] = quoted.units
+            quotes[contract.launcher_id] = quoted
 
     limits = config.limits
     blocked = ""
@@ -288,4 +349,5 @@ def plan(config: OptionsConfig, market: Market, contracts: list[store.Contract],
         asks=asks,
         blocked=blocked,
         net_delta_xch=delta_xch,
+        quotes=quotes,
     )

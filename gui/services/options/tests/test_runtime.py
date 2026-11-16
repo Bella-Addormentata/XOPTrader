@@ -318,7 +318,11 @@ def test_live_test_puts_its_contract_and_every_bundle_on_record(tmp_path, monkey
         (store.WITHDRAW, "confirmed"),
         (store.CANCEL, "confirmed"),
     ]
-    assert [event.kind for event in book.events()] == ["collateral_locked", "collateral_returned"]
+    assert [event.kind for event in book.events()] == [
+        "collateral_locked",
+        "offers_withdrawn",
+        "collateral_returned",
+    ]
     (offer,) = book.offers()
     assert offer.status == "dead" and offer.price_amount == DUST
     assert book.unresolved() == []
@@ -620,7 +624,8 @@ def test_a_live_test_offer_that_is_taken_is_booked_and_clawed_back_later(
     book, (contract,) = _test_contracts(cfg)
     assert contract.status == store.SOLD
     (sold,) = [event for event in book.events() if event.kind == "sold"]
-    assert sold.detail == {"asset": None, "amount": DUST}
+    (taken,) = [offer for offer in book.offers() if offer.status == "taken"]
+    assert sold.detail == {"asset": None, "amount": DUST, "offer_id": taken.id}
     assert maker.balance() == before - 1  # the premium came in for the collateral locked
     book.close()
 

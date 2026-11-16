@@ -5,6 +5,60 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### The options book keeps a record of why it did what it did
+
+The first mainnet run could be reviewed only from terminal output, and the
+database said what happened but not why. Now:
+
+- **A log file.** Every command but `status` and `report` logs to a file
+  beside the database (`options_jobs.log` for `options_jobs.db`), rotated
+  at 2 MB with three old files kept, with the time on every line: the
+  market each step, every action and problem, and engine-guard changes.
+  `--log-file PATH` moves it and `--no-log-file` turns it off. The terminal
+  shows each problem once, and `run` prints the shared-wallet banner again
+  only when what it says has changed.
+- **How each price was worked out.** A `quotes` table keeps, beside each
+  offer, the spot, volatility, model value, carry, markup and minimum
+  premium it was priced from, and which of them set the price. The step's
+  line says so too: `offering … at 0.005 (on the floor; model value
+  0.0047 per XCH)`.
+- **What each step saw.** A `step_log` table keeps the market and the
+  step's verdict: quoting, or why not (spot price too old; Dexie book too
+  thin, crossed or too wide; spot outside the Dexie range; wallet not
+  ready; the step failed, with its error; refused because the trading
+  engine may be running). A row is
+  written when the verdict changes, when a price moves more than 0.5%, and
+  otherwise every 15 minutes.
+- **Fees and sales in the events.** `collateral_locked` and
+  `collateral_returned` carry the fee their transaction paid, a confirmed
+  withdrawal is booked as `offers_withdrawn` with its fee, and `sold` names
+  the offer that was taken.
+- **`report`.** `python -m gui.services.options report --since 24h` (or
+  `7d`, a date, or `all`) prints how long the book quoted and what held it
+  back, how many offers it made and how many sat on the minimum premium,
+  and for each contract the premium against the model value of the offer
+  that was taken, the fees and how long its collateral was locked.
+  `--csv PATH` writes the per-contract figures. It only reads.
+
+### The book's range check leaves out the wallet's own offers
+
+The book stops quoting when spot is outside the price range the Dexie book
+can fill. With `share_trading_wallet` on, that range included the wallet's
+own open offers: the engine's, left resting at their old prices while it is
+stopped. One of the first run's stops was most likely an ask of the
+engine's. The book now asks the wallet for its open offers and leaves them
+out; if the wallet cannot say, every offer counts, as before.
+
+### `status` says whether each unsold contract can be cancelled now
+
+A cancel of a call pays the strike back to the options address inside the
+same transaction, so it needs one coin of the quote asset there to start
+from (any amount; it comes back in full). The first run's wind-down found
+this out from the cancel's error. `status` now lists each unsold contract
+as `possible`, or what it needs and when it will be clawed back instead.
+
 ## [0.10.48] — 2026-11-15 — the options book, first run on mainnet
 
 ### Options book: covered calls and puts on xchoptions.com from a reference wallet (#228, #230)

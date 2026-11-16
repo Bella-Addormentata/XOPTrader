@@ -6,6 +6,15 @@
     python -m gui.services.options --config config.yaml withdraw-all
     python -m gui.services.options --config config.yaml monitor --interval 300
     python -m gui.services.options --config config.yaml live-test
+    python -m gui.services.options --config config.yaml report --since 24h
+
+THE LOG FILE. Every command but ``status`` and ``report`` also logs to a file
+beside the book's database (``options_jobs.log`` for ``options_jobs.db``),
+rotated at 2 MB with three old files kept, with the time on every line. It
+holds what the terminal shows and more: the market each step, every action and
+problem, and engine-guard changes. ``--log-file`` puts it elsewhere and
+``--no-log-file`` turns it off. The terminal shows each problem once, as a
+``note:`` line, and the shared-wallet banner only when what it says changes.
 
 ``status``, ``monitor`` and a dry-run ``step`` sign nothing. ``live-test`` is the
 guided first run against a real wallet: it mints one dust-sized contract, offers
@@ -21,6 +30,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
+import logging.handlers
 import sys
 import time
 from collections.abc import Callable
@@ -28,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from gui.services.options import builder, chain, config, engine_guard, fees, safety, store
+from gui.services.options import report as reporting
 from gui.services.options.reference_wallet import ReferenceWallet
 from gui.services.options.runtime import (
     _ADDITIONAL_DATA,
@@ -37,7 +48,21 @@ from gui.services.options.runtime import (
     shared_wallet_guard,
     wallet_rpc,
 )
-from gui.services.options.service import pack_bundle, unpack_bundle
+from gui.services.options.service import (
+    ENGINE_REFUSED,
+    REPORTED,
+    pack_bundle,
+    unpack_bundle,
+)
+
+log = logging.getLogger(__name__)
+
+_LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+_LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S%z"
+_LOG_BYTES = 2 * 1024 * 1024  # as the GUI's own gui.log
+_LOG_BACKUPS = 3
+#: Commands that only look: they leave the log file to the one that acts.
+_NO_LOG_FILE = ("status", "report")
 
 #: The slot a live-test contract is stored under. It is in no grid, so a live
 #: book that finds one still open retires it, and claws it back once expired.
@@ -48,6 +73,44 @@ _REPUSH_EVERY_POLLS = 8  # two minutes: the first push may never have reached a 
 # With ``fee_mojos: auto`` the test pays one flat fee per spend, sized for the
 # costliest of them (the cancel, about 165 million), so its sums stay simple.
 _LIVE_TEST_COST = 170_000_000
+
+
+class _NotReported(logging.Filter):
+    """Lets through only records the printed step report does not already show."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not getattr(record, "options_report", False)
+
+
+def _log_to_console(verbose: bool) -> logging.Handler:
+    """Warnings (everything with ``--verbose``) to the terminal, as before the log file."""
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO if verbose else logging.WARNING)
+    console.setFormatter(logging.Formatter(logging.BASIC_FORMAT))
+    console.addFilter(_NotReported())
+    root.addHandler(console)
+    return console
+
+
+def default_log_path(cfg: config.OptionsConfig) -> Path | None:
+    """Beside the book's database, named after it; None for an in-memory one."""
+    if cfg.database_path == ":memory:":
+        return None
+    return Path(cfg.database_path).with_suffix(".log")
+
+
+def _log_to_file(path: Path) -> logging.Handler:
+    """Everything from info up, with the time on every line, rotated as the GUI's log is."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        path, maxBytes=_LOG_BYTES, backupCount=_LOG_BACKUPS, encoding="utf-8", delay=True
+    )
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter(_LOG_FORMAT, _LOG_DATE_FORMAT))
+    logging.getLogger().addHandler(handler)
+    return handler
 
 
 def _load(path: str) -> config.OptionsConfig:
@@ -84,30 +147,47 @@ def _print_report(report: Any) -> None:
 
 
 def _shared_wallet_banner(
-    cfg: config.OptionsConfig, book_store: store.OptionStore | None
+    cfg: config.OptionsConfig,
+    book_store: store.OptionStore | None,
+    seen: dict[str, Any] | None = None,
 ) -> engine_guard.EngineState | None:
     """With ``share_trading_wallet`` on: say so, loudly, and whether the engine is up.
 
     None when the opt-in is off. Printed by ``status`` and before every step.
+    With ``seen`` (``run`` keeps one across its steps) it is printed only when
+    what it says has changed since it was last printed; the engine is still
+    asked every time.
     """
     if not cfg.wallet.share_trading_wallet:
         return None
     state = engine_guard.engine_state(cfg.wallet.engine_metrics_url)
-    print(
+    lines = [
         "WARNING: options.wallet.share_trading_wallet is ON. This book signs from the "
         f"trading engine's wallet ({cfg.wallet.host}:{cfg.wallet.port}, key "
-        f"{cfg.wallet.fingerprint}). The engine must stay STOPPED while any contract is open."
-    )
-    print(f"  trading engine: {state.describe()}")
+        f"{cfg.wallet.fingerprint}). The engine must stay STOPPED while any contract is open.",
+        f"  trading engine: {state.describe()}",
+    ]
     open_contracts = book_store.contracts(store.ACTIVE) if book_store is not None else []
     if open_contracts and not state.clear:
         locked = sum(
             item.underlying_amount for item in open_contracts if item.underlying_asset is None
         )
-        print(
+        lines.append(
             f"  WARNING: {len(open_contracts)} contract(s) open with {locked / config.XCH_MOJOS:g} "
             "XCH locked while the engine may be running: its balances include collateral and "
             "premiums it must not count, and its offers can spend coins at the options address"
+        )
+    if seen is not None and seen.get("banner") == lines:
+        return state
+    if seen is not None:
+        seen["banner"] = lines
+    for line in lines:
+        print(line)
+        log.log(
+            logging.INFO if state.clear else logging.WARNING,
+            "[options] %s",
+            line.strip(),
+            extra=REPORTED,
         )
     return state
 
@@ -179,16 +259,63 @@ def _status(cfg: config.OptionsConfig) -> int:
         print(f"  {item.slot:<22} {item.status:<10} {item.launcher_id.hex()}  live offers: {live}")
     for row in book_store.unresolved():
         print(f"  waiting: {row.kind} of {row.launcher_id.hex()[:10]} ({row.status})")
+    if not_ready is None or coins.known_address():
+        for line in _cancel_funding(cfg, book_store, coins):
+            print(line)
     return 0
 
 
-def _guarded_step(cfg: config.OptionsConfig, book: Any, book_store: store.OptionStore) -> bool:
+def _cancel_funding(
+    cfg: config.OptionsConfig, book_store: store.OptionStore, coins: Any
+) -> list[str]:
+    """Whether each unsold contract could be cancelled now, and what is missing if not.
+
+    A cancel pays the strike to ourselves inside the same bundle, so it needs
+    one coin of the strike asset at the options address to start from (any
+    amount; it comes back in full), and XCH there for a fee when one is due.
+    A clawback after expiry needs neither. On the first live run the wind-down
+    found this out from the cancel's error.
+    """
+    unsold = book_store.contracts((store.OPEN,))
+    if not unsold:
+        return []
+    have_xch = bool(coins.xch_coins())
+    lines = ["cancelling now:"]
+    for item in unsold:
+        if item.strike_asset is None:
+            ready = have_xch
+            missing = "an XCH coin at the options address"
+        else:
+            ready = bool(coins.cats(item.strike_asset))
+            name = "the quote asset" if item.strike_asset == cfg.quote_asset_id else "its CAT"
+            missing = f"a coin of {name} (any amount) at the options address"
+        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(item.expiration))
+        if ready:
+            fee = (
+                "" if have_xch or item.strike_asset is None else " (plus XCH there if a fee is due)"
+            )
+            lines.append(f"  {item.slot:<22} possible{fee}")
+        else:
+            lines.append(
+                f"  {item.slot:<22} needs {missing}; without it, it is clawed back after {when}"
+            )
+    return lines
+
+
+def _guarded_step(
+    cfg: config.OptionsConfig,
+    book: Any,
+    book_store: store.OptionStore,
+    seen: dict[str, Any] | None = None,
+) -> bool:
     """One step, unless the shared-wallet guard forbids it. False if refused."""
-    state = _shared_wallet_banner(cfg, book_store)
+    state = _shared_wallet_banner(cfg, book_store, seen)
     # A dry-run step signs nothing, so only a live one needs the engine down.
     refusal = None if cfg.dry_run else _engine_refusal(state, "a live step")
     if refusal is not None:
         print(f"  note: {refusal}")
+        log.warning("[options] %s", refusal, extra=REPORTED)
+        book.journal(ENGINE_REFUSED, state.describe() if state else "", now=int(time.time()))
         return False
     _print_report(book.step())
     return True
@@ -202,17 +329,20 @@ def _step(cfg: config.OptionsConfig) -> int:
 def _run(cfg: config.OptionsConfig, interval: float) -> int:
     book, book_store, _ = build(cfg)
     print(f"stepping every {interval:g} s; Ctrl-C to stop (offers already out expire on their own)")
+    log.info("[options] stepping every %g s (dry_run %s)", interval, cfg.dry_run)
+    seen: dict[str, Any] = {}  # what the shared-wallet banner last said
     try:
         while True:
             # A log of a long run is read by time; nothing in the report says when.
             print(f"--- step at {time.strftime('%Y-%m-%d %H:%M:%S %z')}", flush=True)
             try:
-                _guarded_step(cfg, book, book_store)
+                _guarded_step(cfg, book, book_store, seen)
             except Exception as exc:  # noqa: BLE001 - keep the loop alive; the next step retries
-                logging.getLogger(__name__).exception("step failed: %s", exc)
+                log.exception("step failed: %s", exc)
             time.sleep(interval)
     except KeyboardInterrupt:
         print("stopped")
+        log.info("[options] stopped")
         return 0
 
 
@@ -270,6 +400,35 @@ def _monitor(cfg: config.OptionsConfig, interval: float) -> int:
         except KeyboardInterrupt:
             print("stopped")
             return 0
+
+
+def _report(cfg: config.OptionsConfig, since: str, csv_path: str | None) -> int:
+    """Read-only: what the book did since ``since``."""
+    now = time.time()
+    try:
+        start = reporting.parse_since(since, now)
+    except reporting.ReportError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if cfg.database_path != ":memory:" and not Path(cfg.database_path).is_file():
+        # Opening it would make an empty one, and report on that.
+        print(f"error: no options database at {cfg.database_path}", file=sys.stderr)
+        return 2
+    if start > now:
+        print(f"error: --since {since!r} is in the future", file=sys.stderr)
+        return 2
+    book_store = store.OptionStore(cfg.database_path)
+    try:
+        if start == 0:  # all of it: from the first thing the book recorded
+            start = min(book_store.first_record_at() or int(now), int(now))
+        summary = reporting.summarize(book_store, cfg.quote_unit_mojos, start, int(now))
+    finally:
+        book_store.close()
+    print(reporting.format_text(summary))
+    if csv_path:
+        written = reporting.write_csv(summary, csv_path)
+        print(f"\n{written} contract row(s) written to {csv_path}")
+    return 0
 
 
 def _withdraw_all(cfg: config.OptionsConfig) -> int:
@@ -763,6 +922,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m gui.services.options", description=__doc__)
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--log-file", help="where to log (default: beside the database, as <name>.log)"
+    )
+    parser.add_argument("--no-log-file", action="store_true", help="log to the terminal only")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status", help="address, funds and contracts")
     commands.add_parser("step", help="run one step and print what it did")
@@ -775,11 +938,24 @@ def main(argv: list[str] | None = None) -> int:
     test.add_argument("--amount-xch", type=float, default=0.0001)
     test.add_argument("--yes", action="store_true", help="do not pause before each spend")
     test.add_argument("--timeout", type=float, default=900.0)
+    summary = commands.add_parser("report", help="read-only: what the book did over a period")
+    summary.add_argument(
+        "--since", default="24h", help="24h, 7d, 90m, a date like 2026-11-15, or all"
+    )
+    summary.add_argument("--csv", help="also write the per-contract figures to this file")
     args = parser.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)
+    root = logging.getLogger()
+    level = root.level
+    handlers = [_log_to_console(args.verbose)]
     try:
         cfg = _load(args.config)
+        path = Path(args.log_file) if args.log_file else default_log_path(cfg)
+        if path is not None and not args.no_log_file and args.command not in _NO_LOG_FILE:
+            handlers.append(_log_to_file(path))
+            log.info("[options] %s, config %s", args.command, args.config)
+        if args.command == "report":
+            return _report(cfg, args.since, args.csv)
         if args.command == "status":
             return _status(cfg)
         if args.command == "step":
@@ -806,7 +982,14 @@ def main(argv: list[str] | None = None) -> int:
         RuntimeError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
+        log.error("[options] %s", exc, extra=REPORTED)
         return 1
+    finally:
+        # main() may be called more than once in a process (the tests do).
+        for handler in handlers:
+            root.removeHandler(handler)
+            handler.close()
+        root.setLevel(level)
 
 
 if __name__ == "__main__":

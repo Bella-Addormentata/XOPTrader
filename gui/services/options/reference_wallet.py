@@ -285,6 +285,33 @@ class ReferenceWallet:
             return None
         return rate if rate >= 0 else None
 
+    def open_offer_ids(self) -> list[bytes]:
+        """Trade ids of the offers this wallet made that are still open.
+
+        With ``options.wallet.share_trading_wallet`` these are the engine's
+        resting offers. The market view leaves them out of the Dexie range:
+        they are not liquidity the book could ever trade against. Taken,
+        cancelled and completed offers are not asked for.
+        """
+        answer = self._call(
+            "get_all_offers",
+            {
+                "start": 0,
+                "end": 1000,
+                "exclude_my_offers": False,
+                "exclude_taken_offers": True,
+                "include_completed": False,
+            },
+        )
+        records = answer.get("trade_records") or []
+        if not isinstance(records, list):
+            raise SigningError("wallet get_all_offers returned no list of offers")
+        return [
+            _unhex(record.get("trade_id"), "trade_id")
+            for record in records
+            if isinstance(record, dict) and record.get("is_my_offer", True) is not False
+        ]
+
     def push(self, coin_spends: Sequence[CoinSpend], aggregated_signature: bytes) -> bytes:
         """Hand a signed bundle to the wallet's full-node peer.
 

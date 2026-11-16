@@ -116,6 +116,16 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+#: ``extra`` on a log record whose words a :class:`StepReport` also carries.
+#: The command line prints the report, so its console handler drops these and
+#: only the log file keeps them (with a time on each line).
+REPORTED = {"options_report": True}
+
+#: Step verdicts, as the step journal (``store.step_log``) keeps them.
+WALLET_NOT_READY = "wallet not ready"
+ENGINE_REFUSED = "refused: trading engine may be running"
+STEP_FAILED = "step failed"
+
 #: A pending bundle is pushed again once it is this old, in case the first push
 #: never reached a node.
 _REPUSH_AFTER_SECONDS = 120
@@ -218,11 +228,11 @@ class StepReport:
 
     def did(self, text: str) -> None:
         self.actions.append(text)
-        log.info("[options] %s", text)
+        log.info("[options] %s", text, extra=REPORTED)
 
     def problem(self, text: str) -> None:
         self.problems.append(text)
-        log.warning("[options] %s", text)
+        log.warning("[options] %s", text, extra=REPORTED)
 
 
 def _sdk() -> Any:
@@ -274,6 +284,7 @@ class OptionsBook:
         self._desk = desk
         self._splash = splash
         self._splash_down = False  # the daemon failed once this step: ask no more
+        self._not_ready: str | None = None  # why the wallet was not ready, last asked
         self._clock = clock
         self._keys: dict[bytes, Any] = {}
         self._loaded: dict[bytes, chain.LoadedOption] = {}
@@ -643,7 +654,8 @@ class OptionsBook:
             return
         name = row.launcher_id.hex()[:10]
         asset = None if contract.underlying_asset is None else contract.underlying_asset.hex()
-        detail = {"asset": asset, "amount": contract.underlying_amount}
+        # The fee the confirmed bundle paid, in XCH mojos (None if recorded before fees were).
+        detail = {"asset": asset, "amount": contract.underlying_amount, "fee": row.fee}
         if row.kind == store.MINT:
             self._store.settle_broadcast(
                 row.id,
@@ -666,7 +678,14 @@ class OptionsBook:
             )
             report.did(f"{row.kind} of {contract.slot} ({name}) confirmed")
         else:  # a withdrawal: the option coin moved to ourselves
-            self._store.settle_broadcast(row.id, "confirmed", kill_offers=True, now=now)
+            self._store.settle_broadcast(
+                row.id,
+                "confirmed",
+                kill_offers=True,
+                event="offers_withdrawn",
+                detail={"fee": row.fee},
+                now=now,
+            )
             report.did(f"offers for {contract.slot} ({name}) withdrawn")
 
     def _overtaken(
@@ -820,7 +839,8 @@ class OptionsBook:
         price: dict[str, Any] = {}
         if taken is not None:
             asset = None if taken.price_asset is None else taken.price_asset.hex()
-            price = {"asset": asset, "amount": taken.price_amount}
+            # offer_id finds how that price was worked out, in the quotes table.
+            price = {"asset": asset, "amount": taken.price_amount, "offer_id": taken.id}
         self._store.set_status(
             contract.launcher_id,
             store.SOLD,
@@ -1033,7 +1053,14 @@ class OptionsBook:
             report.did(f"minting {label}")
             return  # one mint a step: the next waits for this one's change
 
-    def _offer(self, contract: store.Contract, ask: int, now: int, report: StepReport) -> None:
+    def _offer(
+        self,
+        contract: store.Contract,
+        ask: int,
+        now: int,
+        report: StepReport,
+        quote: quoting.AskQuote | None = None,
+    ) -> None:
         loaded = self._loaded.get(contract.launcher_id)
         if loaded is None or loaded.option is None:
             return
@@ -1120,10 +1147,15 @@ class OptionsBook:
             expires_at=draft.expires_at_seconds,
             bundle=pack_bundle(draft.coin_spends, signature),
             offer_text=text,
+            quote=None if quote is None or quote.units != ask else quote.as_record(),
             now=now,
         )
         price = ask / self._config.quote_unit_mojos
-        report.did(f"offering {contract.slot} ({name}) at {price:g}")
+        how = ""
+        if quote is not None:
+            floor = "on the floor; " if quote.set_by == "floor" else ""
+            how = f" ({floor}model value {quote.model:.4g} per XCH)"
+        report.did(f"offering {contract.slot} ({name}) at {price:g}{how}")
         if self._desk is not None and self._config.upload_offers:
             try:
                 upload = self._desk.upload_offer(text)
@@ -1231,6 +1263,11 @@ class OptionsBook:
                 self._step(now, report)
         except store.BusyError as exc:
             report.problem(f"step skipped: {exc}")
+        except Exception as exc:
+            # The caller decides what a failure means; the journal keeps that
+            # the book was running and failing, not idle.
+            self.journal(STEP_FAILED, f"{type(exc).__name__}: {exc}", now=now)
+            raise
         report.chain_requests = self._chain.requests - asked
         return report
 
@@ -1248,18 +1285,42 @@ class OptionsBook:
         why = self._wallet.not_ready()
         if why is not None:
             report.problem(why)
+        self._not_ready = why
         return why is None
+
+    def journal(
+        self, verdict: str, detail: str = "", market: Market | None = None, *, now: int
+    ) -> None:
+        """Keep what a step saw and made of it in the step journal, if it is news.
+
+        Never fails a step: the journal is a record, not something to act on.
+        """
+        try:
+            self._store.log_step(
+                verdict,
+                detail=detail,
+                spot=None if market is None else market.spot,
+                sigma=None if market is None else market.sigma,
+                bid=None if market is None else market.bid,
+                ask=None if market is None else market.ask,
+                spot_at=None if market is None else market.as_of,
+                now=now,
+            )
+        except Exception as exc:  # noqa: BLE001 - a full disk must not stop the book
+            log.warning("[options] the step journal could not be written: %s", exc)
 
     def _step(self, now: int, report: StepReport) -> None:
         act = not self._config.dry_run
         self._splash_down = False
         if not self._wallet_ready(report):
             report.problem("nothing done this step")
+            self.journal(WALLET_NOT_READY, self._not_ready or "", now=now)
             return
         self._look(now, report)
         self._settle_broadcasts(now, report, act=act)
         self._reconcile(now, report, act=act)
 
+        market: Market | None = None
         try:
             market = self._market()
             market.require_usable(
@@ -1272,9 +1333,23 @@ class OptionsBook:
             # No price, no quotes. Offers already out expire on their own.
             report.market_error = str(exc)
             report.problem(f"not quoting: {exc}")
+            self.journal(f"not quoting: {exc.reason}", str(exc), market, now=now)
             return
         report.market = market
         self._spot = market.spot
+        book = (
+            "no book"
+            if market.bid is None or market.ask is None
+            else (f"{market.bid:.4f}/{market.ask:.4f}")
+        )
+        log.info(
+            "[options] market: spot %.4f sigma %.2f dexie %s",
+            market.spot,
+            market.sigma,
+            book,
+            extra=REPORTED,
+        )
+        self.journal(store.QUOTING, market=market, now=now)
 
         plan = quoting.plan(self._config, market, self._store.contracts(), now)
         report.blocked = plan.blocked
@@ -1298,7 +1373,7 @@ class OptionsBook:
             contract = self._store.contract(launcher_id)
             if contract is None or contract.status != store.OPEN or launcher_id in busy:
                 continue
-            self._offer(contract, ask, now, report)
+            self._offer(contract, ask, now, report, plan.quotes.get(launcher_id))
 
     def refresh(self) -> StepReport:
         """Bring the book up to date with the chain. Signs nothing and sends nothing."""

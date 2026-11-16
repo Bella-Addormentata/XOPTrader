@@ -584,7 +584,11 @@ def test_a_sale_is_recorded_and_the_slot_is_refilled() -> None:
     assert rig.store.contract(call.launcher_id).status == store.SOLD
     assert rig.maker.balance(rig.usd) == usd_before + offer.price_amount
     (sold,) = rig.events("sold")
-    assert sold.detail == {"asset": rig.usd.hex(), "amount": offer.price_amount}
+    assert sold.detail == {
+        "asset": rig.usd.hex(),
+        "amount": offer.price_amount,
+        "offer_id": offer.id,
+    }
     assert [row.status for row in rig.store.offers(call.launcher_id)].count("taken") == 1
     # The slot is empty again, so a new call is minted in its place.
     replacement = _by_side(rig, "call", store.MINTING, store.OPEN)
@@ -632,7 +636,7 @@ def test_sold_contract_is_clawed_back_after_expiry() -> None:
     assert rig.store.contract(call.launcher_id).status == store.CLOSED
     assert rig.maker.balance() == xch_before + 20 * XCH
     (returned,) = rig.events("collateral_returned")
-    assert returned.detail == {"asset": None, "amount": 20 * XCH, "by": store.CLAWBACK}
+    assert returned.detail == {"asset": None, "amount": 20 * XCH, "by": store.CLAWBACK, "fee": 0}
 
 
 def test_unsold_contracts_are_retired_before_expiry_and_offers_stop() -> None:
@@ -950,7 +954,7 @@ def _collateral_came_home_by_clawback(rig: Rig, call: store.Contract) -> None:
     # The collateral is not left locked behind a cancel the chain will refuse.
     assert rig.store.contract(call.launcher_id).status == store.CLOSED
     (returned,) = rig.events("collateral_returned")
-    assert returned.detail == {"asset": None, "amount": 20 * XCH, "by": store.CLAWBACK}
+    assert returned.detail == {"asset": None, "amount": 20 * XCH, "by": store.CLAWBACK, "fee": 0}
     assert rig.maker.balance() == 500 * XCH - builder.OPTION_COIN_AMOUNT
     assert {row.kind: row.status for row in rig.store.broadcasts(None)} == {
         store.MINT: "confirmed",
@@ -1165,7 +1169,11 @@ def test_a_sale_and_an_exercise_between_two_steps_are_both_booked() -> None:
     kinds = [event.kind for event in rig.store.events(call.launcher_id)]
     assert kinds == ["collateral_locked", "sold", "exercised"]
     (sold,) = rig.events("sold")
-    assert sold.detail == {"asset": rig.usd.hex(), "amount": offer.price_amount}
+    assert sold.detail == {
+        "asset": rig.usd.hex(),
+        "amount": offer.price_amount,
+        "offer_id": offer.id,
+    }
     statuses = [row.status for row in rig.store.offers(call.launcher_id)]
     assert statuses.count("taken") == 1 and "live" not in statuses
     assert rig.store.offers(call.launcher_id)[-1].id == offer.id
@@ -1194,7 +1202,11 @@ def test_a_sale_is_not_booked_without_its_premium_while_the_chain_is_unreadable(
     rig.steps(1)
 
     (sold,) = rig.events("sold")
-    assert sold.detail == {"asset": rig.usd.hex(), "amount": offer.price_amount}
+    assert sold.detail == {
+        "asset": rig.usd.hex(),
+        "amount": offer.price_amount,
+        "offer_id": offer.id,
+    }
 
 
 # ---------------------------------------------------------------------------

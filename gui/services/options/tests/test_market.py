@@ -223,3 +223,78 @@ def test_the_book_is_asked_for_best_price_first() -> None:
     _source(feeds).read()
     book = [url for url in feeds.calls if "/v1/offers" in url]
     assert len(book) == 2 and all("sort=price" in url for url in book)
+
+
+# ---------------------------------------------------------------------------
+# Refusals carry a short reason; our own offers are not liquidity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "view, now, reason",
+    [
+        (_view(), 2000.0, market.STALE),
+        (_view(bid=None), 1000.0, market.NO_BOOK),
+        (_view(bid=1.14, ask=1.13), 1000.0, market.CROSSED),
+        (_view(bid=0.90, ask=1.30), 1000.0, market.TOO_WIDE),
+        (_view(spot=1.20), 1000.0, market.OFF_PEG),
+    ],
+)
+def test_a_refusal_names_its_reason_in_words_that_do_not_change(
+    view: market.Market, now: float, reason: str
+) -> None:
+    # The journal groups stops by these, so a spot that moves a cent does not
+    # look like a new kind of stop.
+    with pytest.raises(market.MarketError) as caught:
+        view.require_usable(now=now, max_age_seconds=600, max_spread_pct=10, require_book=True)
+    assert caught.value.reason == reason
+
+
+def test_a_feed_failure_is_market_data_unavailable() -> None:
+    feeds = Feeds()
+    feeds.fail = "simple/price"
+    with pytest.raises(market.MarketError) as caught:
+        _source(feeds).read()
+    assert caught.value.reason == market.NO_DATA
+
+
+def _owned(offer: dict, trade_id: str) -> dict:
+    return {**offer, "trade_id": trade_id}
+
+
+def test_the_wallets_own_offers_are_left_out_of_the_range() -> None:
+    # On 2026-11-15 the engine's resting offers, left on Dexie while it was
+    # stopped, were the edges of the range all evening.
+    feeds = Feeds()
+    ours = "0x" + "ab" * 32
+    feeds.asks = [_owned(_offer("XCH", 100.0, 110.0), ours), _offer("XCH", 100.0, 113.0)]
+    feeds.bids = [_owned(_offer("wUSDC.b", 112.0, 100.0), "0x" + "cd" * 32)]
+    feeds.bids.append(_offer("wUSDC.b", 109.0, 100.0))
+
+    counted = _source(feeds).read()
+    source = _source(feeds, own_offers=lambda: [bytes.fromhex("ab" * 32)])
+    mine_left_out = source.read()
+
+    assert counted.ask == pytest.approx(1.10)
+    assert mine_left_out.ask == pytest.approx(1.13)
+    assert mine_left_out.bid == counted.bid == pytest.approx(1.12)  # not ours: still counted
+    assert source.left_out == 1
+
+
+def test_if_the_wallet_cannot_list_its_offers_every_offer_counts(caplog) -> None:
+    feeds = Feeds()
+    feeds.asks = [_owned(_offer("XCH", 100.0, 110.0), "0x" + "ab" * 32)]
+    asked: list[int] = []
+
+    def failing() -> list[bytes]:
+        asked.append(1)
+        raise RuntimeError("wallet down")
+
+    source = _source(feeds, own_offers=failing)
+    with caplog.at_level("WARNING"):
+        first = source.read()
+        source.read()
+
+    assert first.ask == pytest.approx(1.10)  # as if nothing were known to be ours
+    assert len(asked) == 2  # asked every read...
+    assert sum("could not ask the wallet" in r.message for r in caplog.records) == 1  # ...said once

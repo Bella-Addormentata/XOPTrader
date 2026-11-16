@@ -21,8 +21,20 @@ Whoever signs or spends holds it, so two processes over one database cannot
 both plan from the same rows and mint the same slot twice.
 
 The ``events`` table is an append-only log of what happened to our money (a
-mint locked collateral, a premium arrived, a contract was exercised). It is
-what an accounting integration would read; nothing reads it yet.
+mint locked collateral, a premium arrived, a contract was exercised), with the
+fee each confirmed transaction paid. ``python -m gui.services.options report``
+reads it, and an accounting integration would.
+
+Two journals say why the book did what it did, so a run can be reviewed after
+the fact instead of re-derived from terminal output:
+
+* ``quotes`` keeps, beside each offer, everything its price was worked out from
+  (spot, volatility, model value, carry, markup, the floor and which of them
+  set the price). One row per offer, written in the same transaction.
+* ``step_log`` keeps the market as each step saw it and the step's verdict
+  (quoting, or why not). A row is written when the verdict changes, when a
+  price moves more than :data:`JOURNAL_MOVE`, and otherwise every
+  :data:`JOURNAL_EVERY_SECONDS`, so it stays small however long the book runs.
 
 ``chain_facts`` is not a record of ours at all. It keeps what was read from the
 chain about spent coins (that a coin was spent, at what height, and how), so
@@ -150,11 +162,79 @@ CREATE TABLE IF NOT EXISTS events (
     kind        TEXT NOT NULL,
     detail      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS quotes (
+    offer_id          INTEGER PRIMARY KEY REFERENCES offers (id),
+    launcher_id       TEXT NOT NULL,
+    at                INTEGER NOT NULL,
+    spot              REAL NOT NULL,
+    sigma             REAL NOT NULL,
+    strike            REAL NOT NULL,
+    seconds_to_expiry INTEGER NOT NULL,
+    model             REAL NOT NULL,
+    carry             REAL NOT NULL,
+    markup            REAL NOT NULL,
+    floor             REAL NOT NULL,
+    per_xch           REAL NOT NULL,
+    units             INTEGER NOT NULL,
+    set_by            TEXT NOT NULL,
+    delta             REAL NOT NULL,
+    lean              REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS step_log (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    at      INTEGER NOT NULL,
+    verdict TEXT NOT NULL,
+    detail  TEXT NOT NULL DEFAULT '',
+    spot    REAL,
+    sigma   REAL,
+    bid     REAL,
+    ask     REAL,
+    spot_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_step_log_at ON step_log (at);
 """
+
+#: ``step_log`` gets a row when a price moves by more than this fraction...
+JOURNAL_MOVE = 0.005
+#: ...and at least this often while nothing changes.
+JOURNAL_EVERY_SECONDS = 900
+
+#: The verdict of a step that went on to quote.
+QUOTING = "quoting"
+
+_QUOTE_COLUMNS = (
+    "spot",
+    "sigma",
+    "strike",
+    "seconds_to_expiry",
+    "model",
+    "carry",
+    "markup",
+    "floor",
+    "per_xch",
+    "units",
+    "set_by",
+    "delta",
+    "lean",
+)
+
+
+_FOREVER = 2**62
 
 
 class BusyError(RuntimeError):
     """Another process is acting on this database."""
+
+
+def _moved(before: float | None, after: float | None, fraction: float) -> bool:
+    """Whether a price changed by more than ``fraction``, or appeared, or went away."""
+    if before is None or after is None:
+        return before is not after
+    if before == 0:
+        return after != 0
+    return abs(after - before) / abs(before) > fraction
 
 
 def _hex(value: bytes | None) -> str | None:
@@ -225,6 +305,43 @@ class Event:
     launcher_id: bytes | None
     kind: str
     detail: dict
+
+
+@dataclasses.dataclass(frozen=True)
+class QuoteRow:
+    """How one offer's price was worked out. Per-XCH figures in the quote asset."""
+
+    offer_id: int
+    launcher_id: bytes
+    at: int
+    spot: float
+    sigma: float
+    strike: float
+    seconds_to_expiry: int
+    model: float
+    carry: float
+    markup: float
+    floor: float
+    per_xch: float
+    units: int
+    set_by: str  # "model" or "floor"
+    delta: float
+    lean: float
+
+
+@dataclasses.dataclass(frozen=True)
+class StepLogRow:
+    """The market as a step saw it, and what the step made of it."""
+
+    id: int
+    at: int
+    verdict: str  # QUOTING, or why not, in a few words that do not change step to step
+    detail: str  # the full message, numbers and all
+    spot: float | None
+    sigma: float | None
+    bid: float | None
+    ask: float | None
+    spot_at: int | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -537,8 +654,14 @@ class OptionStore:
         expires_at: int | None,
         bundle: bytes,
         offer_text: str,
+        quote: dict[str, Any] | None = None,
         now: int | None = None,
     ) -> int:
+        """Record an offer, and with ``quote`` how its price was worked out, in one write.
+
+        ``quote`` holds the fields of :class:`QuoteRow` after ``at`` (as
+        ``quoting.AskQuote.as_record`` gives them).
+        """
         now = int(time.time()) if now is None else int(now)
         with self._write() as db:
             cursor = db.execute(
@@ -556,7 +679,44 @@ class OptionStore:
                     now,
                 ),
             )
-            return int(cursor.lastrowid or 0)
+            offer_id = int(cursor.lastrowid or 0)
+            if quote is not None:
+                columns = ",".join(_QUOTE_COLUMNS)
+                marks = ",".join("?" for _ in range(len(_QUOTE_COLUMNS) + 3))
+                db.execute(
+                    f"INSERT INTO quotes (offer_id, launcher_id, at, {columns})"  # noqa: S608
+                    f" VALUES ({marks})",  # fixed column names only
+                    (offer_id, _hex(launcher_id), now, *(quote[name] for name in _QUOTE_COLUMNS)),
+                )
+            return offer_id
+
+    def quotes(self, since: int | None = None) -> dict[int, QuoteRow]:
+        """How each offer's price was worked out, by offer id (offers made since ``since``)."""
+        rows = self._db.execute(
+            "SELECT * FROM quotes WHERE at >= ? ORDER BY offer_id",
+            (0 if since is None else int(since),),
+        )
+        return {
+            int(row["offer_id"]): QuoteRow(
+                offer_id=int(row["offer_id"]),
+                launcher_id=bytes.fromhex(row["launcher_id"]),
+                at=int(row["at"]),
+                spot=float(row["spot"]),
+                sigma=float(row["sigma"]),
+                strike=float(row["strike"]),
+                seconds_to_expiry=int(row["seconds_to_expiry"]),
+                model=float(row["model"]),
+                carry=float(row["carry"]),
+                markup=float(row["markup"]),
+                floor=float(row["floor"]),
+                per_xch=float(row["per_xch"]),
+                units=int(row["units"]),
+                set_by=row["set_by"],
+                delta=float(row["delta"]),
+                lean=float(row["lean"]),
+            )
+            for row in rows
+        }
 
     @staticmethod
     def _offer(row: sqlite3.Row) -> OfferRow:
@@ -794,6 +954,97 @@ class OptionStore:
             )
             for row in rows
         ]
+
+    # -- the step journal -----------------------------------------------------
+
+    def log_step(
+        self,
+        verdict: str,
+        *,
+        detail: str = "",
+        spot: float | None = None,
+        sigma: float | None = None,
+        bid: float | None = None,
+        ask: float | None = None,
+        spot_at: float | None = None,
+        now: int | None = None,
+        force: bool = False,
+    ) -> bool:
+        """Journal a step's market and verdict, if it says something new. True if written.
+
+        Something new is a different verdict, a price that moved more than
+        :data:`JOURNAL_MOVE` since the last row, or a last row older than
+        :data:`JOURNAL_EVERY_SECONDS`. ``force`` writes regardless.
+        """
+        now = int(time.time()) if now is None else int(now)
+        last = self.last_step()
+        if not force and last is not None and last.verdict == verdict:
+            fresh = now - last.at < JOURNAL_EVERY_SECONDS
+            if fresh and not any(
+                _moved(before, after, JOURNAL_MOVE)
+                for before, after in ((last.spot, spot), (last.bid, bid), (last.ask, ask))
+            ):
+                return False
+        with self._write() as db:
+            db.execute(
+                "INSERT INTO step_log (at, verdict, detail, spot, sigma, bid, ask, spot_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    now,
+                    verdict,
+                    detail,
+                    spot,
+                    sigma,
+                    bid,
+                    ask,
+                    None if spot_at is None else int(spot_at),
+                ),
+            )
+        return True
+
+    @staticmethod
+    def _step_row(row: sqlite3.Row) -> StepLogRow:
+        def real(name: str) -> float | None:
+            return None if row[name] is None else float(row[name])
+
+        return StepLogRow(
+            id=int(row["id"]),
+            at=int(row["at"]),
+            verdict=row["verdict"],
+            detail=row["detail"] or "",
+            spot=real("spot"),
+            sigma=real("sigma"),
+            bid=real("bid"),
+            ask=real("ask"),
+            spot_at=None if row["spot_at"] is None else int(row["spot_at"]),
+        )
+
+    def last_step(self, before: int | None = None) -> StepLogRow | None:
+        """The newest journal row (at or before ``before``, if given)."""
+        if before is None:
+            row = self._db.execute("SELECT * FROM step_log ORDER BY id DESC LIMIT 1").fetchone()
+        else:
+            row = self._db.execute(
+                "SELECT * FROM step_log WHERE at <= ? ORDER BY at DESC, id DESC LIMIT 1",
+                (int(before),),
+            ).fetchone()
+        return None if row is None else self._step_row(row)
+
+    def steps(self, since: int = 0, until: int | None = None) -> list[StepLogRow]:
+        """Journal rows from ``since`` to ``until``, oldest first."""
+        rows = self._db.execute(
+            "SELECT * FROM step_log WHERE at >= ? AND at <= ? ORDER BY at, id",
+            (int(since), _FOREVER if until is None else int(until)),
+        )
+        return [self._step_row(row) for row in rows]
+
+    def first_record_at(self) -> int | None:
+        """When this book first recorded anything (a contract, an event or a journal row)."""
+        row = self._db.execute(
+            "SELECT MIN(at) FROM (SELECT MIN(created_at) AS at FROM contracts"
+            " UNION ALL SELECT MIN(at) FROM events UNION ALL SELECT MIN(at) FROM step_log)"
+        ).fetchone()
+        return None if row is None or row[0] is None else int(row[0])
 
     # -- what was read from the chain (a cache, not a record of ours) --------
 
