@@ -5,9 +5,9 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.49] — 2026-11-15 — the options book pays from the whole wallet
 
-### The options book can pay from the whole wallet
+### The options book can pay from the whole wallet (#233)
 
 `options.wallet.fund_from_wallet` (off by default) lets the book draw what
 its address is short of, in XCH or the quote asset, from the wallet's other
@@ -29,7 +29,7 @@ could not cancel.
 - `status` shows the XCH spendable elsewhere in the wallet.
 - `live-test`'s funding still comes from the options address only.
 
-### The options book finds its quote asset's wallet
+### The options book finds its quote asset's wallet (#233)
 
 The reference wallet answers `cat_get_asset_id` with a `0x` prefix
 (chia-blockchain 2.7.4), which the book's lookup refused, so it never found
