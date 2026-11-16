@@ -204,44 +204,27 @@ def _open_reason(still_open: list[store.Contract]) -> str | None:
     )
 
 
-#: How long past a transaction's ``valid_until`` the engine still waits for it.
-#: The chain checks ASSERT_BEFORE_SECONDS_ABSOLUTE against block timestamps,
-#: which can trail this machine's clock; ten minutes covers that with room.
-SETTLE_MARGIN = 600
-
-
-def _utc(seconds: float) -> str:
-    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(seconds))
-
-
-def _in_flight_reason(book_store: store.OptionStore, now: float) -> str | None:
+def _in_flight_reason(book_store: store.OptionStore) -> str | None:
     """Why the engine must wait for the book's own transactions, or None.
 
     Read for a book with ``options.wallet.engine_beside_open_contracts``: its
     open contracts do not hold the engine, but a transaction it has sent and
     the chain has not ruled on does. The book pushes bundles it built itself,
     so the wallet does not know their coins are being spent and could hand them
-    to an engine offer. A transaction with a ``valid_until`` can no longer
-    confirm once that has passed (plus :data:`SETTLE_MARGIN`), whatever the
-    record still says, and holds the engine only until then. One without it is
-    released only when a step reads its verdict from the chain.
+    to an engine offer. Every unresolved one (pending or stalled) holds the
+    engine until a step records its verdict -- confirmed, overtaken, or lapsed,
+    which the book decides only from the chain's own clock read 32 blocks deep
+    (``service._settle_broadcasts``), never from this machine's. A dry-run step
+    records verdicts too, so Rehearse is enough to settle them.
     """
-    waiting = [
-        row
-        for row in book_store.unresolved()
-        if row.valid_until is None or now < row.valid_until + SETTLE_MARGIN
-    ]
+    waiting = book_store.unresolved()
     if not waiting:
         return None
     kinds = ", ".join(sorted({row.kind for row in waiting}))
-    bounded = [row.valid_until for row in waiting if row.valid_until is not None]
-    until = ""
-    if len(bounded) == len(waiting):
-        until = f", at the latest until {_utc(max(bounded) + SETTLE_MARGIN)}"
     return (
         f"the options book has {len(waiting)} transaction(s) waiting to confirm ({kinds}). "
         "The engine waits so that its offers cannot pick the same coins: leave the book on "
-        f"(Live or Rehearse) until its record shows them settled{until}, then start the engine."
+        "(Live or Rehearse) until its record shows them settled, then start the engine."
     )
 
 
@@ -254,7 +237,7 @@ def _hold_reason(cfg: config.OptionsConfig, book_store: store.OptionStore) -> st
     the callers.
     """
     if cfg.wallet.engine_beside_open_contracts:
-        return _in_flight_reason(book_store, time.time())
+        return _in_flight_reason(book_store)
     return _open_reason(book_store.contracts(store.ACTIVE))
 
 

@@ -22,9 +22,10 @@ to the times the book acts:
   lock is still taken for the launch), and any transaction the book has sent
   that could still confirm. The book pushes bundles it built itself, so the
   wallet does not know those coins are being spent and could hand them to an
-  engine offer. A transaction stops holding the engine once its record shows
-  it settled, or at the latest 10 minutes past its `valid_until`, when it can
-  no longer confirm.
+  engine offer. A transaction holds the engine until a step records its
+  verdict: confirmed, overtaken, or lapsed by the chain's own clock, never
+  this machine's (from the Copilot review of #237). A Rehearse step records
+  verdicts too.
 - **Going Live still needs the engine stopped**, and every signature and push
   still checks for it.
 - It needs `options.wallet.fund_from_wallet: true`, and says so if that is

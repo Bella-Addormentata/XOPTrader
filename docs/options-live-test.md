@@ -158,8 +158,8 @@ goes:
    cancelled instead.
 2. Switch the book Off once it has done what you wanted. If it sent anything,
    leave it Live (or on Rehearse) until its record shows the transaction
-   settled: the engine waits for the book's transactions that could still
-   confirm, at most until 10 minutes past their `valid_until`.
+   settled: the engine waits for every transaction of the book's until a step
+   has recorded its verdict from the chain, which a Rehearse step does too.
 3. Start the engine. It trades beside the open contracts; collateral stays
    locked in them, and a sale or an exercise only adds to the wallet.
 4. After expiry, repeat 1 and 2 to claw the collateral back.

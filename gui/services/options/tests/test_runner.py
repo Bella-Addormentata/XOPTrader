@@ -380,10 +380,13 @@ def test_beside_open_contracts_the_engine_may_start_while_contracts_sit_open(tmp
     [
         (3600, None, True),  # a mint still in flight
         (3600, "stalled", True),  # stalled can still confirm
-        (None, None, True),  # no valid_until: only a verdict from the chain releases it
-        (-60, None, True),  # past valid_until, but block times can trail this clock
-        (-(runner.SETTLE_MARGIN + 60), None, False),  # can no longer confirm
-        (3600, "conflict", False),  # lost to another spend: settled
+        (None, None, True),  # no valid_until at all
+        # Past valid_until by this machine's clock, long ago or just now: only
+        # a verdict the book reads from the chain's own clock releases it.
+        (-60, None, True),
+        (-86_400, None, True),
+        (3600, "confirmed", False),  # it confirmed: its coins are spent
+        (3600, "conflict", False),  # overtaken or lapsed: its coins are free
     ],
 )
 def test_beside_open_contracts_the_book_s_transactions_in_flight_hold_the_engine(
@@ -398,8 +401,8 @@ def test_beside_open_contracts_the_book_s_transactions_in_flight_hold_the_engine
         pass
     if holds:
         assert why is not None and "1 transaction(s) waiting to confirm (mint)" in why
+        assert "until its record shows them settled" in why
         assert in_window == why
-        assert ("at the latest until" in why) is (until is not None)
     else:
         assert why is None and in_window is None
 

@@ -1712,9 +1712,10 @@ options:
     #     still waits for the engine to stop);
     #   - a step is in progress;
     #   - a transaction the book sent could still confirm (pending or stalled,
-    #     until its valid_until plus 10 minutes): the wallet does not know
-    #     those coins are being spent and could hand them to an engine offer.
-    #     Leave the book Live or on Rehearse until its record shows them settled.
+    #     until a step records its verdict from the chain): the wallet does not
+    #     know those coins are being spent and could hand them to an engine
+    #     offer. Leave the book Live or on Rehearse until its record shows them
+    #     settled; a Rehearse step records verdicts too.
     # Going Live still needs the engine stopped. The engine can spend the loose
     # coins at `address` while it runs (premiums, change), so this REQUIRES
     # fund_from_wallet: true -- the book then pays from the rest of the wallet
