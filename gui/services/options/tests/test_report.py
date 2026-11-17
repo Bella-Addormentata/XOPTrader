@@ -226,6 +226,22 @@ def test_steps_half_an_hour_apart_count_as_running_when_the_journal_says_so() ->
     assert report.summarize(untimed, UNIT, T0, UNTIL).quoting_seconds == 6 * 1200
 
 
+def test_steps_a_little_under_15_minutes_apart_count_as_running() -> None:
+    # Unchanged, the journal writes on the first step 15 minutes after its
+    # last row: with steps 800 s apart that is every other step, so its rows
+    # are 1,600 s apart. They are a running book, and one spell of a refusal.
+    quoting, held = store.OptionStore(":memory:"), store.OptionStore(":memory:")
+    for at in range(T0, T0 + 3200 + 1, 800):
+        quoting.log_step(store.QUOTING, interval=800, now=at)
+        held.log_step("not quoting: Dexie book too thin", interval=800, now=at)
+
+    assert [row.at - T0 for row in quoting.steps(T0)] == [0, 1600, 3200]
+    assert report.summarize(quoting, UNIT, T0, T0 + 3200).quoting_seconds == 3200
+    assert report.summarize(held, UNIT, T0, T0 + 3200).held_back == {
+        "not quoting: Dexie book too thin": (3200, 1)
+    }
+
+
 def test_a_step_that_keeps_failing_is_one_spell() -> None:
     # Each failed step journals its market as quoting, then the failure, with
     # the same time. The quoting rows cover nothing and split nothing.

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import csv
 import dataclasses
+import math
 import re
 import time
 from collections.abc import Iterable
@@ -32,12 +33,11 @@ from pathlib import Path
 from gui.services.options import store
 from gui.services.options.config import XCH_MOJOS
 
-#: Longer than this between two journal rows means the book was not running in
-#: between: while it runs it writes at least every ``JOURNAL_EVERY_SECONDS``
-#: (on the first step after that), or every step when steps are further apart
-#: than that. A row says how far apart they were meant to be; this is the slack.
+#: Time the steps themselves take, on top of the interval between them.
 _STEP_SLACK_SECONDS = 300
-_RUNNING_GAP_SECONDS = store.JOURNAL_EVERY_SECONDS + _STEP_SLACK_SECONDS
+#: The step interval taken for a row journaled without one (a one-off step, or
+#: a book from before the interval was kept): ``run``'s default.
+_ASSUMED_INTERVAL_SECONDS = 60
 
 _SPAN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([mhdw])\s*$", re.IGNORECASE)
 _SPAN_SECONDS = {"m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
@@ -127,6 +127,19 @@ def _overlap(start: float, end: float, since: float, until: float) -> float:
     return max(0.0, min(end, until) - max(start, since))
 
 
+def _running_gap(interval: int | None) -> int:
+    """The longest a book that is still running goes between two journal rows.
+
+    An unchanged book writes on its first step at least
+    ``JOURNAL_EVERY_SECONDS`` after the last row (every step, when steps are
+    further apart than that). Steps come a whole number of intervals apart,
+    so that step can be most of an interval later.
+    """
+    every = interval or _ASSUMED_INTERVAL_SECONDS
+    steps = math.ceil(store.JOURNAL_EVERY_SECONDS / every)
+    return steps * every + _STEP_SLACK_SECONDS
+
+
 def _journal(rows: list[store.StepLogRow], since: int, until: int) -> tuple[int, int, dict]:
     """Seconds covered, seconds quoting, and the held-back verdicts with their spells."""
     covered = quoting = 0
@@ -140,8 +153,7 @@ def _journal(rows: list[store.StepLogRow], since: int, until: int) -> tuple[int,
             continue
         # A row speaks for the time until the next one, unless the gap is so
         # long that the book cannot have been running through it.
-        gap = max(_RUNNING_GAP_SECONDS, (row.interval or 0) + _STEP_SLACK_SECONDS)
-        end = min(after, row.at + gap)
+        end = min(after, row.at + _running_gap(row.interval))
         seconds = int(_overlap(row.at, end, since, until))
         if seconds > 0:
             covered += seconds
