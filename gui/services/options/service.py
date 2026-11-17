@@ -1541,8 +1541,9 @@ class OptionsBook:
                     try:
                         if self._held(asset_id) >= want * (1.0 - target.tolerance):
                             self._store.remember(key, "")
-                    except builder.OptionBuildError:
-                        pass
+                    except builder.OptionBuildError as exc:
+                        # The address cannot be read this step: keep waiting.
+                        log.debug("[options] %s top-up still uncertain: %s", what, exc)
                     continue
                 self._store.remember(key, "")
                 report.problem(f"an uncertain {what} top-up from an hour ago is forgotten")

@@ -403,7 +403,6 @@ def test_locked_collateral_counts_toward_the_target() -> None:
 
 def test_listing_that_is_not_an_array_fails_closed() -> None:
     wallet = FakeWallet()
-    client = WalletClient({"host": "localhost", "port": 9256}, poster=wallet)
     original = wallet.__call__
 
     def no_records(url, body):
