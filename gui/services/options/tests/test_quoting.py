@@ -318,3 +318,92 @@ def test_a_small_contract_s_target_is_the_strike_it_will_really_have() -> None:
     plan = quoting.plan(cfg, view, [minted], NOW)
     assert plan.retire == () and plan.mint == ()
     assert list(plan.asks) == [minted.launcher_id]
+
+
+# ---------------------------------------------------------------------------
+# The record kept with each offer
+# ---------------------------------------------------------------------------
+
+
+def _held(
+    strike_pct: int, days: float, spot: float = 1.15, **pricing: float
+) -> tuple[config.OptionsConfig, store.Contract]:
+    """An unsold 0.5 XCH call of the grid, as the first live run held them."""
+    expiry = NOW + int(days * DAY)
+    cfg = _config(
+        contract_xch=0.5,
+        expiries=[expiry],
+        call_strikes_pct=[strike_pct],
+        put_strikes_pct=[],
+        pricing=pricing,
+    )
+    (wanted,) = quoting.plan(cfg, _market(spot), [], NOW).mint
+    return cfg, _contract(wanted, store.OPEN, 7)
+
+
+def test_an_ask_on_the_floor_says_so_and_keeps_the_model_value_apart() -> None:
+    # The first live run's C120: 0.5 XCH at 1.40, under two days out.
+    cfg, contract = _held(120, 1.7)
+    view = market.Market(spot=1.15, sigma=0.99, bid=1.14, ask=1.17, as_of=NOW)
+
+    quote = quoting.ask_quote(contract, view, cfg, NOW, 0.0)
+
+    assert quote.strike == pytest.approx(1.40)
+    assert quote.set_by == "floor"
+    assert quote.per_xch == pytest.approx(cfg.pricing.min_premium)
+    # The model value is a small part of the ask. The markup carries it the
+    # rest of the way to the minimum premium, and the record adds up to it.
+    assert quote.model + quote.carry < cfg.pricing.min_premium / 10
+    assert quote.model + quote.carry + quote.markup == pytest.approx(cfg.pricing.min_premium)
+    assert quote.units == quoting.ask_mojos(contract, view, cfg, NOW, 0.0) == 5
+    assert (quote.spot, quote.sigma, quote.floor) == (1.15, 0.99, cfg.pricing.min_premium)
+
+
+def test_an_ask_above_the_floor_is_set_by_the_model() -> None:
+    cfg, contract = _held(105, 14)
+    view = market.Market(spot=1.15, sigma=0.99, bid=1.14, ask=1.17, as_of=NOW)
+
+    quote = quoting.ask_quote(contract, view, cfg, NOW, 0.0)
+
+    assert quote.set_by == "model"
+    assert quote.per_xch == pytest.approx(quote.model + quote.carry + quote.markup)
+    assert quote.per_xch > cfg.pricing.min_premium
+    record = quote.as_record()
+    assert record["set_by"] == "model" and record["units"] == quote.units
+
+
+def test_steering_that_lifts_a_floor_ask_above_the_floor_is_the_model_s_doing() -> None:
+    # A book leaning short makes calls dearer. Steering scales the top-up to
+    # the minimum premium as well, so this ask ends up above the floor, and
+    # the record still adds up to what was asked.
+    cfg, contract = _held(120, 1.7, steer_strength=0.5)
+    view = market.Market(spot=1.15, sigma=0.99, bid=1.14, ask=1.17, as_of=NOW)
+
+    quote = quoting.ask_quote(contract, view, cfg, NOW, -1.0)
+
+    assert quote.set_by == "model"
+    assert quote.per_xch > cfg.pricing.min_premium
+    assert quote.per_xch == pytest.approx(quote.model + quote.carry + quote.markup)
+    assert quote.units == quoting.ask_mojos(contract, view, cfg, NOW, -1.0) > 5
+
+
+def test_steering_that_lowers_a_model_ask_onto_the_floor_is_the_floor_s_doing() -> None:
+    # A book leaning long makes calls cheaper, here down to the minimum premium.
+    cfg, contract = _held(120, 7, markup_fraction=0.5, steer_strength=0.9)
+    view = market.Market(spot=1.15, sigma=0.99, bid=1.14, ask=1.17, as_of=NOW)
+    assert quoting.ask_quote(contract, view, cfg, NOW, 0.0).set_by == "model"
+
+    quote = quoting.ask_quote(contract, view, cfg, NOW, 1.0)
+
+    assert quote.set_by == "floor"
+    assert quote.per_xch == pytest.approx(cfg.pricing.min_premium)
+    assert quote.model + quote.carry + quote.markup < cfg.pricing.min_premium
+
+
+def test_the_plan_carries_the_quote_behind_every_ask() -> None:
+    cfg, contract = _held(105, 14)
+
+    plan = quoting.plan(cfg, _market(1.15), [contract], NOW)
+
+    assert set(plan.quotes) == set(plan.asks) == {contract.launcher_id}
+    assert plan.quotes[contract.launcher_id].units == plan.asks[contract.launcher_id]

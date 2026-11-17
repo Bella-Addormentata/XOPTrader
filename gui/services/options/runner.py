@@ -16,7 +16,9 @@ What runs is what the command line runs:
   always a rehearsal, and Live is live only because the operator chose it;
 * with ``options.wallet.share_trading_wallet``, the engine check before every
   step and every signature (:mod:`engine_guard`). A live step is refused while
-  the engine runs, and Live cannot be switched on while it does.
+  the engine runs, and Live cannot be switched on while it does;
+* the book's own log file beside its database (``options_jobs.log``), and the
+  step journal in it, as the command line keeps them.
 
 The other direction, the engine waiting for the book, is
 :func:`engine_start_window`: EngineBridge holds it while it checks and
@@ -46,6 +48,7 @@ from pathlib import Path
 from typing import Any
 
 from gui.services.options import config, engine_guard, runtime, store
+from gui.services.options.service import ENGINE_REFUSED
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +59,8 @@ DEFAULT_INTERVAL = 60.0
 SWITCH_WAIT = 2.0
 #: Lines of recent activity kept for the panel.
 _HISTORY = 200
+#: The book's log file takes what this package logs, not the whole app's log.
+_PACKAGE_LOGGER = "gui.services.options"
 
 
 class Mode(enum.StrEnum):
@@ -449,6 +454,25 @@ class OptionsRunner:
 
     # -- the loop (its own thread) -------------------------------------------
 
+    def _open_log(self, cfg: config.OptionsConfig, mode: Mode) -> logging.Handler | None:
+        """The book's own log file, as the command line writes it, for the length of a run.
+
+        It takes what the options modules log, beside the app's own log, which
+        keeps everything. A file that cannot be opened is reported and the run
+        goes on without it.
+        """
+        path = runtime.log_path(cfg)
+        if path is None:
+            return None
+        try:
+            handler = runtime.log_handler(path)
+        except OSError as exc:
+            log.warning("options: the book's log file %s could not be opened: %s", path, exc)
+            return None
+        logging.getLogger(_PACKAGE_LOGGER).addHandler(handler)
+        log.info("[options] %s run started from the app (config %s)", mode.value, self._config_path)
+        return handler
+
     def _engine(self, cfg: config.OptionsConfig) -> engine_guard.EngineState:
         check = self._engine_state or engine_guard.engine_state
         return check(cfg.wallet.engine_metrics_url)
@@ -476,11 +500,17 @@ class OptionsRunner:
                         self._snapshot, mode=Mode.OFF, held=f"could not start: {exc}"
                     )
                 return
+            book.step_interval = self._interval  # kept in the journal for the report
+            book_log = self._open_log(cfg, mode)
             try:
                 while not stop.is_set():
                     self._one_step(cfg, mode, book, book_store)
                     stop.wait(self._interval)
             finally:
+                if book_log is not None:
+                    log.info("[options] %s run stopped", mode.value)
+                    logging.getLogger(_PACKAGE_LOGGER).removeHandler(book_log)
+                    book_log.close()
                 try:
                     book_store.close()
                 except Exception as exc:  # noqa: BLE001 - closing is best effort
@@ -503,6 +533,8 @@ class OptionsRunner:
                     "refused, trading engine up: a live step would sign from the wallet the "
                     f"engine trades through, and the engine is {engine}"
                 )
+                # As the command line does: the step journal counts the time held.
+                book.journal(ENGINE_REFUSED, engine, now=int(self._clock()))
         report = None
         if not held:
             try:

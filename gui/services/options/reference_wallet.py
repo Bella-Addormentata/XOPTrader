@@ -57,6 +57,11 @@ WalletRpc = Callable[[str, dict], dict]
 # transaction signature) only to make the wallet reveal an address's key.
 _KEY_LOOKUP_MESSAGE = "XOPTrader option key lookup"
 
+# Open offers asked of the wallet per page, and the most pages read: far more
+# offers than one wallet keeps open.
+_OFFER_PAGE = 1000
+_MAX_OFFER_PAGES = 20
+
 
 def _sdk() -> Any:
     try:
@@ -284,6 +289,41 @@ class ReferenceWallet:
         except (SigningError, KeyError, TypeError, ValueError):
             return None
         return rate if rate >= 0 else None
+
+    def open_offer_ids(self) -> list[bytes]:
+        """Trade ids of the offers this wallet made that are still open.
+
+        With ``options.wallet.share_trading_wallet`` these are the engine's
+        resting offers. The market view leaves them out of the Dexie range:
+        they are not liquidity the book could ever trade against. Taken,
+        cancelled and completed offers are not asked for. The wallet answers a
+        page at a time; pages are read until one comes back short.
+        """
+        found: dict[bytes, None] = {}  # in the wallet's order, each once
+        start = 0
+        for _ in range(_MAX_OFFER_PAGES):
+            answer = self._call(
+                "get_all_offers",
+                {
+                    "start": start,
+                    "end": start + _OFFER_PAGE,
+                    "exclude_my_offers": False,
+                    "exclude_taken_offers": True,
+                    "include_completed": False,
+                },
+            )
+            records = answer.get("trade_records") or []
+            if not isinstance(records, list):
+                raise SigningError("wallet get_all_offers returned no list of offers")
+            before = len(found)
+            for record in records:
+                if isinstance(record, dict) and record.get("is_my_offer", True) is not False:
+                    found.setdefault(_unhex(record.get("trade_id"), "trade_id"), None)
+            # A page that adds nothing means a wallet that does not page: stop.
+            if len(records) < _OFFER_PAGE or len(found) == before:
+                break
+            start += _OFFER_PAGE
+        return list(found)
 
     def push(self, coin_spends: Sequence[CoinSpend], aggregated_signature: bytes) -> bytes:
         """Hand a signed bundle to the wallet's full-node peer.

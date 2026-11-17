@@ -15,6 +15,7 @@ import shutil
 import ssl
 import subprocess
 import threading
+import types
 from typing import Any
 
 import pytest
@@ -361,7 +362,11 @@ def test_live_test_puts_its_contract_and_every_bundle_on_record(tmp_path, monkey
         (store.WITHDRAW, "confirmed"),
         (store.CANCEL, "confirmed"),
     ]
-    assert [event.kind for event in book.events()] == ["collateral_locked", "collateral_returned"]
+    assert [event.kind for event in book.events()] == [
+        "collateral_locked",
+        "offers_withdrawn",
+        "collateral_returned",
+    ]
     (offer,) = book.offers()
     assert offer.status == "dead" and offer.price_amount == DUST
     assert book.unresolved() == []
@@ -573,7 +578,8 @@ def _no_feed() -> market.Market:
 def test_run_stamps_each_step_with_the_time_and_stops_cleanly(tmp_path, monkeypatch, capsys):
     usd = b"\x07" * 32
     cfg = _config(tmp_path, usd, dry_run=True)
-    monkeypatch.setattr(cli, "build", lambda _cfg: (object(), None, None))
+    book = types.SimpleNamespace()
+    monkeypatch.setattr(cli, "build", lambda _cfg: (book, None, None))
     steps: list[int] = []
     monkeypatch.setattr(cli, "_guarded_step", lambda *_: steps.append(1) or True)
 
@@ -587,6 +593,7 @@ def test_run_stamps_each_step_with_the_time_and_stops_cleanly(tmp_path, monkeypa
 
     out = capsys.readouterr().out
     assert len(steps) == 2 and out.count("--- step at 20") == 2 and out.endswith("stopped\n")
+    assert book.step_interval == 60.0  # the journal keeps it, for the report
 
 
 def test_without_the_opt_in_the_engine_is_never_asked_about(tmp_path, monkeypatch, capsys) -> None:
@@ -663,7 +670,8 @@ def test_a_live_test_offer_that_is_taken_is_booked_and_clawed_back_later(
     book, (contract,) = _test_contracts(cfg)
     assert contract.status == store.SOLD
     (sold,) = [event for event in book.events() if event.kind == "sold"]
-    assert sold.detail == {"asset": None, "amount": DUST}
+    (taken,) = [offer for offer in book.offers() if offer.status == "taken"]
+    assert sold.detail == {"asset": None, "amount": DUST, "offer_id": taken.id}
     assert maker.balance() == before - 1  # the premium came in for the collateral locked
     book.close()
 

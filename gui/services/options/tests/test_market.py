@@ -223,3 +223,136 @@ def test_the_book_is_asked_for_best_price_first() -> None:
     _source(feeds).read()
     book = [url for url in feeds.calls if "/v1/offers" in url]
     assert len(book) == 2 and all("sort=price" in url for url in book)
+
+
+# ---------------------------------------------------------------------------
+# Refusals carry a short reason; our own offers are not liquidity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "view, now, reason",
+    [
+        (_view(), 2000.0, market.STALE),
+        (_view(bid=None), 1000.0, market.NO_BOOK),
+        (_view(bid=1.14, ask=1.13), 1000.0, market.CROSSED),
+        (_view(bid=0.90, ask=1.30), 1000.0, market.TOO_WIDE),
+        (_view(spot=1.20), 1000.0, market.OFF_PEG),
+    ],
+)
+def test_a_refusal_names_its_reason_in_words_that_do_not_change(
+    view: market.Market, now: float, reason: str
+) -> None:
+    # The journal groups stops by these, so a spot that moves a cent does not
+    # look like a new kind of stop.
+    with pytest.raises(market.MarketError) as caught:
+        view.require_usable(now=now, max_age_seconds=600, max_spread_pct=10, require_book=True)
+    assert caught.value.reason == reason
+
+
+def test_a_feed_failure_is_market_data_unavailable() -> None:
+    feeds = Feeds()
+    feeds.fail = "simple/price"
+    with pytest.raises(market.MarketError) as caught:
+        _source(feeds).read()
+    assert caught.value.reason == market.NO_DATA
+
+
+def _owned(offer: dict, trade_id: str) -> dict:
+    return {**offer, "trade_id": trade_id}
+
+
+def test_the_wallets_own_offers_are_left_out_of_the_range() -> None:
+    # On 2026-11-15 the engine's resting offers, left on Dexie while it was
+    # stopped, were the edges of the range all evening.
+    feeds = Feeds()
+    ours = "0x" + "ab" * 32
+    feeds.asks = [_owned(_offer("XCH", 100.0, 110.0), ours), _offer("XCH", 100.0, 113.0)]
+    feeds.bids = [_owned(_offer("wUSDC.b", 112.0, 100.0), "0x" + "cd" * 32)]
+    feeds.bids.append(_offer("wUSDC.b", 109.0, 100.0))
+
+    counted = _source(feeds).read()
+    source = _source(feeds, own_offers=lambda: [bytes.fromhex("ab" * 32)])
+    mine_left_out = source.read()
+
+    assert counted.ask == pytest.approx(1.10)
+    assert mine_left_out.ask == pytest.approx(1.13)
+    assert mine_left_out.bid == counted.bid == pytest.approx(1.12)  # not ours: still counted
+    assert source.left_out == 1
+
+
+class PagedFeeds(Feeds):
+    """Dexie as it answers: a page of offers at a time, with how many there are."""
+
+    def __call__(self, url: str) -> tuple[int, str]:
+        if "/v1/offers" not in url:
+            return super().__call__(url)
+        self.calls.append(url)
+        query = dict(part.split("=", 1) for part in url.split("?", 1)[1].split("&"))
+        size, page = int(query["page_size"]), int(query["page"])
+        side = self.asks if query["offered"] == "xch" else self.bids
+        offers = side[(page - 1) * size : page * size]
+        return 200, json.dumps({"count": len(side), "page": page, "offers": offers})
+
+
+def _pages(feeds: Feeds, side: str) -> list[int]:
+    """The pages asked for, in order, of the asks (XCH offered) or the bids."""
+    mark = "offered=xch&" if side == "asks" else "&requested=xch&"
+    asked = [url for url in feeds.calls if mark in url]
+    return [int(url.split("&page=", 1)[1].split("&", 1)[0]) for url in asked]
+
+
+def test_a_page_of_our_own_offers_does_not_hide_the_book_behind_it() -> None:
+    # A first page that is all ours leaves nothing of it; the hedge is
+    # covered by others' offers on the next one.
+    feeds = PagedFeeds()
+    ids = [f"{index:064x}" for index in range(100)]
+    feeds.asks = [_owned(_offer("XCH", 1.0, 1.10), "0x" + tid) for tid in ids]
+    feeds.asks.append(_offer("XCH", 100.0, 113.0))
+    source = _source(feeds, own_offers=lambda: [bytes.fromhex(tid) for tid in ids])
+
+    view = source.read()
+
+    assert view.ask == pytest.approx(1.13)
+    assert source.left_out == 100
+    assert _pages(feeds, "asks") == [1, 2]
+
+
+def test_further_pages_are_read_only_while_the_hedge_is_not_yet_covered() -> None:
+    feeds = PagedFeeds()
+    feeds.asks = [_offer("XCH", 1.0, 1.10) for _ in range(250)]  # 100 XCH a page
+    feeds.bids = [_offer("wUSDC.b", 0.1, 0.1) for _ in range(1000)]  # 10 XCH a page
+
+    view = _source(feeds).read()  # a hedge of 20 XCH
+
+    assert view.ask == pytest.approx(1.10) and _pages(feeds, "asks") == [1]
+    assert view.bid == pytest.approx(1.0) and _pages(feeds, "bids") == [1, 2]
+
+
+def test_a_side_that_never_covers_the_hedge_is_read_for_a_few_pages_at_most() -> None:
+    feeds = PagedFeeds()
+    feeds.asks = [_offer("XCH", 0.01, 0.011) for _ in range(2000)]  # 1 XCH a page
+
+    view = _source(feeds).read()
+
+    assert view.ask is None
+    assert _pages(feeds, "asks") == [1, 2, 3, 4, 5]
+
+
+def test_if_the_wallet_cannot_list_its_offers_every_offer_counts(caplog) -> None:
+    feeds = Feeds()
+    feeds.asks = [_owned(_offer("XCH", 100.0, 110.0), "0x" + "ab" * 32)]
+    asked: list[int] = []
+
+    def failing() -> list[bytes]:
+        asked.append(1)
+        raise RuntimeError("wallet down")
+
+    source = _source(feeds, own_offers=failing)
+    with caplog.at_level("WARNING"):
+        first = source.read()
+        source.read()
+
+    assert first.ask == pytest.approx(1.10)  # as if nothing were known to be ours
+    assert len(asked) == 2  # asked every read...
+    assert sum("could not ask the wallet" in r.message for r in caplog.records) == 1  # ...said once

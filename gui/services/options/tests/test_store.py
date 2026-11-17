@@ -494,3 +494,264 @@ def test_a_database_from_before_splash_is_brought_up_to_date(tmp_path) -> None:
     assert (row.price_amount, row.splash_at) == (900, None)
     book.set_offer(row.id, splash_at=77)
     assert book.offers()[0].splash_at == 77
+
+
+# -- the two journals: how each price was worked out, and what each step saw --
+
+QUOTE = {
+    "spot": 1.15,
+    "sigma": 0.82,
+    "strike": 1.265,
+    "seconds_to_expiry": 86_400,
+    "model": 0.0047,
+    "carry": 0.0003,
+    "markup": 0.0001,
+    "floor": 0.01,
+    "per_xch": 0.01,
+    "units": 5,
+    "set_by": "floor",
+    "delta": 0.21,
+    "lean": -0.4,
+}
+
+
+def _quoted(book: store.OptionStore, *, now: int, quote: dict | None = QUOTE) -> int:
+    return book.add_offer(
+        launcher_id=LAUNCHER,
+        price_asset=USD,
+        price_amount=5,
+        expires_at=None,
+        bundle=b"offer",
+        offer_text=f"offer{now}",
+        quote=quote,
+        now=now,
+    )
+
+
+def test_an_offer_and_how_its_price_was_worked_out_are_one_write() -> None:
+    book = store.OptionStore(":memory:")
+    _add(book)
+
+    offer_id = _quoted(book, now=150)
+
+    quote = book.quotes()[offer_id]
+    assert (quote.offer_id, quote.launcher_id, quote.at) == (offer_id, LAUNCHER, 150)
+    assert {name: getattr(quote, name) for name in QUOTE} == QUOTE
+
+
+def test_an_offer_made_without_a_quote_has_no_quote_row() -> None:
+    book = store.OptionStore(":memory:")
+    _add(book)
+
+    _quoted(book, now=150, quote=None)
+
+    assert len(book.offers()) == 1
+    assert book.quotes() == {}
+
+
+def test_a_quote_that_cannot_be_written_takes_its_offer_with_it() -> None:
+    book = store.OptionStore(":memory:")
+    _add(book)
+    broken = {name: value for name, value in QUOTE.items() if name != "model"}
+
+    with pytest.raises(KeyError):
+        _quoted(book, now=150, quote=broken)
+
+    assert book.offers() == []  # no offer without the record of its price
+    assert book.quotes() == {}
+
+
+def test_quotes_can_be_read_from_a_time_on() -> None:
+    book = store.OptionStore(":memory:")
+    _add(book)
+    _quoted(book, now=150)
+    later = _quoted(book, now=250)
+
+    assert list(book.quotes(since=200)) == [later]
+    assert len(book.quotes()) == 2
+
+
+def test_the_step_journal_writes_only_what_is_new() -> None:
+    book = store.OptionStore(":memory:")
+    market = {"spot": 1.0, "sigma": 0.8, "bid": 0.99, "ask": 1.01, "spot_at": 95}
+
+    assert book.log_step(store.QUOTING, **market, now=100)  # the first row
+    assert not book.log_step(store.QUOTING, **market, now=200)  # nothing new
+    small = dict(market, spot=1.0 + store.JOURNAL_MOVE / 2)
+    assert not book.log_step(store.QUOTING, **small, now=300)  # a move under the threshold
+    moved = dict(market, spot=1.0 + store.JOURNAL_MOVE * 2)
+    assert book.log_step(store.QUOTING, **moved, now=400)
+    assert book.log_step("not quoting: spot price too old", **moved, now=410)  # a new verdict
+    assert book.log_step(store.QUOTING, **moved, now=420)  # and back
+    no_book = dict(moved, bid=None)
+    assert book.log_step(store.QUOTING, **no_book, now=430)  # a price that went away
+    assert not book.log_step(store.QUOTING, **no_book, now=440)
+    late = 430 + store.JOURNAL_EVERY_SECONDS
+    assert book.log_step(store.QUOTING, **no_book, now=late)  # a heartbeat while nothing changes
+    assert book.log_step(store.QUOTING, **no_book, now=late + 1, force=True)
+
+    assert [row.at for row in book.steps()] == [100, 400, 410, 420, 430, late, late + 1]
+
+
+def test_a_journal_row_reads_back_as_it_was_written() -> None:
+    book = store.OptionStore(":memory:")
+    book.log_step(
+        "not quoting: spot outside the Dexie range",
+        detail="spot 1.1753 is outside the Dexie range 1.1500 to 1.1700",
+        spot=1.1753,
+        sigma=0.8,
+        bid=1.15,
+        ask=1.17,
+        spot_at=1000,
+        now=1010,
+    )
+    book.log_step("wallet not ready", detail="wallet is syncing", now=1020)
+
+    full, bare = book.steps()
+    assert (full.verdict, full.detail, full.spot, full.sigma, full.bid, full.ask) == (
+        "not quoting: spot outside the Dexie range",
+        "spot 1.1753 is outside the Dexie range 1.1500 to 1.1700",
+        1.1753,
+        0.8,
+        1.15,
+        1.17,
+    )
+    assert (full.at, full.spot_at) == (1010, 1000)
+    assert (bare.verdict, bare.detail, bare.spot, bare.bid, bare.spot_at) == (
+        "wallet not ready",
+        "wallet is syncing",
+        None,
+        None,
+        None,
+    )
+
+
+def test_the_step_journal_reads_by_time() -> None:
+    book = store.OptionStore(":memory:")
+    assert book.last_step() is None
+    for at in (100, 200, 300):
+        book.log_step(f"verdict at {at}", now=at)
+
+    assert book.last_step().at == 300
+    assert book.last_step(before=250).at == 200
+    assert book.last_step(before=200).at == 200
+    assert book.last_step(before=50) is None
+    assert [row.at for row in book.steps(since=150)] == [200, 300]
+    assert [row.at for row in book.steps(since=150, until=250)] == [200]
+    assert [row.at for row in book.steps()] == [100, 200, 300]
+
+
+def test_the_journals_survive_a_restart(tmp_path) -> None:
+    path = tmp_path / "options_jobs.db"
+    book = store.OptionStore(path)
+    _add(book)
+    offer_id = _quoted(book, now=150)
+    book.log_step(store.QUOTING, spot=1.15, now=160)
+    book.close()
+
+    reopened = store.OptionStore(path)
+
+    assert reopened.quotes()[offer_id].per_xch == QUOTE["per_xch"]
+    assert [(row.verdict, row.spot) for row in reopened.steps()] == [(store.QUOTING, 1.15)]
+    assert not reopened.log_step(store.QUOTING, spot=1.15, now=170)  # it remembers the last row
+
+
+def test_a_database_from_before_the_journals_gets_them(tmp_path) -> None:
+    path = tmp_path / "options_jobs.db"
+    book = store.OptionStore(path)
+    _add(book)
+    _offer(book, 900)
+    book.close()
+    old = sqlite3.connect(path)
+    old.executescript("DROP TABLE quotes; DROP TABLE step_log;")
+    old.commit()
+    old.close()
+
+    book = store.OptionStore(path)
+
+    assert book.quotes() == {} and book.steps() == []
+    offer_id = _quoted(book, now=200)
+    assert list(book.quotes()) == [offer_id]
+    assert book.log_step(store.QUOTING, now=210)
+    assert len(book.offers()) == 2
+
+
+def test_the_book_knows_when_it_first_recorded_anything() -> None:
+    book = store.OptionStore(":memory:")
+    assert book.first_record_at() is None
+
+    book.log_step(store.QUOTING, now=500)
+    assert book.first_record_at() == 500
+    _add(book, now=300)
+    assert book.first_record_at() == 300
+    book.add_event("note", {}, now=200)
+    assert book.first_record_at() == 200
+
+
+def _tables(path) -> set[str]:
+    raw = sqlite3.connect(path)
+    try:
+        return {row[0] for row in raw.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        raw.close()
+
+
+def test_a_snapshot_reads_an_older_database_without_writing_to_it(tmp_path) -> None:
+    # A report must not change the database it reads: a book of an older
+    # version may still be using it, and the disk may be read-only.
+    path = tmp_path / "options_jobs.db"
+    book = store.OptionStore(path)
+    _add(book)
+    _offer(book, 900)
+    book.close()
+    old = sqlite3.connect(path)
+    old.executescript("DROP TABLE quotes; DROP TABLE step_log;")  # as v0.10.48 left it
+    old.commit()
+    old.close()
+    before = path.read_bytes()
+
+    copy = store.OptionStore.snapshot(path)
+
+    assert copy.contract(LAUNCHER).slot == "C110@1000" and len(copy.offers()) == 1
+    assert copy.quotes() == {} and copy.steps() == []  # journals it never kept: empty
+    assert copy.log_step(store.QUOTING, now=950)  # the copy takes writes...
+    copy.close()
+    assert path.read_bytes() == before  # ...the file takes none
+    assert "quotes" not in _tables(path) and "step_log" not in _tables(path)
+
+
+def test_a_snapshot_sees_what_the_book_has_written_so_far(tmp_path) -> None:
+    path = tmp_path / "options_jobs.db"
+    book = store.OptionStore(path)
+    _add(book)
+    book.log_step(store.QUOTING, now=200)
+
+    copy = store.OptionStore.snapshot(path)  # while the book still has it open
+    book.log_step("not quoting: market data unavailable", now=300)
+
+    assert [row.at for row in copy.steps()] == [200]
+    copy.close()
+    book.close()
+
+
+def test_a_journal_row_keeps_the_step_interval_it_was_written_under() -> None:
+    book = store.OptionStore(":memory:")
+    book.log_step(store.QUOTING, interval=59.5, now=100)
+    book.log_step("not quoting: market data unavailable", now=200)
+
+    assert [row.interval for row in book.steps()] == [60, None]
+
+
+def test_a_journal_from_before_the_step_interval_gets_it(tmp_path) -> None:
+    path = tmp_path / "options_jobs.db"
+    book = store.OptionStore(path)
+    book.log_step(store.QUOTING, now=100)
+    book.close()
+    old = sqlite3.connect(path)
+    old.executescript("ALTER TABLE step_log DROP COLUMN interval;")
+    old.close()
+
+    book = store.OptionStore(path)
+
+    assert book.log_step("not quoting: market data unavailable", interval=60, now=200)
+    assert [row.interval for row in book.steps()] == [None, 60]

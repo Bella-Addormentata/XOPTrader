@@ -6,6 +6,15 @@
     python -m gui.services.options --config config.yaml withdraw-all
     python -m gui.services.options --config config.yaml monitor --interval 300
     python -m gui.services.options --config config.yaml live-test
+    python -m gui.services.options --config config.yaml report --since 24h
+
+THE LOG FILE. Every command but ``status`` and ``report`` also logs to a file
+beside the book's database (``options_jobs.log`` for ``options_jobs.db``),
+rotated at 2 MB with three old files kept, with the time on every line. It
+holds what the terminal shows and more: the market each step, every action and
+problem, and engine-guard changes. ``--log-file`` puts it elsewhere and
+``--no-log-file`` turns it off. The terminal shows each problem once, as a
+``note:`` line, and the shared-wallet banner only when what it says changes.
 
 ``status``, ``monitor`` and a dry-run ``step`` sign nothing. ``live-test`` is the
 guided first run against a real wallet: it mints one dust-sized contract, offers
@@ -21,6 +30,8 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
+import os
+import sqlite3
 import sys
 import time
 from collections.abc import Callable
@@ -28,16 +39,31 @@ from pathlib import Path
 from typing import Any
 
 from gui.services.options import builder, chain, config, engine_guard, fees, safety, store
+from gui.services.options import report as reporting
 from gui.services.options.reference_wallet import ReferenceWallet
 from gui.services.options.runtime import (
     _ADDITIONAL_DATA,
+    LOG_BACKUPS,
     build,
     chain_reader,
     chain_source,
+    log_handler,
+    log_path,
     shared_wallet_guard,
     wallet_rpc,
 )
-from gui.services.options.service import pack_bundle, unpack_bundle
+from gui.services.options.service import (
+    ENGINE_REFUSED,
+    REPORTED,
+    pack_bundle,
+    reserved_coin_ids,
+    unpack_bundle,
+)
+
+log = logging.getLogger(__name__)
+
+#: Commands that only look: they leave the log file to the one that acts.
+_NO_LOG_FILE = ("status", "report")
 
 #: The slot a live-test contract is stored under. It is in no grid, so a live
 #: book that finds one still open retires it, and claws it back once expired.
@@ -48,6 +74,37 @@ _REPUSH_EVERY_POLLS = 8  # two minutes: the first push may never have reached a 
 # With ``fee_mojos: auto`` the test pays one flat fee per spend, sized for the
 # costliest of them (the cancel, about 165 million), so its sums stay simple.
 _LIVE_TEST_COST = 170_000_000
+
+
+class _NotReported(logging.Filter):
+    """Lets through only records the printed step report does not already show."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not getattr(record, "options_report", False)
+
+
+def _log_to_console(verbose: bool) -> logging.Handler:
+    """Warnings (everything with ``--verbose``) to the terminal, as before the log file."""
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO if verbose else logging.WARNING)
+    console.setFormatter(logging.Formatter(logging.BASIC_FORMAT))
+    console.addFilter(_NotReported())
+    root.addHandler(console)
+    return console
+
+
+def default_log_path(cfg: config.OptionsConfig) -> Path | None:
+    """Beside the book's database, named after it; None for an in-memory one."""
+    return log_path(cfg)
+
+
+def _log_to_file(path: Path) -> logging.Handler:
+    """Everything from info up, with the time on every line, rotated as the GUI's log is."""
+    handler = log_handler(path)
+    logging.getLogger().addHandler(handler)
+    return handler
 
 
 def _load(path: str) -> config.OptionsConfig:
@@ -85,11 +142,16 @@ def _print_report(report: Any) -> None:
 
 
 def _shared_wallet_banner(
-    cfg: config.OptionsConfig, book_store: store.OptionStore | None
+    cfg: config.OptionsConfig,
+    book_store: store.OptionStore | None,
+    seen: dict[str, Any] | None = None,
 ) -> engine_guard.EngineState | None:
     """With ``share_trading_wallet`` on: say so, loudly, and whether the engine is up.
 
     None when the opt-in is off. Printed by ``status`` and before every step.
+    With ``seen`` (``run`` keeps one across its steps) it is printed only when
+    what it says has changed since it was last printed; the engine is still
+    asked every time.
     """
     if not cfg.wallet.share_trading_wallet:
         return None
@@ -101,31 +163,43 @@ def _shared_wallet_banner(
         if beside
         else "The engine must stay STOPPED while any contract is open."
     )
-    print(
+    lines = [
         "WARNING: options.wallet.share_trading_wallet is ON. This book signs from the "
         f"trading engine's wallet ({cfg.wallet.host}:{cfg.wallet.port}, key "
-        f"{cfg.wallet.fingerprint}). {rule}"
-    )
-    print(f"  trading engine: {state.describe()}")
+        f"{cfg.wallet.fingerprint}). {rule}",
+        f"  trading engine: {state.describe()}",
+    ]
     open_contracts = book_store.contracts(store.ACTIVE) if book_store is not None else []
     if open_contracts and not state.clear:
         locked = sum(
             item.underlying_amount for item in open_contracts if item.underlying_asset is None
         )
         if beside:
-            print(
+            lines.append(
                 f"  note: {len(open_contracts)} contract(s) open with "
                 f"{locked / config.XCH_MOJOS:g} XCH locked beside the engine: their collateral "
                 "is locked in the contracts; a live step waits for the engine to stop, and "
                 "then pays from the rest of the wallet what the options address lacks"
             )
         else:
-            print(
+            lines.append(
                 f"  WARNING: {len(open_contracts)} contract(s) open with "
                 f"{locked / config.XCH_MOJOS:g} XCH locked while the engine may be running: its "
                 "balances include collateral and premiums it must not count, and its offers can "
                 "spend coins at the options address"
             )
+    if seen is not None and seen.get("banner") == lines:
+        return state
+    if seen is not None:
+        seen["banner"] = lines
+    for line in lines:
+        print(line)
+        log.log(
+            logging.INFO if state.clear else logging.WARNING,
+            "[options] %s",
+            line.strip(),
+            extra=REPORTED,
+        )
     return state
 
 
@@ -215,16 +289,107 @@ def _status(cfg: config.OptionsConfig) -> int:
         print(f"  {item.slot:<22} {item.status:<10} {item.launcher_id.hex()}  live offers: {live}")
     for row in book_store.unresolved():
         print(f"  waiting: {row.kind} of {row.launcher_id.hex()[:10]} ({row.status})")
+    if not_ready is None or coins.known_address():
+        for line in _cancel_funding(cfg, book_store, coins):
+            print(line)
     return 0
 
 
-def _guarded_step(cfg: config.OptionsConfig, book: Any, book_store: store.OptionStore) -> bool:
+def _cancel_funding(
+    cfg: config.OptionsConfig,
+    book_store: store.OptionStore,
+    coins: Any,
+    now: float | None = None,
+) -> list[str]:
+    """Whether each unsold contract could be cancelled now, and what is missing if not.
+
+    A cancel pays the strike to ourselves inside the same bundle, so it needs
+    one coin of the strike asset to start from (any amount; it comes back in
+    full), and XCH for its fee: at the options address, or with
+    ``fund_from_wallet`` anywhere in the wallet. A fixed ``fee_mojos`` is
+    checked against that XCH; with ``fee_mojos: auto`` the fee is sized only
+    when the cancel is sent. An expired contract cannot be cancelled at all:
+    it is clawed back, which needs neither. On the first live run the
+    wind-down found this out from the cancel's error. Coins a transaction
+    still waiting already spends do not count, as they do not for the cancel
+    itself.
+    """
+    unsold = book_store.contracts((store.OPEN,))
+    if not unsold:
+        return []
+    now = time.time() if now is None else now
+    anywhere = cfg.wallet.fund_from_wallet
+    where = "in the wallet" if anywhere else "at the options address"
+    reserved = reserved_coin_ids(book_store)
+
+    def free(listed: list[Any]) -> list[Any]:
+        return [coin for coin in listed if bytes(coin.coin_id()) not in reserved]
+
+    xch = sum(
+        int(coin.amount)
+        for coin in free(coins.wallet_xch_coins() if anywhere else coins.xch_coins())
+    )
+    fee = None if cfg.fee_auto else cfg.fee_mojos  # None: sized when the cancel is sent
+    lines = ["cancelling now:"]
+    for item in unsold:
+        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(item.expiration))
+        if item.expiration <= now:
+            lines.append(
+                f"  {item.slot:<22} expired at {when}, so it can only be clawed back; "
+                "a live step does that"
+            )
+            continue
+        missing = []
+        if item.strike_asset is None:
+            # The strike is XCH: one XCH coin starts it, and the fee comes from the same XCH.
+            if xch < max(fee or 0, 1):
+                missing.append(
+                    f"{fee} mojos of XCH {where} for its fee" if fee else f"an XCH coin {where}"
+                )
+        else:
+            asset = item.strike_asset
+            listed = (
+                coins.wallet_cat_coins(asset)
+                if anywhere
+                else [cat.coin for cat in coins.cats(asset)]
+            )
+            if not free(listed):
+                name = "the quote asset" if asset == cfg.quote_asset_id else "its CAT"
+                missing.append(f"a coin of {name} (any amount) {where}")
+            if fee and xch < fee:
+                missing.append(f"{fee} mojos of XCH {where} for its fee")
+        if missing:
+            them = "them" if len(missing) > 1 else "it"
+            lines.append(
+                f"  {item.slot:<22} needs {' and '.join(missing)}; "
+                f"without {them}, it is clawed back after {when}"
+            )
+        elif fee is not None:
+            lines.append(f"  {item.slot:<22} possible")
+        elif xch:
+            lines.append(
+                f"  {item.slot:<22} possible if its fee, sized when it is sent, is within "
+                f"the {xch} mojos of XCH {where}"
+            )
+        else:
+            lines.append(f"  {item.slot:<22} possible (plus XCH {where} if a fee is due)")
+    return lines
+
+
+def _guarded_step(
+    cfg: config.OptionsConfig,
+    book: Any,
+    book_store: store.OptionStore,
+    seen: dict[str, Any] | None = None,
+) -> bool:
     """One step, unless the shared-wallet guard forbids it. False if refused."""
-    state = _shared_wallet_banner(cfg, book_store)
+    state = _shared_wallet_banner(cfg, book_store, seen)
     # A dry-run step signs nothing, so only a live one needs the engine down.
     refusal = None if cfg.dry_run else _engine_refusal(state, "a live step", cfg)
     if refusal is not None:
         print(f"  note: {refusal}")
+        log.warning("[options] %s", refusal, extra=REPORTED)
+        book.journal(ENGINE_REFUSED, state.describe() if state else "", now=int(time.time()))
         return False
     _print_report(book.step())
     return True
@@ -237,18 +402,22 @@ def _step(cfg: config.OptionsConfig) -> int:
 
 def _run(cfg: config.OptionsConfig, interval: float) -> int:
     book, book_store, _ = build(cfg)
+    book.step_interval = interval
     print(f"stepping every {interval:g} s; Ctrl-C to stop (offers already out expire on their own)")
+    log.info("[options] stepping every %g s (dry_run %s)", interval, cfg.dry_run)
+    seen: dict[str, Any] = {}  # what the shared-wallet banner last said
     try:
         while True:
             # A log of a long run is read by time; nothing in the report says when.
             print(f"--- step at {time.strftime('%Y-%m-%d %H:%M:%S %z')}", flush=True)
             try:
-                _guarded_step(cfg, book, book_store)
+                _guarded_step(cfg, book, book_store, seen)
             except Exception as exc:  # noqa: BLE001 - keep the loop alive; the next step retries
-                logging.getLogger(__name__).exception("step failed: %s", exc)
+                log.exception("step failed: %s", exc)
             time.sleep(interval)
     except KeyboardInterrupt:
         print("stopped")
+        log.info("[options] stopped")
         return 0
 
 
@@ -306,6 +475,107 @@ def _monitor(cfg: config.OptionsConfig, interval: float) -> int:
         except KeyboardInterrupt:
             print("stopped")
             return 0
+
+
+#: Files that SQLite and the book keep beside the database.
+_DATABASE_COMPANIONS = ("-journal", "-wal", "-shm", ".lock")
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """Whether two paths name one file, through a link or another spelling."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:  # one of them is not there (yet)
+        pass
+    try:
+        return os.path.normcase(str(a.resolve())) == os.path.normcase(str(b.resolve()))
+    except (OSError, RuntimeError):  # a link loop, say: writing there fails on its own
+        return False
+
+
+def _book_files(
+    cfg: config.OptionsConfig, config_path: str | None, log_file: Path | None
+) -> list[tuple[Path, str]]:
+    """The files the book keeps, each with what a refusal calls it."""
+    files: list[tuple[Path, str]] = []
+    if cfg.database_path != ":memory:":
+        database = Path(cfg.database_path)
+        files.append((database, "the options database"))
+        files += [
+            (Path(f"{database}{suffix}"), f"the database's {suffix} file")
+            for suffix in _DATABASE_COMPANIONS
+        ]
+    if config_path is not None:
+        files.append((Path(config_path), "the config file"))
+    if log_file is not None:
+        files.append((log_file, "the book's log file"))
+        files += [
+            (Path(f"{log_file}.{n}"), "one of the book's older log files")
+            for n in range(1, LOG_BACKUPS + 1)
+        ]
+    return files
+
+
+def _clash(target: Path, files: list[tuple[Path, str]]) -> str | None:
+    """What ``target`` is, when nothing may be written to it: one of ``files``
+    (through a link or another spelling too), or any SQLite database (a copy
+    of the book's, say)."""
+    for path, name in files:
+        if _same_file(target, path):
+            return f"is {name}"
+    try:
+        with open(target, "rb") as handle:
+            if handle.read(len(_SQLITE_HEADER)) == _SQLITE_HEADER:
+                return "is an SQLite database"
+    except OSError:
+        pass  # nothing there yet, or nothing readable: the write says what is wrong
+    return None
+
+
+def _report(
+    cfg: config.OptionsConfig,
+    since: str,
+    csv_path: str | None,
+    config_path: str | None = None,
+    log_file: Path | None = None,
+) -> int:
+    """Read-only: what the book did since ``since``."""
+    now = time.time()
+    try:
+        start = reporting.parse_since(since, now)
+    except reporting.ReportError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if cfg.database_path != ":memory:" and not Path(cfg.database_path).is_file():
+        # Said plainly, rather than in SQLite's words.
+        print(f"error: no options database at {cfg.database_path}", file=sys.stderr)
+        return 2
+    if start > now:
+        print(f"error: --since {since!r} is in the future", file=sys.stderr)
+        return 2
+    # Writing the CSV empties its file first: never one the book keeps.
+    clash = _clash(Path(csv_path), _book_files(cfg, config_path, log_file)) if csv_path else None
+    if clash is not None:
+        print(f"error: --csv {csv_path} {clash}; the CSV needs a file of its own", file=sys.stderr)
+        return 2
+    try:
+        # A copy: the file is only read, even when it is from an older version.
+        book_store = store.OptionStore.snapshot(cfg.database_path)
+    except sqlite3.Error as exc:
+        print(f"error: could not read {cfg.database_path}: {exc}", file=sys.stderr)
+        return 2
+    try:
+        if start == 0:  # all of it: from the first thing the book recorded
+            start = min(book_store.first_record_at() or int(now), int(now))
+        summary = reporting.summarize(book_store, cfg.quote_unit_mojos, start, int(now))
+    finally:
+        book_store.close()
+    print(reporting.format_text(summary))
+    if csv_path:
+        written = reporting.write_csv(summary, csv_path)
+        print(f"\n{written} contract row(s) written to {csv_path}")
+    return 0
 
 
 def _withdraw_all(cfg: config.OptionsConfig) -> int:
@@ -373,11 +643,7 @@ class _LiveTest:
         coin a waiting mint of the book's is counting on would knock that mint
         out.
         """
-        reserved = {
-            bytes(spend.coin.coin_id())
-            for row in self.book_store.unresolved()
-            for spend in unpack_bundle(row.bundle)[0]
-        }
+        reserved = reserved_coin_ids(self.book_store)
         return [coin for coin in self.coins.xch_coins() if bytes(coin.coin_id()) not in reserved]
 
     def settle(self) -> None:
@@ -799,6 +1065,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m gui.services.options", description=__doc__)
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--log-file", help="where to log (default: beside the database, as <name>.log)"
+    )
+    parser.add_argument("--no-log-file", action="store_true", help="log to the terminal only")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status", help="address, funds and contracts")
     commands.add_parser("step", help="run one step and print what it did")
@@ -811,11 +1081,33 @@ def main(argv: list[str] | None = None) -> int:
     test.add_argument("--amount-xch", type=float, default=0.0001)
     test.add_argument("--yes", action="store_true", help="do not pause before each spend")
     test.add_argument("--timeout", type=float, default=900.0)
+    summary = commands.add_parser("report", help="read-only: what the book did over a period")
+    summary.add_argument(
+        "--since", default="24h", help="24h, 7d, 90m, a date like 2026-11-15, or all"
+    )
+    summary.add_argument("--csv", help="also write the per-contract figures to this file")
     args = parser.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)
+    root = logging.getLogger()
+    level = root.level
+    handlers = [_log_to_console(args.verbose)]
     try:
         cfg = _load(args.config)
+        path = Path(args.log_file) if args.log_file else default_log_path(cfg)
+        if path is not None and not args.no_log_file and args.command not in _NO_LOG_FILE:
+            # Log lines are appended, and the file is renamed as it rotates.
+            clash = _clash(path, _book_files(cfg, args.config, None))
+            if clash is not None:
+                print(
+                    f"error: log file {path} {clash}; give --log-file a file of its own,"
+                    " or pass --no-log-file",
+                    file=sys.stderr,
+                )
+                return 2
+            handlers.append(_log_to_file(path))
+            log.info("[options] %s, config %s", args.command, args.config)
+        if args.command == "report":
+            return _report(cfg, args.since, args.csv, args.config, path)
         if args.command == "status":
             return _status(cfg)
         if args.command == "step":
@@ -842,7 +1134,14 @@ def main(argv: list[str] | None = None) -> int:
         RuntimeError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
+        log.error("[options] %s", exc, extra=REPORTED)
         return 1
+    finally:
+        # main() may be called more than once in a process (the tests do).
+        for handler in handlers:
+            root.removeHandler(handler)
+            handler.close()
+        root.setLevel(level)
 
 
 if __name__ == "__main__":

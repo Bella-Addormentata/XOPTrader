@@ -21,16 +21,26 @@ A view is as old as its spot observation, not as the request that fetched it:
 ``Market.as_of`` is the time CoinGecko says the price was last updated. A feed
 that answers promptly with an old price is therefore refused as stale, and one
 that does not say when its price was observed is refused outright.
+
+OUR OWN OFFERS ARE NOT LIQUIDITY. With ``options.wallet.share_trading_wallet``
+the book's wallet is the engine's, and the engine leaves its offers resting on
+Dexie when it is stopped. Counted in the range, they pin it: on the first live
+run (2026-11-15) the best ask sat at 1.1700 and the best bid at 1.1413 for
+hours while the market moved, most likely the stopped engine's, and quoting
+stopped when spot rose past that ask. :class:`MarketSource` is handed the
+trade ids of the wallet's own open offers and leaves those out. Dexie's
+``trade_id`` is the offer's name, the same id the wallet keeps it under.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import math
 import statistics
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 COINGECKO_URL = "https://api.coingecko.com/api/v3"
@@ -43,10 +53,39 @@ Get = Callable[..., tuple[int, str]]
 _SECONDS_PER_YEAR = 365 * 24 * 3600
 # An observation stamped later than this past our own clock is not believed.
 _MAX_CLOCK_SKEW_SECONDS = 300
+# Dexie answers a page of offers at a time; at most this many pages are read
+# for one side of one step.
+_PAGE_SIZE = 100
+_MAX_PAGES = 5
+
+log = logging.getLogger(__name__)
+
+
+def _bare_hex(value: str) -> str:
+    text = value.strip().lower()
+    return text[2:] if text.startswith("0x") else text
+
+
+#: Why a view was refused, in a few words that stay the same from one step to
+#: the next (the message itself carries the numbers). The journal and the
+#: report group by these.
+NO_DATA = "market data unavailable"
+STALE = "spot price too old"
+NO_BOOK = "Dexie book too thin"
+CROSSED = "Dexie book crossed"
+TOO_WIDE = "Dexie spread too wide"
+OFF_PEG = "spot outside the Dexie range"
 
 
 class MarketError(RuntimeError):
-    """No usable market view. Do not quote."""
+    """No usable market view. Do not quote.
+
+    ``reason`` is one of the short reasons above; the message says the rest.
+    """
+
+    def __init__(self, message: str, reason: str = NO_DATA) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def _default_get(timeout: float) -> Get:
@@ -121,21 +160,26 @@ class Market:
         if not math.isfinite(self.sigma) or self.sigma <= 0:
             raise MarketError("no volatility")
         if now - self.as_of > max_age_seconds:
-            raise MarketError(f"the spot price is {int(now - self.as_of)} s old")
+            raise MarketError(f"the spot price is {int(now - self.as_of)} s old", STALE)
         if self.bid is None or self.ask is None:
             if require_book:
-                raise MarketError("the Dexie book cannot fill the hedge size on both sides")
+                raise MarketError(
+                    "the Dexie book cannot fill the hedge size on both sides", NO_BOOK
+                )
             return
         if self.bid > self.ask:
-            raise MarketError("the Dexie book is crossed at the hedge size")
+            raise MarketError("the Dexie book is crossed at the hedge size", CROSSED)
         middle = (self.bid + self.ask) / 2.0
         spread_pct = (self.ask - self.bid) / middle * 100.0
         if spread_pct > max_spread_pct:
-            raise MarketError(f"the Dexie spread is {spread_pct:.1f}%, above {max_spread_pct}%")
+            raise MarketError(
+                f"the Dexie spread is {spread_pct:.1f}%, above {max_spread_pct}%", TOO_WIDE
+            )
         if not self.bid <= self.spot <= self.ask:
             raise MarketError(
                 f"spot {self.spot:.4f} is outside the executable range "
-                f"{self.bid:.4f}-{self.ask:.4f}; the quote asset may be off its peg"
+                f"{self.bid:.4f}-{self.ask:.4f}; the quote asset may be off its peg",
+                OFF_PEG,
             )
 
 
@@ -155,7 +199,13 @@ class MarketSource:
         coingecko_url: str = COINGECKO_URL,
         coingecko_api_key: str = "",
         dexie_url: str = DEXIE_URL,
+        own_offers: Callable[[], Iterable[bytes]] | None = None,
     ) -> None:
+        """``own_offers`` gives the trade ids of the wallet's own open offers.
+
+        Those are left out of the executable range. When it fails, every
+        offer is counted, as before it existed, and the failure is logged.
+        """
         self._asset = bytes(quote_asset_id).hex()
         self._hedge = float(hedge_size_xch)
         self._get = get or _default_get(timeout)
@@ -168,8 +218,12 @@ class MarketSource:
         key = str(coingecko_api_key or "").strip()
         self._coingecko_headers = {"x-cg-demo-api-key": key} if key else None
         self._dexie = dexie_url.rstrip("/")
+        self._own_offers = own_offers
+        self._own_failed = False  # logged once, not every step
         self._sigma: float | None = None
         self._sigma_at = 0.0
+        #: How many of the wallet's own offers the last read left out.
+        self.left_out = 0
 
     def _json(self, url: str, headers: dict[str, str] | None = None) -> Any:
         try:
@@ -228,36 +282,86 @@ class MarketSource:
         self._sigma_at = now
         return self._sigma
 
-    def _side(self, offered: str, requested: str) -> list[tuple[float, float]]:
-        """Open single-asset offers as ``(quote per XCH, XCH size)``."""
-        data = self._json(
-            f"{self._dexie}/v1/offers?offered={offered}&requested={requested}"
-            "&status=0&page_size=100&compact=true&sort=price"  # best price first
-        )
-        levels = []
-        for offer in data.get("offers", []) if isinstance(data, dict) else []:
-            try:
-                gives, wants = offer["offered"], offer["requested"]
-                if len(gives) != 1 or len(wants) != 1:
+    def _ours(self) -> frozenset[str]:
+        """Trade ids of the wallet's own open offers, as bare lowercase hex."""
+        if self._own_offers is None:
+            return frozenset()
+        try:
+            ids = frozenset(bytes(item).hex() for item in self._own_offers())
+        except Exception as exc:  # noqa: BLE001 - any failure: count every offer, as before
+            if not self._own_failed:
+                log.warning(
+                    "[options] could not ask the wallet for its own offers (%s); "
+                    "the Dexie range counts every offer until it answers",
+                    exc,
+                )
+            self._own_failed = True
+            return frozenset()
+        if self._own_failed:
+            log.info("[options] the wallet lists its own offers again")
+        self._own_failed = False
+        return ids
+
+    def _side(
+        self, offered: str, requested: str, ours: frozenset[str] = frozenset()
+    ) -> list[tuple[float, float]]:
+        """Open single-asset offers as ``(quote per XCH, XCH size)``, leaving out ``ours``.
+
+        Pages are read best price first until what is kept covers the hedge
+        size, the side runs out, or ``_MAX_PAGES`` have been read. One page
+        used to be all: leaving out our own offers could then leave a side
+        short of the hedge size with others' offers on the next page.
+        """
+        levels: list[tuple[float, float]] = []
+        seen: set[str] = set()
+        size = 0.0
+        for page in range(1, _MAX_PAGES + 1):
+            data = self._json(
+                f"{self._dexie}/v1/offers?offered={offered}&requested={requested}"
+                f"&status=0&page_size={_PAGE_SIZE}&page={page}&compact=true&sort=price"
+            )
+            offers = data.get("offers") if isinstance(data, dict) else None
+            offers = offers if isinstance(offers, list) else []
+            for offer in offers:
+                trade_id = offer.get("trade_id") if isinstance(offer, dict) else None
+                if isinstance(trade_id, str):
+                    key = _bare_hex(trade_id)
+                    if key in seen:  # moved up a page between two reads
+                        continue
+                    seen.add(key)
+                    if key in ours:
+                        self.left_out += 1
+                        continue
+                try:
+                    gives, wants = offer["offered"], offer["requested"]
+                    if len(gives) != 1 or len(wants) != 1:
+                        continue
+                    give, want = float(gives[0]["amount"]), float(wants[0]["amount"])
+                except (KeyError, TypeError, ValueError, IndexError):
                     continue
-                give, want = float(gives[0]["amount"]), float(wants[0]["amount"])
-            except (KeyError, TypeError, ValueError, IndexError):
-                continue
-            if give <= 0 or want <= 0:
-                continue
-            if offered == "xch":
-                levels.append((want / give, give))  # sells XCH: an ask
-            else:
-                levels.append((give / want, want))  # buys XCH: a bid
+                if give <= 0 or want <= 0:
+                    continue
+                if offered == "xch":
+                    levels.append((want / give, give))  # sells XCH: an ask
+                    size += give
+                else:
+                    levels.append((give / want, want))  # buys XCH: a bid
+                    size += want
+            count = data.get("count") if isinstance(data, dict) else None
+            last = isinstance(count, int) and page * _PAGE_SIZE >= count
+            if size >= self._hedge or len(offers) < _PAGE_SIZE or last:
+                break
         return levels
 
     def read(self) -> Market:
         now = self._clock()
         spot, observed = self._spot(now)
         sigma = self._volatility(now)
+        ours = self._ours()
+        self.left_out = 0
         try:
-            asks = sorted(self._side("xch", self._asset))
-            bids = sorted(self._side(self._asset, "xch"), reverse=True)
+            asks = sorted(self._side("xch", self._asset, ours))
+            bids = sorted(self._side(self._asset, "xch", ours), reverse=True)
         except MarketError:
             asks, bids = [], []
         return Market(

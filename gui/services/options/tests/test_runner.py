@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from pathlib import Path
@@ -12,7 +13,7 @@ import pytest
 yaml = pytest.importorskip("yaml")
 
 from gui.services.options import engine_guard, runner, store  # noqa: E402
-from gui.services.options.service import StepReport  # noqa: E402
+from gui.services.options.service import ENGINE_REFUSED, StepReport  # noqa: E402
 
 USD = "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"
 DOWN = engine_guard.EngineState(running=False, certain=True, detail="nothing there")
@@ -72,6 +73,10 @@ class FakeBook:
         self.steps = 0
         self.fail = fail
         self.thread: str | None = None
+        self.journaled: list[tuple[str, str]] = []
+
+    def journal(self, verdict: str, detail: str = "", market: Any = None, *, now: int) -> None:
+        self.journaled.append((verdict, detail))
 
     def step(self) -> StepReport:
         self.thread = threading.current_thread().name
@@ -187,6 +192,8 @@ def test_an_engine_started_during_a_live_run_holds_every_step(tmp_path) -> None:
     run.stop()
     assert made[0].steps == stepped  # no step while the engine is up
     assert "RUNNING" in run.snapshot().engine
+    # Journaled as the command line journals it, for the report's held-back time.
+    assert (ENGINE_REFUSED, UP.describe()) in made[0].journaled
 
 
 def test_a_failing_step_is_reported_and_the_loop_keeps_going(tmp_path) -> None:
@@ -520,3 +527,24 @@ def test_the_command_line_reads_a_relative_book_beside_config_yaml_too(
     (elsewhere / "data" / "options_jobs.db").write_bytes(b"")
     with pytest.raises(config.OptionsConfigError, match="Move it beside config.yaml"):
         cli._load(str(path))
+
+
+def test_a_run_from_the_app_writes_the_book_s_own_log_file(tmp_path, caplog) -> None:
+    made: list[FakeBook] = []
+    run = runner.OptionsRunner(_write(tmp_path), interval=0.02, build=_builder(made))
+    package = logging.getLogger("gui.services.options")
+    handlers = list(package.handlers)
+
+    with caplog.at_level(logging.INFO, logger="gui.services.options"):
+        run.start(runner.Mode.REHEARSE)
+        _wait(lambda: made and made[0].steps >= 2)
+        run.stop()
+
+    # Beside the database, as the command line writes it, with a time on every line.
+    lines = (tmp_path / "data" / "options_jobs.log").read_text(encoding="utf-8").splitlines()
+    assert "rehearse run started from the app" in lines[0]
+    assert sum("dry run: would mint C110" in line for line in lines) >= 2
+    assert lines[-1].endswith("[options] rehearse run stopped")
+    assert all(line[:4].isdigit() and line[4] == "-" for line in lines)
+    assert package.handlers == handlers  # the file is let go with the run
+    assert made[0].step_interval == 0.02  # the journal keeps it, for the report

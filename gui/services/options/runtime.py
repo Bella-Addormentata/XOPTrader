@@ -12,8 +12,10 @@ terminal: ``status``, ``step``, ``run`` and ``withdraw-all``.
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from gui.services.options import (
@@ -30,6 +32,34 @@ from gui.services.options.reference_wallet import ReferenceWallet, WalletRpc, co
 from gui.services.options.service import OptionsBook, OptionsError
 
 log = logging.getLogger(__name__)
+
+#: The book's own log file: rotated as the GUI's gui.log is, the time on every line.
+LOG_BYTES = 2 * 1024 * 1024
+LOG_BACKUPS = 3
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S%z"
+
+
+def log_path(cfg: config.OptionsConfig) -> Path | None:
+    """The book's log file: beside its database, named after it; None for an in-memory one."""
+    if cfg.database_path == ":memory:":
+        return None
+    database = Path(cfg.database_path)
+    if database.suffix == ".log":  # the log must not be the database itself
+        return database.with_name(f"{database.name}.log")
+    return database.with_suffix(".log")
+
+
+def log_handler(path: Path) -> logging.Handler:
+    """A handler writing info and up to ``path``, rotated. Opens the file on its first line."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        path, maxBytes=LOG_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8", delay=True
+    )
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
+    return handler
+
 
 _COINSET = {
     config.MAINNET: "https://api.coinset.org",
@@ -349,6 +379,9 @@ def build(
             cfg.quote_asset_id,
             hedge_size_xch=cfg.market.hedge_size_xch,
             coingecko_api_key=cfg.coingecko_api_key,
+            # The wallet's own offers (the engine's, on a shared wallet) are
+            # not liquidity the hedge could use: left out of the Dexie range.
+            own_offers=wallet.open_offer_ids,
         ).read
     # The site lists mainnet options only.
     listing = desk.DeskClient() if cfg.network == config.MAINNET else None

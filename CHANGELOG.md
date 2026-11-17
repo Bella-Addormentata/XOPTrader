@@ -5,6 +5,74 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### The options book keeps a record of why it did what it did
+
+The first mainnet run could be reviewed only from terminal output, and the
+database said what happened but not why. Now:
+
+- **A log file.** The book logs to a file beside its database
+  (`options_jobs.log` for `options_jobs.db`), rotated at 2 MB with three
+  old files kept, with the time on every line: the market each step, every
+  action and problem, and engine-guard changes. A run from the app's
+  Options page writes it, as does every command but `status` and `report`;
+  on the command line `--log-file PATH` moves it and `--no-log-file` turns
+  it off. A log file that would be the database, a file beside it, the
+  config file or any other SQLite database is refused. The terminal shows
+  each problem once, and `run` prints the shared-wallet banner again only
+  when what it says has changed.
+- **How each price was worked out.** A `quotes` table keeps, beside each
+  offer, the spot, volatility, model value, carry, markup and minimum
+  premium it was priced from, and which of them set the price. The step's
+  line says so too: `offering … at 0.005 (on the floor; model value
+  0.0047 per XCH)`.
+- **What each step saw.** A `step_log` table keeps the market and the
+  step's verdict: quoting, or why not (spot price too old; Dexie book too
+  thin, crossed or too wide; spot outside the Dexie range; wallet not
+  ready; the step failed, with its error; refused because the trading
+  engine may be running). A row is written when the verdict changes, when
+  a price moves more than 0.5%, and otherwise every 15 minutes. It also
+  keeps the step interval, so the report can tell a long `--interval` from
+  a book that was not running.
+- **Fees and sales in the events.** `collateral_locked` and
+  `collateral_returned` carry the fee their transaction paid, a confirmed
+  withdrawal is booked as `offers_withdrawn` with its fee, and `sold` names
+  the offer that was taken.
+- **`report`.** `python -m gui.services.options report --since 24h` (or
+  `7d`, a date, or `all`) prints how long the book quoted and what held it
+  back, how many offers it made and how many sat on the minimum premium,
+  and for each contract the premium against the model value of the offer
+  that was taken, the fees and how long its collateral was locked.
+  `--csv PATH` writes the per-contract figures, and refuses a path that is
+  the database, a file SQLite or the book keeps beside it, the config file,
+  the book's log files or any other SQLite database. It only reads: it works on a copy, so a
+  database from before these tables is left as it is, and a read-only one
+  can be reported on.
+
+### The book's range check leaves out the wallet's own offers
+
+The book stops quoting when spot is outside the price range the Dexie book
+can fill. With `share_trading_wallet` on, that range included the wallet's
+own open offers: the engine's, which rest at their old prices while it is
+stopped. One of the first run's stops was most likely an ask of the
+engine's. The book now asks the wallet for its open offers and leaves them
+out; if the wallet cannot say, every offer counts, as before. When that
+leaves the first page of Dexie's book short of the hedge size, the next
+pages are read too (five at most).
+
+### `status` says whether each unsold contract can be cancelled now
+
+A cancel of a call pays the strike back to the options address inside the
+same transaction, so it needs one coin of the quote asset to start from
+(any amount; it comes back in full): at the options address, or anywhere
+in the wallet with `fund_from_wallet`. The first run's wind-down found this
+out from the cancel's error. `status` now lists each unsold contract as
+`possible`, or what it needs and when it will be clawed back instead. A
+coin that a transaction still waiting already spends does not count, as it
+does not for the cancel itself; a fixed `fee_mojos` is checked against the XCH
+there; and an expired contract is shown as one only a clawback can close.
+
 ## [0.10.51] — 2026-11-16 — the engine can trade beside open option contracts
 
 ### The engine can trade beside open option contracts (opt-in) (#237)
