@@ -218,7 +218,8 @@ having kept the terminal output:
   in how many spells), how long it was not running, the offers made and how
   many sat on the minimum premium, and for each contract the premium a sale
   brought against the model value of the offer that was taken, the fees its
-  transactions paid and how long its collateral was locked. `--since` takes a
+  transactions paid and how long its collateral was locked. A fee counts in
+  the period its transaction was sent, once it has confirmed. `--since` takes a
   span (`90m`, `24h`, `7d`, `2w`), a date or time (UTC unless it says
   otherwise) or `all`. It only reads, so it is safe while `run` is going.
   Periods from before this release have no journal: they show contracts, fees
@@ -228,8 +229,10 @@ having kept the terminal output:
 now. A cancel of a call pays its strike to the options address inside the same
 transaction, so it needs one coin of the quote asset to start from (any amount;
 it comes back in full), and XCH for a fee when one is due: at the options
-address, or anywhere in the wallet with `wallet.fund_from_wallet`. A contract
-it cannot cancel is clawed back after expiry instead.
+address, or anywhere in the wallet with `wallet.fund_from_wallet`. A fixed
+`fee_mojos` is checked against that XCH; with `fee_mojos: auto` the fee is only
+known when the cancel is sent. A contract it cannot cancel is clawed back after
+expiry instead, and once expired a contract can only be clawed back.
 
 ## Announcing offers on Splash (optional)
 

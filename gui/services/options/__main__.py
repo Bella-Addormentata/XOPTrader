@@ -294,54 +294,83 @@ def _status(cfg: config.OptionsConfig) -> int:
 
 
 def _cancel_funding(
-    cfg: config.OptionsConfig, book_store: store.OptionStore, coins: Any
+    cfg: config.OptionsConfig,
+    book_store: store.OptionStore,
+    coins: Any,
+    now: float | None = None,
 ) -> list[str]:
     """Whether each unsold contract could be cancelled now, and what is missing if not.
 
     A cancel pays the strike to ourselves inside the same bundle, so it needs
     one coin of the strike asset to start from (any amount; it comes back in
-    full), and XCH for a fee when one is due: at the options address, or with
-    ``fund_from_wallet`` anywhere in the wallet. A clawback after expiry needs
-    neither. On the first live run the wind-down found this out from the
-    cancel's error. Coins a transaction still waiting already spends do not
-    count, as they do not for the cancel itself.
+    full), and XCH for its fee: at the options address, or with
+    ``fund_from_wallet`` anywhere in the wallet. A fixed ``fee_mojos`` is
+    checked against that XCH; with ``fee_mojos: auto`` the fee is sized only
+    when the cancel is sent. An expired contract cannot be cancelled at all:
+    it is clawed back, which needs neither. On the first live run the
+    wind-down found this out from the cancel's error. Coins a transaction
+    still waiting already spends do not count, as they do not for the cancel
+    itself.
     """
     unsold = book_store.contracts((store.OPEN,))
     if not unsold:
         return []
+    now = time.time() if now is None else now
     anywhere = cfg.wallet.fund_from_wallet
     where = "in the wallet" if anywhere else "at the options address"
     reserved = reserved_coin_ids(book_store)
 
-    def free(listed: list[Any]) -> bool:
-        return any(bytes(coin.coin_id()) not in reserved for coin in listed)
+    def free(listed: list[Any]) -> list[Any]:
+        return [coin for coin in listed if bytes(coin.coin_id()) not in reserved]
 
-    have_xch = free(coins.wallet_xch_coins() if anywhere else coins.xch_coins())
+    xch = sum(
+        int(coin.amount)
+        for coin in free(coins.wallet_xch_coins() if anywhere else coins.xch_coins())
+    )
+    fee = None if cfg.fee_auto else cfg.fee_mojos  # None: sized when the cancel is sent
     lines = ["cancelling now:"]
     for item in unsold:
+        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(item.expiration))
+        if item.expiration <= now:
+            lines.append(
+                f"  {item.slot:<22} expired at {when}, so it can only be clawed back; "
+                "a live step does that"
+            )
+            continue
+        missing = []
         if item.strike_asset is None:
-            ready = have_xch
-            missing = f"an XCH coin {where}"
+            # The strike is XCH: one XCH coin starts it, and the fee comes from the same XCH.
+            if xch < max(fee or 0, 1):
+                missing.append(
+                    f"{fee} mojos of XCH {where} for its fee" if fee else f"an XCH coin {where}"
+                )
         else:
             asset = item.strike_asset
-            if anywhere:
-                ready = free(coins.wallet_cat_coins(asset))
-            else:
-                ready = free([cat.coin for cat in coins.cats(asset)])
-            name = "the quote asset" if asset == cfg.quote_asset_id else "its CAT"
-            missing = f"a coin of {name} (any amount) {where}"
-        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(item.expiration))
-        if ready:
-            fee = (
-                ""
-                if have_xch or item.strike_asset is None
-                else f" (plus XCH {where} if a fee is due)"
+            listed = (
+                coins.wallet_cat_coins(asset)
+                if anywhere
+                else [cat.coin for cat in coins.cats(asset)]
             )
-            lines.append(f"  {item.slot:<22} possible{fee}")
-        else:
+            if not free(listed):
+                name = "the quote asset" if asset == cfg.quote_asset_id else "its CAT"
+                missing.append(f"a coin of {name} (any amount) {where}")
+            if fee and xch < fee:
+                missing.append(f"{fee} mojos of XCH {where} for its fee")
+        if missing:
+            them = "them" if len(missing) > 1 else "it"
             lines.append(
-                f"  {item.slot:<22} needs {missing}; without it, it is clawed back after {when}"
+                f"  {item.slot:<22} needs {' and '.join(missing)}; "
+                f"without {them}, it is clawed back after {when}"
             )
+        elif fee is not None:
+            lines.append(f"  {item.slot:<22} possible")
+        elif xch:
+            lines.append(
+                f"  {item.slot:<22} possible if its fee, sized when it is sent, is within "
+                f"the {xch} mojos of XCH {where}"
+            )
+        else:
+            lines.append(f"  {item.slot:<22} possible (plus XCH {where} if a fee is due)")
     return lines
 
 
@@ -371,6 +400,7 @@ def _step(cfg: config.OptionsConfig) -> int:
 
 def _run(cfg: config.OptionsConfig, interval: float) -> int:
     book, book_store, _ = build(cfg)
+    book.step_interval = interval
     print(f"stepping every {interval:g} s; Ctrl-C to stop (offers already out expire on their own)")
     log.info("[options] stepping every %g s (dry_run %s)", interval, cfg.dry_run)
     seen: dict[str, Any] = {}  # what the shared-wallet banner last said

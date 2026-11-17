@@ -50,6 +50,17 @@ def test_a_step_that_quotes_journals_the_market_it_quoted_from() -> None:
     assert row.spot_at is not None and abs(row.spot_at - row.at) < 60
 
 
+def test_a_book_stepped_on_a_timer_journals_its_interval() -> None:
+    # So the report can tell steps half an hour apart from a book that stopped.
+    rig = Rig()
+    rig.steps(1)
+    rig.book.step_interval = 1800.0
+    rig.spot = 1.10 * (1 + 2 * store.JOURNAL_MOVE)
+    rig.steps(1)
+
+    assert [row.interval for row in rig.store.steps()] == [None, 1800]
+
+
 def test_the_journal_keeps_news_not_every_step() -> None:
     rig = Rig()
     rig.steps(4)  # the same market throughout: one row says it all

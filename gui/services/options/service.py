@@ -354,6 +354,10 @@ class OptionsBook:
         self._chain_time_asked_at: int | None = None
         self._rate: tuple[int, int] | None = None  # (when asked, mojos per cost)
         self._withdrawn_at: dict[bytes, int] = {}
+        #: Seconds between steps, set by whatever steps the book on a timer
+        #: (``run``, the app's Options page). The step journal keeps it, so the
+        #: report can tell a long interval from a book that was not running.
+        self.step_interval: float | None = None
 
     @property
     def chain(self) -> chain.CachedChain:
@@ -1400,6 +1404,7 @@ class OptionsBook:
                 bid=None if market is None else market.bid,
                 ask=None if market is None else market.ask,
                 spot_at=None if market is None else market.as_of,
+                interval=self.step_interval,
                 now=now,
             )
         except Exception as exc:  # noqa: BLE001 - a full disk must not stop the book

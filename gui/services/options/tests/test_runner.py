@@ -547,3 +547,4 @@ def test_a_run_from_the_app_writes_the_book_s_own_log_file(tmp_path, caplog) -> 
     assert lines[-1].endswith("[options] rehearse run stopped")
     assert all(line[:4].isdigit() and line[4] == "-" for line in lines)
     assert package.handlers == handlers  # the file is let go with the run
+    assert made[0].step_interval == 0.02  # the journal keeps it, for the report

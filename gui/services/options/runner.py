@@ -500,6 +500,7 @@ class OptionsRunner:
                         self._snapshot, mode=Mode.OFF, held=f"could not start: {exc}"
                     )
                 return
+            book.step_interval = self._interval  # kept in the journal for the report
             book_log = self._open_log(cfg, mode)
             try:
                 while not stop.is_set():

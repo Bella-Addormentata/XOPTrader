@@ -732,3 +732,26 @@ def test_a_snapshot_sees_what_the_book_has_written_so_far(tmp_path) -> None:
     assert [row.at for row in copy.steps()] == [200]
     copy.close()
     book.close()
+
+
+def test_a_journal_row_keeps_the_step_interval_it_was_written_under() -> None:
+    book = store.OptionStore(":memory:")
+    book.log_step(store.QUOTING, interval=59.5, now=100)
+    book.log_step("not quoting: market data unavailable", now=200)
+
+    assert [row.interval for row in book.steps()] == [60, None]
+
+
+def test_a_journal_from_before_the_step_interval_gets_it(tmp_path) -> None:
+    path = tmp_path / "options_jobs.db"
+    book = store.OptionStore(path)
+    book.log_step(store.QUOTING, now=100)
+    book.close()
+    old = sqlite3.connect(path)
+    old.executescript("ALTER TABLE step_log DROP COLUMN interval;")
+    old.close()
+
+    book = store.OptionStore(path)
+
+    assert book.log_step("not quoting: market data unavailable", interval=60, now=200)
+    assert [row.interval for row in book.steps()] == [None, 60]

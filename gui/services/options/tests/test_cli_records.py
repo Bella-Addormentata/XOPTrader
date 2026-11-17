@@ -32,7 +32,7 @@ from gui.services.options.tests.test_runtime import (  # noqa: E402
 
 USD = b"\x07" * 32
 _STAMP = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4} ")
-_EXPIRY = 1_794_787_200  # 2026-11-16 00:00 UTC
+_EXPIRY = 4_102_444_800  # 2100-01-01 00:00 UTC: not expired while these tests run
 
 
 def _config_file(tmp_path: Path) -> tuple[str, Path]:
@@ -350,7 +350,7 @@ def test_status_says_whether_each_unsold_contract_can_be_cancelled_now(
     # options address; a put's is XCH, and there is XCH.
     assert _cancel_lines(capsys.readouterr().out) == {
         "C110@5": "needs a coin of the quote asset (any amount) at the options address; "
-        "without it, it is clawed back after 2026-11-16 00:00 UTC",
+        "without it, it is clawed back after 2100-01-01 00:00 UTC",
         "P90@5": "possible",
     }
 
@@ -359,16 +359,28 @@ def test_status_says_whether_each_unsold_contract_can_be_cancelled_now(
     assert _cancel_lines(capsys.readouterr().out) == {"C110@5": "possible", "P90@5": "possible"}
 
 
-def test_a_cancel_with_the_quote_asset_but_no_xch_may_still_need_a_fee(tmp_path) -> None:
-    cfg = _config(tmp_path, USD)
-    book_store = store.OptionStore(":memory:")
+class _Coins:
+    """XCH and quote-asset coins at the options address."""
+
+    def __init__(self, xch: list, cats: list) -> None:
+        self._xch, self._cats = xch, cats
+
+    def xch_coins(self) -> list:
+        return self._xch
+
+    def cats(self, asset_id: bytes) -> list:
+        return self._cats
+
+
+def _unsold(book_store: store.OptionStore, side: str = "call") -> None:
+    call = side == "call"
     book_store.add_contract(
         launcher_id=b"\x11" * 32,
-        slot="C110@5",
-        side="call",
-        underlying_asset=None,
+        slot="C110@5" if call else "P90@5",
+        side=side,
+        underlying_asset=None if call else USD,
         underlying_amount=1,
-        strike_asset=USD,
+        strike_asset=USD if call else None,
         strike_amount=1,
         expiration=_EXPIRY,
         creator_puzzle_hash=b"\x33" * 32,
@@ -376,21 +388,71 @@ def test_a_cancel_with_the_quote_asset_but_no_xch_may_still_need_a_fee(tmp_path)
         deadline=9,
     )
 
-    class Coins:
-        def __init__(self, xch: list, cats: list) -> None:
-            self._xch, self._cats = xch, cats
 
-        def xch_coins(self) -> list:
-            return self._xch
+_FEE_LIMITS = {"max_fee_mojos": 10_000_000}
 
-        def cats(self, asset_id: bytes) -> list:
-            return self._cats
 
-    assert cli._cancel_funding(cfg, book_store, Coins([], [_Cat(_coin(1))])) == []  # minting
+@pytest.mark.parametrize(
+    ("fee", "xch", "says"),
+    [
+        (0, 0, "possible"),
+        ("auto", 0, "possible (plus XCH at the options address if a fee is due)"),
+        (
+            "auto",
+            5,
+            "possible if its fee, sized when it is sent, is within the 5 mojos of XCH "
+            "at the options address",
+        ),
+        (1_000_000, 2_000_000, "possible"),
+        (
+            1_000_000,
+            1,
+            "needs 1000000 mojos of XCH at the options address for its fee; "
+            "without it, it is clawed back after 2100-01-01 00:00 UTC",
+        ),
+    ],
+)
+def test_a_cancel_s_fee_is_checked_against_the_xch_there(tmp_path, fee, xch, says) -> None:
+    cfg = _config(tmp_path, USD, fee_mojos=fee, limits=_FEE_LIMITS)
+    book_store = store.OptionStore(":memory:")
+    _unsold(book_store)
+    coins = _Coins([_coin(2, xch)] if xch else [], [_Cat(_coin(1))])
+    assert cli._cancel_funding(cfg, book_store, coins) == []  # still minting
 
     _minted(book_store, b"\x11" * 32, store.OPEN)
-    (_, line) = cli._cancel_funding(cfg, book_store, Coins([], [_Cat(_coin(1))]))
-    assert line.split(None, 1)[1] == "possible (plus XCH at the options address if a fee is due)"
+
+    (_, line) = cli._cancel_funding(cfg, book_store, coins)
+    assert line.split(None, 1)[1] == says
+
+
+def test_a_put_s_strike_and_fee_both_come_from_xch(tmp_path) -> None:
+    cfg = _config(tmp_path, USD, fee_mojos=1_000_000, limits=_FEE_LIMITS)
+    book_store = store.OptionStore(":memory:")
+    _unsold(book_store, "put")
+    _minted(book_store, b"\x11" * 32, store.OPEN)
+
+    (_, line) = cli._cancel_funding(cfg, book_store, _Coins([_coin(2, 1)], []))
+    assert line.split(None, 1)[1].startswith(
+        "needs 1000000 mojos of XCH at the options address for its fee;"
+    )
+    (_, line) = cli._cancel_funding(cfg, book_store, _Coins([_coin(2, 1_000_000)], []))
+    assert line.split(None, 1)[1] == "possible"
+
+
+def test_an_expired_contract_is_not_offered_a_cancel(tmp_path) -> None:
+    # The chain refuses a cancel after expiry; a stopped book has not yet
+    # noticed, so the contract is still on record as open.
+    cfg = _config(tmp_path, USD)
+    book_store = store.OptionStore(":memory:")
+    _unsold(book_store)
+    _minted(book_store, b"\x11" * 32, store.OPEN)
+
+    coins = _Coins([_coin(2, 10**9)], [_Cat(_coin(1))])
+    (_, line) = cli._cancel_funding(cfg, book_store, coins, now=_EXPIRY + 60)
+
+    assert line.split(None, 1)[1] == (
+        "expired at 2100-01-01 00:00 UTC, so it can only be clawed back; a live step does that"
+    )
 
 
 def test_with_fund_from_wallet_a_cancel_may_start_from_anywhere_in_the_wallet(tmp_path) -> None:

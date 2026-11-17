@@ -49,6 +49,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import math
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -191,7 +192,8 @@ CREATE TABLE IF NOT EXISTS step_log (
     sigma   REAL,
     bid     REAL,
     ask     REAL,
-    spot_at INTEGER
+    spot_at INTEGER,
+    interval INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_step_log_at ON step_log (at);
 """
@@ -342,6 +344,8 @@ class StepLogRow:
     bid: float | None
     ask: float | None
     spot_at: int | None
+    #: Seconds to the next step, when steps came on a timer; None for a single step.
+    interval: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -442,6 +446,10 @@ class OptionStore:
             columns = {row["name"] for row in self._db.execute("PRAGMA table_info(offers)")}
             if "splash_at" not in columns:
                 self._db.execute("ALTER TABLE offers ADD COLUMN splash_at INTEGER")
+            # ...and a step journal from before it kept the step interval.
+            columns = {row["name"] for row in self._db.execute("PRAGMA table_info(step_log)")}
+            if "interval" not in columns:
+                self._db.execute("ALTER TABLE step_log ADD COLUMN interval INTEGER")
 
     def close(self) -> None:
         if self._lock is not None:
@@ -994,6 +1002,7 @@ class OptionStore:
         bid: float | None = None,
         ask: float | None = None,
         spot_at: float | None = None,
+        interval: float | None = None,
         now: int | None = None,
         force: bool = False,
     ) -> bool:
@@ -1002,6 +1011,8 @@ class OptionStore:
         Something new is a different verdict, a price that moved more than
         :data:`JOURNAL_MOVE` since the last row, or a last row older than
         :data:`JOURNAL_EVERY_SECONDS`. ``force`` writes regardless.
+        ``interval`` is how long until the next step, when steps come on a
+        timer: the report needs it to tell a long interval from a stop.
         """
         now = int(time.time()) if now is None else int(now)
         last = self.last_step()
@@ -1014,8 +1025,9 @@ class OptionStore:
                 return False
         with self._write() as db:
             db.execute(
-                "INSERT INTO step_log (at, verdict, detail, spot, sigma, bid, ask, spot_at)"
-                " VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO step_log"
+                " (at, verdict, detail, spot, sigma, bid, ask, spot_at, interval)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
                 (
                     now,
                     verdict,
@@ -1025,6 +1037,7 @@ class OptionStore:
                     bid,
                     ask,
                     None if spot_at is None else int(spot_at),
+                    None if interval is None else math.ceil(interval),
                 ),
             )
         return True
@@ -1044,6 +1057,7 @@ class OptionStore:
             bid=real("bid"),
             ask=real("ask"),
             spot_at=None if row["spot_at"] is None else int(row["spot_at"]),
+            interval=None if row["interval"] is None else int(row["interval"]),
         )
 
     def last_step(self, before: int | None = None) -> StepLogRow | None:

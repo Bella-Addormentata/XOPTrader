@@ -30,7 +30,9 @@ database said what happened but not why. Now:
   thin, crossed or too wide; spot outside the Dexie range; wallet not
   ready; the step failed, with its error; refused because the trading
   engine may be running). A row is written when the verdict changes, when
-  a price moves more than 0.5%, and otherwise every 15 minutes.
+  a price moves more than 0.5%, and otherwise every 15 minutes. It also
+  keeps the step interval, so the report can tell a long `--interval` from
+  a book that was not running.
 - **Fees and sales in the events.** `collateral_locked` and
   `collateral_returned` carry the fee their transaction paid, a confirmed
   withdrawal is booked as `offers_withdrawn` with its fee, and `sold` names
@@ -64,7 +66,8 @@ in the wallet with `fund_from_wallet`. The first run's wind-down found this
 out from the cancel's error. `status` now lists each unsold contract as
 `possible`, or what it needs and when it will be clawed back instead. A
 coin that a transaction still waiting already spends does not count, as it
-does not for the cancel itself.
+does not for the cancel itself; a fixed `fee_mojos` is checked against the XCH
+there; and an expired contract is shown as one only a clawback can close.
 
 ## [0.10.51] — 2026-11-16 — the engine can trade beside open option contracts
 

@@ -213,6 +213,33 @@ def test_a_verdict_that_comes_back_is_another_spell() -> None:
     assert seconds == 100 + 100 + 1200 + 1000
 
 
+def test_steps_half_an_hour_apart_count_as_running_when_the_journal_says_so() -> None:
+    # Every step writes a row when steps are more than 15 minutes apart. Rows
+    # 30 minutes apart are a running book if that was its interval, and a
+    # book that stopped in between if it was not.
+    timed, untimed = store.OptionStore(":memory:"), store.OptionStore(":memory:")
+    for at in range(T0, T0 + 3 * 3600, 1800):
+        timed.log_step(store.QUOTING, interval=1800, now=at, force=True)
+        untimed.log_step(store.QUOTING, now=at, force=True)
+
+    assert report.summarize(timed, UNIT, T0, UNTIL).quoting_seconds == 3 * 3600
+    assert report.summarize(untimed, UNIT, T0, UNTIL).quoting_seconds == 6 * 1200
+
+
+def test_a_step_that_keeps_failing_is_one_spell() -> None:
+    # Each failed step journals its market as quoting, then the failure, with
+    # the same time. The quoting rows cover nothing and split nothing.
+    book = store.OptionStore(":memory:")
+    for at in range(T0, T0 + 600, 60):
+        book.log_step(store.QUOTING, interval=60, now=at, force=True)
+        book.log_step("step failed", detail="RuntimeError: boom", interval=60, now=at, force=True)
+
+    summary = report.summarize(book, UNIT, T0, T0 + 600)
+
+    assert summary.quoting_seconds == 0
+    assert summary.held_back == {"step failed": (600, 1)}
+
+
 def test_a_period_before_the_journal_existed_says_so() -> None:
     book = store.OptionStore(":memory:")
 

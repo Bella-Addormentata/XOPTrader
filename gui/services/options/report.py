@@ -8,7 +8,9 @@
   the model rather than the minimum premium (from the quotes journal);
 * per contract, the premium a sale brought against the model value of the
   offer that was taken, the fees its transactions paid, and how long its
-  collateral was locked (from contracts, broadcasts and events).
+  collateral was locked (from contracts, broadcasts and events). A fee counts
+  in the period its transaction was sent, once it has confirmed, so each fee
+  falls in exactly one of two adjoining periods.
 
 ``--csv PATH`` writes the per-contract figures for a spreadsheet. The report
 only reads, so it is safe to run while the book is running.
@@ -32,8 +34,10 @@ from gui.services.options.config import XCH_MOJOS
 
 #: Longer than this between two journal rows means the book was not running in
 #: between: while it runs it writes at least every ``JOURNAL_EVERY_SECONDS``
-#: (on the first step after that), and steps come a minute or so apart.
-_RUNNING_GAP_SECONDS = store.JOURNAL_EVERY_SECONDS + 300
+#: (on the first step after that), or every step when steps are further apart
+#: than that. A row says how far apart they were meant to be; this is the slack.
+_STEP_SLACK_SECONDS = 300
+_RUNNING_GAP_SECONDS = store.JOURNAL_EVERY_SECONDS + _STEP_SLACK_SECONDS
 
 _SPAN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([mhdw])\s*$", re.IGNORECASE)
 _SPAN_SECONDS = {"m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
@@ -130,9 +134,14 @@ def _journal(rows: list[store.StepLogRow], since: int, until: int) -> tuple[int,
     previous: str | None = None  # the verdict running into this row, if it ran right up to it
     for index, row in enumerate(rows):
         after = rows[index + 1].at if index + 1 < len(rows) else until
+        if row.at >= after:
+            # Followed at once by another row, as a step that failed after it
+            # had journaled its market: it covers no time, and breaks no spell.
+            continue
         # A row speaks for the time until the next one, unless the gap is so
         # long that the book cannot have been running through it.
-        end = min(after, row.at + _RUNNING_GAP_SECONDS)
+        gap = max(_RUNNING_GAP_SECONDS, (row.interval or 0) + _STEP_SLACK_SECONDS)
+        end = min(after, row.at + gap)
         seconds = int(_overlap(row.at, end, since, until))
         if seconds > 0:
             covered += seconds
