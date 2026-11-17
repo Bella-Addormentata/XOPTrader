@@ -42,9 +42,11 @@ database said what happened but not why. Now:
   back, how many offers it made and how many sat on the minimum premium,
   and for each contract the premium against the model value of the offer
   that was taken, the fees and how long its collateral was locked.
-  `--csv PATH` writes the per-contract figures. It only reads: it works on
-  a copy, so a database from before these tables is left as it is, and a
-  read-only one can be reported on.
+  `--csv PATH` writes the per-contract figures, and refuses a path that is
+  the database, a file SQLite or the book keeps beside it, the config file
+  or any other SQLite database. It only reads: it works on a copy, so a
+  database from before these tables is left as it is, and a read-only one
+  can be reported on.
 
 ### The book's range check leaves out the wallet's own offers
 

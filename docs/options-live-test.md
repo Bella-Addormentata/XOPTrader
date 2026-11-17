@@ -222,6 +222,8 @@ having kept the terminal output:
   the period its transaction was sent, once it has confirmed. `--since` takes a
   span (`90m`, `24h`, `7d`, `2w`), a date or time (UTC unless it says
   otherwise) or `all`. It only reads, so it is safe while `run` is going.
+  `--csv` will not write over the database, the files beside it, the config
+  file or any other SQLite database.
   Periods from before this release have no journal: they show contracts, fees
   and sales, but no quoting time or price breakdown.
 

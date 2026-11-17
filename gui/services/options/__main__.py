@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
+import os
 import sqlite3
 import sys
 import time
@@ -475,7 +476,52 @@ def _monitor(cfg: config.OptionsConfig, interval: float) -> int:
             return 0
 
 
-def _report(cfg: config.OptionsConfig, since: str, csv_path: str | None) -> int:
+#: Files that SQLite and the book keep beside the database.
+_DATABASE_COMPANIONS = ("-journal", "-wal", "-shm", ".lock")
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """Whether two paths name one file, through a link or another spelling."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:  # one of them is not there (yet)
+        pass
+    try:
+        return os.path.normcase(str(a.resolve())) == os.path.normcase(str(b.resolve()))
+    except (OSError, RuntimeError):  # a link loop, say: writing there fails on its own
+        return False
+
+
+def _csv_clash(cfg: config.OptionsConfig, config_path: str | None, csv_path: str) -> str | None:
+    """What ``csv_path`` is, when ``report --csv`` must not write it.
+
+    Writing the CSV empties its file first. It must not land on the book's
+    database or a file kept beside it, on the config file, or on any other
+    SQLite database (a copy of the book's, say).
+    """
+    target = Path(csv_path)
+    if cfg.database_path != ":memory:":
+        database = Path(cfg.database_path)
+        if _same_file(target, database):
+            return "is the options database"
+        for suffix in _DATABASE_COMPANIONS:
+            if _same_file(target, Path(f"{database}{suffix}")):
+                return f"is the database's {suffix} file"
+    if config_path is not None and _same_file(target, Path(config_path)):
+        return "is the config file"
+    try:
+        with open(target, "rb") as handle:
+            if handle.read(len(_SQLITE_HEADER)) == _SQLITE_HEADER:
+                return "is an SQLite database"
+    except OSError:
+        pass  # nothing there yet, or nothing readable: the write says what is wrong
+    return None
+
+
+def _report(
+    cfg: config.OptionsConfig, since: str, csv_path: str | None, config_path: str | None = None
+) -> int:
     """Read-only: what the book did since ``since``."""
     now = time.time()
     try:
@@ -489,6 +535,10 @@ def _report(cfg: config.OptionsConfig, since: str, csv_path: str | None) -> int:
         return 2
     if start > now:
         print(f"error: --since {since!r} is in the future", file=sys.stderr)
+        return 2
+    clash = _csv_clash(cfg, config_path, csv_path) if csv_path else None
+    if clash is not None:
+        print(f"error: --csv {csv_path} {clash}; the CSV needs a file of its own", file=sys.stderr)
         return 2
     try:
         # A copy: the file is only read, even when it is from an older version.
@@ -1029,7 +1079,7 @@ def main(argv: list[str] | None = None) -> int:
             handlers.append(_log_to_file(path))
             log.info("[options] %s, config %s", args.command, args.config)
         if args.command == "report":
-            return _report(cfg, args.since, args.csv)
+            return _report(cfg, args.since, args.csv, args.config)
         if args.command == "status":
             return _status(cfg)
         if args.command == "step":

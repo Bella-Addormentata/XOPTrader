@@ -5,6 +5,7 @@ that a cancel would be funded."""
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sqlite3
 import time
@@ -237,6 +238,59 @@ def test_a_report_on_a_file_that_is_no_database_says_so(tmp_path, capsys) -> Non
     assert cli.main(["--config", path, "report"]) == 2
 
     assert f"could not read {db}" in capsys.readouterr().err
+
+
+def _files(root: Path) -> dict[Path, bytes]:
+    return {file: file.read_bytes() for file in root.rglob("*") if file.is_file()}
+
+
+@pytest.mark.parametrize(
+    ("target", "clash"),
+    [
+        (lambda db, conf: db, "is the options database"),
+        (lambda db, conf: db.parent / ".." / "data" / db.name, "is the options database"),
+        (lambda db, conf: Path(f"{db}-journal"), "is the database's -journal file"),
+        (lambda db, conf: Path(f"{db}.lock"), "is the database's .lock file"),
+        (lambda db, conf: conf, "is the config file"),
+    ],
+    ids=["database", "another-spelling", "journal", "lock", "config"],
+)
+def test_a_report_does_not_write_its_csv_over_a_file_the_book_uses(
+    tmp_path, capsys, target, clash
+) -> None:
+    # Writing the CSV would empty the file first: a slip of the tab key
+    # could wipe the book's contracts and signed transactions.
+    path, db = _config_file(tmp_path)
+    store.OptionStore(db).close()
+    before = _files(tmp_path)
+    sheet = target(db, Path(path))
+
+    assert cli.main(["--config", path, "report", "--since", "all", "--csv", str(sheet)]) == 2
+
+    assert f"error: --csv {sheet} {clash}; the CSV needs a file of its own" in (
+        capsys.readouterr().err
+    )
+    assert _files(tmp_path) == before
+
+
+def test_a_report_does_not_write_its_csv_over_any_database(tmp_path, capsys) -> None:
+    # A link to the book's database is the database; a copy of it is still
+    # a database, and no place for a CSV.
+    path, db = _config_file(tmp_path)
+    store.OptionStore(db).close()
+    copy = tmp_path / "book-copy.csv"
+    copy.write_bytes(db.read_bytes())
+    link = tmp_path / "book-link.csv"
+    try:
+        os.link(db, link)
+    except OSError:
+        pytest.skip("no hard links on this file system")
+    before = _files(tmp_path)
+
+    for sheet, clash in ((link, "is the options database"), (copy, "is an SQLite database")):
+        assert cli.main(["--config", path, "report", "--csv", str(sheet)]) == 2
+        assert f"--csv {sheet} {clash}" in capsys.readouterr().err
+    assert _files(tmp_path) == before
 
 
 # -- the shared-wallet banner and a refused step ------------------------------
