@@ -286,3 +286,41 @@ TEST(CoinFenceWiring, BalancesAndSpendableCoinsAskTheFence)
     EXPECT_NE(member(src, "get_wallet_balance").find("CoinFenceUnavailable"), std::string::npos);
     EXPECT_NE(member(src, "get_spendable_coins").find("puzzle_hashes()"), std::string::npos);
 }
+
+// -- review of #240 ------------------------------------------------------------------
+
+TEST(CoinFenceWiring, TheRefresherReadsStrictlyAndSendsGetAListReadJustNow)
+{
+    std::ifstream in(XOP_TESTS_ENGINE_CPP, std::ios::binary);
+    std::ostringstream engine;
+    engine << in.rdbuf();
+    const std::string setup = engine.str().substr(engine.str().find("void Engine::setup_coin_fence()"));
+    EXPECT_NE(setup.substr(0, setup.find("\n}")).find("get_unspent_coin_records_strict("),
+              std::string::npos)
+        << "an unreadable inventory must throw, not read as no coins";
+
+    const std::string src = read_chia_rpc_cpp();
+    const std::string fx = member(src, "fence_exclusions");
+    EXPECT_NE(fx.find("refresh_now()"), std::string::npos)
+        << "non-offer spends cannot be checked afterwards: they need a list read just now";
+}
+
+TEST(CoinFenceState, RefreshNowIgnoresTheAgeAndRecordsTheWallClock)
+{
+    boost::asio::io_context ioc;
+    rpc::CoinFence fence;
+    fence.configure({kPuzzle}, std::chrono::seconds(30));
+    int calls = 0;
+    fence.set_refresher([&calls]() -> boost::asio::awaitable<std::vector<rpc::FencedCoin>> {
+        ++calls;
+        co_return std::vector<rpc::FencedCoin>{{"aa", kPuzzle, 5}};
+    });
+    for (int i = 0; i < 2; ++i) {
+        auto done = boost::asio::co_spawn(ioc, fence.refresh_now(), boost::asio::use_future);
+        ioc.restart();
+        ioc.run();
+        done.get();
+    }
+    EXPECT_EQ(calls, 2);
+    EXPECT_GT(fence.snapshot().refreshed_unix, 1.7e9);
+}

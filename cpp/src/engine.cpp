@@ -4707,6 +4707,11 @@ void Engine::setup_coin_fence()
         }
     }
 
+    // [review] The fence's identity, published so the book only signs beside
+    // an engine that fences ITS address: the address's puzzle hash ("" when
+    // it could not be read) and the network.
+    options_fence_identity_ = (base ? *base : std::string{}) + "@" + oc.network;
+
     coin_fence_ = std::make_shared<rpc::CoinFence>();
     coin_fence_->configure(hashes, std::chrono::seconds(30));
     coin_fence_->set_assets(asset_of);
@@ -4718,8 +4723,10 @@ void Engine::setup_coin_fence()
             }
             std::vector<rpc::FencedCoin> coins;
             for (const auto& ph : hashes) {
+                // [review] Strict: an unreadable answer throws (fence
+                // unknown) instead of reading as "no coins there".
                 const std::vector<json> records =
-                    co_await node->get_coin_records_by_puzzle_hash(ph, /*include_spent=*/false);
+                    co_await node->get_unspent_coin_records_strict(ph);
                 for (const auto& rec : records) {
                     const json& coin = rec.contains("coin") ? rec["coin"] : rec;
                     const std::string coin_ph =
@@ -4775,7 +4782,8 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         }
         if (metrics_ && metrics_->is_running()) {
             metrics_->update_options_fence(snap.enabled, snap.fresh, snap.coin_count,
-                                           snap.age_seconds);
+                                           snap.age_seconds, snap.refreshed_unix,
+                                           options_fence_identity_);
         }
     }
     wallet_skip_warned_this_cycle_ = false;

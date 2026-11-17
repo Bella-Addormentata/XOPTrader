@@ -459,6 +459,16 @@ public:
         std::int64_t       end_height    = 0);
 
     /**
+     * @brief [OPTIONS-FENCE] The unspent coin records at `puzzle_hash`, read
+     *        strictly: the answer must say success:true and carry a
+     *        coin_records array whose every entry has a coin with
+     *        parent_coin_info, puzzle_hash and amount.  Anything else throws,
+     *        so an unreadable answer is never taken for "no coins there".
+     */
+    asio::awaitable<std::vector<json>> get_unspent_coin_records_strict(
+        const std::string& puzzle_hash);
+
+    /**
      * @brief Estimate the recommended transaction fee based on mempool state.
      *
      * Calls the Chia full-node `get_fee_estimate` RPC endpoint (available

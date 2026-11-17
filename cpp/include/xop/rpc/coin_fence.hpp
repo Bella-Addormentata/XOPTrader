@@ -226,6 +226,10 @@ public:
         bool                     fresh{false};
         std::size_t              coin_count{0};
         double                   age_seconds{-1.0};  ///< -1 = never refreshed.
+        /// Unix time of the last successful refresh, 0 = none.  Published so
+        /// a reader computes the age itself: a stopped engine cannot keep
+        /// reporting a fresh fence.
+        double                   refreshed_unix{0.0};
         std::string              last_error;
     };
 
@@ -280,6 +284,8 @@ public:
         std::lock_guard lock(mtx_);
         coins_ = std::move(coins);
         refreshed_at_ = now;
+        refreshed_unix_ = std::chrono::duration<double>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
         last_error_.clear();
     }
 
@@ -344,11 +350,22 @@ public:
     /// max_age.  Never throws: a failed refresh leaves the fence unknown.
     boost::asio::awaitable<void> ensure_fresh()
     {
-        Refresher refresher;
         {
             std::lock_guard lock(mtx_);
             if (!enabled_) co_return;
             if (refreshed_at_ && Clock::now() - *refreshed_at_ <= max_age_) co_return;
+        }
+        co_await refresh_now();
+    }
+
+    /// Refresh through the refresher now, whatever the list's age.  Never
+    /// throws: a failed refresh leaves the fence unknown.
+    boost::asio::awaitable<void> refresh_now()
+    {
+        Refresher refresher;
+        {
+            std::lock_guard lock(mtx_);
+            if (!enabled_) co_return;
             refresher = refresher_;
         }
         if (!refresher) {
@@ -369,6 +386,7 @@ public:
         s.enabled = enabled_;
         s.coin_count = coins_.size();
         s.last_error = last_error_;
+        s.refreshed_unix = refreshed_at_ ? refreshed_unix_ : 0.0;
         if (refreshed_at_) {
             s.age_seconds = std::chrono::duration<double>(now - *refreshed_at_).count();
             s.fresh = !puzzle_hashes_.empty() && now - *refreshed_at_ <= max_age_;
@@ -390,6 +408,7 @@ private:
     std::vector<std::pair<std::string, std::string>> asset_of_;
     std::vector<FencedCoin>            coins_;
     std::optional<Clock::time_point>   refreshed_at_;
+    double                             refreshed_unix_{0.0};
     std::string                        last_error_;
     Refresher                          refresher_;
 };

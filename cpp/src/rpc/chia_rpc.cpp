@@ -794,6 +794,8 @@ ChiaFullNodeRPC::get_coin_records_by_puzzle_hash(
                                         payload);
 
     std::vector<json> records;
+    // (Lenient by design for its existing callers; the fence uses
+    // get_unspent_coin_records_strict.)
     if (resp.contains("coin_records") && resp["coin_records"].is_array()) {
         records.reserve(resp["coin_records"].size());
         for (auto& rec : resp["coin_records"]) {
@@ -1478,11 +1480,52 @@ ChiaWalletRPC::split_coins(
 // [OPTIONS-FENCE] helpers
 // ---------------------------------------------------------------------------
 
+asio::awaitable<std::vector<json>>
+ChiaFullNodeRPC::get_unspent_coin_records_strict(const std::string& puzzle_hash)
+{
+    const json payload = {{"puzzle_hash", puzzle_hash}, {"include_spent_coins", false}};
+    const json resp = co_await rpc_post("get_coin_records_by_puzzle_hash", payload);
+    if (!resp.is_object() || !resp.contains("success") || !resp["success"].is_boolean()
+        || !resp["success"].get<bool>()) {
+        throw ChiaRPCApplicationError(
+            "get_coin_records_by_puzzle_hash: no success:true in the answer", resp);
+    }
+    if (!resp.contains("coin_records") || !resp["coin_records"].is_array()) {
+        throw ChiaRPCApplicationError(
+            "get_coin_records_by_puzzle_hash: no coin_records array in the answer", resp);
+    }
+    std::vector<json> records;
+    records.reserve(resp["coin_records"].size());
+    for (const auto& rec : resp["coin_records"]) {
+        const bool ok = rec.is_object() && rec.contains("coin") && rec["coin"].is_object()
+            && rec["coin"].contains("parent_coin_info") && rec["coin"]["parent_coin_info"].is_string()
+            && rec["coin"].contains("puzzle_hash") && rec["coin"]["puzzle_hash"].is_string()
+            && rec["coin"].contains("amount") && rec["coin"]["amount"].is_number_unsigned();
+        if (!ok) {
+            throw ChiaRPCApplicationError(
+                "get_coin_records_by_puzzle_hash: a malformed coin record", resp);
+        }
+        if (rec.contains("spent") && rec["spent"].is_boolean() && rec["spent"].get<bool>()) {
+            continue;
+        }
+        records.push_back(rec);
+    }
+    co_return records;
+}
+
 asio::awaitable<std::vector<std::string>>
 ChiaWalletRPC::fence_exclusions(const char* what)
 {
     if (!fence_ || !fence_->enabled()) co_return std::vector<std::string>{};
-    co_await fence_->ensure_fresh();
+    // [review] An offer is read back after it is made (the post-check), so a
+    // list up to 30 s old will do.  Every other coin-selecting call is
+    // broadcast by the wallet as it returns -- nothing can be checked after
+    // -- so it gets a list read just now.
+    if (std::string_view{what} == "create_offer_for_ids") {
+        co_await fence_->ensure_fresh();
+    } else {
+        co_await fence_->refresh_now();
+    }
     auto ids = fence_->exclusions();
     if (!ids) {
         const auto snap = fence_->snapshot();

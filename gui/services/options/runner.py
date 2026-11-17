@@ -338,6 +338,20 @@ def engine_start_window(config_path: Path) -> Iterator[str | None]:
         yield reason
 
 
+def fence_identity(cfg: config.OptionsConfig) -> str:
+    """The book address as the engine publishes its fence: "<puzzle hash>@<network>".
+
+    "" when the address cannot be read, which matches no fence.
+    """
+    try:
+        import chia_wallet_sdk
+
+        puzzle_hash = bytes(chia_wallet_sdk.Address.decode(cfg.wallet.address).puzzle_hash)
+        return f"{puzzle_hash.hex()}@{cfg.network}"
+    except Exception:  # noqa: BLE001 - unreadable: matches nothing
+        return ""
+
+
 # -- the runner ------------------------------------------------------------------
 
 
@@ -494,9 +508,9 @@ class OptionsRunner:
 
     def _fenced_beside(self, cfg: config.OptionsConfig, state: engine_guard.EngineState) -> bool:
         """[OPTIONS-FENCE] A running engine the book may act beside: its fence holds."""
-        return bool(
-            cfg.wallet.engine_fence and state.running and self._fence(cfg).holds
-        )
+        if not (cfg.wallet.engine_fence and state.running):
+            return False
+        return self._fence(cfg).holds_for(fence_identity(cfg))
 
     def _note(self, text: str) -> None:
         stamp = time.strftime("%H:%M:%S", time.localtime(self._clock()))

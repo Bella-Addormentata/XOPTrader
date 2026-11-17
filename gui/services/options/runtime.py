@@ -389,8 +389,22 @@ def shared_wallet_guard(cfg: config.OptionsConfig, wallet: Any) -> Any:
     """``wallet``, checked for a running engine at every sign and push when shared."""
     if not cfg.wallet.share_trading_wallet:
         return wallet
+    if not cfg.wallet.engine_fence:
+        return engine_guard.EngineCheckedWallet(wallet, cfg.wallet.engine_metrics_url)
+    from gui.services.options import fence
+
+    rpc = getattr(wallet, "_rpc", None) or wallet_rpc(cfg)
+    book_fence = fence.WalletFence(rpc, cfg.wallet.address, cfg.address_prefix)
+    try:
+        identity = book_fence.identity(cfg.network)
+    except fence.FenceUnavailableError:
+        identity = ""  # never matches: the book then signs nothing beside the engine
     return engine_guard.EngineCheckedWallet(
-        wallet, cfg.wallet.engine_metrics_url, fenced=cfg.wallet.engine_fence
+        wallet,
+        cfg.wallet.engine_metrics_url,
+        fenced=True,
+        identity=identity,
+        conflicts=book_fence.conflicting_offers,
     )
 
 

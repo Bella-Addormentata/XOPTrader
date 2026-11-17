@@ -1736,7 +1736,8 @@ options:
     #     them before it is posted. It reports the fence on its metrics
     #     endpoint (xop_options_fence_*);
     #   - the engine leaves those coins out of its balances, so its sizing and
-    #     the Wallet tab's coin targets see the trading funds only;
+    #     ratio targets see the trading funds only (the Wallet tab's own balance
+    #     view still shows the whole wallet);
     #   - the app's own spends (bridges, claims, Dexie takes, the book's
     #     top-ups) exclude them too;
     #   - the book spends only coins at `address` (fund_from_wallet is refused)

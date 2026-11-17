@@ -183,21 +183,28 @@ def test_a_fence_that_cannot_list_its_coins_refuses_the_spend() -> None:
 
 # -- the engine's fence, read off its metrics ---------------------------------------
 
-METRICS = """# HELP xop_options_fence_enabled 1 when on
+IDENTITY = PUZZLE.hex() + "@mainnet"
+NOW = 1_800_000_000.0
+METRICS = f"""# HELP xop_options_fence_enabled 1 when on
 xop_options_fence_enabled 1
 xop_options_fence_fresh 1
 xop_options_fence_coins 3
-xop_options_fence_age_seconds 12.5
+xop_options_fence_age_seconds 0
+xop_options_fence_refreshed_unix {NOW - 12.5}
+xop_options_fence_info{{fence="{IDENTITY}"}} 1
 """
 
 
 def test_the_engine_s_fence_is_read_from_its_metrics() -> None:
-    state = engine_guard.parse_fence(METRICS)
-    assert state.holds and state.coins == 3 and state.age_seconds == 12.5
+    state = engine_guard.parse_fence(METRICS, now=NOW)
+    assert state.holds_for(IDENTITY) and state.coins == 3 and state.age_seconds == 12.5
+    assert not state.holds_for("aa" * 32 + "@mainnet"), "another address's fence"
+    assert not state.holds_for(""), "an unreadable address matches nothing"
     assert not engine_guard.parse_fence("xop_posting_gated 0\n").reported
-    assert not engine_guard.parse_fence(METRICS.replace("fresh 1", "fresh 0")).holds
-    assert not engine_guard.parse_fence(METRICS.replace("enabled 1", "enabled 0")).holds
-    assert not engine_guard.parse_fence(METRICS.replace("12.5", "600")).holds, "stale refresh"
+    assert not engine_guard.parse_fence(METRICS.replace("fresh 1", "fresh 0"), now=NOW).holds
+    assert not engine_guard.parse_fence(METRICS.replace("enabled 1", "enabled 0"), now=NOW).holds
+    # The age is worked out from the refresh time: a stopped engine goes stale.
+    assert not engine_guard.parse_fence(METRICS, now=NOW + 600).holds, "stale refresh"
     unreachable = engine_guard.fence_state(
         "http://localhost:1/metrics", fetch=lambda url: (_ for _ in ()).throw(OSError("refused"))
     )
@@ -211,8 +218,21 @@ def test_a_signature_beside_a_running_engine_needs_its_fence(monkeypatch) -> Non
     signed: list[str] = []
     inner = types.SimpleNamespace(sign=lambda spends: signed.append("sign") or b"s")
     monkeypatch.setattr(engine_guard, "engine_state", lambda url: UP)
-    monkeypatch.setattr(engine_guard, "fence_state", lambda url: engine_guard.parse_fence(METRICS))
-    assert engine_guard.EngineCheckedWallet(inner, "u", fenced=True).sign([]) == b"s"
+    monkeypatch.setattr(
+        engine_guard, "fence_state", lambda url: engine_guard.parse_fence(METRICS, now=NOW)
+    )
+    assert (
+        engine_guard.EngineCheckedWallet(inner, "u", fenced=True, identity=IDENTITY).sign([])
+        == b"s"
+    )
+    with pytest.raises(engine_guard.EngineRunningError, match="without a working fence"):
+        engine_guard.EngineCheckedWallet(
+            inner, "u", fenced=True, identity="bb" * 32 + "@mainnet"
+        ).sign([])
+    with pytest.raises(engine_guard.EngineRunningError, match="resting offers hold coins"):
+        engine_guard.EngineCheckedWallet(
+            inner, "u", fenced=True, identity=IDENTITY, conflicts=lambda: ["0x1234"]
+        ).sign([])
     with pytest.raises(engine_guard.EngineRunningError, match="refused, trading engine up"):
         engine_guard.EngineCheckedWallet(inner, "u").sign([])
     monkeypatch.setattr(
@@ -239,7 +259,7 @@ def test_live_beside_a_fenced_engine(tmp_path) -> None:
     }
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(root), encoding="utf-8")
-    holds = engine_guard.parse_fence(METRICS)
+    holds = engine_guard.parse_fence(METRICS, now=NOW)
     broken = engine_guard.parse_fence("")
 
     run = runner.OptionsRunner(
@@ -370,5 +390,106 @@ def test_locked_collateral_counts_toward_the_target() -> None:
         deadline=1,
         now=0,
     )
+    from gui.services.options import store as store_mod
+
+    for row in stub._store.unresolved():
+        stub._store.settle_broadcast(row.id, "confirmed", contract_status=store_mod.OPEN)
     top_up(StepReport())
     assert coins.sent == [], "0.5 loose + 1.0 locked = the 1.5 XCH target"
+
+
+# -- review of #240 ----------------------------------------------------------------
+
+
+def test_listing_that_is_not_an_array_fails_closed() -> None:
+    wallet = FakeWallet()
+    client = WalletClient({"host": "localhost", "port": 9256}, poster=wallet)
+    original = wallet.__call__
+
+    def no_records(url, body):
+        answer = original(url, body)
+        if url.endswith("get_spendable_coins"):
+            answer = {"success": True}
+        return answer
+
+    client = WalletClient({"host": "localhost", "port": 9256}, poster=no_records)
+    client.set_fence(fence.WalletFence(client._post, ADDRESS, "xch").coin_ids)
+    with pytest.raises(WalletError, match="did not list"):
+        client._post("send_transaction", {"wallet_id": 1, "amount": 1, "address": "x", "fee": 0})
+
+
+def test_resting_offers_holding_the_sub_account_s_coins_are_found() -> None:
+    wallet = FakeWallet()
+    original = wallet.__call__
+
+    def offers(url, body):
+        if url.endswith("get_all_offers"):
+            return {
+                "success": True,
+                "trade_records": [
+                    {
+                        "trade_id": "0xaaaa",
+                        "is_my_offer": True,
+                        "status": "PENDING_ACCEPT",
+                        "coins_of_interest": [{"puzzle_hash": "0x" + PUZZLE.hex()}],
+                    },
+                    {
+                        "trade_id": "0xbbbb",
+                        "is_my_offer": True,
+                        "status": "PENDING_ACCEPT",
+                        "coins_of_interest": [{"puzzle_hash": "0x" + "05" * 32}],
+                    },
+                    {
+                        "trade_id": "0xcccc",
+                        "is_my_offer": True,
+                        "status": "CANCELLED",
+                        "coins_of_interest": [{"puzzle_hash": "0x" + PUZZLE.hex()}],
+                    },
+                ],
+            }
+        return original(url, body)
+
+    book_fence = fence.WalletFence(offers, ADDRESS, "xch")
+    assert book_fence.conflicting_offers() == ["0xaaaa"]
+    assert book_fence.identity("mainnet") == PUZZLE.hex() + "@mainnet"
+
+
+def test_an_uncertain_top_up_is_not_sent_again() -> None:
+    from gui.services.options.service import StepReport
+
+    cfg = _parse(_shared(engine_fence=True), target={"xch": 1.5})
+    stub, coins, top_up = _book(cfg, loose_xch=0, loose_quote=0)
+
+    def fail(**kwargs):
+        coins.sent.append(kwargs)
+        raise TimeoutError("read timed out")
+
+    coins.send_to_address = fail
+    report = StepReport()
+    top_up(report)
+    assert len(coins.sent) == 1 and any("may not have been sent" in p for p in report.problems)
+    top_up(StepReport())
+    assert len(coins.sent) == 1, "no second send while the first one's fate is unknown"
+
+
+def test_top_ups_wait_while_a_transaction_of_the_book_is_in_flight() -> None:
+    from gui.services.options.service import StepReport
+
+    cfg = _parse(_shared(engine_fence=True), target={"xch": 1.5})
+    stub, coins, top_up = _book(cfg, loose_xch=1_000_000_000_000, loose_quote=0)
+    stub._store.add_contract(
+        launcher_id=b"\x08" * 32,
+        slot="C110@1",
+        side="call",
+        underlying_asset=None,
+        underlying_amount=1_000_000_000_000,
+        strike_asset=bytes.fromhex(USD),
+        strike_amount=625,
+        expiration=2_000_000_000,
+        creator_puzzle_hash=PUZZLE,
+        bundle=b"",
+        deadline=1,
+        now=0,
+    )
+    top_up(StepReport())
+    assert coins.sent == [], "the mint is in flight: its inputs and collateral would count twice"

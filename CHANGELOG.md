@@ -23,8 +23,9 @@ stop the engine to act:
   refresh) is cancelled locally before it is posted. The fence is in
   `ChiaWalletRPC`, the one class every engine wallet call goes through, and a
   test fails if a coin-selecting call there stops asking it.
-- **The engine's balances leave it out**, so its sizing and the Wallet tab's
-  coin targets see the trading funds only.
+- **The engine's balances leave it out**, so its sizing and ratio targets
+  see the trading funds only. (The Wallet tab's own balance view still shows
+  the whole wallet.)
 - **The app's own spends leave it out too**: bridge sends and claims, Dexie
   takes and the book's top-ups, through `WalletClient`.
 - **The book** spends only coins at its own address (`fund_from_wallet` is

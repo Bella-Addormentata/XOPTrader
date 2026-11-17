@@ -314,6 +314,9 @@ def reserved_coin_ids(book_store: store.OptionStore) -> set[bytes]:
     }
 
 
+#: [OPTIONS-FENCE] A top-up whose outcome is not known yet.
+_SEND_UNCERTAIN = "uncertain"
+
 class OptionsBook:
     def __init__(
         self,
@@ -1500,7 +1503,7 @@ class OptionsBook:
             loose = sum(int(cat.coin.amount) for cat in self._listed("quote asset", asset_id))
         locked = sum(
             int(item.underlying_amount)
-            for item in self._store.contracts(store.ACTIVE)
+            for item in self._store.contracts((store.OPEN, store.SOLD))
             if (item.underlying_asset is None) == (asset_id is None)
             and (asset_id is None or bytes(item.underlying_asset) == bytes(asset_id))
         )
@@ -1517,6 +1520,11 @@ class OptionsBook:
         target = self._config.target
         if target is None or not self._config.wallet.engine_fence:
             return
+        if self._store.unresolved() or self._store.contracts((store.MINTING, store.CLOSING)):
+            # [review] A mint or cancel in flight still has its inputs in the
+            # listing and its collateral in the record: counted now it would be
+            # counted twice. Wait for it to settle.
+            return
         for asset_id, want, what in (
             (None, target.xch_mojos, "XCH"),
             (self._config.quote_asset_id, target.quote_mojos, "quote asset"),
@@ -1525,6 +1533,20 @@ class OptionsBook:
                 continue
             key = "topup_pending:" + ("xch" if asset_id is None else bytes(asset_id).hex())
             pending, _, sent_at = (self._store.recall(key) or "").partition("|")
+            if pending == _SEND_UNCERTAIN:
+                # [review] A send whose outcome is unknown (timed out, or the
+                # app stopped mid-send) is never sent again on a guess: wait
+                # until the address shows it, or an hour has passed.
+                if now - int(sent_at or now) <= self._TOP_UP_FORGET_SECONDS:
+                    try:
+                        if self._held(asset_id) >= want * (1.0 - target.tolerance):
+                            self._store.remember(key, "")
+                    except builder.OptionBuildError:
+                        pass
+                    continue
+                self._store.remember(key, "")
+                report.problem(f"an uncertain {what} top-up from an hour ago is forgotten")
+                pending = ""
             if pending:
                 try:
                     confirmed = self._coins.transaction_confirmed(pending)
@@ -1563,10 +1585,16 @@ class OptionsBook:
                 report.did(f"dry run: would top up the options address by {short} {what} mojos")
                 continue
             fee = self._top_up_fee()
+            # [review] The intent is written before the send: a timeout or a
+            # crash after the wallet accepted it must not lead to a second one.
+            self._store.remember(key, f"{_SEND_UNCERTAIN}|{now}")
             try:
                 transaction = self._coins.send_to_address(asset_id=asset_id, amount=short, fee=fee)
             except Exception as exc:  # noqa: BLE001 - reported; the rest of the step goes on
-                report.problem(f"top-up of {what} not sent: {exc}")
+                report.problem(
+                    f"top-up of {what} may not have been sent ({exc}); no new one until the "
+                    "address shows it or an hour has passed"
+                )
                 continue
             self._store.remember(key, f"{transaction or 'unknown'}|{now}")
             self._store.add_event(

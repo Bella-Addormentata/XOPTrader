@@ -93,7 +93,7 @@ class WalletFence:
         address: str,
         prefix: str = "xch",
         *,
-        max_age: float = 15.0,
+        max_age: float = 0.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._rpc = rpc
@@ -117,6 +117,68 @@ class WalletFence:
             )
         return bytes(decoded.puzzle_hash)
 
+    def identity(self, network: str) -> str:
+        """"<puzzle hash>@<network>": what the engine publishes for the address it fences."""
+        return f"{self.puzzle_hash().hex()}@{network}"
+
+    def puzzle_hashes(self) -> set[bytes]:
+        """The address and its wrapping under every CAT wallet the wallet has open."""
+        sdk = _sdk()
+        inner = self.puzzle_hash()
+        out = {inner}
+        for wallet in self._wallets():
+            if int(wallet.get("type", -1)) == _CAT_WALLET:
+                asset = self._rpc("cat_get_asset_id", {"wallet_id": int(wallet["id"])}).get(
+                    "asset_id"
+                )
+                out.add(bytes(sdk.cat_puzzle_hash(_unhex(asset), inner)))
+        return out
+
+    def conflicting_offers(self) -> list[str]:
+        """Our resting offers that hold a coin of the sub-account (made before the fence).
+
+        Such an offer can still be taken or cancelled with a fee, spending the
+        coin under the book: while any is out the book must not act beside the
+        engine. Raises FenceUnavailableError when the wallet will not say.
+        """
+        try:
+            wanted = self.puzzle_hashes()
+            answer = self._rpc(
+                "get_all_offers",
+                {
+                    "start": 0,
+                    "end": 1000,
+                    "exclude_my_offers": False,
+                    "exclude_taken_offers": True,
+                    "include_completed": False,
+                },
+            )
+        except FenceUnavailableError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            raise FenceUnavailableError(f"the wallet's offers could not be read: {exc}") from exc
+        records = answer.get("trade_records")
+        if not isinstance(records, list):
+            raise FenceUnavailableError("the wallet's offers could not be read (no trade_records)")
+        held: list[str] = []
+        for record in records:
+            if not isinstance(record, dict) or not record.get("is_my_offer"):
+                continue
+            if record.get("status") not in ("PENDING_ACCEPT", "PENDING_CONFIRM", "PENDING_CANCEL"):
+                continue
+            for coin in record.get("coins_of_interest") or []:
+                if _unhex(coin.get("puzzle_hash")) in wanted:
+                    held.append(str(record.get("trade_id") or "?")[:12])
+                    break
+        return held
+
+    def _wallets(self) -> list[dict]:
+        answer = self._rpc("get_wallets", {})
+        wallets = answer.get("wallets")
+        if not isinstance(wallets, list):
+            raise FenceUnavailableError("the wallet did not list its wallets")
+        return wallets
+
     def coin_ids(self) -> list[str]:
         """0x-hex ids of every spendable coin at the sub-account. Raises FenceUnavailableError."""
         now = self._clock()
@@ -138,9 +200,8 @@ class WalletFence:
     def _list(self) -> list[str]:
         sdk = _sdk()
         inner = self.puzzle_hash()
-        answer = self._rpc("get_wallets", {})
         ids: list[str] = []
-        for wallet in answer.get("wallets") or []:
+        for wallet in self._wallets():
             kind = int(wallet.get("type", -1))
             if kind not in (_STANDARD_WALLET, _CAT_WALLET):
                 continue
@@ -151,7 +212,12 @@ class WalletFence:
                 asset = self._rpc("cat_get_asset_id", {"wallet_id": wallet_id}).get("asset_id")
                 wanted = bytes(sdk.cat_puzzle_hash(_unhex(asset), inner))
             coins = self._rpc("get_spendable_coins", {"wallet_id": wallet_id})
-            for record in coins.get("confirmed_records") or []:
+            records = coins.get("confirmed_records")
+            if not isinstance(records, list):
+                raise FenceUnavailableError(
+                    f"the wallet did not list wallet {wallet_id}'s spendable coins"
+                )
+            for record in records:
                 coin = record.get("coin", record)
                 puzzle_hash = _unhex(coin.get("puzzle_hash"))
                 if puzzle_hash != wanted:

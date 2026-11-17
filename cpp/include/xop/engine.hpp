@@ -2007,6 +2007,9 @@ private:
     /// wallet spend (rpc/coin_fence.hpp).  Null unless
     /// options.wallet.engine_fence is on (config.hpp OptionsFenceConfig).
     std::shared_ptr<rpc::CoinFence> coin_fence_;
+    /// [OPTIONS-FENCE] "<puzzle hash>@<network>", published on the metrics
+    /// endpoint so the book can check the fence is for its address.
+    std::string options_fence_identity_;
 
     /// [OPTIONS-FENCE] Turn the fence on from config_.options_fence: the
     /// puzzle hashes, the full-node refresher, the wallet hook.

@@ -404,7 +404,8 @@ public:
     /// options book: xop_options_fence_enabled / _fresh (0/1), _coins, and
     /// _age_seconds (-1 before the first refresh).
     void update_options_fence(bool enabled, bool fresh, std::size_t coins,
-                              double age_seconds);
+                              double age_seconds, double refreshed_unix = 0.0,
+                              const std::string& identity = {});
 
     /// [PEGSUSPEND] Per-asset peg status for the GUI's Depeg tab.
     /// rows: ("symbol|asset_id", status 0=holding 1=warn 2=suspended,
@@ -562,6 +563,11 @@ private:
     prometheus::Gauge* options_fence_fresh_{nullptr};
     prometheus::Gauge* options_fence_coins_{nullptr};
     prometheus::Gauge* options_fence_age_{nullptr};
+    /// xop_options_fence_refreshed_unix and xop_options_fence_info{fence=...}.
+    prometheus::Gauge* options_fence_refreshed_{nullptr};
+    prometheus::Family<prometheus::Gauge>* options_fence_info_family_{nullptr};
+    prometheus::Gauge* options_fence_info_{nullptr};
+    std::string options_fence_identity_;
     /// [S31] Latched copy of the watchdog gate, guarded by mtx_.
     ///
     /// Two threads publish this gauge and one of them samples its input

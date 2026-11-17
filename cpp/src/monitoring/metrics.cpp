@@ -389,6 +389,10 @@ void MetricsExporter::register_metrics()
     options_fence_fresh_ = nullptr;
     options_fence_coins_ = nullptr;
     options_fence_age_ = nullptr;
+    options_fence_refreshed_ = nullptr;
+    options_fence_info_family_ = nullptr;
+    options_fence_info_ = nullptr;
+    options_fence_identity_.clear();
     gate_cancels_pending_ = nullptr;
 
     options_fence_enabled_ = &prometheus::BuildGauge()
@@ -415,6 +419,17 @@ void MetricsExporter::register_metrics()
         .Register(*registry_)
         .Add({});
     options_fence_age_->Set(-1.0);
+    options_fence_refreshed_ = &prometheus::BuildGauge()
+        .Name("xop_options_fence_refreshed_unix")
+        .Help("Unix time of the fenced list's last successful refresh; 0 before "
+              "the first.  Readers compute the age themselves")
+        .Register(*registry_)
+        .Add({});
+    options_fence_info_family_ = &prometheus::BuildGauge()
+        .Name("xop_options_fence_info")
+        .Help("1, labelled with the fenced address's puzzle hash and network "
+              "(fence=\"<puzzle hash>@<network>\")")
+        .Register(*registry_);
 
     posting_gated_gauge_ = &prometheus::BuildGauge()
         .Name("xop_posting_gated")
@@ -1010,10 +1025,18 @@ void MetricsExporter::update_peg_status(
 }
 
 void MetricsExporter::update_options_fence(bool enabled, bool fresh, std::size_t coins,
-                                           double age_seconds)
+                                           double age_seconds, double refreshed_unix,
+                                           const std::string& identity)
 {
     std::unique_lock lock(mtx_);
     if (!running_) return;
+    if (options_fence_refreshed_) options_fence_refreshed_->Set(refreshed_unix);
+    if (options_fence_info_family_ && identity != options_fence_identity_) {
+        if (options_fence_info_) options_fence_info_family_->Remove(options_fence_info_);
+        options_fence_info_ = &options_fence_info_family_->Add({{"fence", identity}});
+        options_fence_info_->Set(1.0);
+        options_fence_identity_ = identity;
+    }
     if (options_fence_enabled_) options_fence_enabled_->Set(enabled ? 1.0 : 0.0);
     if (options_fence_fresh_) options_fence_fresh_->Set(fresh ? 1.0 : 0.0);
     if (options_fence_coins_) options_fence_coins_->Set(static_cast<double>(coins));
