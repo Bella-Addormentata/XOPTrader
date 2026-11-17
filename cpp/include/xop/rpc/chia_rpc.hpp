@@ -48,6 +48,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include "xop/rpc/coin_fence.hpp"
 #include "xop/rpc/node_requests.hpp"
 #include "xop/rpc/transport_evidence.hpp"
 #include "xop/rpc/wallet_requests.hpp"
@@ -167,6 +168,21 @@ public:
 private:
     long     http_code_;
     CURLcode curl_code_;
+};
+
+/**
+ * @brief [OPTIONS-FENCE] A coin-selecting call refused before it was sent:
+ *        the options sub-account's fence is on and its coin list is not
+ *        known, or a new offer locked a fenced coin (rpc/coin_fence.hpp).
+ *
+ * An application error: nothing reached the wallet as a spend, so every
+ * caller's existing "the wallet said no" handling applies, and the wallet
+ * circuit (transport failures only) is not tripped.
+ */
+class CoinFenceUnavailable : public ChiaRPCApplicationError {
+public:
+    explicit CoinFenceUnavailable(const std::string& msg)
+        : ChiaRPCApplicationError(msg, json{{"success", false}, {"error", msg}}) {}
 };
 
 // ---------------------------------------------------------------------------
@@ -1001,6 +1017,38 @@ public:
         std::int64_t wallet_id,
         std::int64_t start = 0,
         std::int64_t end   = 50);
+
+    // -- [OPTIONS-FENCE] ------------------------------------------------------
+
+    /**
+     * @brief Install the options sub-account's fence (rpc/coin_fence.hpp).
+     *
+     * From then on every call that makes the wallet select coins --
+     * create_offer, take_offer, cancel_offer/cancel_offers with a fee,
+     * send_transaction, split_coins, select_coins -- refreshes the fence when
+     * it is stale, sends its coins as excluded_coin_ids, and throws
+     * CoinFenceUnavailable instead of spending when the list is not known.
+     * A null or unconfigured fence changes nothing.
+     */
+    void set_coin_fence(std::shared_ptr<CoinFence> fence) { fence_ = std::move(fence); }
+
+    [[nodiscard]] const std::shared_ptr<CoinFence>& coin_fence() const { return fence_; }
+
+    /// `payload` with `ids` merged into its top-level excluded_coin_ids
+    /// (0x-prefixed, existing entries kept, no duplicates).  Public for tests.
+    static void add_exclusions(json& payload, const std::vector<std::string>& ids);
+
+    /// [OPTIONS-FENCE] A get_wallet_balance answer with the sub-account's
+    /// `amount` and `coins` taken off every figure (never below 0).  Public
+    /// for tests.
+    static void subtract_fenced_balance(json& balance, std::uint64_t amount, std::size_t coins);
+
+private:
+    /// The fence's coins for a call about to select coins: empty with no
+    /// fence; throws CoinFenceUnavailable when it is on but unknown.
+    asio::awaitable<std::vector<std::string>> fence_exclusions(const char* what);
+
+    std::shared_ptr<CoinFence> fence_;
 };
 
 } // namespace xop::rpc

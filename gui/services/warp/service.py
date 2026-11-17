@@ -7538,7 +7538,7 @@ class _WarpWorker(QObject):
         from . import wallet as wallet_mod
 
         chia = self._config.get("chia") or {}
-        return wallet_mod.WalletClient(
+        client = wallet_mod.WalletClient(
             {
                 "host": chia.get("wallet_host") or "localhost",
                 "port": int(chia.get("wallet_port") or 9256),
@@ -7551,6 +7551,15 @@ class _WarpWorker(QObject):
             # blocks the send, so make it unlikely rather than merely safe.
             timeout=30.0,
         )
+        # [OPTIONS-FENCE] With options.wallet.engine_fence, every spend this
+        # client makes leaves the options sub-account's coins alone. The fence
+        # lists them through the same client (listing calls are not fenced).
+        from gui.services.options import fence as fence_mod
+
+        fenced = fence_mod.fenced_address(self._config)
+        if fenced is not None:
+            client.set_fence(fence_mod.WalletFence(client._post, *fenced).coin_ids)
+        return client
 
     def _settle_takes_quietly(self, engine: "WarpEngine") -> None:
         """:meth:`_settle_dexie_takes`, contracted never to raise."""

@@ -241,6 +241,10 @@ def _hold_reason(cfg: config.OptionsConfig, book_store: store.OptionStore) -> st
     transactions still in flight do; being Live and stepping are checked by
     the callers.
     """
+    if cfg.wallet.engine_fence:
+        # [OPTIONS-FENCE] The book spends only fenced coins: neither its open
+        # contracts nor its transactions in flight are the engine's to touch.
+        return None
     if cfg.wallet.engine_beside_open_contracts:
         return _in_flight_reason(book_store)
     return _open_reason(book_store.contracts(store.ACTIVE))
@@ -268,7 +272,7 @@ def engine_start_blocker(config_path: Path) -> str | None:
             return why
         if cfg is None:
             continue
-        if live:
+        if live and not cfg.wallet.engine_fence:
             return (
                 "the options book is Live on the trading wallet; switch it off on the "
                 "Options page first"
@@ -306,7 +310,7 @@ def engine_start_window(config_path: Path) -> Iterator[str | None]:
                 if reason:
                     break
                 continue
-            if live:
+            if live and not cfg.wallet.engine_fence:
                 reason = (
                     "the options book is Live on the trading wallet; switch it off on the "
                     "Options page first"
@@ -355,11 +359,13 @@ class OptionsRunner:
         build: Callable[..., tuple[Any, Any, Any]] = runtime.build,
         engine_state: Callable[[str], engine_guard.EngineState] | None = None,
         clock: Callable[[], float] = time.time,
+        fence_state: Callable[[str], engine_guard.FenceState] | None = None,
     ) -> None:
         self._config_path = Path(config_path)
         self._interval = max(0.01, float(interval))
         self._build = build
         self._engine_state = engine_state
+        self._fence_state = fence_state
         self._clock = clock
         self._lock = threading.Lock()
         self._run: _Run | None = None
@@ -395,10 +401,15 @@ class OptionsRunner:
         cfg = load_options(self._config_path)
         if mode is Mode.LIVE and cfg.wallet.share_trading_wallet:
             state = self._engine(cfg)
-            if not state.clear:
+            if not state.clear and not self._fenced_beside(cfg, state):
                 raise RunnerError(
                     "Live refused: the options book shares the trading wallet and the trading "
-                    f"engine is {state.describe()}. Stop the engine first."
+                    f"engine is {state.describe()}. Stop the engine first"
+                    + (
+                        f" (its fence: {self._fence(cfg).detail})."
+                        if cfg.wallet.engine_fence
+                        else "."
+                    )
                 )
         current = self._run
         if current is not None and current.thread.is_alive():
@@ -477,6 +488,16 @@ class OptionsRunner:
         check = self._engine_state or engine_guard.engine_state
         return check(cfg.wallet.engine_metrics_url)
 
+    def _fence(self, cfg: config.OptionsConfig) -> engine_guard.FenceState:
+        check = self._fence_state or engine_guard.fence_state
+        return check(cfg.wallet.engine_metrics_url)
+
+    def _fenced_beside(self, cfg: config.OptionsConfig, state: engine_guard.EngineState) -> bool:
+        """[OPTIONS-FENCE] A running engine the book may act beside: its fence holds."""
+        return bool(
+            cfg.wallet.engine_fence and state.running and self._fence(cfg).holds
+        )
+
     def _note(self, text: str) -> None:
         stamp = time.strftime("%H:%M:%S", time.localtime(self._clock()))
         with self._lock:
@@ -528,7 +549,7 @@ class OptionsRunner:
         if cfg.wallet.share_trading_wallet:
             state = self._engine(cfg)
             engine = state.describe()
-            if mode is Mode.LIVE and not state.clear:
+            if mode is Mode.LIVE and not state.clear and not self._fenced_beside(cfg, state):
                 held = (
                     "refused, trading engine up: a live step would sign from the wallet the "
                     f"engine trades through, and the engine is {engine}"

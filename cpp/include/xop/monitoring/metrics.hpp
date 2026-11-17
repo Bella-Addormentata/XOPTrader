@@ -400,6 +400,12 @@ public:
     /// signal.  Thread-safe by the same mutex as every other updater.
     void update_watchdog_gate(bool fired);
 
+    /// [OPTIONS-FENCE] The options sub-account's fence, for the GUI and the
+    /// options book: xop_options_fence_enabled / _fresh (0/1), _coins, and
+    /// _age_seconds (-1 before the first refresh).
+    void update_options_fence(bool enabled, bool fresh, std::size_t coins,
+                              double age_seconds);
+
     /// [PEGSUSPEND] Per-asset peg status for the GUI's Depeg tab.
     /// rows: ("symbol|asset_id", status 0=holding 1=warn 2=suspended,
     /// deviation_pct). Rebuilt each publish so a re-enabled asset's gauge
@@ -551,6 +557,11 @@ private:
     /// not trading -- the exact inversion the breaker gate was split out to
     /// prevent.
     prometheus::Gauge* gate_watchdog_{nullptr};
+    /// [OPTIONS-FENCE] update_options_fence().
+    prometheus::Gauge* options_fence_enabled_{nullptr};
+    prometheus::Gauge* options_fence_fresh_{nullptr};
+    prometheus::Gauge* options_fence_coins_{nullptr};
+    prometheus::Gauge* options_fence_age_{nullptr};
     /// [S31] Latched copy of the watchdog gate, guarded by mtx_.
     ///
     /// Two threads publish this gauge and one of them samples its input

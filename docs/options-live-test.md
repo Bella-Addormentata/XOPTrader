@@ -171,6 +171,30 @@ mode, so a book left Live when the app closed comes back Live only if
 something else still holds the engine; otherwise the page says it was not
 resumed, and step 1 starts it again.
 
+### Selling while the engine trades: the engine fence
+
+`options.wallet.engine_fence: true` (engine v0.10.52 or later) turns the
+options address into a sub-account that nothing but the book spends. The
+engine excludes its coins from every wallet call that selects coins and from
+its balances; the app's own sends do the same. The book then spends only from
+its address, so `fund_from_wallet` must be off; set `options.target` to keep
+the address funded. A first run:
+
+1. Install the release with the fence. Set `engine_fence: true`,
+   `fund_from_wallet: false` and a small `target` (say `xch: 1.5`,
+   `quote: 2`), and restart the app so the engine starts with the fence.
+2. Check the engine's metrics answer `xop_options_fence_enabled 1` and
+   `xop_options_fence_fresh 1`, and its log says `[OPTIONS-FENCE] ON`.
+3. Leave the book Off for a while with the engine trading. Its log should show
+   no `[OPTIONS-FENCE]` refusals beyond the first heartbeat, and the coins at
+   the options address should stay where they are.
+4. Switch the book to Rehearse: it says what it would top up and mint. Then
+   Live with one small contract: it tops up, mints and lists while the engine
+   keeps trading.
+
+If the engine's fence goes down (an older engine, the full node unreachable,
+a stale refresh), the book stops signing beside it and says why, as before.
+
 Two things to know once contracts are out:
 
 - **Setting `dry_run: true` again stops all spending**, housekeeping included.

@@ -385,7 +385,36 @@ void MetricsExporter::register_metrics()
     gate_xch_recovery_ = nullptr;
     gate_dry_run_ = nullptr;
     gate_watchdog_ = nullptr;
+    options_fence_enabled_ = nullptr;
+    options_fence_fresh_ = nullptr;
+    options_fence_coins_ = nullptr;
+    options_fence_age_ = nullptr;
     gate_cancels_pending_ = nullptr;
+
+    options_fence_enabled_ = &prometheus::BuildGauge()
+        .Name("xop_options_fence_enabled")
+        .Help("1 when options.wallet.engine_fence is on: every wallet spend "
+              "excludes the options sub-account's coins")
+        .Register(*registry_)
+        .Add({});
+    options_fence_fresh_ = &prometheus::BuildGauge()
+        .Name("xop_options_fence_fresh")
+        .Help("1 when the fenced coin list is known and fresh; 0 means "
+              "coin-selecting wallet calls are being refused")
+        .Register(*registry_)
+        .Add({});
+    options_fence_coins_ = &prometheus::BuildGauge()
+        .Name("xop_options_fence_coins")
+        .Help("Unspent coins at the options sub-account, excluded from spends")
+        .Register(*registry_)
+        .Add({});
+    options_fence_age_ = &prometheus::BuildGauge()
+        .Name("xop_options_fence_age_seconds")
+        .Help("Seconds since the fenced coin list was refreshed; -1 before "
+              "the first refresh")
+        .Register(*registry_)
+        .Add({});
+    options_fence_age_->Set(-1.0);
 
     posting_gated_gauge_ = &prometheus::BuildGauge()
         .Name("xop_posting_gated")
@@ -978,6 +1007,17 @@ void MetricsExporter::update_peg_status(
         peg_deviation_family_->Remove(&peg_deviation_family_->Add(old));
     }
     peg_labels_ = std::move(published);
+}
+
+void MetricsExporter::update_options_fence(bool enabled, bool fresh, std::size_t coins,
+                                           double age_seconds)
+{
+    std::unique_lock lock(mtx_);
+    if (!running_) return;
+    if (options_fence_enabled_) options_fence_enabled_->Set(enabled ? 1.0 : 0.0);
+    if (options_fence_fresh_) options_fence_fresh_->Set(fresh ? 1.0 : 0.0);
+    if (options_fence_coins_) options_fence_coins_->Set(static_cast<double>(coins));
+    if (options_fence_age_) options_fence_age_->Set(age_seconds);
 }
 
 void MetricsExporter::update_watchdog_gate(bool fired)

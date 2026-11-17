@@ -3024,6 +3024,20 @@ struct EngineConfig {
 // ---------------------------------------------------------------------------
 // Top-level application configuration aggregating every section.
 // ---------------------------------------------------------------------------
+/// [OPTIONS-FENCE] What the engine reads of the GUI's `options:` section
+/// (gui/services/options/config.py owns and validates it).  On only when
+/// options.enabled, options.wallet.share_trading_wallet and
+/// options.wallet.engine_fence are all true: the options book then shares
+/// this wallet, and every engine spend leaves the options address's coins
+/// alone (rpc/coin_fence.hpp).  On with an address that cannot be read is
+/// still on -- the fence then refuses every coin-selecting call.
+struct OptionsFenceConfig {
+    bool        enabled{false};
+    std::string address;              ///< options.wallet.address (bech32m).
+    std::string network{"mainnet"};   ///< options.network: address prefix xch / txch.
+    std::string quote_asset_id;       ///< options.quote_asset_id: its CAT wrapping is fenced too.
+};
+
 struct AppConfig {
     ChiaConfig       chia;
     DexieConfig      dexie;
@@ -3053,6 +3067,7 @@ struct AppConfig {
     RecoveryConfig   recovery;
     BuyerConfig      buyer;
     EngineConfig     engine;
+    OptionsFenceConfig options_fence;
 };
 
 // ---------------------------------------------------------------------------

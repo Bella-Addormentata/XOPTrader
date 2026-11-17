@@ -45,6 +45,17 @@ them). A running engine can spend the loose coins at the options address, so
 this needs ``fund_from_wallet``: the book then pays from the rest of the wallet
 when it next acts. Every signature and push still checks that the engine is
 stopped, as above.
+
+THE ENGINE FENCE. ``wallet.engine_fence: true`` (off by default, needs
+``share_trading_wallet``) makes the options address a sub-account the engine
+leaves alone: the engine (v0.10.52 and later) sends that address's coins as
+excluded_coin_ids on every wallet call that selects coins, and the app's own
+spenders do the same (:mod:`fence`). The book may then be Live while the engine
+runs, as long as the engine reports its fence on and fresh on its metrics
+endpoint (:mod:`engine_guard`); otherwise the rules above apply. With the fence
+the book spends only coins at its own address, so ``fund_from_wallet`` is
+refused; ``target`` keeps the address topped up instead, by ordinary wallet
+sends from the rest of the wallet.
 """
 
 from __future__ import annotations
@@ -208,6 +219,24 @@ class WalletConfig:
     #: With ``share_trading_wallet``: open contracts do not hold the engine,
     #: only the book acting does. Off by default; needs ``fund_from_wallet``.
     engine_beside_open_contracts: bool = False
+    #: With ``share_trading_wallet``: the engine fences the options address off
+    #: and the book may be Live beside it. Off by default; refuses
+    #: ``fund_from_wallet``.
+    engine_fence: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class TargetConfig:
+    """What the options sub-account is kept at (``options.target``).
+
+    Counted with the collateral its open contracts lock, so a mint does not
+    look like a shortfall. Below ``1 - tolerance`` of a figure, a step tops
+    the address up to the figure with an ordinary wallet send.
+    """
+
+    xch_mojos: int
+    quote_mojos: int
+    tolerance: float  # a fraction, 0.2 = 20%
 
 
 @dataclasses.dataclass(frozen=True)
@@ -303,6 +332,8 @@ class OptionsConfig:
     chain_refresh_seconds: int
     database_path: str
     splash: SplashConfig = dataclasses.field(default_factory=SplashConfig)
+    #: ``options.target``: the sub-account's balance target. None = no top-ups.
+    target: TargetConfig | None = None
     #: The app's CoinGecko key (``coingecko.api_key``, kept in secrets.yaml).
     #: Not an options setting; carried here so the price feed can send it.
     coingecko_api_key: str = dataclasses.field(default="", repr=False)
@@ -431,6 +462,21 @@ def parse(root: Any) -> OptionsConfig | None:
         metrics_url = f"http://localhost:{metrics_port}/metrics"
     fund = _flag(wallet_raw, "fund_from_wallet", False)
     beside = _flag(wallet_raw, "engine_beside_open_contracts", False)
+    fence = _flag(wallet_raw, "engine_fence", False)
+    if fence and not share:
+        raise OptionsConfigError(
+            "options.wallet.engine_fence needs options.wallet.share_trading_wallet: true; a "
+            "wallet of its own needs no fence"
+        )
+    if fence and fund:
+        # The fenced engine leaves only the options address alone. A book that
+        # also took coins from the rest of the wallet would race the engine for
+        # them again, as on 2026-11-15.
+        raise OptionsConfigError(
+            "options.wallet.engine_fence and fund_from_wallet cannot both be on: with the fence "
+            "the book spends only coins at its own address; set options.target to keep it "
+            "topped up instead"
+        )
     if share and beside and not fund:
         # A running engine's offers pick coins from the whole wallet, those at
         # the options address included. The book's next cancel or clawback
@@ -452,6 +498,7 @@ def parse(root: Any) -> OptionsConfig | None:
         engine_metrics_url=metrics_url,
         fund_from_wallet=fund,
         engine_beside_open_contracts=beside,
+        engine_fence=fence,
     )
 
     quote_decimals = int(_number(section, "quote_asset_decimals", 3))
@@ -590,6 +637,26 @@ def parse(root: Any) -> OptionsConfig | None:
         database_path=str(section.get("database_path") or "data/options_jobs.db").strip(),
         splash=splash_config,
         coingecko_api_key=str(coingecko.get("api_key") or "").strip(),
+        target=_target(section, quote_unit),
+    )
+
+
+def _target(section: dict, quote_unit: int) -> TargetConfig | None:
+    """``options.target``: ``xch`` and ``quote`` in whole units, ``tolerance_pct``."""
+    raw = section.get("target")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise OptionsConfigError("options.target must be a mapping (xch, quote, tolerance_pct)")
+    xch = _number(raw, "xch", 0.0)
+    quote = _number(raw, "quote", 0.0)
+    tolerance = _number(raw, "tolerance_pct", 20.0)
+    if tolerance >= 100.0:
+        raise OptionsConfigError("options.target.tolerance_pct must be below 100")
+    return TargetConfig(
+        xch_mojos=int(round(xch * XCH_MOJOS)),
+        quote_mojos=int(round(quote * quote_unit)),
+        tolerance=tolerance / 100.0,
     )
 
 

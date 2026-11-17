@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <cctype>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -996,7 +997,26 @@ ChiaWalletRPC::get_wallet_balance(std::int64_t wallet_id)
         throw ChiaRPCError("get_wallet_balance: response missing "
                            "'wallet_balance' field");
     }
-    co_return resp["wallet_balance"];
+    json balance = resp["wallet_balance"];
+
+    // [OPTIONS-FENCE] The options sub-account is not trading inventory: its
+    // coins come off every figure the engine sizes and reconciles from.  An
+    // unknown fence reports no balance at all rather than an inflated one.
+    if (fence_ && fence_->enabled() && balance.is_object()) {
+        co_await fence_->ensure_fresh();
+        const std::string asset =
+            balance.contains("asset_id") && balance["asset_id"].is_string()
+                ? fence_normalise_hex(balance["asset_id"].get<std::string>())
+                : std::string{"xch"};
+        const auto held = fence_->held(asset);
+        if (!held) {
+            throw CoinFenceUnavailable(
+                "[OPTIONS-FENCE] get_wallet_balance refused: the options sub-account's coins are "
+                "not known, so the trading balance cannot be told apart from it");
+        }
+        subtract_fenced_balance(balance, held->first, held->second);
+    }
+    co_return balance;
 }
 
 asio::awaitable<std::vector<json>> ChiaWalletRPC::get_wallets()
@@ -1023,12 +1043,47 @@ ChiaWalletRPC::create_offer(const json&   offer_dict,
                              std::optional<std::uint64_t> min_coin_amount,
                              const std::vector<std::string>& excluded_coin_ids)
 {
+    // [OPTIONS-FENCE] The options sub-account's coins join the caller's
+    // exclusions; an unknown fence throws before anything is created.
+    const std::vector<std::string> fence =
+        co_await fence_exclusions("create_offer_for_ids");
+    const std::vector<std::string> fenced_excluded_coin_ids =
+        fence.empty() ? excluded_coin_ids : merge_exclusions(excluded_coin_ids, fence);
+
     // The Chia wallet RPC endpoint is "create_offer_for_ids".
     const json payload = build_create_offer_payload(
         offer_dict, fee, validate_only, max_time, min_coin_amount,
-        excluded_coin_ids);
+        fenced_excluded_coin_ids);
 
     const json resp = co_await rpc_post("create_offer_for_ids", payload);
+
+    // [OPTIONS-FENCE] Post-check: a coin can reach the options address after
+    // the fence's last refresh.  An offer that locked one is cancelled here,
+    // locally (no chain spend; nothing was posted yet), and the create fails.
+    if (fence_ && fence_->enabled() && !validate_only) {
+        const auto hits = fenced_coins_in_trade_record(resp, fence_->puzzle_hashes());
+        if (!hits || !hits->empty()) {
+            const std::string trade_id =
+                resp.contains("trade_record") && resp["trade_record"].is_object()
+                    ? resp["trade_record"].value("trade_id", std::string{})
+                    : std::string{};
+            if (!trade_id.empty()) {
+                try {
+                    // Local only (no fee, not secure): no coin is selected.
+                    co_await cancel_offer(trade_id, 0, /*secure=*/false);
+                } catch (const std::exception& e) {
+                    spdlog::error("[OPTIONS-FENCE] could not cancel offer {} locally: {}",
+                                  trade_id, e.what());
+                }
+            }
+            const std::string what =
+                hits ? std::to_string(hits->size()) + " coin(s) at the options address"
+                     : std::string{"coins its trade record does not list"};
+            throw CoinFenceUnavailable(
+                "[OPTIONS-FENCE] offer " + trade_id + " locked " + what +
+                "; cancelled locally before posting");
+        }
+    }
 
     // Return the full response so callers can access both the bech32 offer
     // text (.offer) and the trade record (.trade_record).
@@ -1091,10 +1146,11 @@ asio::awaitable<json>
 ChiaWalletRPC::take_offer(const std::string& offer_text,
                            std::uint64_t      fee)
 {
-    const json payload = {
+    json payload = {
         {"offer", offer_text},
         {"fee",   fee}
     };
+    add_exclusions(payload, co_await fence_exclusions("take_offer"));
     co_return co_await rpc_post("take_offer", payload);
 }
 
@@ -1103,11 +1159,15 @@ ChiaWalletRPC::cancel_offer(const std::string& trade_id,
                              std::uint64_t      fee,
                              bool               secure)
 {
-    const json payload = {
+    json payload = {
         {"trade_id", trade_id},
         {"fee",      fee},
         {"secure",   secure}
     };
+    // [OPTIONS-FENCE] Only a fee makes the wallet select a coin.
+    if (secure && fee > 0) {
+        add_exclusions(payload, co_await fence_exclusions("cancel_offer"));
+    }
     co_return co_await rpc_post("cancel_offer", payload);
 }
 
@@ -1121,8 +1181,12 @@ ChiaWalletRPC::cancel_offers(std::uint64_t batch_fee, bool secure)
     // to false (so only offers with an XCH leg matched -- a CAT/CAT offer
     // was never cancelled), and its paging loop breaks on the first batch
     // that matched nothing (so the scan stopped early).
-    co_return co_await rpc_post(
-        "cancel_offers", make_cancel_offers_request(batch_fee, secure));
+    json payload = make_cancel_offers_request(batch_fee, secure);
+    // [OPTIONS-FENCE] Only a fee makes the wallet select a coin.
+    if (secure && batch_fee > 0) {
+        add_exclusions(payload, co_await fence_exclusions("cancel_offers"));
+    }
+    co_return co_await rpc_post("cancel_offers", payload);
 }
 
 asio::awaitable<json>
@@ -1262,6 +1326,7 @@ ChiaWalletRPC::select_coins(std::int64_t  wallet_id,
     if (min_coin_amount > 0) {
         payload["min_coin_amount"] = min_coin_amount;
     }
+    add_exclusions(payload, co_await fence_exclusions("select_coins"));
 
     const json resp = co_await rpc_post("select_coins", payload);
 
@@ -1282,12 +1347,24 @@ ChiaWalletRPC::get_spendable_coins(std::int64_t wallet_id)
     const json resp    = co_await rpc_post(
         "get_spendable_coins", payload);
 
+    // [OPTIONS-FENCE] Coins at the options sub-account are not the engine's
+    // to plan with: they are left out by puzzle hash.
+    std::set<std::string> fenced;
+    if (fence_ && fence_->enabled()) fenced = fence_->puzzle_hashes();
+
     std::vector<json> coins;
     if (resp.contains("confirmed_records") &&
         resp["confirmed_records"].is_array())
     {
         coins.reserve(resp["confirmed_records"].size());
         for (auto& c : resp["confirmed_records"]) {
+            if (!fenced.empty()) {
+                const json& coin = c.contains("coin") ? c["coin"] : c;
+                if (coin.contains("puzzle_hash") && coin["puzzle_hash"].is_string()
+                    && fenced.count(fence_normalise_hex(coin["puzzle_hash"].get<std::string>())) > 0U) {
+                    continue;
+                }
+            }
             coins.push_back(std::move(c));
         }
     }
@@ -1318,7 +1395,9 @@ ChiaWalletRPC::send_transaction(const json& params)
                            "(wallet_id, amount, address, fee)");
     }
 
-    const json resp = co_await rpc_post("send_transaction", params);
+    json fenced = params;
+    add_exclusions(fenced, co_await fence_exclusions("send_transaction"));
+    const json resp = co_await rpc_post("send_transaction", fenced);
 
     // The Chia wallet daemon returns {"success": false, "error": "..."}
     // on application-level rejection.  rpc_post already checks HTTP-level
@@ -1363,7 +1442,7 @@ ChiaWalletRPC::split_coins(
         coin_id = "0x" + coin_id;
     }
 
-    const json payload = {
+    json payload = {
         {"wallet_id",       wallet_id},
         {"target_coin_id",  coin_id},
         {"number_of_coins", number_of_coins},
@@ -1371,6 +1450,15 @@ ChiaWalletRPC::split_coins(
         {"fee",             fee},
         {"push",            true}
     };
+    // [OPTIONS-FENCE] Never split a fenced coin; keep the fee coin off them.
+    const std::vector<std::string> fence = co_await fence_exclusions("split_coins");
+    for (const auto& id : fence) {
+        if (fence_normalise_hex(id) == fence_normalise_hex(coin_id)) {
+            throw CoinFenceUnavailable("[OPTIONS-FENCE] split_coins refused: coin " + coin_id +
+                                       " is at the options address");
+        }
+    }
+    add_exclusions(payload, fence);
 
     const json resp = co_await rpc_post("split_coins", payload);
 
@@ -1384,6 +1472,60 @@ ChiaWalletRPC::split_coins(
     }
 
     co_return resp;
+}
+
+// ---------------------------------------------------------------------------
+// [OPTIONS-FENCE] helpers
+// ---------------------------------------------------------------------------
+
+asio::awaitable<std::vector<std::string>>
+ChiaWalletRPC::fence_exclusions(const char* what)
+{
+    if (!fence_ || !fence_->enabled()) co_return std::vector<std::string>{};
+    co_await fence_->ensure_fresh();
+    auto ids = fence_->exclusions();
+    if (!ids) {
+        const auto snap = fence_->snapshot();
+        throw CoinFenceUnavailable(
+            std::string{"[OPTIONS-FENCE] "} + what +
+            " refused: the options sub-account's coins are not known" +
+            (snap.last_error.empty() ? std::string{} : " (" + snap.last_error + ")"));
+    }
+    co_return *ids;
+}
+
+void ChiaWalletRPC::subtract_fenced_balance(json& balance, std::uint64_t amount, std::size_t coins)
+{
+    if (amount == 0U && coins == 0U) return;
+    for (const char* key : {"confirmed_wallet_balance", "unconfirmed_wallet_balance",
+                            "spendable_balance", "max_send_amount"}) {
+        if (!balance.contains(key) || !balance[key].is_number()) continue;
+        const auto value = balance[key].get<std::int64_t>();
+        const auto cut   = static_cast<std::int64_t>(amount);
+        balance[key]     = value > cut ? value - cut : std::int64_t{0};
+    }
+    if (balance.contains("unspent_coin_count") && balance["unspent_coin_count"].is_number()) {
+        const auto value = balance["unspent_coin_count"].get<std::int64_t>();
+        const auto cut   = static_cast<std::int64_t>(coins);
+        balance["unspent_coin_count"] = value > cut ? value - cut : std::int64_t{0};
+    }
+}
+
+void ChiaWalletRPC::add_exclusions(json& payload, const std::vector<std::string>& ids)
+{
+    if (ids.empty()) return;
+    std::vector<std::string> merged;
+    if (payload.contains("excluded_coin_ids") && payload["excluded_coin_ids"].is_array()) {
+        for (const auto& id : payload["excluded_coin_ids"]) {
+            if (id.is_string()) merged.push_back(id.get<std::string>());
+        }
+    }
+    merged = merge_exclusions(std::move(merged), ids);
+    json out = json::array();
+    for (const auto& id : merged) {
+        out.push_back(id.rfind("0x", 0) == 0 ? id : "0x" + id);
+    }
+    payload["excluded_coin_ids"] = std::move(out);
 }
 
 // ---------------------------------------------------------------------------

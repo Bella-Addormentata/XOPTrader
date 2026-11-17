@@ -882,6 +882,9 @@ Engine::Engine(const AppConfig& config, bool dry_run,
     wal_cfg.verify_ssl       = config_.chia.verify_ssl;
     wallet_ = std::make_shared<rpc::ChiaWalletRPC>(ioc_, wal_cfg);
 
+    // [OPTIONS-FENCE] Before anything can spend.
+    setup_coin_fence();
+
     // Build dexie client config from AppConfig.
     rpc::DexieConfig dexie_cfg;
     dexie_cfg.base_url                = config_.dexie.api_base;
@@ -4659,6 +4662,84 @@ asio::awaitable<void> Engine::run_startup_analysis()
 // [T1-03] on_new_block_coro -- native coroutine heartbeat cycle.
 // Steps 2 and 8 are co_awaited (they contain async RPC calls).
 // All other steps remain synchronous within the coroutine frame.
+// ---------------------------------------------------------------------------
+// [OPTIONS-FENCE] setup_coin_fence
+// ---------------------------------------------------------------------------
+// The fence covers the options address itself (XCH) and its wrapping under
+// every CAT this engine trades, plus the options book's quote asset.  The
+// list comes from the full node by puzzle hash -- all unspent coins there,
+// whether or not an offer holds them -- so it does not depend on which CAT
+// wallets the trading wallet has opened.  An address that cannot be decoded
+// leaves the fence ON with no puzzle hashes: every coin-selecting call is
+// then refused, which is the point of failing closed.
+void Engine::setup_coin_fence()
+{
+    const OptionsFenceConfig& oc = config_.options_fence;
+    if (!oc.enabled || !wallet_) return;
+
+    const std::string hrp = oc.network == "testnet11" ? "txch" : "xch";
+    std::vector<std::string> hashes;
+    std::vector<std::pair<std::string, std::string>> asset_of;
+    const std::optional<std::string> base = rpc::decode_chia_address(oc.address, hrp);
+    if (!base) {
+        spdlog::error("[Engine] [OPTIONS-FENCE] options.wallet.address '{}' is not a valid {} "
+                      "address -- the fence stays on and refuses every coin-selecting call",
+                      oc.address, hrp);
+    } else {
+        hashes.push_back(*base);
+        asset_of.emplace_back(*base, "xch");
+        std::set<std::string> assets;
+        for (const auto& pair : config_.pairs) {
+            for (const std::string* a : {&pair.base_asset_id, &pair.quote_asset_id}) {
+                const std::string id = rpc::fence_normalise_hex(*a);
+                if (!id.empty() && id != "xch") assets.insert(id);
+            }
+        }
+        if (!oc.quote_asset_id.empty()) assets.insert(rpc::fence_normalise_hex(oc.quote_asset_id));
+        for (const auto& asset : assets) {
+            if (auto ph = execution::CoinManager::cat_puzzle_hash(asset, *base)) {
+                hashes.push_back(*ph);
+                asset_of.emplace_back(*ph, asset);
+            } else {
+                spdlog::warn("[Engine] [OPTIONS-FENCE] asset id '{}' is not 32 bytes of hex -- "
+                             "its coins at the options address are not fenced", asset);
+            }
+        }
+    }
+
+    coin_fence_ = std::make_shared<rpc::CoinFence>();
+    coin_fence_->configure(hashes, std::chrono::seconds(30));
+    coin_fence_->set_assets(asset_of);
+    coin_fence_->set_refresher(
+        [node = full_node_, hashes]() -> asio::awaitable<std::vector<rpc::FencedCoin>> {
+            if (!node) {
+                throw std::runtime_error("no full node configured to list the options "
+                                         "address's coins");
+            }
+            std::vector<rpc::FencedCoin> coins;
+            for (const auto& ph : hashes) {
+                const std::vector<json> records =
+                    co_await node->get_coin_records_by_puzzle_hash(ph, /*include_spent=*/false);
+                for (const auto& rec : records) {
+                    const json& coin = rec.contains("coin") ? rec["coin"] : rec;
+                    const std::string coin_ph =
+                        rpc::fence_normalise_hex(coin.at("puzzle_hash").get<std::string>());
+                    const Mojo amount = coin.at("amount").get<Mojo>();
+                    coins.push_back(rpc::FencedCoin{
+                        execution::CoinManager::compute_coin_name(
+                            rpc::fence_normalise_hex(coin.at("parent_coin_info").get<std::string>()),
+                            coin_ph, amount),
+                        coin_ph, static_cast<std::uint64_t>(amount)});
+                }
+            }
+            co_return coins;
+        });
+    wallet_->set_coin_fence(coin_fence_);
+    spdlog::warn("[Engine] [OPTIONS-FENCE] ON for {} ({} puzzle hash(es)): every wallet spend "
+                 "leaves the options sub-account's coins alone",
+                 oc.address, hashes.size());
+}
+
 asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
 {
     spdlog::info("[Engine] Processing block {}", block_height);
@@ -4678,6 +4759,24 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // first wallet call of every heartbeat is always issued -- the canary.
     if (wallet_) {
         wallet_transport_at_cycle_start_ = wallet_->transport_counters();
+    }
+
+    // [OPTIONS-FENCE] A fresh list for this heartbeat, from the full node (the
+    // wallet RPC is not touched), and its state on the metrics endpoint for
+    // the GUI and the options book.  A failure leaves the fence unknown: the
+    // wallet client then refuses every coin-selecting call until it is known.
+    if (coin_fence_) {
+        co_await coin_fence_->ensure_fresh();
+        const auto snap = coin_fence_->snapshot();
+        if (!snap.fresh) {
+            spdlog::warn("[Engine] [OPTIONS-FENCE] the options sub-account's coins are not "
+                         "known ({}) -- coin-selecting wallet calls are refused until they are",
+                         snap.last_error.empty() ? std::string{"not refreshed"} : snap.last_error);
+        }
+        if (metrics_ && metrics_->is_running()) {
+            metrics_->update_options_fence(snap.enabled, snap.fresh, snap.coin_count,
+                                           snap.age_seconds);
+        }
     }
     wallet_skip_warned_this_cycle_ = false;
     // [SEED-FAIL-CLOSED review round 6] Not synced until this heartbeat's Step 8

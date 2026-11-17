@@ -885,11 +885,9 @@ std::string lower_hex(const TreeHash& bytes)
 
 std::optional<std::string> CoinManager::settlement_puzzle_hash(const std::string& asset)
 {
-    // settlement_payments.clsp v1 (OFFER_MOD_HASH) and cat_v2.clsp (CAT_MOD_HASH).
+    // settlement_payments.clsp v1 (OFFER_MOD_HASH).
     static constexpr std::string_view kOfferModHash =
         "cfbfdeed5c4ca2de3d0bf520b9cb4bb7743a359bd2e6a188d19ce7dffc21d3e7";
-    static constexpr std::string_view kCatModHash =
-        "37bef360ee858133b69d595a906dc45d01af50379dad515eb9518abb7c1d2a7a";
 
     std::string lowered = asset;
     for (char& ch : lowered) {
@@ -898,12 +896,26 @@ std::optional<std::string> CoinManager::settlement_puzzle_hash(const std::string
     if (lowered == "xch") {
         return std::string{kOfferModHash};
     }
-    const std::optional<TreeHash> tail = hash32_from_hex(lowered);
-    if (!tail) {
+    return cat_puzzle_hash(lowered, std::string{kOfferModHash});
+}
+
+std::optional<std::string> CoinManager::cat_puzzle_hash(const std::string& asset,
+                                                        const std::string& inner_puzzle_hash)
+{
+    // cat_v2.clsp (CAT_MOD_HASH).
+    static constexpr std::string_view kCatModHash =
+        "37bef360ee858133b69d595a906dc45d01af50379dad515eb9518abb7c1d2a7a";
+
+    std::string lowered = asset;
+    for (char& ch : lowered) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    const std::optional<TreeHash> tail  = hash32_from_hex(lowered);
+    const std::optional<TreeHash> inner = hash32_from_hex(inner_puzzle_hash);
+    if (!tail || !inner) {
         return std::nullopt;
     }
-    const TreeHash offer_mod = hash32_from_hex(kOfferModHash).value();
-    const TreeHash cat_mod   = hash32_from_hex(kCatModHash).value();
+    const TreeHash cat_mod = hash32_from_hex(kCatModHash).value();
 
     static constexpr std::uint8_t kQuote = 0x01;
     static constexpr std::uint8_t kApply = 0x02;
@@ -913,11 +925,12 @@ std::optional<std::string> CoinManager::settlement_puzzle_hash(const std::string
     const TreeHash cons  = tree_atom(&kCons, 1U);
     const TreeHash nil   = tree_atom(nullptr, 0U);
 
-    // The arguments, built from the innermost out: OFFER_MOD (a puzzle: its
-    // tree hash), the TAIL and CAT_MOD_HASH (atoms).  The innermost tail of
-    // the list is the environment, 1 -- the same atom as the quote keyword.
+    // The arguments, built from the innermost out: the inner puzzle (a
+    // puzzle: its tree hash), the TAIL and CAT_MOD_HASH (atoms).  The
+    // innermost tail of the list is the environment, 1 -- the same atom as
+    // the quote keyword.
     TreeHash args = quote;
-    for (const TreeHash& arg : {offer_mod, tree_atom(*tail), tree_atom(cat_mod)}) {
+    for (const TreeHash& arg : {*inner, tree_atom(*tail), tree_atom(cat_mod)}) {
         args = tree_pair(cons, tree_pair(tree_pair(quote, arg), tree_pair(args, nil)));
     }
     return lower_hex(tree_pair(apply, tree_pair(tree_pair(quote, cat_mod), tree_pair(args, nil))));

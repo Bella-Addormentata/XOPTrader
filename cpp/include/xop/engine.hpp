@@ -2003,6 +2003,15 @@ private:
     /// Chia wallet RPC (port 9256).
     std::shared_ptr<rpc::ChiaWalletRPC> wallet_;
 
+    /// [OPTIONS-FENCE] The options sub-account's coins, kept out of every
+    /// wallet spend (rpc/coin_fence.hpp).  Null unless
+    /// options.wallet.engine_fence is on (config.hpp OptionsFenceConfig).
+    std::shared_ptr<rpc::CoinFence> coin_fence_;
+
+    /// [OPTIONS-FENCE] Turn the fence on from config_.options_fence: the
+    /// puzzle hashes, the full-node refresher, the wallet hook.
+    void setup_coin_fence();
+
     /// Dexie aggregator REST client (shared with OfferManager for submission).
     std::shared_ptr<rpc::DexieClient> dexie_;
 

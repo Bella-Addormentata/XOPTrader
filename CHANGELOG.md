@@ -7,6 +7,40 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### The options book can sell while the engine trades, from the same wallet (opt-in)
+
+A new switch, `options.wallet.engine_fence`, makes the options address a
+sub-account that every spender leaves alone, so the book no longer has to
+stop the engine to act:
+
+- **The engine fences it.** Every wallet call the engine makes that selects
+  coins (offers and their fee coins, takes, cancels that pay a fee, sends,
+  coin splits, coin selection) sends the sub-account's coins as
+  `excluded_coin_ids`. The list comes from the full node by puzzle hash (the
+  address and its CAT wrappings), refreshed every 30 seconds at the point of
+  use; while it is unknown those calls are refused, never sent without it. A
+  new offer that locked a fenced coin anyway (one that arrived after the
+  refresh) is cancelled locally before it is posted. The fence is in
+  `ChiaWalletRPC`, the one class every engine wallet call goes through, and a
+  test fails if a coin-selecting call there stops asking it.
+- **The engine's balances leave it out**, so its sizing and the Wallet tab's
+  coin targets see the trading funds only.
+- **The app's own spends leave it out too**: bridge sends and claims, Dexie
+  takes and the book's top-ups, through `WalletClient`.
+- **The book** spends only coins at its own address (`fund_from_wallet` is
+  refused with the fence) and may sign beside a running engine only while the
+  engine reports its fence on and refreshed within two minutes
+  (`xop_options_fence_*` on its metrics endpoint). Otherwise the old rules
+  apply: an older engine, or one whose fence is down, still holds the book.
+- **`options.target`** keeps the sub-account funded: when the XCH or quote
+  asset held there (collateral in open contracts counted) falls more than
+  `tolerance_pct` below target, a Live step tops it up with an ordinary
+  wallet send, one at a time per asset.
+
+Not yet: premiums and returned collateral are not swept back to the trading
+funds automatically, and the engine sees a top-up as its balance going down
+rather than booking it as a transfer, so keep the target small.
+
 ### The options book keeps a record of why it did what it did
 
 The first mainnet run could be reviewed only from terminal output, and the
