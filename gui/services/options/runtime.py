@@ -44,7 +44,10 @@ def log_path(cfg: config.OptionsConfig) -> Path | None:
     """The book's log file: beside its database, named after it; None for an in-memory one."""
     if cfg.database_path == ":memory:":
         return None
-    return Path(cfg.database_path).with_suffix(".log")
+    database = Path(cfg.database_path)
+    if database.suffix == ".log":  # the log must not be the database itself
+        return database.with_name(f"{database.name}.log")
+    return database.with_suffix(".log")
 
 
 def log_handler(path: Path) -> logging.Handler:

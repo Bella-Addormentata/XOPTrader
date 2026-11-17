@@ -18,8 +18,10 @@ database said what happened but not why. Now:
   action and problem, and engine-guard changes. A run from the app's
   Options page writes it, as does every command but `status` and `report`;
   on the command line `--log-file PATH` moves it and `--no-log-file` turns
-  it off. The terminal shows each problem once, and `run` prints the
-  shared-wallet banner again only when what it says has changed.
+  it off. A log file that would be the database, a file beside it, the
+  config file or any other SQLite database is refused. The terminal shows
+  each problem once, and `run` prints the shared-wallet banner again only
+  when what it says has changed.
 - **How each price was worked out.** A `quotes` table keeps, beside each
   offer, the spot, volatility, model value, carry, markup and minimum
   premium it was priced from, and which of them set the price. The step's
@@ -43,8 +45,8 @@ database said what happened but not why. Now:
   and for each contract the premium against the model value of the offer
   that was taken, the fees and how long its collateral was locked.
   `--csv PATH` writes the per-contract figures, and refuses a path that is
-  the database, a file SQLite or the book keeps beside it, the config file
-  or any other SQLite database. It only reads: it works on a copy, so a
+  the database, a file SQLite or the book keeps beside it, the config file,
+  the book's log files or any other SQLite database. It only reads: it works on a copy, so a
   database from before these tables is left as it is, and a read-only one
   can be reported on.
 

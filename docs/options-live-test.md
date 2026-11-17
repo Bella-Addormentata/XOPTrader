@@ -196,7 +196,8 @@ having kept the terminal output:
   changes. A run from the app's Options page writes it, as does every command
   but `status` and `report`. It is rotated at 2 MB with three old files kept.
   On the command line `--log-file PATH` puts it elsewhere and `--no-log-file`
-  turns it off.
+  turns it off. A log file that would be the database, a file beside it, the
+  config file or any other SQLite database is refused.
 - **The database's journals.** `quotes` keeps, beside each offer, the spot,
   volatility, model value, carry, markup and minimum premium it was priced
   from, and which of them set the price. `step_log` keeps the market each step
@@ -223,7 +224,7 @@ having kept the terminal output:
   span (`90m`, `24h`, `7d`, `2w`), a date or time (UTC unless it says
   otherwise) or `all`. It only reads, so it is safe while `run` is going.
   `--csv` will not write over the database, the files beside it, the config
-  file or any other SQLite database.
+  file, the book's log files or any other SQLite database.
   Periods from before this release have no journal: they show contracts, fees
   and sales, but no quoting time or price breakdown.
 

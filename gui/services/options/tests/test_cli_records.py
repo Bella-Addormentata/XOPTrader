@@ -65,6 +65,10 @@ def _shared(tmp_path: Path, **overrides: Any) -> Any:
     return _config(tmp_path, USD, chia=_TRADING, wallet=wallet, **overrides)
 
 
+def _files(root: Path) -> dict[Path, bytes]:
+    return {file: file.read_bytes() for file in root.rglob("*") if file.is_file()}
+
+
 # -- the log file -------------------------------------------------------------
 
 
@@ -101,6 +105,34 @@ def test_the_log_file_can_be_put_elsewhere_or_turned_off(tmp_path, monkeypatch) 
     assert not (db.parent / "options_jobs.log").exists()
 
 
+@pytest.mark.parametrize(
+    ("target", "clash"),
+    [
+        (lambda db, conf: db, "is the options database"),
+        (lambda db, conf: Path(f"{db}.lock"), "is the database's .lock file"),
+        (lambda db, conf: conf, "is the config file"),
+    ],
+    ids=["database", "lock", "config"],
+)
+def test_the_log_file_is_never_one_the_book_keeps(
+    tmp_path, monkeypatch, capsys, target, clash
+) -> None:
+    # Log lines are appended to it, and it is renamed as it rotates: either
+    # would wreck the database.
+    path, db = _config_file(tmp_path)
+    store.OptionStore(db).close()
+    monkeypatch.setattr(cli, "_step", _logging_step)
+    before = _files(tmp_path)
+    log_file = target(db, Path(path))
+
+    assert cli.main(["--config", path, "--log-file", str(log_file), "step"]) == 2
+
+    assert f"error: log file {log_file} {clash}; give --log-file a file of its own" in (
+        capsys.readouterr().err
+    )
+    assert _files(tmp_path) == before
+
+
 def test_commands_that_only_look_write_no_log_file(tmp_path, monkeypatch) -> None:
     path, db = _config_file(tmp_path)
     store.OptionStore(db).close()
@@ -130,6 +162,9 @@ def test_an_error_is_shown_once_and_kept_in_the_log_file(tmp_path, monkeypatch, 
 def test_the_log_is_named_after_the_database(tmp_path) -> None:
     assert cli.default_log_path(_config(tmp_path, USD)) == tmp_path / "options_jobs.log"
     assert cli.default_log_path(_config(tmp_path, USD, database_path=":memory:")) is None
+    # A database named like a log keeps its log beside it, not in it.
+    named_like_a_log = _config(tmp_path, USD, database_path=str(tmp_path / "book.log"))
+    assert cli.default_log_path(named_like_a_log) == tmp_path / "book.log.log"
 
 
 def test_the_terminal_leaves_out_only_what_the_printed_report_says() -> None:
@@ -240,10 +275,6 @@ def test_a_report_on_a_file_that_is_no_database_says_so(tmp_path, capsys) -> Non
     assert f"could not read {db}" in capsys.readouterr().err
 
 
-def _files(root: Path) -> dict[Path, bytes]:
-    return {file: file.read_bytes() for file in root.rglob("*") if file.is_file()}
-
-
 @pytest.mark.parametrize(
     ("target", "clash"),
     [
@@ -252,8 +283,13 @@ def _files(root: Path) -> dict[Path, bytes]:
         (lambda db, conf: Path(f"{db}-journal"), "is the database's -journal file"),
         (lambda db, conf: Path(f"{db}.lock"), "is the database's .lock file"),
         (lambda db, conf: conf, "is the config file"),
+        (lambda db, conf: db.with_suffix(".log"), "is the book's log file"),
+        (
+            lambda db, conf: Path(f"{db.with_suffix('.log')}.2"),
+            "is one of the book's older log files",
+        ),
     ],
-    ids=["database", "another-spelling", "journal", "lock", "config"],
+    ids=["database", "another-spelling", "journal", "lock", "config", "log", "older-log"],
 )
 def test_a_report_does_not_write_its_csv_over_a_file_the_book_uses(
     tmp_path, capsys, target, clash

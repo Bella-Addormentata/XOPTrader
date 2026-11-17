@@ -43,6 +43,7 @@ from gui.services.options import report as reporting
 from gui.services.options.reference_wallet import ReferenceWallet
 from gui.services.options.runtime import (
     _ADDITIONAL_DATA,
+    LOG_BACKUPS,
     build,
     chain_reader,
     chain_source,
@@ -493,23 +494,36 @@ def _same_file(a: Path, b: Path) -> bool:
         return False
 
 
-def _csv_clash(cfg: config.OptionsConfig, config_path: str | None, csv_path: str) -> str | None:
-    """What ``csv_path`` is, when ``report --csv`` must not write it.
-
-    Writing the CSV empties its file first. It must not land on the book's
-    database or a file kept beside it, on the config file, or on any other
-    SQLite database (a copy of the book's, say).
-    """
-    target = Path(csv_path)
+def _book_files(
+    cfg: config.OptionsConfig, config_path: str | None, log_file: Path | None
+) -> list[tuple[Path, str]]:
+    """The files the book keeps, each with what a refusal calls it."""
+    files: list[tuple[Path, str]] = []
     if cfg.database_path != ":memory:":
         database = Path(cfg.database_path)
-        if _same_file(target, database):
-            return "is the options database"
-        for suffix in _DATABASE_COMPANIONS:
-            if _same_file(target, Path(f"{database}{suffix}")):
-                return f"is the database's {suffix} file"
-    if config_path is not None and _same_file(target, Path(config_path)):
-        return "is the config file"
+        files.append((database, "the options database"))
+        files += [
+            (Path(f"{database}{suffix}"), f"the database's {suffix} file")
+            for suffix in _DATABASE_COMPANIONS
+        ]
+    if config_path is not None:
+        files.append((Path(config_path), "the config file"))
+    if log_file is not None:
+        files.append((log_file, "the book's log file"))
+        files += [
+            (Path(f"{log_file}.{n}"), "one of the book's older log files")
+            for n in range(1, LOG_BACKUPS + 1)
+        ]
+    return files
+
+
+def _clash(target: Path, files: list[tuple[Path, str]]) -> str | None:
+    """What ``target`` is, when nothing may be written to it: one of ``files``
+    (through a link or another spelling too), or any SQLite database (a copy
+    of the book's, say)."""
+    for path, name in files:
+        if _same_file(target, path):
+            return f"is {name}"
     try:
         with open(target, "rb") as handle:
             if handle.read(len(_SQLITE_HEADER)) == _SQLITE_HEADER:
@@ -520,7 +534,11 @@ def _csv_clash(cfg: config.OptionsConfig, config_path: str | None, csv_path: str
 
 
 def _report(
-    cfg: config.OptionsConfig, since: str, csv_path: str | None, config_path: str | None = None
+    cfg: config.OptionsConfig,
+    since: str,
+    csv_path: str | None,
+    config_path: str | None = None,
+    log_file: Path | None = None,
 ) -> int:
     """Read-only: what the book did since ``since``."""
     now = time.time()
@@ -536,7 +554,8 @@ def _report(
     if start > now:
         print(f"error: --since {since!r} is in the future", file=sys.stderr)
         return 2
-    clash = _csv_clash(cfg, config_path, csv_path) if csv_path else None
+    # Writing the CSV empties its file first: never one the book keeps.
+    clash = _clash(Path(csv_path), _book_files(cfg, config_path, log_file)) if csv_path else None
     if clash is not None:
         print(f"error: --csv {csv_path} {clash}; the CSV needs a file of its own", file=sys.stderr)
         return 2
@@ -1076,10 +1095,19 @@ def main(argv: list[str] | None = None) -> int:
         cfg = _load(args.config)
         path = Path(args.log_file) if args.log_file else default_log_path(cfg)
         if path is not None and not args.no_log_file and args.command not in _NO_LOG_FILE:
+            # Log lines are appended, and the file is renamed as it rotates.
+            clash = _clash(path, _book_files(cfg, args.config, None))
+            if clash is not None:
+                print(
+                    f"error: log file {path} {clash}; give --log-file a file of its own,"
+                    " or pass --no-log-file",
+                    file=sys.stderr,
+                )
+                return 2
             handlers.append(_log_to_file(path))
             log.info("[options] %s, config %s", args.command, args.config)
         if args.command == "report":
-            return _report(cfg, args.since, args.csv, args.config)
+            return _report(cfg, args.since, args.csv, args.config, path)
         if args.command == "status":
             return _status(cfg)
         if args.command == "step":
