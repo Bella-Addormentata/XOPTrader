@@ -182,7 +182,7 @@ class WalletFence:
     def coin_ids(self) -> list[str]:
         """0x-hex ids of every spendable coin at the sub-account. Raises FenceUnavailableError."""
         now = self._clock()
-        if self._ids is not None and now - self._at <= self._max_age:
+        if self._ids is not None and self._max_age > 0 and now - self._at <= self._max_age:
             return list(self._ids)
         try:
             ids = self._list()

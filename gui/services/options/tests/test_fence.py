@@ -157,13 +157,15 @@ def test_every_spend_of_the_app_leaves_the_sub_account_alone() -> None:
     for body in spends:
         assert wallet.ids_at_the_address() <= set(body["excluded_coin_ids"])
     assert "0xab" in spends[2]["excluded_coin_ids"], "a caller's own exclusions stay"
-    # Listing calls are not fenced, and the list is kept for a while.
+    # Listing calls are not fenced, and each spend lists afresh.
     assert all(
         "excluded_coin_ids" not in body
         for endpoint, body in wallet.calls
         if endpoint == "get_wallets"
     )
-    assert sum(1 for endpoint, _ in wallet.calls if endpoint == "get_wallets") == 1
+    assert sum(1 for endpoint, _ in wallet.calls if endpoint == "get_wallets") == 3, (
+        "no cache for spends: each one lists the sub-account afresh"
+    )
 
 
 def test_a_fence_that_cannot_list_its_coins_refuses_the_spend() -> None:
