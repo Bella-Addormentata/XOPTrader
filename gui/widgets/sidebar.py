@@ -65,6 +65,7 @@ _NAV_ITEMS: Final[list[tuple[str, str]]] = [
     ("Warp",       "\U0001F309"),   # 🌉  bridge
     ("Base",       "\U0001F537"),   # 🔷  Base-network hot wallet
     ("Permuto",    "📉"),   # 📉  volatility perps venue
+    ("Options",    "\U0001F3AF"),   # 🎯  options book (covered calls)
     ("Settings",   "\u2699\uFE0F"), # ⚙️  gear
 ]
 
@@ -331,7 +332,7 @@ class Sidebar(QWidget):
         Parameters
         ----------
         index : int
-            Zero-based page index (0 = Dashboard .. 10 = Settings).
+            Zero-based page index (0 = Dashboard .. 11 = Settings).
         """
         if 0 <= index < len(self._buttons):
             self._on_button_clicked(index)

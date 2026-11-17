@@ -30,7 +30,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
-import logging.handlers
 import sys
 import time
 from collections.abc import Callable
@@ -45,6 +44,8 @@ from gui.services.options.runtime import (
     build,
     chain_reader,
     chain_source,
+    log_handler,
+    log_path,
     shared_wallet_guard,
     wallet_rpc,
 )
@@ -57,10 +58,6 @@ from gui.services.options.service import (
 
 log = logging.getLogger(__name__)
 
-_LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
-_LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S%z"
-_LOG_BYTES = 2 * 1024 * 1024  # as the GUI's own gui.log
-_LOG_BACKUPS = 3
 #: Commands that only look: they leave the log file to the one that acts.
 _NO_LOG_FILE = ("status", "report")
 
@@ -96,19 +93,12 @@ def _log_to_console(verbose: bool) -> logging.Handler:
 
 def default_log_path(cfg: config.OptionsConfig) -> Path | None:
     """Beside the book's database, named after it; None for an in-memory one."""
-    if cfg.database_path == ":memory:":
-        return None
-    return Path(cfg.database_path).with_suffix(".log")
+    return log_path(cfg)
 
 
 def _log_to_file(path: Path) -> logging.Handler:
     """Everything from info up, with the time on every line, rotated as the GUI's log is."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.handlers.RotatingFileHandler(
-        path, maxBytes=_LOG_BYTES, backupCount=_LOG_BACKUPS, encoding="utf-8", delay=True
-    )
-    handler.setLevel(logging.INFO)
-    handler.setFormatter(logging.Formatter(_LOG_FORMAT, _LOG_DATE_FORMAT))
+    handler = log_handler(path)
     logging.getLogger().addHandler(handler)
     return handler
 
@@ -122,7 +112,8 @@ def _load(path: str) -> config.OptionsConfig:
     parsed = config.parse(root)
     if parsed is None:
         raise SystemExit(f"{path}: options are not enabled (options.enabled: true to turn on)")
-    return parsed
+    # Read beside config.yaml, as the app's Options page and its engine check do.
+    return config.resolve_database_path(parsed, path)
 
 
 def _print_report(report: Any) -> None:
@@ -160,11 +151,18 @@ def _shared_wallet_banner(
     """
     if not cfg.wallet.share_trading_wallet:
         return None
+    beside = cfg.wallet.engine_beside_open_contracts
     state = engine_guard.engine_state(cfg.wallet.engine_metrics_url)
+    rule = (
+        "The engine may run while contracts sit open (engine_beside_open_contracts), but "
+        "must be STOPPED while this book acts."
+        if beside
+        else "The engine must stay STOPPED while any contract is open."
+    )
     lines = [
         "WARNING: options.wallet.share_trading_wallet is ON. This book signs from the "
         f"trading engine's wallet ({cfg.wallet.host}:{cfg.wallet.port}, key "
-        f"{cfg.wallet.fingerprint}). The engine must stay STOPPED while any contract is open.",
+        f"{cfg.wallet.fingerprint}). {rule}",
         f"  trading engine: {state.describe()}",
     ]
     open_contracts = book_store.contracts(store.ACTIVE) if book_store is not None else []
@@ -172,11 +170,20 @@ def _shared_wallet_banner(
         locked = sum(
             item.underlying_amount for item in open_contracts if item.underlying_asset is None
         )
-        lines.append(
-            f"  WARNING: {len(open_contracts)} contract(s) open with {locked / config.XCH_MOJOS:g} "
-            "XCH locked while the engine may be running: its balances include collateral and "
-            "premiums it must not count, and its offers can spend coins at the options address"
-        )
+        if beside:
+            lines.append(
+                f"  note: {len(open_contracts)} contract(s) open with "
+                f"{locked / config.XCH_MOJOS:g} XCH locked beside the engine: their collateral "
+                "is locked in the contracts; a live step waits for the engine to stop, and "
+                "then pays from the rest of the wallet what the options address lacks"
+            )
+        else:
+            lines.append(
+                f"  WARNING: {len(open_contracts)} contract(s) open with "
+                f"{locked / config.XCH_MOJOS:g} XCH locked while the engine may be running: its "
+                "balances include collateral and premiums it must not count, and its offers can "
+                "spend coins at the options address"
+            )
     if seen is not None and seen.get("banner") == lines:
         return state
     if seen is not None:
@@ -192,14 +199,21 @@ def _shared_wallet_banner(
     return state
 
 
-def _engine_refusal(state: engine_guard.EngineState | None, what: str) -> str | None:
+def _engine_refusal(
+    state: engine_guard.EngineState | None,
+    what: str,
+    cfg: config.OptionsConfig | None = None,
+) -> str | None:
     """Why ``what``, which signs, must not run now; None if it may."""
     if state is None or state.clear:
         return None
+    if cfg is not None and cfg.wallet.engine_beside_open_contracts:
+        how = "Stop the engine while the book acts (it may run again once the book is done)"
+    else:
+        how = "Stop the engine and keep it stopped while contracts are open"
     return (
         f"refused, trading engine up: {what} would sign from the wallet the engine trades "
-        f"through, and the engine is {state.describe()}. Stop the engine and keep it stopped "
-        "while contracts are open, then try again."
+        f"through, and the engine is {state.describe()}. {how}, then try again."
     )
 
 
@@ -252,6 +266,18 @@ def _status(cfg: config.OptionsConfig) -> int:
             f"  spendable there: {xch / config.XCH_MOJOS:g} XCH, "
             f"{quote / cfg.quote_unit_mojos:g} quote"
         )
+        if cfg.wallet.fund_from_wallet:
+            here = coins.puzzle_hash()
+            rest = sum(
+                int(coin.amount)
+                for coin in coins.wallet_xch_coins()
+                if bytes(coin.puzzle_hash) != here
+            )
+            print(
+                f"  spendable elsewhere in the wallet: {rest / config.XCH_MOJOS:g} XCH "
+                "(fund_from_wallet: what the options address is short of comes from here; "
+                "change comes back to the options address)"
+            )
     contracts = book_store.contracts()
     print(f"{len(contracts)} contract(s)")
     for item in contracts:
@@ -271,28 +297,34 @@ def _cancel_funding(
     """Whether each unsold contract could be cancelled now, and what is missing if not.
 
     A cancel pays the strike to ourselves inside the same bundle, so it needs
-    one coin of the strike asset at the options address to start from (any
-    amount; it comes back in full), and XCH there for a fee when one is due.
-    A clawback after expiry needs neither. On the first live run the wind-down
-    found this out from the cancel's error.
+    one coin of the strike asset to start from (any amount; it comes back in
+    full), and XCH for a fee when one is due: at the options address, or with
+    ``fund_from_wallet`` anywhere in the wallet. A clawback after expiry needs
+    neither. On the first live run the wind-down found this out from the
+    cancel's error.
     """
     unsold = book_store.contracts((store.OPEN,))
     if not unsold:
         return []
-    have_xch = bool(coins.xch_coins())
+    anywhere = cfg.wallet.fund_from_wallet
+    where = "in the wallet" if anywhere else "at the options address"
+    have_xch = bool(coins.wallet_xch_coins() if anywhere else coins.xch_coins())
     lines = ["cancelling now:"]
     for item in unsold:
         if item.strike_asset is None:
             ready = have_xch
-            missing = "an XCH coin at the options address"
+            missing = f"an XCH coin {where}"
         else:
-            ready = bool(coins.cats(item.strike_asset))
-            name = "the quote asset" if item.strike_asset == cfg.quote_asset_id else "its CAT"
-            missing = f"a coin of {name} (any amount) at the options address"
+            asset = item.strike_asset
+            ready = bool(coins.wallet_cat_coins(asset) if anywhere else coins.cats(asset))
+            name = "the quote asset" if asset == cfg.quote_asset_id else "its CAT"
+            missing = f"a coin of {name} (any amount) {where}"
         when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(item.expiration))
         if ready:
             fee = (
-                "" if have_xch or item.strike_asset is None else " (plus XCH there if a fee is due)"
+                ""
+                if have_xch or item.strike_asset is None
+                else f" (plus XCH {where} if a fee is due)"
             )
             lines.append(f"  {item.slot:<22} possible{fee}")
         else:
@@ -311,7 +343,7 @@ def _guarded_step(
     """One step, unless the shared-wallet guard forbids it. False if refused."""
     state = _shared_wallet_banner(cfg, book_store, seen)
     # A dry-run step signs nothing, so only a live one needs the engine down.
-    refusal = None if cfg.dry_run else _engine_refusal(state, "a live step")
+    refusal = None if cfg.dry_run else _engine_refusal(state, "a live step", cfg)
     if refusal is not None:
         print(f"  note: {refusal}")
         log.warning("[options] %s", refusal, extra=REPORTED)
@@ -434,7 +466,7 @@ def _report(cfg: config.OptionsConfig, since: str, csv_path: str | None) -> int:
 def _withdraw_all(cfg: config.OptionsConfig) -> int:
     book, book_store, _ = build(cfg)
     state = _shared_wallet_banner(cfg, book_store)
-    refusal = None if cfg.dry_run else _engine_refusal(state, "withdraw-all")
+    refusal = None if cfg.dry_run else _engine_refusal(state, "withdraw-all", cfg)
     if refusal is not None:
         print(f"  note: {refusal}")
         return 3
@@ -555,7 +587,7 @@ class _LiveTest:
         safety.require(effect, expected)
         _confirm(f"  sign and send the {what}?", self.assume_yes)
         # Asked again at every spend: the engine may have been started since.
-        refusal = _engine_refusal(_shared_wallet_banner(self.cfg, None), f"the {what}")
+        refusal = _engine_refusal(_shared_wallet_banner(self.cfg, None), f"the {what}", self.cfg)
         if refusal is not None:
             raise SystemExit(f"{refusal} Nothing was signed; run live-test again to carry on.")
         signature = self.wallet.sign(coin_spends)
@@ -722,7 +754,7 @@ def _live_test(
     if why is not None:
         raise SystemExit(f"{why}; run the test again once it is ready")
     book, book_store, coins = build(cfg, rpc=rpc, reader=reader, clock=time.time)
-    refusal = _engine_refusal(_shared_wallet_banner(cfg, book_store), "live-test")
+    refusal = _engine_refusal(_shared_wallet_banner(cfg, book_store), "live-test", cfg)
     if refusal is not None:
         raise SystemExit(refusal)
     address = coins.puzzle_hash()

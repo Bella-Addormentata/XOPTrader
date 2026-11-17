@@ -12,8 +12,10 @@ terminal: ``status``, ``step``, ``run`` and ``withdraw-all``.
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from gui.services.options import (
@@ -30,6 +32,31 @@ from gui.services.options.reference_wallet import ReferenceWallet, WalletRpc, co
 from gui.services.options.service import OptionsBook, OptionsError
 
 log = logging.getLogger(__name__)
+
+#: The book's own log file: rotated as the GUI's gui.log is, the time on every line.
+LOG_BYTES = 2 * 1024 * 1024
+LOG_BACKUPS = 3
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S%z"
+
+
+def log_path(cfg: config.OptionsConfig) -> Path | None:
+    """The book's log file: beside its database, named after it; None for an in-memory one."""
+    if cfg.database_path == ":memory:":
+        return None
+    return Path(cfg.database_path).with_suffix(".log")
+
+
+def log_handler(path: Path) -> logging.Handler:
+    """A handler writing info and up to ``path``, rotated. Opens the file on its first line."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        path, maxBytes=LOG_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8", delay=True
+    )
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
+    return handler
+
 
 _COINSET = {
     config.MAINNET: "https://api.coinset.org",
@@ -131,6 +158,10 @@ class WalletCoinSource:
         mine = self.puzzle_hash()
         return [coin for coin in self._spendable(_XCH_WALLET_ID) if bytes(coin.puzzle_hash) == mine]
 
+    def wallet_xch_coins(self) -> list[Any]:
+        """Every spendable XCH coin of the wallet, at any address (``fund_from_wallet``)."""
+        return self._spendable(_XCH_WALLET_ID)
+
     def _cat_wallet(self, asset_id: bytes) -> int | None:
         asset_id = bytes(asset_id)
         now = self._clock()
@@ -145,7 +176,10 @@ class WalletCoinSource:
                 try:
                     wallet_id = int(wallet["id"])
                     found = self._rpc("cat_get_asset_id", {"wallet_id": wallet_id})
-                    self._cat_wallets[bytes.fromhex(str(found["asset_id"]))] = wallet_id
+                    # chia-blockchain 2.7.4 answers "0x"-prefixed, which
+                    # bytes.fromhex refuses: the asset's wallet was never found.
+                    asset_hex = str(found["asset_id"]).strip().lower().removeprefix("0x")
+                    self._cat_wallets[bytes.fromhex(asset_hex)] = wallet_id
                 except (KeyError, TypeError, ValueError):
                     continue
         return self._cat_wallets.get(asset_id)
@@ -161,6 +195,15 @@ class WalletCoinSource:
         # The wallet already knows the coin; only its parent's spend, which is
         # settled and so read once, is needed from the chain.
         return [chain.load_cat_coin(self._chain, coin) for coin in self._cat_coins(asset_id)]
+
+    def wallet_cat_coins(self, asset_id: bytes) -> list[Any]:
+        """Every spendable coin of one CAT in the wallet, any address, no lineage yet."""
+        wallet_id = self._cat_wallet(asset_id)
+        return [] if wallet_id is None else self._spendable(wallet_id)
+
+    def cat_of(self, coin: Any) -> Any:
+        """One coin from :meth:`wallet_cat_coins`, with its lineage (one settled read)."""
+        return chain.load_cat_coin(self._chain, coin)
 
     def held(self, asset_ids: Any) -> frozenset[bytes]:
         """Ids of the spendable coins at the address. The chain is not asked."""

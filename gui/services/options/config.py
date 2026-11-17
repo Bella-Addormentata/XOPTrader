@@ -23,6 +23,28 @@ address (a blank one takes the wallet's current address, where the engine's
 self-sends land); the wallet must be on this machine, where the engine check
 can see; and every signature and push first checks that the engine is not
 running (:mod:`engine_guard`), refusing if it is or if it cannot tell.
+
+FUNDING FROM THE WALLET. ``wallet.fund_from_wallet: true`` (off by default)
+lets what the options address is short of, in XCH or the quote asset, come
+from the wallet's other addresses: collateral, fees, and the seed coins a
+cancel starts from (one of the strike asset, one of XCH for the fee). What the
+book owns still lands at the options address (all change, returned
+collateral, premiums), and the funding coins' addresses count as ours in the
+safety check, so it stays exact. ``live-test`` still funds itself from the
+options address only.
+
+THE ENGINE BESIDE OPEN CONTRACTS. ``wallet.engine_beside_open_contracts: true``
+(off by default, read only with ``share_trading_wallet``) narrows "the engine
+is STOPPED while contracts are open" to "the engine is stopped while the book
+acts". Contracts that sit open do not hold the engine: their collateral is
+locked in the contract, which the wallet does not spend, and their offers spend
+only the option coin. What still holds it: the book being Live, a step in
+progress, and a transaction the book has sent that could still confirm (the
+wallet does not know those coins are being spent, so an engine offer could pick
+them). A running engine can spend the loose coins at the options address, so
+this needs ``fund_from_wallet``: the book then pays from the rest of the wallet
+when it next acts. Every signature and push still checks that the engine is
+stopped, as above.
 """
 
 from __future__ import annotations
@@ -180,6 +202,12 @@ class WalletConfig:
     #: Where a running engine answers (its Prometheus endpoint), asked before
     #: anything is signed while ``share_trading_wallet`` is on.
     engine_metrics_url: str = ""
+    #: Fund collateral, fees and a cancel's seed coin from the rest of the
+    #: wallet when the options address runs short. Off by default.
+    fund_from_wallet: bool = False
+    #: With ``share_trading_wallet``: open contracts do not hold the engine,
+    #: only the book acting does. Off by default; needs ``fund_from_wallet``.
+    engine_beside_open_contracts: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -401,6 +429,17 @@ def parse(root: Any) -> OptionsConfig | None:
                 "options.wallet.engine_metrics_url"
             ) from exc
         metrics_url = f"http://localhost:{metrics_port}/metrics"
+    fund = _flag(wallet_raw, "fund_from_wallet", False)
+    beside = _flag(wallet_raw, "engine_beside_open_contracts", False)
+    if share and beside and not fund:
+        # A running engine's offers pick coins from the whole wallet, those at
+        # the options address included. The book's next cancel or clawback
+        # must not depend on them still being there.
+        raise OptionsConfigError(
+            "options.wallet.engine_beside_open_contracts needs options.wallet.fund_from_wallet: "
+            "true. The engine may spend the coins at the options address while contracts are "
+            "open, so the book must be able to pay from the rest of the wallet when it acts"
+        )
     wallet = WalletConfig(
         mode=mode,
         host=host,
@@ -411,6 +450,8 @@ def parse(root: Any) -> OptionsConfig | None:
         address=address,
         share_trading_wallet=share,
         engine_metrics_url=metrics_url,
+        fund_from_wallet=fund,
+        engine_beside_open_contracts=beside,
     )
 
     quote_decimals = int(_number(section, "quote_asset_decimals", 3))
@@ -550,3 +591,30 @@ def parse(root: Any) -> OptionsConfig | None:
         splash=splash_config,
         coingecko_api_key=str(coingecko.get("api_key") or "").strip(),
     )
+
+
+def resolve_database_path(
+    cfg: OptionsConfig, config_path: str | os.PathLike[str], *, cwd: str | None = None
+) -> OptionsConfig:
+    """``database_path`` made absolute, read beside config.yaml. One rule for every entry point.
+
+    The command line used to read a relative path against the folder it was
+    run from, and the app's Options page and its engine check read it beside
+    config.yaml: run from another folder, the two looked at different books,
+    and the check could pass an engine start over open contracts. Both read it
+    beside config.yaml now. A book found only where the old rule put it is not
+    silently replaced by a new, empty one: that is refused, saying where it is.
+    """
+    if cfg.database_path == ":memory:" or os.path.isabs(cfg.database_path):
+        return cfg
+    beside = os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(config_path)), cfg.database_path)
+    )
+    here = os.path.abspath(os.path.join(cwd or os.getcwd(), cfg.database_path))
+    if here != beside and os.path.exists(here) and not os.path.exists(beside):
+        raise OptionsConfigError(
+            f"options.database_path {cfg.database_path!r} is read beside config.yaml ({beside}), "
+            f"but the book is at {here}, where it was read against the folder the command ran "
+            "from. Move it beside config.yaml, or set options.database_path to its absolute path."
+        )
+    return dataclasses.replace(cfg, database_path=beside)

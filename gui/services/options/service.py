@@ -186,6 +186,23 @@ class CoinSource(Protocol):
     def xch_coins(self) -> list[Coin]:
         """Spendable XCH coins at that address."""
 
+    def wallet_xch_coins(self) -> list[Coin]:
+        """Spendable XCH coins at any address of the wallet, that one included.
+
+        Asked only with ``options.wallet.fund_from_wallet``. The wallet already
+        leaves out coins its own resting offers and pending transactions hold.
+        """
+
+    def wallet_cat_coins(self, asset_id: bytes) -> list[Coin]:
+        """Spendable coins of one CAT at any address of the wallet, without lineage.
+
+        Asked only with ``fund_from_wallet``; :meth:`cat_of` then loads the few
+        that are chosen, so the chain is not read for every one.
+        """
+
+    def cat_of(self, coin: Coin) -> Cat:
+        """A CAT coin from :meth:`wallet_cat_coins`, with its lineage proof."""
+
     def cats(self, asset_id: bytes) -> list[Cat]:
         """Spendable coins of one CAT at that address, with lineage proofs."""
 
@@ -249,6 +266,25 @@ def _paying(fee: int) -> str:
     return f", fee {fee} mojos" if fee else ""
 
 
+def _cover(coins: list[Coin], short: int) -> list[Coin]:
+    """Coins from the rest of the wallet covering ``short``, or [] if they cannot.
+
+    The smallest single coin that covers it, so a large trading coin is not
+    taken for a fee or a seed; failing that, the largest first.
+    """
+    covering = [coin for coin in coins if int(coin.amount) >= short]
+    if covering:
+        return [min(covering, key=lambda item: int(item.amount))]
+    chosen: list[Coin] = []
+    total = 0
+    for coin in sorted(coins, key=lambda item: int(item.amount), reverse=True):
+        chosen.append(coin)
+        total += int(coin.amount)
+        if total >= short:
+            return chosen
+    return []
+
+
 def pack_bundle(coin_spends: list[CoinSpend], signature: bytes) -> bytes:
     """A signed bundle as the store keeps it."""
     sdk = _sdk()
@@ -287,6 +323,11 @@ class OptionsBook:
         self._not_ready: str | None = None  # why the wallet was not ready, last asked
         self._clock = clock
         self._keys: dict[bytes, Any] = {}
+        #: Addresses of this wallet, other than the options address, whose coins
+        #: have funded a bundle (``options.wallet.fund_from_wallet``). They are the
+        #: key's own, so their keys go in custody and the safety check counts
+        #: them as ours.
+        self._funding_addresses: set[bytes] = set()
         self._loaded: dict[bytes, chain.LoadedOption] = {}
         self._spot = 0.0
         self._looked_at: int | None = None  # when the chain was last read afresh
@@ -395,12 +436,13 @@ class OptionsBook:
 
     def _custody(self, *extra: bytes) -> builder.Custody:
         custody = builder.Custody()
-        for puzzle_hash in {self._address(), *(bytes(item) for item in extra)}:
+        wanted = {self._address(), *self._funding_addresses, *(bytes(item) for item in extra)}
+        for puzzle_hash in wanted:
             custody.add_key(self._key(puzzle_hash))
         return custody
 
     def _ours(self) -> set[bytes]:
-        mine = {self._address()}
+        mine = {self._address(), *self._funding_addresses}
         mine.update(item.creator_puzzle_hash for item in self._store.contracts(store.ACTIVE))
         return mine
 
@@ -433,7 +475,13 @@ class OptionsBook:
             ) from exc
 
     def _xch(self, needed: int) -> list[Coin]:
-        """The fewest spendable XCH coins that cover ``needed`` mojos."""
+        """The fewest spendable XCH coins that cover ``needed`` mojos.
+
+        The options address's own coins first. With ``fund_from_wallet``, what
+        they leave short comes from the rest of the wallet: the smallest one
+        coin that covers it, so a large trading coin is not swept into a fee,
+        else the largest first. Change always goes to the options address.
+        """
         if needed <= 0:
             return []
         reserved = self._reserved()
@@ -445,13 +493,35 @@ class OptionsBook:
             total += int(coin.amount)
             if total >= needed:
                 return chosen
+        if self._config.wallet.fund_from_wallet:
+            topped_up = self._from_wallet(needed - total, reserved)
+            if topped_up:
+                self._funding_addresses.update(bytes(coin.puzzle_hash) for coin in topped_up)
+                return chosen + topped_up
+        where = "at the options address" + (
+            " or elsewhere in the wallet" if self._config.wallet.fund_from_wallet else ""
+        )
         waiting = " (the rest is set aside for transactions still waiting)" if reserved else ""
         raise builder.OptionBuildError(
-            f"not enough XCH free at the options address: need {needed} mojos, "
-            f"have {total}{waiting}"
+            f"not enough XCH free {where}: need {needed} mojos, have {total}{waiting}"
         )
 
+    def _from_wallet(self, short: int, reserved: set[bytes]) -> list[Coin]:
+        """Coins elsewhere in the wallet that cover ``short`` mojos, or [] if they cannot."""
+        address = self._address()
+        try:
+            listed = self._coins.wallet_xch_coins()
+        except (RuntimeError, OSError, ValueError) as exc:
+            raise builder.OptionBuildError(f"could not list the wallet's XCH coins: {exc}") from exc
+        others = [
+            coin
+            for coin in listed
+            if bytes(coin.puzzle_hash) != address and bytes(coin.coin_id()) not in reserved
+        ]
+        return _cover(others, short)
+
     def _cats(self, asset_id: bytes, needed: int) -> list[Cat]:
+        """The fewest spendable coins of one CAT covering ``needed``; as :meth:`_xch` for XCH."""
         reserved = self._reserved()
         cats = [
             cat
@@ -465,8 +535,27 @@ class OptionsBook:
             total += int(cat.coin.amount)
             if total >= needed:
                 return chosen
+        if self._config.wallet.fund_from_wallet:
+            own = {bytes(cat.coin.coin_id()) for cat in cats}
+            try:
+                listed = self._coins.wallet_cat_coins(asset_id)
+                picked = _cover(
+                    [coin for coin in listed if bytes(coin.coin_id()) not in own | reserved],
+                    needed - total,
+                )
+                topped_up = [self._coins.cat_of(coin) for coin in picked]
+            except (RuntimeError, OSError, ValueError, chain.ChainError) as exc:
+                raise builder.OptionBuildError(
+                    f"could not list the wallet's quote asset coins: {exc}"
+                ) from exc
+            if topped_up:
+                self._funding_addresses.update(bytes(cat.info.p2_puzzle_hash) for cat in topped_up)
+                return chosen + topped_up
+        where = "at the options address" + (
+            " or elsewhere in the wallet" if self._config.wallet.fund_from_wallet else ""
+        )
         raise builder.OptionBuildError(
-            f"not enough of the quote asset at the options address: need {needed}, have {total}"
+            f"not enough of the quote asset {where}: need {needed}, have {total}"
         )
 
     # -- signing and broadcasting -------------------------------------------

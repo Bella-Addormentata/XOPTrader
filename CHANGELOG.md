@@ -12,13 +12,14 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The first mainnet run could be reviewed only from terminal output, and the
 database said what happened but not why. Now:
 
-- **A log file.** Every command but `status` and `report` logs to a file
-  beside the database (`options_jobs.log` for `options_jobs.db`), rotated
-  at 2 MB with three old files kept, with the time on every line: the
-  market each step, every action and problem, and engine-guard changes.
-  `--log-file PATH` moves it and `--no-log-file` turns it off. The terminal
-  shows each problem once, and `run` prints the shared-wallet banner again
-  only when what it says has changed.
+- **A log file.** The book logs to a file beside its database
+  (`options_jobs.log` for `options_jobs.db`), rotated at 2 MB with three
+  old files kept, with the time on every line: the market each step, every
+  action and problem, and engine-guard changes. A run from the app's
+  Options page writes it, as does every command but `status` and `report`;
+  on the command line `--log-file PATH` moves it and `--no-log-file` turns
+  it off. The terminal shows each problem once, and `run` prints the
+  shared-wallet banner again only when what it says has changed.
 - **How each price was worked out.** A `quotes` table keeps, beside each
   offer, the spot, volatility, model value, carry, markup and minimum
   premium it was priced from, and which of them set the price. The step's
@@ -28,9 +29,8 @@ database said what happened but not why. Now:
   step's verdict: quoting, or why not (spot price too old; Dexie book too
   thin, crossed or too wide; spot outside the Dexie range; wallet not
   ready; the step failed, with its error; refused because the trading
-  engine may be running). A row is
-  written when the verdict changes, when a price moves more than 0.5%, and
-  otherwise every 15 minutes.
+  engine may be running). A row is written when the verdict changes, when
+  a price moves more than 0.5%, and otherwise every 15 minutes.
 - **Fees and sales in the events.** `collateral_locked` and
   `collateral_returned` carry the fee their transaction paid, a confirmed
   withdrawal is booked as `offers_withdrawn` with its fee, and `sold` names
@@ -46,7 +46,7 @@ database said what happened but not why. Now:
 
 The book stops quoting when spot is outside the price range the Dexie book
 can fill. With `share_trading_wallet` on, that range included the wallet's
-own open offers: the engine's, left resting at their old prices while it is
+own open offers: the engine's, which rest at their old prices while it is
 stopped. One of the first run's stops was most likely an ask of the
 engine's. The book now asks the wallet for its open offers and leaves them
 out; if the wallet cannot say, every offer counts, as before.
@@ -54,10 +54,132 @@ out; if the wallet cannot say, every offer counts, as before.
 ### `status` says whether each unsold contract can be cancelled now
 
 A cancel of a call pays the strike back to the options address inside the
-same transaction, so it needs one coin of the quote asset there to start
-from (any amount; it comes back in full). The first run's wind-down found
-this out from the cancel's error. `status` now lists each unsold contract
-as `possible`, or what it needs and when it will be clawed back instead.
+same transaction, so it needs one coin of the quote asset to start from
+(any amount; it comes back in full): at the options address, or anywhere
+in the wallet with `fund_from_wallet`. The first run's wind-down found this
+out from the cancel's error. `status` now lists each unsold contract as
+`possible`, or what it needs and when it will be clawed back instead.
+
+## [0.10.51] — 2026-11-16 — the engine can trade beside open option contracts
+
+### The engine can trade beside open option contracts (opt-in) (#237)
+
+With the trading wallet shared, 0.10.50 kept the engine stopped for as long
+as the options book had any contract open: in the first live run, two unsold
+calls kept it down from the evening of 2026-11-15 on. A new switch,
+`options.wallet.engine_beside_open_contracts` (off by default), narrows that
+to the times the book acts:
+
+- **What no longer holds the engine:** contracts that sit open. Their
+  collateral is locked in the contract, which the wallet does not spend, and
+  their offers spend only the option coin.
+- **What still does:** the book being Live, a step in progress (its acting
+  lock is still taken for the launch), and any transaction the book has sent
+  that could still confirm. The book pushes bundles it built itself, so the
+  wallet does not know those coins are being spent and could hand them to an
+  engine offer. A transaction holds the engine until a step records its
+  verdict: confirmed, overtaken, or lapsed by the chain's own clock, never
+  this machine's (from the Copilot review of #237). A Rehearse step records
+  verdicts too.
+- **Going Live still needs the engine stopped**, and every signature and push
+  still checks for it.
+- It needs `options.wallet.fund_from_wallet: true`, and says so if that is
+  off: a running engine can spend the loose coins at the options address, so
+  the book must be able to pay from the rest of the wallet when it next acts.
+- `status`, each step and the Options page's Live confirmation say which rule
+  is in force.
+
+## [0.10.50] — 2026-11-16 — an Options page, and the engine waits for the book
+
+### An Options page switches the options book Off, to Rehearse, or Live (#235)
+
+The options book ran only from a terminal (`python -m gui.services.options
+run`), which the installed app cannot do. A new Options page runs it inside
+the app:
+
+- **Off / Rehearse / Live.** Rehearse is always a dry run, whatever
+  `options.dry_run` says: it builds and checks and signs nothing. Live asks
+  first. The choice is remembered and taken up again at the next launch;
+  Live again only if the engine is down by then.
+- **What it is doing:** the mode, steps and last step, the engine check,
+  anything holding it, the market it sees, the fees it has paid, its
+  contracts (collateral in its own asset) with their live offers, and its
+  recent activity.
+- It reads `config.yaml` (with `secrets.yaml`) from the path the app loads,
+  so the options settings belong there. A relative `options.database_path`
+  is read beside that file, not the program's folder.
+
+### The engine does not start over an options book's open contracts (#235)
+
+With `options.wallet.share_trading_wallet`, the engine now refuses to start
+while the options book has contracts open or is Live, at launch and from
+Start, Restart or a venue switch, and says why. On 2026-11-15 the app's
+launch-time auto-start, which ran no checks at all, brought the engine up
+under two open contracts at the first launch of a new version, and the
+engine spent the book's coins within minutes. Live cannot be switched on
+while the engine runs either.
+
+- The check and the launch hold the book's acting lock, the one every step
+  takes, so a step cannot mint between "nothing is open" and the engine
+  being up. A book in the middle of a step is a reason to try again.
+- It covers every book the app has run, not only the one config.yaml names
+  now: switching config.yaml in Settings stops the page's book and follows
+  the new file, and the old book's open contracts still hold the engine.
+- A book that shares the trading wallet but whose settings cannot be read
+  holds the engine: its contracts cannot be checked.
+- Switching the book off waits a moment for the step in progress, then
+  shows it as finishing; nothing new starts until it has.
+
+### One rule for where the options book's database is (#235)
+
+A relative `options.database_path` is now read beside `config.yaml` by the
+command line as well as the app. The command line used to read it against
+the folder it was run from, so the two could look at different books. A
+book found only where the old rule put it is refused with where it is, not
+replaced by a new, empty one.
+
+Start Trading also no longer shows the engine running when the start was
+refused or failed.
+
+### The app's self-check covers the options book (#235)
+
+`--self-check` imports `chia_wallet_sdk` and the options runner and builds
+one puzzle with it, so a bundle without the options book's native
+dependency fails its build instead of failing at the first step.
+
+## [0.10.49] — 2026-11-15 — the options book pays from the whole wallet
+
+### The options book can pay from the whole wallet (#233)
+
+`options.wallet.fund_from_wallet` (off by default) lets the book draw what
+its address is short of, in XCH or the quote asset, from the wallet's other
+addresses: collateral, fees, and the seed coins a cancel starts from. On
+the first mainnet run the engine, started again with contracts open, put
+the address's only XCH coin into its own offers, and the address had never
+held the quote asset a cancel of a call struck in it needs, so the book
+could not cancel.
+
+- The options address's own coins are used first. What they leave short
+  comes from the smallest single coin elsewhere that covers it, so a large
+  trading coin is not swept into a fee, else from the largest first.
+- Coins the wallet holds for resting offers or pending transactions are
+  not used. A CAT coin's lineage is read only for the coins chosen.
+- Everything the book owns still lands at the options address: all change,
+  returned collateral and premiums.
+- The safety check counts the funding coins' addresses as the book's, so
+  it still refuses any bundle whose effect differs from what was declared.
+- `status` shows the XCH spendable elsewhere in the wallet.
+- `live-test`'s funding still comes from the options address only.
+
+### The options book finds its quote asset's wallet (#233)
+
+The reference wallet answers `cat_get_asset_id` with a `0x` prefix
+(chia-blockchain 2.7.4), which the book's lookup refused, so it never found
+the wallet for its quote asset. It showed 0 quote, would have noticed a sale
+only at its next hourly look instead of within a step, and could not find
+the quote-asset coin a cancel of a call struck in it starts from. Either
+form is read now; the test wallet answers with the prefix, as the real one
+does.
 
 ## [0.10.48] — 2026-11-15 — the options book, first run on mainnet
 

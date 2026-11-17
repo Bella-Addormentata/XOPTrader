@@ -34,6 +34,12 @@ clawback after expiry.
     the wallet's current address is where the engine's self-sends land, and
     on the first mainnet run the engine spent the coin there within minutes.
     An address a Dexie trade paid into works, and needs nothing sent first.
+    With `options.wallet.fund_from_wallet: true` the book also pays from the
+    rest of the wallet when that address runs short, in XCH or the quote
+    asset, while everything it owns still lands at the address. On the first
+    run the engine's resting offers took the address's coins, and a cancel of
+    a call struck in wUSDC.b also needs a wUSDC.b coin to start from, which
+    the address had never held.
 - That wallet's RPC port, under `options.wallet` in `config.yaml`, and its
   `config/ssl/wallet/private_wallet.crt` and `.key`, under `options.wallet` in
   `secrets.yaml` (see `secrets.example.yaml`; `~` is expanded). `secrets.yaml`
@@ -130,6 +136,41 @@ before `run`. `withdraw-all` takes every open offer off the market by spending
 its coin. Stopping `run` is safe: offers already out expire on their own and
 collateral waits to be reclaimed on the next `step` after expiry.
 
+In the app, the Options page does the same without a terminal: **Rehearse**
+steps the book as a dry run whatever `options.dry_run` says, **Live** steps it
+for real after a confirmation, and **Off** stops it after the step in
+progress. It reads the app's own `config.yaml`, so the options settings must be
+in that file (and `secrets.yaml` beside it). With the trading wallet shared,
+the engine will not start while the book has contracts open, and Live will not
+switch on while the engine runs. Run the book either from the page or from a
+terminal, not both: they share one database, and the second one to act is
+refused ("another process is acting").
+
+With `options.wallet.engine_beside_open_contracts: true` (and
+`fund_from_wallet: true`, which it needs) the engine is held only while the
+book acts, not for as long as contracts are open. A day with contracts out then
+goes:
+
+1. Stop the engine, switch the book to Live, and let it mint, list or cancel.
+   A stop that keeps the engine's offers leaves their coins locked: if the
+   book reports it cannot find a coin it needs (a cancel of a call struck in
+   the quote asset needs one of that asset), stop the engine with its offers
+   cancelled instead.
+2. Switch the book Off once it has done what you wanted. If it sent anything,
+   leave it Live (or on Rehearse) until its record shows the transaction
+   settled: the engine waits for every transaction of the book's until a step
+   has recorded its verdict from the chain, which a Rehearse step does too.
+3. Start the engine. It trades beside the open contracts; collateral stays
+   locked in them, and a sale or an exercise only adds to the wallet.
+4. After expiry, repeat 1 and 2 to claw the collateral back.
+
+The engine can spend the loose coins at the options address while it runs,
+which is why the book must be able to pay from the rest of the wallet. At
+launch the engine starts before the Options page takes up its remembered
+mode, so a book left Live when the app closed comes back Live only if
+something else still holds the engine; otherwise the page says it was not
+resumed, and step 1 starts it again.
+
 Two things to know once contracts are out:
 
 - **Setting `dry_run: true` again stops all spending**, housekeeping included.
@@ -150,11 +191,12 @@ Three records say what the book did and why, so a run can be reviewed without
 having kept the terminal output:
 
 - **The log file**, beside the database and named after it
-  (`data/options_jobs.log` for `data/options_jobs.db`). Every command but
-  `status` and `report` writes to it, with the time on every line: the market
-  each step, every action and problem, and engine-guard changes. It is rotated
-  at 2 MB with three old files kept. `--log-file PATH` puts it elsewhere and
-  `--no-log-file` turns it off.
+  (`data/options_jobs.log` for `data/options_jobs.db`), with the time on every
+  line: the market each step, every action and problem, and engine-guard
+  changes. A run from the app's Options page writes it, as does every command
+  but `status` and `report`. It is rotated at 2 MB with three old files kept.
+  On the command line `--log-file PATH` puts it elsewhere and `--no-log-file`
+  turns it off.
 - **The database's journals.** `quotes` keeps, beside each offer, the spot,
   volatility, model value, carry, markup and minimum premium it was priced
   from, and which of them set the price. `step_log` keeps the market each step
@@ -163,9 +205,8 @@ having kept the terminal output:
   market data unavailable), `wallet not ready`, `step failed` (with the
   error), or `refused: trading engine may be running`. It writes a row when
   the verdict changes, when a price moves more than 0.5%, and otherwise every
-  15 minutes.
-  The `events` table carries the fee each confirmed transaction paid, and a
-  sale names the offer that was taken.
+  15 minutes. The `events` table carries the fee each confirmed transaction
+  paid, and a sale names the offer that was taken.
 - **`report`**, which reads the two:
 
   ```
@@ -185,9 +226,10 @@ having kept the terminal output:
 
 `status` also says, for each unsold contract, whether it could be cancelled
 now. A cancel of a call pays its strike to the options address inside the same
-transaction, so it needs one coin of the quote asset there to start from (any
-amount; it comes back in full), and XCH there for a fee when one is due. A
-contract it cannot cancel is clawed back after expiry instead.
+transaction, so it needs one coin of the quote asset to start from (any amount;
+it comes back in full), and XCH for a fee when one is due: at the options
+address, or anywhere in the wallet with `wallet.fund_from_wallet`. A contract
+it cannot cancel is clawed back after expiry instead.
 
 ## Announcing offers on Splash (optional)
 
@@ -356,8 +398,10 @@ one flat fee per spend, sized for its costliest.
   keeps option coins out of its own offers and books option events.
   `wallet.share_trading_wallet` is not that: it is the operator undertaking to
   keep the engine stopped, checked before every signature, and nothing more.
-  Starting the engine while contracts are open is not prevented, only
-  reported; the engine then counts collateral and premiums as its own.
+  The app will not start the engine while contracts are open (with
+  `engine_beside_open_contracts`, while the book acts), but an engine started
+  some other way, from a terminal or a service manager, is only reported; the
+  engine then counts premiums and returned collateral as its own.
 - **The wallet reports no verdict on a broadcast.** Outcomes are read from the
   chain, so a rejected transaction shows up as one that never confirms. It is
   pushed again on every step. While it is unresolved its coins stay set aside

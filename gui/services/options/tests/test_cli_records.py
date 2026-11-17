@@ -331,4 +331,47 @@ def test_a_cancel_with_the_quote_asset_but_no_xch_may_still_need_a_fee(tmp_path)
 
     book_store.set_status(b"\x11" * 32, store.OPEN)
     (_, line) = cli._cancel_funding(cfg, book_store, Coins([], ["usd"]))
-    assert line.split(None, 1)[1] == "possible (plus XCH there if a fee is due)"
+    assert line.split(None, 1)[1] == "possible (plus XCH at the options address if a fee is due)"
+
+
+def test_with_fund_from_wallet_a_cancel_may_start_from_anywhere_in_the_wallet(tmp_path) -> None:
+    wallet = {"port": 9356, "cert_path": "c", "key_path": "k", "fund_from_wallet": True}
+    cfg = _config(tmp_path, USD, wallet=wallet)
+    book_store = store.OptionStore(":memory:")
+    book_store.add_contract(
+        launcher_id=b"\x11" * 32,
+        slot="C110@5",
+        side="call",
+        underlying_asset=None,
+        underlying_amount=1,
+        strike_asset=USD,
+        strike_amount=1,
+        expiration=_EXPIRY,
+        creator_puzzle_hash=b"\x33" * 32,
+        bundle=b"x",
+        deadline=9,
+    )
+    book_store.set_status(b"\x11" * 32, store.OPEN)
+
+    class Wallet:
+        """Nothing at the options address; ``rest`` is what the rest of the wallet holds."""
+
+        def __init__(self, rest: list) -> None:
+            self._rest = rest
+
+        def xch_coins(self) -> list:
+            return []
+
+        def cats(self, asset_id: bytes) -> list:
+            return []
+
+        def wallet_xch_coins(self) -> list:
+            return self._rest
+
+        def wallet_cat_coins(self, asset_id: bytes) -> list:
+            return self._rest
+
+    (_, line) = cli._cancel_funding(cfg, book_store, Wallet(["coin"]))
+    assert line.split(None, 1)[1] == "possible"
+    (_, line) = cli._cancel_funding(cfg, book_store, Wallet([]))
+    assert "needs a coin of the quote asset (any amount) in the wallet;" in line

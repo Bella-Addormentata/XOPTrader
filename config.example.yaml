@@ -1621,12 +1621,16 @@ warp:
 # reference wallet, re-posting each offer before it expires, noticing sales and
 # exercises on chain, and reclaiming collateral at expiry.
 #
-# Run it from a terminal (there is no GUI page yet):
+# Run it from the app's Options page: Off / Rehearse (dry run, signs nothing) /
+# Live (after a confirmation). The choice is remembered and taken up again at
+# the next launch. Or from a terminal, from a source checkout:
 #   python -m gui.services.options --config config.yaml status
 #   python -m gui.services.options --config config.yaml live-test
 #   python -m gui.services.options --config config.yaml monitor --interval 300
 #   python -m gui.services.options --config config.yaml run
-# Read docs/options-live-test.md before the first live run.
+# The page reads this file (and secrets.yaml beside it), so the options
+# settings belong here, next to the engine's. A relative database_path is read
+# beside this file. Read docs/options-live-test.md before the first live run.
 options:
   enabled: false                         # [OPTIONAL, default: false] master switch
   # [SAFETY, default: true] Rehearsal. Each step builds the next mint, checks
@@ -1663,10 +1667,11 @@ options:
     # [OPTIONAL, default: false] Sign from the TRADING wallet anyway: its
     # daemon (chia.wallet_host / wallet_port) and its key. Only for a machine
     # where a second daemon and key are not wanted, and only with the trading
-    # ENGINE STOPPED for as long as any contract is open: its offers pick coins
-    # from the whole wallet, so they can spend coins at the options address, and
-    # the collateral and premiums change its balances behind its back, which its
-    # drawdown guard can read as a loss. With this on:
+    # ENGINE STOPPED for as long as any contract is open (or, with
+    # engine_beside_open_contracts below, while the book acts): its offers pick
+    # coins from the whole wallet, so they can spend coins at the options
+    # address, and the collateral and premiums change its balances behind its
+    # back, which its drawdown guard can read as a loss. With this on:
     #   - the port and fingerprint checks above are lifted, and fingerprint is
     #     REQUIRED and must be chia.wallet_fingerprint, which must be set too
     #     (a step logs the wallet in to it; another key would be switched in
@@ -1687,6 +1692,39 @@ options:
     # [OPTIONAL] Where a running engine answers, for the check above.
     # Default: http://localhost:<monitoring.prometheus_port>/metrics
     engine_metrics_url: ""
+    # [OPTIONAL, default: false] Pay from the whole wallet, not just `address`.
+    # What the options address is short of, in XCH or the quote asset --
+    # collateral, a fee, the seed coins a cancel starts from (a call struck in
+    # the quote asset needs one coin of it) -- comes from the wallet's other
+    # addresses: the smallest single coin that covers it, else the largest
+    # first. Coins the wallet holds for resting offers are not used.
+    # Everything the book owns still lands at `address`: all change, returned
+    # collateral and premiums. Bounded by the limits like any mint.
+    # live-test's funding still comes from `address` only.
+    fund_from_wallet: false
+    # [OPTIONAL, default: false; read only with share_trading_wallet] Let the
+    # trading ENGINE RUN while contracts sit open; it is stopped only while the
+    # book acts. Contracts that sit open are safe beside it: their collateral
+    # is locked in the contract, which the wallet does not spend, and their
+    # offers spend only the option coin. The engine is still held while:
+    #   - the book is Live (switch it Off on the Options page first; a book
+    #     run from a terminal is not seen as Live, but every signature it makes
+    #     still waits for the engine to stop);
+    #   - a step is in progress;
+    #   - a transaction the book sent could still confirm (pending or stalled,
+    #     until a step records its verdict from the chain): the wallet does not
+    #     know those coins are being spent and could hand them to an engine
+    #     offer. Leave the book Live or on Rehearse until its record shows them
+    #     settled; a Rehearse step records verdicts too.
+    # Going Live still needs the engine stopped. The engine can spend the loose
+    # coins at `address` while it runs (premiums, change), so this REQUIRES
+    # fund_from_wallet: true -- the book then pays from the rest of the wallet
+    # when it next acts. The engine sees the book's mints, cancels and
+    # clawbacks as balance changes made while it was stopped. At launch the
+    # engine starts before the Options page takes up its remembered mode, so
+    # a book left Live when the app closed comes back Live only if something
+    # else still holds the engine; otherwise the page says it was not resumed.
+    engine_beside_open_contracts: false
 
   # The asset options are struck and paid in: Base-bridged wUSDC.b.
   quote_asset_id: "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"
