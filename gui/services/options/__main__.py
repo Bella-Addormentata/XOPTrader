@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
+import sqlite3
 import sys
 import time
 from collections.abc import Callable
@@ -53,6 +54,7 @@ from gui.services.options.service import (
     ENGINE_REFUSED,
     REPORTED,
     pack_bundle,
+    reserved_coin_ids,
     unpack_bundle,
 )
 
@@ -301,14 +303,20 @@ def _cancel_funding(
     full), and XCH for a fee when one is due: at the options address, or with
     ``fund_from_wallet`` anywhere in the wallet. A clawback after expiry needs
     neither. On the first live run the wind-down found this out from the
-    cancel's error.
+    cancel's error. Coins a transaction still waiting already spends do not
+    count, as they do not for the cancel itself.
     """
     unsold = book_store.contracts((store.OPEN,))
     if not unsold:
         return []
     anywhere = cfg.wallet.fund_from_wallet
     where = "in the wallet" if anywhere else "at the options address"
-    have_xch = bool(coins.wallet_xch_coins() if anywhere else coins.xch_coins())
+    reserved = reserved_coin_ids(book_store)
+
+    def free(listed: list[Any]) -> bool:
+        return any(bytes(coin.coin_id()) not in reserved for coin in listed)
+
+    have_xch = free(coins.wallet_xch_coins() if anywhere else coins.xch_coins())
     lines = ["cancelling now:"]
     for item in unsold:
         if item.strike_asset is None:
@@ -316,7 +324,10 @@ def _cancel_funding(
             missing = f"an XCH coin {where}"
         else:
             asset = item.strike_asset
-            ready = bool(coins.wallet_cat_coins(asset) if anywhere else coins.cats(asset))
+            if anywhere:
+                ready = free(coins.wallet_cat_coins(asset))
+            else:
+                ready = free([cat.coin for cat in coins.cats(asset)])
             name = "the quote asset" if asset == cfg.quote_asset_id else "its CAT"
             missing = f"a coin of {name} (any amount) {where}"
         when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(item.expiration))
@@ -443,13 +454,18 @@ def _report(cfg: config.OptionsConfig, since: str, csv_path: str | None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if cfg.database_path != ":memory:" and not Path(cfg.database_path).is_file():
-        # Opening it would make an empty one, and report on that.
+        # Said plainly, rather than in SQLite's words.
         print(f"error: no options database at {cfg.database_path}", file=sys.stderr)
         return 2
     if start > now:
         print(f"error: --since {since!r} is in the future", file=sys.stderr)
         return 2
-    book_store = store.OptionStore(cfg.database_path)
+    try:
+        # A copy: the file is only read, even when it is from an older version.
+        book_store = store.OptionStore.snapshot(cfg.database_path)
+    except sqlite3.Error as exc:
+        print(f"error: could not read {cfg.database_path}: {exc}", file=sys.stderr)
+        return 2
     try:
         if start == 0:  # all of it: from the first thing the book recorded
             start = min(book_store.first_record_at() or int(now), int(now))
@@ -528,11 +544,7 @@ class _LiveTest:
         coin a waiting mint of the book's is counting on would knock that mint
         out.
         """
-        reserved = {
-            bytes(spend.coin.coin_id())
-            for row in self.book_store.unresolved()
-            for spend in unpack_bundle(row.bundle)[0]
-        }
+        reserved = reserved_coin_ids(self.book_store)
         return [coin for coin in self.coins.xch_coins() if bytes(coin.coin_id()) not in reserved]
 
     def settle(self) -> None:

@@ -402,6 +402,35 @@ class OptionStore:
         self._db = sqlite3.connect(self._path)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA foreign_keys = ON")
+        self._upgrade()
+        self._lock: sqlite3.Connection | None = None
+        self._lock_depth = 0
+
+    @classmethod
+    def snapshot(cls, path: str | Path) -> OptionStore:
+        """A copy of the database at ``path``, held in memory, for reading.
+
+        The file is opened read-only and never written, so a report can look
+        at a database the book is using, or one on a read-only disk. What an
+        older version's database lacks (the journals, newer columns) is added
+        to the copy alone, where a journal it never kept reads as empty.
+        """
+        copy = cls(":memory:")
+        if str(path) == ":memory:":
+            return copy
+        source = sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            source.backup(copy._db)
+        except BaseException:
+            copy.close()
+            raise
+        finally:
+            source.close()
+        copy._upgrade()
+        return copy
+
+    def _upgrade(self) -> None:
+        """Add the tables, and the columns older versions did not have."""
         with self._db:
             self._db.executescript(_SCHEMA)
             # A database from before bundles carried their own deadline.
@@ -413,8 +442,6 @@ class OptionStore:
             columns = {row["name"] for row in self._db.execute("PRAGMA table_info(offers)")}
             if "splash_at" not in columns:
                 self._db.execute("ALTER TABLE offers ADD COLUMN splash_at INTEGER")
-        self._lock: sqlite3.Connection | None = None
-        self._lock_depth = 0
 
     def close(self) -> None:
         if self._lock is not None:

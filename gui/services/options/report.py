@@ -157,7 +157,10 @@ def summarize(
         rows = [before, *rows]
     covered, quoting, held = _journal(rows, since, until)
 
-    quotes = book_store.quotes(since)
+    # A sale in the period can take an offer made before it: its quote is
+    # looked up among them all. The counts are of offers made in the period.
+    every_quote = book_store.quotes()
+    quotes = {offer_id: row for offer_id, row in every_quote.items() if row.at >= since}
     offers = [row for row in book_store.offers() if since <= row.created_at <= until]
     events = [event for event in book_store.events() if since <= event.at <= until]
     every_event = book_store.events()
@@ -178,10 +181,12 @@ def summarize(
         size_xch = (
             contract.underlying_amount if contract.side == "call" else contract.strike_amount
         ) / XCH_MOJOS
-        quote_leg = (
-            contract.strike_amount if contract.side == "call" else contract.underlying_amount
-        )
-        strike = (quote_leg / quote_unit_mojos) / size_xch if size_xch else 0.0
+        call = contract.side == "call"
+        quote_leg = contract.strike_amount if call else contract.underlying_amount
+        # The live test's contract is XCH on both legs, so its strike is in XCH.
+        quote_asset = contract.strike_asset if call else contract.underlying_asset
+        unit = XCH_MOJOS if quote_asset is None else quote_unit_mojos
+        strike = (quote_leg / unit) / size_xch if size_xch else 0.0
 
         premium, in_xch, model_at_sale = 0.0, False, None
         for event in events:
@@ -190,7 +195,7 @@ def summarize(
             amount = int(event.detail.get("amount") or 0)
             in_xch = event.detail.get("asset") is None
             premium += amount / (XCH_MOJOS if in_xch else quote_unit_mojos)
-            taken = quotes.get(int(event.detail.get("offer_id") or 0))
+            taken = every_quote.get(int(event.detail.get("offer_id") or 0))
             if taken is not None:
                 model_at_sale = taken.model * size_xch
 

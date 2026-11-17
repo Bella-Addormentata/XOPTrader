@@ -53,6 +53,10 @@ Get = Callable[..., tuple[int, str]]
 _SECONDS_PER_YEAR = 365 * 24 * 3600
 # An observation stamped later than this past our own clock is not believed.
 _MAX_CLOCK_SKEW_SECONDS = 300
+# Dexie answers a page of offers at a time; at most this many pages are read
+# for one side of one step.
+_PAGE_SIZE = 100
+_MAX_PAGES = 5
 
 log = logging.getLogger(__name__)
 
@@ -301,30 +305,52 @@ class MarketSource:
     def _side(
         self, offered: str, requested: str, ours: frozenset[str] = frozenset()
     ) -> list[tuple[float, float]]:
-        """Open single-asset offers as ``(quote per XCH, XCH size)``, leaving out ``ours``."""
-        data = self._json(
-            f"{self._dexie}/v1/offers?offered={offered}&requested={requested}"
-            "&status=0&page_size=100&compact=true&sort=price"  # best price first
-        )
-        levels = []
-        for offer in data.get("offers", []) if isinstance(data, dict) else []:
-            trade_id = offer.get("trade_id") if isinstance(offer, dict) else None
-            if ours and isinstance(trade_id, str) and _bare_hex(trade_id) in ours:
-                self.left_out += 1
-                continue
-            try:
-                gives, wants = offer["offered"], offer["requested"]
-                if len(gives) != 1 or len(wants) != 1:
+        """Open single-asset offers as ``(quote per XCH, XCH size)``, leaving out ``ours``.
+
+        Pages are read best price first until what is kept covers the hedge
+        size, the side runs out, or ``_MAX_PAGES`` have been read. One page
+        used to be all: leaving out our own offers could then leave a side
+        short of the hedge size with others' offers on the next page.
+        """
+        levels: list[tuple[float, float]] = []
+        seen: set[str] = set()
+        size = 0.0
+        for page in range(1, _MAX_PAGES + 1):
+            data = self._json(
+                f"{self._dexie}/v1/offers?offered={offered}&requested={requested}"
+                f"&status=0&page_size={_PAGE_SIZE}&page={page}&compact=true&sort=price"
+            )
+            offers = data.get("offers") if isinstance(data, dict) else None
+            offers = offers if isinstance(offers, list) else []
+            for offer in offers:
+                trade_id = offer.get("trade_id") if isinstance(offer, dict) else None
+                if isinstance(trade_id, str):
+                    key = _bare_hex(trade_id)
+                    if key in seen:  # moved up a page between two reads
+                        continue
+                    seen.add(key)
+                    if key in ours:
+                        self.left_out += 1
+                        continue
+                try:
+                    gives, wants = offer["offered"], offer["requested"]
+                    if len(gives) != 1 or len(wants) != 1:
+                        continue
+                    give, want = float(gives[0]["amount"]), float(wants[0]["amount"])
+                except (KeyError, TypeError, ValueError, IndexError):
                     continue
-                give, want = float(gives[0]["amount"]), float(wants[0]["amount"])
-            except (KeyError, TypeError, ValueError, IndexError):
-                continue
-            if give <= 0 or want <= 0:
-                continue
-            if offered == "xch":
-                levels.append((want / give, give))  # sells XCH: an ask
-            else:
-                levels.append((give / want, want))  # buys XCH: a bid
+                if give <= 0 or want <= 0:
+                    continue
+                if offered == "xch":
+                    levels.append((want / give, give))  # sells XCH: an ask
+                    size += give
+                else:
+                    levels.append((give / want, want))  # buys XCH: a bid
+                    size += want
+            count = data.get("count") if isinstance(data, dict) else None
+            last = isinstance(count, int) and page * _PAGE_SIZE >= count
+            if size >= self._hedge or len(offers) < _PAGE_SIZE or last:
+                break
         return levels
 
     def read(self) -> Market:

@@ -297,6 +297,23 @@ def unpack_bundle(bundle: bytes) -> tuple[list[CoinSpend], bytes]:
     return list(parsed.coin_spends), bytes(parsed.aggregated_signature.to_bytes())
 
 
+def reserved_coin_ids(book_store: store.OptionStore) -> set[bytes]:
+    """Coins an unresolved broadcast already spends; they must not fund another.
+
+    A stalled broadcast counts. Its bundle is still signed and can still
+    confirm, so handing its coins to a second bundle would put two
+    conflicting spends in flight. They are freed by chain evidence only: the
+    bundle confirms, or one of its coins is spent some other way. The wallet
+    cannot leave them out itself: it does not know about bundles pushed
+    around it, and lists a coin as spendable until its spend confirms.
+    """
+    return {
+        bytes(spend.coin.coin_id())
+        for row in book_store.unresolved()
+        for spend in unpack_bundle(row.bundle)[0]
+    }
+
+
 class OptionsBook:
     def __init__(
         self,
@@ -447,18 +464,8 @@ class OptionsBook:
         return mine
 
     def _reserved(self) -> set[bytes]:
-        """Coins an unresolved broadcast already spends; they must not fund another.
-
-        A stalled broadcast counts. Its bundle is still signed and can still
-        confirm, so handing its coins to a second bundle would put two
-        conflicting spends in flight. They are freed by chain evidence only:
-        the bundle confirms, or one of its coins is spent some other way.
-        """
-        taken: set[bytes] = set()
-        for row in self._store.unresolved():
-            for spend in unpack_bundle(row.bundle)[0]:
-                taken.add(bytes(spend.coin.coin_id()))
-        return taken
+        """Coins an unresolved broadcast already spends: see :func:`reserved_coin_ids`."""
+        return reserved_coin_ids(self._store)
 
     def _listed(self, what: str, asset_id: bytes | None = None) -> list[Any]:
         """The wallet's coins, or :class:`builder.OptionBuildError` if it will not say.

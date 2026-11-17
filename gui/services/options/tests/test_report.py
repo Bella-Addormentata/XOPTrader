@@ -269,6 +269,41 @@ def test_a_period_counts_only_what_happened_in_it() -> None:
     assert (summary.sales, summary.clawbacks, summary.offers) == (0, 1, 0)
 
 
+def test_a_sale_in_the_period_finds_the_quote_of_an_offer_made_before_it() -> None:
+    book, _ = _book()
+
+    # The call's second offer was made at T0 + 1200 and taken at T0 + 3000.
+    summary = report.summarize(book, UNIT, T0 + 2000, UNTIL)
+
+    call = {line.launcher_id: line for line in summary.contracts}[CALL.hex()]
+    assert call.premium == pytest.approx(0.007)
+    assert call.model_at_sale == pytest.approx(0.012 * 0.5)
+    assert (call.offers, call.quoted, summary.quoted) == (0, 0, 0)  # made before the period
+
+
+def test_the_live_test_s_contract_has_its_strike_in_xch() -> None:
+    # XCH on both legs: 0.0001 XCH for 0.0001 XCH is a strike of 1, not 1e9.
+    book = store.OptionStore(":memory:")
+    book.add_contract(
+        launcher_id=CALL,
+        slot="live-test",
+        side="call",
+        underlying_asset=None,
+        underlying_amount=XCH // 10_000,
+        strike_asset=None,
+        strike_amount=XCH // 10_000,
+        expiration=T0 + 86_400,
+        creator_puzzle_hash=ME,
+        bundle=b"mint",
+        deadline=T0 + 600,
+        now=T0,
+    )
+
+    (line,) = report.summarize(book, UNIT, T0, UNTIL).contracts
+
+    assert (line.size_xch, line.strike) == (pytest.approx(0.0001), pytest.approx(1.0))
+
+
 def test_a_premium_paid_in_xch_is_kept_apart_from_the_quote_asset_total() -> None:
     book = store.OptionStore(":memory:")
     _contract(book, CALL, "call", at=T0, fee=0)

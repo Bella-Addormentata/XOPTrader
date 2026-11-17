@@ -281,6 +281,64 @@ def test_the_wallets_own_offers_are_left_out_of_the_range() -> None:
     assert source.left_out == 1
 
 
+class PagedFeeds(Feeds):
+    """Dexie as it answers: a page of offers at a time, with how many there are."""
+
+    def __call__(self, url: str) -> tuple[int, str]:
+        if "/v1/offers" not in url:
+            return super().__call__(url)
+        self.calls.append(url)
+        query = dict(part.split("=", 1) for part in url.split("?", 1)[1].split("&"))
+        size, page = int(query["page_size"]), int(query["page"])
+        side = self.asks if query["offered"] == "xch" else self.bids
+        offers = side[(page - 1) * size : page * size]
+        return 200, json.dumps({"count": len(side), "page": page, "offers": offers})
+
+
+def _pages(feeds: Feeds, side: str) -> list[int]:
+    """The pages asked for, in order, of the asks (XCH offered) or the bids."""
+    mark = "offered=xch&" if side == "asks" else "&requested=xch&"
+    asked = [url for url in feeds.calls if mark in url]
+    return [int(url.split("&page=", 1)[1].split("&", 1)[0]) for url in asked]
+
+
+def test_a_page_of_our_own_offers_does_not_hide_the_book_behind_it() -> None:
+    # A first page that is all ours leaves nothing of it; the hedge is
+    # covered by others' offers on the next one.
+    feeds = PagedFeeds()
+    ids = [f"{index:064x}" for index in range(100)]
+    feeds.asks = [_owned(_offer("XCH", 1.0, 1.10), "0x" + tid) for tid in ids]
+    feeds.asks.append(_offer("XCH", 100.0, 113.0))
+    source = _source(feeds, own_offers=lambda: [bytes.fromhex(tid) for tid in ids])
+
+    view = source.read()
+
+    assert view.ask == pytest.approx(1.13)
+    assert source.left_out == 100
+    assert _pages(feeds, "asks") == [1, 2]
+
+
+def test_further_pages_are_read_only_while_the_hedge_is_not_yet_covered() -> None:
+    feeds = PagedFeeds()
+    feeds.asks = [_offer("XCH", 1.0, 1.10) for _ in range(250)]  # 100 XCH a page
+    feeds.bids = [_offer("wUSDC.b", 0.1, 0.1) for _ in range(1000)]  # 10 XCH a page
+
+    view = _source(feeds).read()  # a hedge of 20 XCH
+
+    assert view.ask == pytest.approx(1.10) and _pages(feeds, "asks") == [1]
+    assert view.bid == pytest.approx(1.0) and _pages(feeds, "bids") == [1, 2]
+
+
+def test_a_side_that_never_covers_the_hedge_is_read_for_a_few_pages_at_most() -> None:
+    feeds = PagedFeeds()
+    feeds.asks = [_offer("XCH", 0.01, 0.011) for _ in range(2000)]  # 1 XCH a page
+
+    view = _source(feeds).read()
+
+    assert view.ask is None
+    assert _pages(feeds, "asks") == [1, 2, 3, 4, 5]
+
+
 def test_if_the_wallet_cannot_list_its_offers_every_offer_counts(caplog) -> None:
     feeds = Feeds()
     feeds.asks = [_owned(_offer("XCH", 100.0, 110.0), "0x" + "ab" * 32)]

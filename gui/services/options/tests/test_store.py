@@ -686,3 +686,49 @@ def test_the_book_knows_when_it_first_recorded_anything() -> None:
     assert book.first_record_at() == 300
     book.add_event("note", {}, now=200)
     assert book.first_record_at() == 200
+
+
+def _tables(path) -> set[str]:
+    raw = sqlite3.connect(path)
+    try:
+        return {row[0] for row in raw.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        raw.close()
+
+
+def test_a_snapshot_reads_an_older_database_without_writing_to_it(tmp_path) -> None:
+    # A report must not change the database it reads: a book of an older
+    # version may still be using it, and the disk may be read-only.
+    path = tmp_path / "options_jobs.db"
+    book = store.OptionStore(path)
+    _add(book)
+    _offer(book, 900)
+    book.close()
+    old = sqlite3.connect(path)
+    old.executescript("DROP TABLE quotes; DROP TABLE step_log;")  # as v0.10.48 left it
+    old.commit()
+    old.close()
+    before = path.read_bytes()
+
+    copy = store.OptionStore.snapshot(path)
+
+    assert copy.contract(LAUNCHER).slot == "C110@1000" and len(copy.offers()) == 1
+    assert copy.quotes() == {} and copy.steps() == []  # journals it never kept: empty
+    assert copy.log_step(store.QUOTING, now=950)  # the copy takes writes...
+    copy.close()
+    assert path.read_bytes() == before  # ...the file takes none
+    assert "quotes" not in _tables(path) and "step_log" not in _tables(path)
+
+
+def test_a_snapshot_sees_what_the_book_has_written_so_far(tmp_path) -> None:
+    path = tmp_path / "options_jobs.db"
+    book = store.OptionStore(path)
+    _add(book)
+    book.log_step(store.QUOTING, now=200)
+
+    copy = store.OptionStore.snapshot(path)  # while the book still has it open
+    book.log_step("not quoting: market data unavailable", now=300)
+
+    assert [row.at for row in copy.steps()] == [200]
+    copy.close()
+    book.close()

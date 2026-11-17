@@ -40,7 +40,9 @@ database said what happened but not why. Now:
   back, how many offers it made and how many sat on the minimum premium,
   and for each contract the premium against the model value of the offer
   that was taken, the fees and how long its collateral was locked.
-  `--csv PATH` writes the per-contract figures. It only reads.
+  `--csv PATH` writes the per-contract figures. It only reads: it works on
+  a copy, so a database from before these tables is left as it is, and a
+  read-only one can be reported on.
 
 ### The book's range check leaves out the wallet's own offers
 
@@ -49,7 +51,9 @@ can fill. With `share_trading_wallet` on, that range included the wallet's
 own open offers: the engine's, which rest at their old prices while it is
 stopped. One of the first run's stops was most likely an ask of the
 engine's. The book now asks the wallet for its open offers and leaves them
-out; if the wallet cannot say, every offer counts, as before.
+out; if the wallet cannot say, every offer counts, as before. When that
+leaves the first page of Dexie's book short of the hedge size, the next
+pages are read too (five at most).
 
 ### `status` says whether each unsold contract can be cancelled now
 
@@ -58,7 +62,9 @@ same transaction, so it needs one coin of the quote asset to start from
 (any amount; it comes back in full): at the options address, or anywhere
 in the wallet with `fund_from_wallet`. The first run's wind-down found this
 out from the cancel's error. `status` now lists each unsold contract as
-`possible`, or what it needs and when it will be clawed back instead.
+`possible`, or what it needs and when it will be clawed back instead. A
+coin that a transaction still waiting already spends does not count, as it
+does not for the cancel itself.
 
 ## [0.10.51] — 2026-11-16 — the engine can trade beside open option contracts
 

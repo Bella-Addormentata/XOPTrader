@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -197,6 +198,47 @@ def test_a_report_without_a_database_says_so_and_makes_none(tmp_path, capsys) ->
     assert not db.exists()
 
 
+def test_a_report_leaves_a_database_from_before_the_journals_as_it_was(tmp_path, capsys) -> None:
+    # As v0.10.48 left it, with no quotes and no step journal. A book of that
+    # version may still be using it: the report only reads.
+    path, db = _config_file(tmp_path)
+    book = store.OptionStore(db)
+    book.add_contract(
+        launcher_id=b"\x11" * 32,
+        slot="C110@5",
+        side="call",
+        underlying_asset=None,
+        underlying_amount=10**12,
+        strike_asset=USD,
+        strike_amount=1250,
+        expiration=_EXPIRY,
+        creator_puzzle_hash=b"\x33" * 32,
+        bundle=b"x",
+        deadline=int(time.time()) + 600,
+        now=int(time.time()) - 600,
+    )
+    book.close()
+    old = sqlite3.connect(db)
+    old.executescript("DROP TABLE quotes; DROP TABLE step_log;")
+    old.close()
+    before = db.read_bytes()
+
+    assert cli.main(["--config", path, "report", "--since", "all"]) == 0
+
+    assert "C110@5" in capsys.readouterr().out
+    assert db.read_bytes() == before
+
+
+def test_a_report_on_a_file_that_is_no_database_says_so(tmp_path, capsys) -> None:
+    path, db = _config_file(tmp_path)
+    db.parent.mkdir(parents=True)
+    db.write_bytes(b"not a database, just some bytes" * 20)
+
+    assert cli.main(["--config", path, "report"]) == 2
+
+    assert f"could not read {db}" in capsys.readouterr().err
+
+
 # -- the shared-wallet banner and a refused step ------------------------------
 
 
@@ -245,6 +287,23 @@ def test_a_step_refused_for_the_engine_is_journaled(tmp_path, monkeypatch, capsy
 # -- status: can each unsold contract be cancelled now? ------------------------
 
 
+def _minted(book_store: store.OptionStore, launcher: bytes, status: str) -> None:
+    """Move a contract stored with a stand-in bundle to ``status``, its mint confirmed."""
+    (mint,) = [row for row in book_store.broadcasts() if row.launcher_id == launcher]
+    book_store.settle_broadcast(mint.id, "confirmed", contract_status=status)
+
+
+class _Cat:
+    """A CAT coin at the options address; only its coin is read here."""
+
+    def __init__(self, coin: Any) -> None:
+        self.coin = coin
+
+
+def _coin(tag: int, amount: int = 1) -> Any:
+    return sdk.Coin(bytes([tag]) * 32, b"\x55" * 32, amount)
+
+
 def _cancel_lines(out: str) -> dict[str, str]:
     lines = out.splitlines()
     after = lines[lines.index("cancelling now:") + 1 :]
@@ -282,7 +341,7 @@ def test_status_says_whether_each_unsold_contract_can_be_cancelled_now(
             bundle=b"x",
             deadline=9,
         )
-        book_store.set_status(launcher, status)
+        _minted(book_store, launcher, status)
     book_store.close()
 
     assert cli._status(cfg) == 0
@@ -327,10 +386,10 @@ def test_a_cancel_with_the_quote_asset_but_no_xch_may_still_need_a_fee(tmp_path)
         def cats(self, asset_id: bytes) -> list:
             return self._cats
 
-    assert cli._cancel_funding(cfg, book_store, Coins([], ["usd"])) == []  # still minting
+    assert cli._cancel_funding(cfg, book_store, Coins([], [_Cat(_coin(1))])) == []  # minting
 
-    book_store.set_status(b"\x11" * 32, store.OPEN)
-    (_, line) = cli._cancel_funding(cfg, book_store, Coins([], ["usd"]))
+    _minted(book_store, b"\x11" * 32, store.OPEN)
+    (_, line) = cli._cancel_funding(cfg, book_store, Coins([], [_Cat(_coin(1))]))
     assert line.split(None, 1)[1] == "possible (plus XCH at the options address if a fee is due)"
 
 
@@ -351,7 +410,7 @@ def test_with_fund_from_wallet_a_cancel_may_start_from_anywhere_in_the_wallet(tm
         bundle=b"x",
         deadline=9,
     )
-    book_store.set_status(b"\x11" * 32, store.OPEN)
+    _minted(book_store, b"\x11" * 32, store.OPEN)
 
     class Wallet:
         """Nothing at the options address; ``rest`` is what the rest of the wallet holds."""
@@ -371,7 +430,59 @@ def test_with_fund_from_wallet_a_cancel_may_start_from_anywhere_in_the_wallet(tm
         def wallet_cat_coins(self, asset_id: bytes) -> list:
             return self._rest
 
-    (_, line) = cli._cancel_funding(cfg, book_store, Wallet(["coin"]))
+    (_, line) = cli._cancel_funding(cfg, book_store, Wallet([_coin(2)]))
     assert line.split(None, 1)[1] == "possible"
     (_, line) = cli._cancel_funding(cfg, book_store, Wallet([]))
     assert "needs a coin of the quote asset (any amount) in the wallet;" in line
+
+
+def test_a_coin_a_waiting_transaction_spends_cannot_start_a_cancel(tmp_path) -> None:
+    # The cancel leaves such a coin alone, so status must not count it either.
+    cfg = _config(tmp_path, USD)
+    book_store = store.OptionStore(":memory:")
+    book_store.add_contract(
+        launcher_id=b"\x11" * 32,
+        slot="C110@5",
+        side="call",
+        underlying_asset=None,
+        underlying_amount=1,
+        strike_asset=USD,
+        strike_amount=1,
+        expiration=_EXPIRY,
+        creator_puzzle_hash=b"\x33" * 32,
+        bundle=b"x",
+        deadline=9,
+    )
+    _minted(book_store, b"\x11" * 32, store.OPEN)
+    seed, xch = _coin(1), _coin(2, 10**9)
+
+    class Coins:
+        def xch_coins(self) -> list:
+            return [xch]
+
+        def cats(self, asset_id: bytes) -> list:
+            return [_Cat(seed)]
+
+    (_, line) = cli._cancel_funding(cfg, book_store, Coins())
+    assert line.split(None, 1)[1] == "possible"
+
+    # Another contract's mint, still waiting, spends the only quote-asset coin.
+    nil = bytes([0x80])
+    book_store.add_contract(
+        launcher_id=b"\x22" * 32,
+        slot="C120@5",
+        side="call",
+        underlying_asset=None,
+        underlying_amount=1,
+        strike_asset=USD,
+        strike_amount=1,
+        expiration=_EXPIRY,
+        creator_puzzle_hash=b"\x33" * 32,
+        bundle=cli.pack_bundle([sdk.CoinSpend(seed, nil, nil)], bytes([0xC0]) + bytes(95)),
+        deadline=9,
+    )
+
+    (_, line) = cli._cancel_funding(cfg, book_store, Coins())
+    assert line.split(None, 1)[1].startswith(
+        "needs a coin of the quote asset (any amount) at the options address;"
+    )

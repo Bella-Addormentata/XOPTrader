@@ -692,3 +692,36 @@ def test_a_wallet_that_lists_offers_it_cannot_name_is_refused(records) -> None:
 def test_a_wallet_with_no_open_offers_lists_none() -> None:
     reference, _ = _offers_wallet(None)
     assert reference.open_offer_ids() == []
+
+
+def _paging_wallet(ids: list[bytes], *, pages: bool = True):
+    calls: list[dict] = []
+
+    def rpc(endpoint: str, body: dict) -> dict:
+        calls.append(body)
+        start, end = (body["start"], body["end"]) if pages else (0, 1000)
+        return {"success": True, "trade_records": [{"trade_id": i.hex()} for i in ids[start:end]]}
+
+    return ReferenceWallet(rpc, agg_sig_me_additional_data=ADDITIONAL_DATA), calls
+
+
+def test_the_wallet_s_open_offers_are_read_a_page_at_a_time() -> None:
+    # A shared wallet's offers for other pairs count too; none may be missed
+    # because it fell past the first page.
+    ids = [index.to_bytes(32, "big") for index in range(2500)]
+    reference, calls = _paging_wallet(ids)
+
+    assert reference.open_offer_ids() == ids
+    assert [(body["start"], body["end"]) for body in calls] == [
+        (0, 1000),
+        (1000, 2000),
+        (2000, 3000),
+    ]
+
+
+def test_a_wallet_that_does_not_page_is_not_asked_without_end() -> None:
+    ids = [index.to_bytes(32, "big") for index in range(1500)]
+    reference, calls = _paging_wallet(ids, pages=False)  # always the first thousand
+
+    assert reference.open_offer_ids() == ids[:1000]
+    assert len(calls) == 2  # the second page added nothing: stop

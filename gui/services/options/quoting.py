@@ -63,10 +63,14 @@ class AskQuote:
 
     Per-XCH figures are in the quote asset, as :func:`pricing.ask_price` gives
     them; ``units`` is the ask itself, in quote-asset mojos for the whole
-    contract. ``set_by`` says what set it: ``"model"`` when value, carry and
-    markup came to more than ``pricing.min_premium``, ``"floor"`` when the
-    minimum premium was the higher. On the first live run (2026-11-15) every
-    ask was ``"floor"``, which nothing on record could show.
+    contract. ``markup`` is all the ask adds to model value and carry before
+    the floor: ``pricing.markup_fraction`` of the model value, whatever it
+    took to reach ``pricing.min_premium``, and the steering applied to both.
+    So ``per_xch`` is ``max(model + carry + markup, floor)``, and ``set_by``
+    says which of the two it is: ``"model"`` when the steered sum came to more
+    than the minimum premium, ``"floor"`` when the minimum held it up. On the
+    first live run (2026-11-15) every ask was ``"floor"``, which nothing on
+    record could show.
     """
 
     spot: float
@@ -75,7 +79,7 @@ class AskQuote:
     seconds_to_expiry: int
     model: float  # American value at sigma + sigma_markup
     carry: float  # return forgone on the locked collateral
-    markup: float  # markup_fraction of the model value, after steering
+    markup: float  # all that is added to model + carry before the floor, steered
     floor: float  # pricing.min_premium
     per_xch: float  # the ask per XCH
     units: int  # the ask for the whole contract, in quote-asset mojos
@@ -207,14 +211,17 @@ def ask_quote(
     # ``quote.markup`` includes whatever it took to reach the minimum premium,
     # so steering scales that too. The minimum is a floor, not a markup: it is
     # put back after steering.
-    floor = max(quote.model + quote.carry, config.pricing.min_premium)
+    minimum = config.pricing.min_premium
+    floor = max(quote.model + quote.carry, minimum)
     strength = min(max(config.pricing.steer_strength, 0.0), 0.9)
     factor = _steer(contract.side, lean, strength)
-    steered = quote.model + quote.carry + quote.markup * factor
+    markup = quote.markup * factor
+    steered = quote.model + quote.carry + markup
     per_xch = max(floor, steered)
-    # What ``ask_price`` added to reach the minimum premium is not markup. The
-    # record keeps the two apart, so it can say which of them set the price.
-    proper = config.pricing.markup_fraction * quote.model
+    # What set the ask really offered. Steering can lift an ask that needed the
+    # minimum premium above it, or lower one the model set onto it. Unsteered,
+    # an ask topped up to the minimum sums back to it within a rounding error.
+    on_floor = steered < minimum or math.isclose(steered, minimum, rel_tol=1e-9)
     return AskQuote(
         spot=market.spot,
         sigma=market.sigma,
@@ -222,11 +229,11 @@ def ask_quote(
         seconds_to_expiry=contract.expiration - now,
         model=quote.model,
         carry=quote.carry,
-        markup=proper * factor,
-        floor=config.pricing.min_premium,
+        markup=markup,
+        floor=minimum,
         per_xch=per_xch,
         units=quote_units(per_xch, contract_size_xch(contract), config.quote_unit_mojos),
-        set_by="floor" if quote.markup - proper > 0.0 else "model",
+        set_by="floor" if on_floor else "model",
         delta=quote.delta,
         lean=lean,
     )
