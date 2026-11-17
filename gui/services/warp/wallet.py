@@ -71,6 +71,7 @@ class WalletClient:
         *,
         poster: Optional[Poster] = None,
         timeout: float = 5.0,
+        fence: Callable[[], list] | None = None,
     ) -> None:
         self._host = params.get("host") or "localhost"
         self._port = int(params.get("port") or 9256)
@@ -80,9 +81,24 @@ class WalletClient:
         self._timeout = timeout
         self._base = f"https://{self._host}:{self._port}"
         self._poster = poster or _default_poster(self._cert, self._key, timeout)
+        #: [OPTIONS-FENCE] Coin ids no spend of this client may select (the
+        #: options sub-account, gui/services/options/fence.py). Raises to refuse.
+        self._fence = fence
+
+    def set_fence(self, fence: Callable[[], list] | None) -> None:
+        """[OPTIONS-FENCE] Install (or clear) the provider of coins to exclude."""
+        self._fence = fence
 
     def _post(self, endpoint: str, body: dict) -> dict:
         url = f"{self._base}/{endpoint}"
+        if self._fence is not None:
+            from gui.services.options import fence as fence_mod
+
+            if endpoint in fence_mod.SPENDING:
+                try:
+                    body = fence_mod.merge_exclusions(body, self._fence())
+                except fence_mod.FenceUnavailableError as exc:
+                    raise WalletError(f"{endpoint} refused: {exc}") from exc
         try:
             data = self._poster(url, body)
         except WalletError:

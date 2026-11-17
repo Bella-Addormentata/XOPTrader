@@ -211,6 +211,13 @@ def _engine_refusal(
     """Why ``what``, which signs, must not run now; None if it may."""
     if state is None or state.clear:
         return None
+    if cfg is not None and cfg.wallet.engine_fence and state.running:
+        # [OPTIONS-FENCE] Beside an engine fencing this book's address. Each
+        # signature still checks again, conflicting offers included.
+        from gui.services.options.runner import fence_identity
+
+        if engine_guard.fence_state(cfg.wallet.engine_metrics_url).holds_for(fence_identity(cfg)):
+            return None
     if cfg is not None and cfg.wallet.engine_beside_open_contracts:
         how = "Stop the engine while the book acts (it may run again once the book is done)"
     else:

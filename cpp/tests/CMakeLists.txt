@@ -105,6 +105,7 @@ add_executable(xop_tests
     test_coin_lock_ledger.cpp
     test_exposure_gate.cpp
     test_asset_reserve.cpp
+    test_coin_fence.cpp
     test_reservation_offset.cpp
     test_bridge_ingest.cpp
     test_topup_take.cpp
@@ -165,6 +166,7 @@ target_include_directories(xop_tests
 target_compile_definitions(xop_tests
     PRIVATE
         XOP_TESTS_ENGINE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/../src/engine.cpp"
+        XOP_TESTS_CHIA_RPC_CPP="${CMAKE_CURRENT_SOURCE_DIR}/../src/rpc/chia_rpc.cpp"
 )
 
 # Register with CTest so that `ctest` discovers and runs the tests.

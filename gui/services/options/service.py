@@ -314,6 +314,9 @@ def reserved_coin_ids(book_store: store.OptionStore) -> set[bytes]:
     }
 
 
+#: [OPTIONS-FENCE] A top-up whose outcome is not known yet.
+_SEND_UNCERTAIN = "uncertain"
+
 class OptionsBook:
     def __init__(
         self,
@@ -1420,6 +1423,7 @@ class OptionsBook:
         self._look(now, report)
         self._settle_broadcasts(now, report, act=act)
         self._reconcile(now, report, act=act)
+        self._top_up(now, report, act=act)
 
         market: Market | None = None
         try:
@@ -1475,6 +1479,133 @@ class OptionsBook:
             if contract is None or contract.status != store.OPEN or launcher_id in busy:
                 continue
             self._offer(contract, ask, now, report, plan.quotes.get(launcher_id))
+
+    # -- [OPTIONS-FENCE] the sub-account's target ------------------------------------
+
+    #: A top-up's fee with ``fee_mojos: auto``: a plain wallet send, priced high
+    #: enough to confirm promptly, never above ``limits.max_fee_mojos``.
+    _TOP_UP_FEE = 10_000_000
+    #: A top-up the wallet cannot account for after this long is forgotten, so
+    #: a send deleted as stuck does not stop top-ups for good.
+    _TOP_UP_FORGET_SECONDS = 3600
+
+    def _top_up_fee(self) -> int:
+        if not self._config.fee_auto:
+            return int(self._config.fee_mojos)
+        cap = self._config.limits.max_fee_mojos
+        return min(self._TOP_UP_FEE, cap) if cap > 0 else self._TOP_UP_FEE
+
+    def _held(self, asset_id: bytes | None) -> int:
+        """The sub-account in one asset: its loose coins plus the collateral its contracts lock."""
+        if asset_id is None:
+            loose = sum(int(coin.amount) for coin in self._listed("XCH"))
+        else:
+            loose = sum(int(cat.coin.amount) for cat in self._listed("quote asset", asset_id))
+        locked = sum(
+            int(item.underlying_amount)
+            for item in self._store.contracts((store.OPEN, store.SOLD))
+            if (item.underlying_asset is None) == (asset_id is None)
+            and (asset_id is None or bytes(item.underlying_asset) == bytes(asset_id))
+        )
+        return loose + locked
+
+    def _top_up(self, now: int, report: StepReport, *, act: bool) -> None:
+        """Keep the options sub-account at ``options.target`` with ordinary wallet sends.
+
+        Only with ``options.wallet.engine_fence``: the fence is what makes the
+        address a sub-account. One top-up per asset at a time; the next waits
+        until the wallet says the last one confirmed. Collateral locked in open
+        contracts counts as held, so a mint is not a shortfall.
+        """
+        target = self._config.target
+        if target is None or not self._config.wallet.engine_fence:
+            return
+        if self._store.unresolved() or self._store.contracts((store.MINTING, store.CLOSING)):
+            # [review] A mint or cancel in flight still has its inputs in the
+            # listing and its collateral in the record: counted now it would be
+            # counted twice. Wait for it to settle.
+            return
+        for asset_id, want, what in (
+            (None, target.xch_mojos, "XCH"),
+            (self._config.quote_asset_id, target.quote_mojos, "quote asset"),
+        ):
+            if want <= 0:
+                continue
+            key = "topup_pending:" + ("xch" if asset_id is None else bytes(asset_id).hex())
+            pending, _, sent_at = (self._store.recall(key) or "").partition("|")
+            if pending == _SEND_UNCERTAIN:
+                # [review] A send whose outcome is unknown (timed out, or the
+                # app stopped mid-send) is never sent again on a guess: wait
+                # until the address shows it, or an hour has passed.
+                if now - int(sent_at or now) <= self._TOP_UP_FORGET_SECONDS:
+                    try:
+                        if self._held(asset_id) >= want * (1.0 - target.tolerance):
+                            self._store.remember(key, "")
+                    except builder.OptionBuildError as exc:
+                        # The address cannot be read this step: keep waiting.
+                        log.debug("[options] %s top-up still uncertain: %s", what, exc)
+                    continue
+                self._store.remember(key, "")
+                report.problem(f"an uncertain {what} top-up from an hour ago is forgotten")
+                pending = ""
+            if pending:
+                try:
+                    confirmed = self._coins.transaction_confirmed(pending)
+                except Exception as exc:  # noqa: BLE001 - one asset's check must not stop the step
+                    # A send the wallet no longer knows (deleted as stuck) must
+                    # not hold the sub-account forever: after an hour, forget it.
+                    if now - int(sent_at or now) > self._TOP_UP_FORGET_SECONDS:
+                        self._store.remember(key, "")
+                        report.problem(
+                            f"the {what} top-up {pending[:12]} was never seen to confirm; "
+                            f"forgotten ({exc})"
+                        )
+                    else:
+                        report.problem(f"could not check the {what} top-up {pending[:12]}: {exc}")
+                    continue
+                if not confirmed:
+                    if now - int(sent_at or now) > self._TOP_UP_FORGET_SECONDS:
+                        report.problem(
+                            f"the {what} top-up {pending[:12]} has not confirmed in an hour"
+                        )
+                    continue
+                self._store.remember(key, "")
+                self._store.add_event(
+                    "topup_confirmed", {"asset": what, "transaction": pending}, now=now
+                )
+                report.did(f"top-up of {what} confirmed")
+            try:
+                held = self._held(asset_id)
+            except builder.OptionBuildError as exc:
+                report.problem(f"top-up of {what} skipped: {exc}")
+                continue
+            if held >= want * (1.0 - target.tolerance):
+                continue
+            short = want - held
+            if not act:
+                report.did(f"dry run: would top up the options address by {short} {what} mojos")
+                continue
+            fee = self._top_up_fee()
+            # [review] The intent is written before the send: a timeout or a
+            # crash after the wallet accepted it must not lead to a second one.
+            self._store.remember(key, f"{_SEND_UNCERTAIN}|{now}")
+            try:
+                transaction = self._coins.send_to_address(asset_id=asset_id, amount=short, fee=fee)
+            except Exception as exc:  # noqa: BLE001 - reported; the rest of the step goes on
+                report.problem(
+                    f"top-up of {what} may not have been sent ({exc}); no new one until the "
+                    "address shows it or an hour has passed"
+                )
+                continue
+            self._store.remember(key, f"{transaction or 'unknown'}|{now}")
+            self._store.add_event(
+                "topup_sent",
+                {"asset": what, "amount": short, "fee": fee, "transaction": transaction},
+                now=now,
+            )
+            report.did(
+                f"topping up the options address by {short} {what} mojos ({transaction[:12]})"
+            )
 
     def refresh(self) -> StepReport:
         """Bring the book up to date with the chain. Signs nothing and sends nothing."""

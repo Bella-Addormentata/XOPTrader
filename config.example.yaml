@@ -1725,6 +1725,39 @@ options:
     # a book left Live when the app closed comes back Live only if something
     # else still holds the engine; otherwise the page says it was not resumed.
     engine_beside_open_contracts: false
+    # [OPTIONAL, default: false; needs share_trading_wallet] THE ENGINE FENCE.
+    # Makes `address` a sub-account the engine and the app leave alone, so the
+    # book can be Live WHILE the engine trades, from the same wallet:
+    #   - the engine (v0.10.52+) lists every unspent coin at `address`, and at
+    #     its CAT wrappings, from the full node, and sends them as
+    #     excluded_coin_ids on every wallet call that selects coins (offers,
+    #     takes, cancels with a fee, sends, splits). It refuses to spend while
+    #     that list is unknown, and cancels any new offer that holds one of
+    #     them before it is posted. It reports the fence on its metrics
+    #     endpoint (xop_options_fence_*);
+    #   - the engine leaves those coins out of its balances, so its sizing and
+    #     ratio targets see the trading funds only (the Wallet tab's own balance
+    #     view still shows the whole wallet);
+    #   - the app's own spends (bridges, claims, Dexie takes, the book's
+    #     top-ups) exclude them too;
+    #   - the book spends only coins at `address` (fund_from_wallet is refused)
+    #     and may sign beside a running engine only while the engine reports
+    #     its fence on and refreshed in the last 2 minutes; otherwise the
+    #     rules above apply.
+    # Set `target` below to keep the sub-account funded.
+    engine_fence: false
+
+  # [OPTIONAL; used with wallet.engine_fence] The sub-account's balance
+  # target, in whole units. Collateral locked in open contracts counts as held.
+  # When a figure falls more than tolerance_pct below target, a Live step tops
+  # the address up to it with an ordinary wallet send from the trading funds
+  # (one at a time per asset; a dry run only says so). Sweeping premiums back
+  # is not automatic yet. Keep it well under the engine's rolling-loss limit
+  # (risk.window_loss): the engine sees a top-up as its balance going down.
+  # target:
+  #   xch: 1.5          # collateral for the grid + fees
+  #   quote: 2          # wUSDC.b: a cancel's seed coin (+ put collateral)
+  #   tolerance_pct: 20
 
   # The asset options are struck and paid in: Base-bridged wUSDC.b.
   quote_asset_id: "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"

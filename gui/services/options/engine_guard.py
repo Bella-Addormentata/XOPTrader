@@ -28,6 +28,7 @@ from __future__ import annotations
 import dataclasses
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -137,6 +138,105 @@ def engine_state(
     )
 
 
+# -- [OPTIONS-FENCE] the engine's fence, read off its metrics endpoint ------------
+
+#: How old the engine's last refresh of its fence list may be for the book to
+#: act beside it. The engine refreshes at most every 30 seconds while it runs.
+FENCE_MAX_AGE_SECONDS = 120.0
+
+
+@dataclasses.dataclass(frozen=True)
+class FenceState:
+    """What a running engine says about the options fence (``xop_options_fence_*``)."""
+
+    reported: bool  # the endpoint answered with the fence gauges at all
+    enabled: bool
+    fresh: bool
+    coins: int
+    age_seconds: float
+    detail: str
+    #: "<puzzle hash>@<network>" the engine fences (xop_options_fence_info).
+    identity: str = ""
+
+    @property
+    def holds(self) -> bool:
+        """On, fresh, refreshed recently. Whose address: see :meth:`holds_for`."""
+        return (
+            self.reported
+            and self.enabled
+            and self.fresh
+            and 0.0 <= self.age_seconds <= FENCE_MAX_AGE_SECONDS
+        )
+
+    def holds_for(self, identity: str) -> bool:
+        """:attr:`holds`, and for this address and network ("" never matches)."""
+        return self.holds and bool(identity) and self.identity == identity
+
+
+def _gauges(text: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for line in text.splitlines():
+        if not line.startswith("xop_options_fence_"):
+            continue
+        name, _, value = line.partition(" ")
+        try:
+            out[name.split("{", 1)[0]] = float(value.strip().split(" ")[0])
+        except ValueError:
+            continue
+    return out
+
+
+def _identity(text: str) -> str:
+    for line in text.splitlines():
+        if line.startswith("xop_options_fence_info{"):
+            labels = line[len("xop_options_fence_info{") :].split("}", 1)[0]
+            for part in labels.split(","):
+                key, _, value = part.partition("=")
+                if key.strip() == "fence":
+                    return value.strip().strip('"')
+    return ""
+
+
+def parse_fence(metrics_text: str, *, now: float | None = None) -> FenceState:
+    """The fence gauges in a Prometheus exposition; an engine without them reports nothing.
+
+    The age is worked out here from ``xop_options_fence_refreshed_unix``, not
+    read from the engine: an engine whose heartbeat has stopped keeps serving
+    its last numbers, and its fence must not go on looking fresh.
+    """
+    gauges = _gauges(metrics_text)
+    needed = ("xop_options_fence_enabled", "xop_options_fence_refreshed_unix")
+    if any(name not in gauges for name in needed):
+        return FenceState(False, False, False, 0, -1.0, "the engine reports no options fence")
+    enabled = gauges.get("xop_options_fence_enabled", 0.0) >= 1.0
+    fresh = gauges.get("xop_options_fence_fresh", 0.0) >= 1.0
+    coins = int(gauges.get("xop_options_fence_coins", 0.0))
+    refreshed = gauges.get("xop_options_fence_refreshed_unix", 0.0)
+    clock = time.time() if now is None else now
+    age = clock - refreshed if refreshed > 0 else -1.0
+    identity = _identity(metrics_text)
+    detail = (
+        f"fence {'on' if enabled else 'off'} for {identity or 'no address'}, "
+        f"{'fresh' if fresh else 'NOT fresh'}, {coins} coin(s), refreshed {age:.0f}s ago"
+    )
+    return FenceState(True, enabled, fresh, coins, age, detail, identity)
+
+
+def fence_state(
+    metrics_url: str, *, fetch: Callable[[str], str] | None = None
+) -> FenceState:
+    """Ask the engine's metrics endpoint about its fence. Unreachable = not reported."""
+    try:
+        if fetch is not None:
+            text = fetch(metrics_url)
+        else:
+            with urllib.request.urlopen(metrics_url, timeout=_HTTP_TIMEOUT) as resp:  # noqa: S310
+                text = resp.read().decode("utf-8", "replace")
+    except (OSError, ValueError) as exc:
+        return FenceState(False, False, False, 0, -1.0, f"{metrics_url}: {exc}")
+    return parse_fence(text)
+
+
 class EngineRunningError(signing.SigningError):
     """A signature or push refused because the trading engine may be running.
 
@@ -154,20 +254,52 @@ class EngineCheckedWallet:
     called, so it can be replaced in tests.
     """
 
-    def __init__(self, wallet: Any, metrics_url: str) -> None:
+    def __init__(
+        self,
+        wallet: Any,
+        metrics_url: str,
+        *,
+        fenced: bool = False,
+        identity: str = "",
+        conflicts: Callable[[], list[str]] | None = None,
+    ) -> None:
         self._wallet = wallet
         self._metrics_url = metrics_url
+        #: [OPTIONS-FENCE] ``options.wallet.engine_fence``: a running engine is
+        #: fine while it reports its fence on, fresh, and for ``identity`` (this
+        #: book's address), and none of its resting offers holds that address's
+        #: coins (``conflicts``: descriptions of any that do).
+        self._fenced = fenced
+        self._identity = identity
+        self._conflicts = conflicts
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._wallet, name)
 
     def _require_engine_down(self, what: str) -> None:
         state = engine_state(self._metrics_url)
-        if not state.clear:
+        if state.clear:
+            return
+        if self._fenced and state.running:
+            fence = fence_state(self._metrics_url)
+            if fence.holds_for(self._identity):
+                held = self._conflicts() if self._conflicts is not None else []
+                if not held:
+                    return
+                raise EngineRunningError(
+                    f"refused: {what} beside the engine while {len(held)} of its resting offers "
+                    f"hold coins of the options address ({', '.join(held[:3])}); they were made "
+                    "before the fence was on. Cancel them (stop the engine with its offers "
+                    "cancelled, or let them expire), then try again"
+                )
             raise EngineRunningError(
-                f"refused, trading engine up: {what} from the wallet it trades through, and "
-                f"the engine is {state.describe()}"
+                f"refused, trading engine up without a working fence: {what} from the wallet it "
+                f"trades through, and the engine is {state.describe()}; {fence.detail}"
             )
+        raise EngineRunningError(
+            f"refused, trading engine up: {what} from the wallet it trades through, and "
+            f"the engine is {state.describe()}"
+        )
 
     def sign(self, coin_spends: Sequence[Any]) -> bytes:
         self._require_engine_down("signing")

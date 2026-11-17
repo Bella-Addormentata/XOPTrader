@@ -224,6 +224,12 @@ class OptionsWidget(QWidget):
             wallet = options_runner.load_options(self._config_path).wallet
         except options_runner.RunnerError:
             wallet = None
+        if wallet is not None and wallet.share_trading_wallet and wallet.engine_fence:
+            return (
+                "With the engine fence on, the trading engine keeps trading while the book is "
+                "Live, as long as it reports its fence of the options address; if it stops "
+                "reporting it, the book stops signing until it does."
+            )
         if (
             wallet is not None
             and wallet.share_trading_wallet

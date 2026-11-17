@@ -542,6 +542,19 @@ public:
      */
     static std::optional<std::string> settlement_puzzle_hash(const std::string& asset);
 
+    /**
+     * @brief [OPTIONS-FENCE] The puzzle hash of a CAT coin whose inner puzzle
+     *        hashes to `inner_puzzle_hash` -- CAT v2 curried with the asset's
+     *        TAIL around it.  settlement_puzzle_hash() is this around
+     *        OFFER_MOD; the options fence uses it around the options address.
+     *
+     * @param asset              The CAT's 32-byte asset id, hex, 0x optional.
+     * @param inner_puzzle_hash  32 bytes, hex, 0x optional.
+     * @return 64-character lowercase hex, or std::nullopt for malformed input.
+     */
+    static std::optional<std::string> cat_puzzle_hash(const std::string& asset,
+                                                       const std::string& inner_puzzle_hash);
+
 private:
     // -- Internal helpers ---------------------------------------------------
 

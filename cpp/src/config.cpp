@@ -3468,6 +3468,50 @@ InventoryAgingConfig parse_inventory_aging(const YAML::Node& root)
 }
 
 // ---------------------------------------------------------------------------
+// parse_options_fence -- [OPTIONS-FENCE] the GUI's `options:` section, read
+// only for the fence.  Never throws: the section belongs to the GUI, which
+// validates it; a malformed switch reads as off, and a fence switched on with
+// no readable address stays on (and so refuses to spend) -- fail closed.
+// ---------------------------------------------------------------------------
+OptionsFenceConfig parse_options_fence(const YAML::Node& root)
+{
+    OptionsFenceConfig cfg;
+    const YAML::Node options = root["options"];
+    if (!options || !options.IsMap()) return cfg;
+    const auto flag = [](const YAML::Node& parent, const char* key) {
+        const YAML::Node v = parent[key];
+        if (!v || !v.IsScalar()) return false;
+        try {
+            return v.as<bool>();
+        } catch (const YAML::Exception&) {
+            return false;
+        }
+    };
+    const auto text = [](const YAML::Node& parent, const char* key) {
+        const YAML::Node v = parent[key];
+        if (!v || !v.IsScalar()) return std::string{};
+        try {
+            return v.as<std::string>();
+        } catch (const YAML::Exception&) {
+            return std::string{};
+        }
+    };
+    const YAML::Node wallet = options["wallet"];
+    if (!wallet || !wallet.IsMap() || !flag(wallet, "engine_fence")) return cfg;
+    if (!flag(options, "enabled") || !flag(wallet, "share_trading_wallet")) {
+        spdlog::warn("[Config] options.wallet.engine_fence is set but the options book is "
+                     "off or does not share this wallet -- no fence");
+        return cfg;
+    }
+    cfg.enabled        = true;
+    cfg.address        = text(wallet, "address");
+    cfg.quote_asset_id = text(options, "quote_asset_id");
+    const std::string network = text(options, "network");
+    if (!network.empty()) cfg.network = network;
+    return cfg;
+}
+
+// ---------------------------------------------------------------------------
 // parse_accounting -- optional `accounting:` section (2026-07-30).
 // Double-entry ledger and its wallet reconciliation control.
 // ---------------------------------------------------------------------------
@@ -5319,6 +5363,7 @@ AppConfig load_config(const std::string& path,
     cfg.fees       = parse_fees(root);
     cfg.inventory_aging = parse_inventory_aging(root);
     cfg.accounting = parse_accounting(root);
+    cfg.options_fence = parse_options_fence(root);
     // [review] The GUI anchors a relative warp.jobs_db at the config file's
     // directory (gui/services/warp/service.py _job_db_path); the engine must
     // open the SAME file whatever its working directory, or its

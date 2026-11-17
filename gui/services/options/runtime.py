@@ -208,6 +208,47 @@ class WalletCoinSource:
         """One coin from :meth:`wallet_cat_coins`, with its lineage (one settled read)."""
         return chain.load_cat_coin(self._chain, coin)
 
+    # -- [OPTIONS-FENCE] top-ups ---------------------------------------------------
+
+    def send_to_address(self, *, asset_id: bytes | None, amount: int, fee: int) -> str:
+        """An ordinary wallet send of ``amount`` to the options address; its transaction id.
+
+        The wallet picks the coins, so it skips those held for offers and
+        those its own pending sends spend; with ``engine_fence`` the client's
+        fence also keeps it off the options address's own coins.
+        """
+        address = self.address()
+        if asset_id is None:
+            answer = self._rpc(
+                "send_transaction",
+                {
+                    "wallet_id": _XCH_WALLET_ID,
+                    "amount": int(amount),
+                    "address": address,
+                    "fee": int(fee),
+                },
+            )
+        else:
+            wallet_id = self._cat_wallet(bytes(asset_id))
+            if wallet_id is None:
+                raise OptionsError("the wallet holds none of the quote asset to top up from")
+            answer = self._rpc(
+                "cat_spend",
+                {
+                    "wallet_id": wallet_id,
+                    "amount": int(amount),
+                    "inner_address": address,
+                    "fee": int(fee),
+                },
+            )
+        tx = answer.get("transaction_id") or (answer.get("transaction") or {}).get("name") or ""
+        return str(tx)
+
+    def transaction_confirmed(self, transaction_id: str) -> bool:
+        """Whether the wallet's transaction has confirmed."""
+        answer = self._rpc("get_transaction", {"transaction_id": str(transaction_id)})
+        return bool((answer.get("transaction") or {}).get("confirmed"))
+
     def held(self, asset_ids: Any) -> frozenset[bytes]:
         """Ids of the spendable coins at the address. The chain is not asked."""
         ids = {bytes(coin.coin_id()) for coin in self.xch_coins()}
@@ -236,6 +277,15 @@ def wallet_rpc(cfg: config.OptionsConfig) -> WalletRpc:
         },
         timeout=30.0,
     )
+    if cfg.wallet.engine_fence:
+        # [OPTIONS-FENCE] The book's own coin-selecting calls (its top-ups)
+        # must not pick the sub-account's coins either: a top-up pays from
+        # the rest of the wallet into the sub-account.
+        from gui.services.options import fence
+
+        client.set_fence(
+            fence.WalletFence(client._post, cfg.wallet.address, cfg.address_prefix).coin_ids  # noqa: SLF001
+        )
     return client._post  # noqa: SLF001 - WalletClient's one generic call
 
 
@@ -339,7 +389,23 @@ def shared_wallet_guard(cfg: config.OptionsConfig, wallet: Any) -> Any:
     """``wallet``, checked for a running engine at every sign and push when shared."""
     if not cfg.wallet.share_trading_wallet:
         return wallet
-    return engine_guard.EngineCheckedWallet(wallet, cfg.wallet.engine_metrics_url)
+    if not cfg.wallet.engine_fence:
+        return engine_guard.EngineCheckedWallet(wallet, cfg.wallet.engine_metrics_url)
+    from gui.services.options import fence
+
+    rpc = getattr(wallet, "_rpc", None) or wallet_rpc(cfg)
+    book_fence = fence.WalletFence(rpc, cfg.wallet.address, cfg.address_prefix)
+    try:
+        identity = book_fence.identity(cfg.network)
+    except fence.FenceUnavailableError:
+        identity = ""  # never matches: the book then signs nothing beside the engine
+    return engine_guard.EngineCheckedWallet(
+        wallet,
+        cfg.wallet.engine_metrics_url,
+        fenced=True,
+        identity=identity,
+        conflicts=book_fence.conflicting_offers,
+    )
 
 
 def build(
