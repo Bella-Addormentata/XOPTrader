@@ -248,6 +248,47 @@ def test_the_remembered_mode_is_taken_up_at_launch_without_asking(app, tmp_path,
         _close(page, app)
 
 
+class _SyncingRunner(RunnerDouble):
+    """[AUTO-FENCE] Counts the page's checks of the engine's fence flag."""
+
+    def __init__(self, refuse: str = "") -> None:
+        super().__init__(refuse)
+        self.syncs = 0
+
+    def sync_fence(self) -> None:
+        self.syncs += 1
+
+
+def test_attach_checks_the_fence_flag_unless_a_run_started(app, tmp_path):
+    """A flag the last session left must follow the book's record, not linger."""
+    runner = _SyncingRunner()
+    page = _page(app, tmp_path / "a", runner)
+    try:
+        assert runner.syncs == 1 and runner.starts == []
+    finally:
+        _close(page, app)
+
+    QSettings("XOP-tests-options", options_page._SETTINGS_APP).setValue(
+        options_page.KEY_MODE, "rehearse"
+    )
+    resumed = _SyncingRunner()
+    page = _page(app, tmp_path / "b", resumed)
+    try:
+        assert resumed.starts == [Mode.REHEARSE] and resumed.syncs == 0, "starting raised it"
+    finally:
+        _close(page, app)
+
+    refused = _SyncingRunner(refuse="Live refused: the trading engine is RUNNING")
+    QSettings("XOP-tests-options", options_page._SETTINGS_APP).setValue(
+        options_page.KEY_MODE, "live"
+    )
+    page = _page(app, tmp_path / "c", refused)
+    try:
+        assert refused.syncs == 1, "a resume that could not happen still checks the flag"
+    finally:
+        _close(page, app)
+
+
 def test_recent_activity_keeps_coming_once_the_runner_s_history_is_full(app, tmp_path):
     runner = RunnerDouble()
     page = _page(app, tmp_path, runner)

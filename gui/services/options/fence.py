@@ -15,13 +15,30 @@ itself, so a CAT wallet opened later is covered at the next refresh.
 
 Fail-closed: a fence that is on but cannot list its coins raises
 :class:`FenceUnavailableError`, and the client refuses the spend.
+
+[AUTO-FENCE] With ``engine_fence: auto`` the fence is up only while the options
+book is in use. The book (:mod:`runner`) keeps :data:`FLAG_NAME` beside the
+engine's database while it is switched on, has a contract open or a
+transaction unsettled; the engine follows the flag, and so does this client
+(``WalletFence(active=...)``). A flag that cannot be read counts as up.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
+
+#: [AUTO-FENCE] The flag the engine follows with ``engine_fence: auto``: kept
+#: beside its database, where the Dexie switch's pause.flag is.
+FLAG_NAME = "options_fence.flag"
+#: The engine's database when config.yaml names none (EngineBridge's default).
+_DEFAULT_ENGINE_DB = "data/xop_trader.db"
 
 #: Wallet RPC endpoints that make the wallet select coins.
 SPENDING = frozenset(
@@ -67,10 +84,76 @@ def fenced_address(root: Any) -> tuple[str, str] | None:
     wallet = options.get("wallet")
     if not isinstance(wallet, dict):
         return None
-    if wallet.get("engine_fence") is not True or wallet.get("share_trading_wallet") is not True:
+    if wallet.get("engine_fence") is not True and not follows_book(root):
+        return None
+    if wallet.get("share_trading_wallet") is not True:
         return None
     prefix = "txch" if str(options.get("network") or "mainnet").strip() == "testnet11" else "xch"
     return str(wallet.get("address") or "").strip(), prefix
+
+
+def follows_book(root: Any) -> bool:
+    """[AUTO-FENCE] Whether ``options.wallet.engine_fence`` is ``auto`` in the config mapping."""
+    if not isinstance(root, dict):
+        return False
+    options = root.get("options")
+    wallet = options.get("wallet") if isinstance(options, dict) else None
+    raw = wallet.get("engine_fence") if isinstance(wallet, dict) else None
+    return isinstance(raw, str) and raw.strip().lower() == "auto"
+
+
+def flag_path(home: Path | str | None, root: Any = None) -> Path:
+    """[AUTO-FENCE] Where the engine looks for :data:`FLAG_NAME`: beside its database.
+
+    ``database.path`` of the config mapping ``root`` (``data/xop_trader.db``
+    when unset), relative to ``home``, config.yaml's folder: the engine's
+    working directory when the app starts it, and the folder the app's own
+    pause flag is written in (EngineBridge).
+    """
+    raw = ""
+    if isinstance(root, dict) and isinstance(root.get("database"), dict):
+        raw = str(root["database"].get("path") or "").strip()
+    database = Path(os.path.expanduser(raw or _DEFAULT_ENGINE_DB))
+    if not database.is_absolute() and home is not None:
+        database = Path(home) / database
+    return database.parent / FLAG_NAME
+
+
+def flag_up(path: Path) -> bool:
+    """Whether the flag is there. One that cannot be read counts as there: the fence fails up."""
+    try:
+        return Path(path).exists()
+    except OSError:
+        return True
+
+
+def set_flag(path: Path, up: bool, why: str = "") -> bool:
+    """Raise or lower the flag; whether it moved. Never raises: a failure is logged.
+
+    A flag that cannot be lowered stays up, which keeps the fence up: the
+    safe side. One that cannot be raised is the book's to notice: it signs
+    nothing beside the engine until the engine reports its fence up.
+    """
+    path = Path(path)
+    try:
+        there = path.exists()
+        if up and not there:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"the options book is in use: {why}\n", encoding="utf-8")
+            log.info("[options] fence flag raised (%s): %s", why, path)
+            return True
+        if not up and there:
+            path.unlink()
+            log.info("[options] fence flag lowered, the book is off with nothing open: %s", path)
+            return True
+    except OSError as exc:
+        log.warning(
+            "[options] the fence flag %s could not be %s: %s",
+            path,
+            "raised" if up else "lowered",
+            exc,
+        )
+    return False
 
 
 def _sdk() -> Any:
@@ -95,12 +178,15 @@ class WalletFence:
         *,
         max_age: float = 0.0,
         clock: Callable[[], float] = time.monotonic,
+        active: Callable[[], bool] | None = None,
     ) -> None:
         self._rpc = rpc
         self._address = address
         self._prefix = prefix
         self._max_age = max_age
         self._clock = clock
+        #: [AUTO-FENCE] Whether the fence is up just now; None = always.
+        self._active = active
         self._ids: list[str] | None = None
         self._at = 0.0
 
@@ -180,7 +266,13 @@ class WalletFence:
         return wallets
 
     def coin_ids(self) -> list[str]:
-        """0x-hex ids of every spendable coin at the sub-account. Raises FenceUnavailableError."""
+        """0x-hex ids of every spendable coin at the sub-account. Raises FenceUnavailableError.
+
+        [AUTO-FENCE] None while the fence is down: the options address's
+        coins are then the wallet's like any other.
+        """
+        if self._active is not None and not self._active():
+            return []
         now = self._clock()
         if self._ids is not None and self._max_age > 0 and now - self._at <= self._max_age:
             return list(self._ids)

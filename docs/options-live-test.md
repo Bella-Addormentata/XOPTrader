@@ -200,6 +200,27 @@ the address funded. A first run:
 If the engine's fence goes down (an older engine, the full node unreachable,
 a stale refresh), the book stops signing beside it and says why, as before.
 
+#### The fence that follows the book: `engine_fence: auto`
+
+With `engine_fence: auto` (engine v0.10.53 or later) the fence is up only while
+the book is in use: switched on (Rehearse or Live), a contract open, or a
+transaction unsettled. The app keeps `options_fence.flag` beside the engine's
+database for as long as that lasts (the folder the Dexie switch's `pause.flag`
+goes in), and the engine follows it within seconds; its log says
+`[OPTIONS-FENCE] UP` and `DOWN`. Once the book is off with nothing open, the
+flag goes and the coins at the options address are trading funds again: Dexie
+can use spare XCH and premiums there. The next time the book is switched on,
+`target` tops the address back up.
+
+Switching the book Live beside a running engine is no longer refused: the
+flag goes up first, and each Live step waits until the engine reports the
+fence up ("waiting for the trading engine to put its fence up"). If an engine
+offer made while the fence was down still holds a coin at the options
+address, the book also waits for that offer to be refreshed or to expire
+(about 20 minutes at most). A first run is the same as above, with `auto` in
+step 1; in step 2 the metrics read `xop_options_fence_enabled 0` until the
+book is switched on, then `1`.
+
 Two things to know once contracts are out:
 
 - **Setting `dry_run: true` again stops all spending**, housekeeping included.

@@ -31,6 +31,14 @@ while its own transactions are still in flight instead of the last.
 
 The book's SQLite store belongs to the thread that opened it, so everything the
 GUI shows is copied into the snapshot on that thread, after each step.
+
+[AUTO-FENCE] With ``options.wallet.engine_fence: auto`` the runner keeps the
+engine's fence flag (:func:`fence.set_flag`) while the book is in use: raised
+before a run starts, and checked again when a run ends and when the page
+attaches, against the book's record -- down only once the book is off with no
+contract open and no transaction unsettled (:func:`in_use_reason`). A Live
+run beside a running engine then waits, step by step, until the engine
+reports its fence up; it is not refused at the switch.
 """
 
 from __future__ import annotations
@@ -47,7 +55,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-from gui.services.options import config, engine_guard, runtime, store
+from gui.services.options import config, engine_guard, fence, runtime, store
 from gui.services.options.service import ENGINE_REFUSED
 
 log = logging.getLogger(__name__)
@@ -236,6 +244,23 @@ def _in_flight_reason(book_store: store.OptionStore) -> str | None:
     )
 
 
+def in_use_reason(book_store: store.OptionStore) -> str | None:
+    """[AUTO-FENCE] Why the book's record keeps the fence up, or None.
+
+    A contract open (its next cancel or clawback needs the book's coins where
+    it left them) or a transaction the chain has not ruled on (the wallet does
+    not know its coins are being spent). Being switched on is the runner's to
+    add.
+    """
+    still_open = book_store.contracts(store.ACTIVE)
+    if still_open:
+        return f"{len(still_open)} contract(s) open"
+    waiting = book_store.unresolved()
+    if waiting:
+        return f"{len(waiting)} transaction(s) unsettled"
+    return None
+
+
 def _hold_reason(cfg: config.OptionsConfig, book_store: store.OptionStore) -> str | None:
     """Why this shared-wallet book holds the engine, from its record; None if it does not.
 
@@ -388,6 +413,11 @@ class OptionsRunner:
         self._run: _Run | None = None
         self._snapshot = Snapshot()
         self._recent: collections.deque[str] = collections.deque(maxlen=_HISTORY)
+        #: [AUTO-FENCE] Serialises the flag with the run it answers for: a run
+        #: is created and the flag raised under it, and a run ending clears
+        #: itself and checks the flag under it, so an ending run can never
+        #: lower the flag a new one has just raised.
+        self._fence_lock = threading.Lock()
 
     @property
     def config_path(self) -> Path:
@@ -416,7 +446,10 @@ class OptionsRunner:
             self.stop()
             return
         cfg = load_options(self._config_path)
-        if mode is Mode.LIVE and cfg.wallet.share_trading_wallet:
+        # [AUTO-FENCE] Not refused here: switching on is what raises the flag
+        # the engine's fence follows, and each live step waits for it.
+        follows = cfg.wallet.fence_follows_book
+        if mode is Mode.LIVE and cfg.wallet.share_trading_wallet and not follows:
             state = self._engine(cfg)
             if not state.clear and not self._fenced_beside(cfg, state):
                 raise RunnerError(
@@ -445,7 +478,10 @@ class OptionsRunner:
         thread = threading.Thread(
             target=self._loop, args=(cfg, mode, stop), name=f"options-{mode.value}", daemon=True
         )
-        self._run = _Run(thread=thread, stop=stop, mode=mode)
+        with self._fence_lock:
+            self._run = _Run(thread=thread, stop=stop, mode=mode)
+            if cfg.wallet.fence_follows_book:
+                fence.set_flag(self._fence_flag(), True, f"switched on ({mode.value})")
         _set_book(self._config_path, live=mode is Mode.LIVE)
         with self._lock:
             self._snapshot = dataclasses.replace(
@@ -507,6 +543,51 @@ class OptionsRunner:
         log.info("[options] %s run started from the app (config %s)", mode.value, self._config_path)
         return handler
 
+    # -- [AUTO-FENCE] the engine's fence flag --------------------------------------
+
+    def _fence_flag(self) -> Path:
+        """Where the engine of this config.yaml looks for the flag (beside its database)."""
+        from gui.services.config_split import load_merged
+
+        try:
+            root = load_merged(self._config_path)
+        except Exception:  # noqa: BLE001 - the default database's folder, as the bridge's
+            root = None
+        return fence.flag_path(self._config_path.parent, root)
+
+    def sync_fence(self) -> None:
+        """Raise or lower the flag to match the book; for the page, when it attaches.
+
+        Up while a run is on or the record has a contract open or a transaction
+        unsettled; down otherwise. Only with ``engine_fence: auto``. Never
+        raises: options not set up leave the flag as it is.
+        """
+        try:
+            cfg = load_options(self._config_path)
+        except RunnerError:
+            return
+        if not cfg.wallet.fence_follows_book:
+            return
+        with self._fence_lock:
+            self._sync_fence_locked(cfg)
+
+    def _sync_fence_locked(self, cfg: config.OptionsConfig) -> None:
+        """Caller holds ``_fence_lock``. An unreadable record keeps the flag up."""
+        if self._run is not None:
+            why: str | None = f"switched on ({self._run.mode.value})"
+        elif not Path(cfg.database_path).exists():
+            why = None
+        else:
+            try:
+                book_store = store.OptionStore(cfg.database_path)
+                try:
+                    why = in_use_reason(book_store)
+                finally:
+                    book_store.close()
+            except Exception as exc:  # noqa: BLE001 - fail up
+                why = f"its record could not be read ({exc})"
+        fence.set_flag(self._fence_flag(), why is not None, why or "")
+
     def _engine(self, cfg: config.OptionsConfig) -> engine_guard.EngineState:
         check = self._engine_state or engine_guard.engine_state
         return check(cfg.wallet.engine_metrics_url)
@@ -566,9 +647,12 @@ class OptionsRunner:
             # This run is over: whoever was waiting on it can start the next.
             with self._lock:
                 self._snapshot = dataclasses.replace(self._snapshot, running=False, stopping=False)
-            current = self._run
-            if current is not None and current.stop is stop:
-                self._run = None
+            with self._fence_lock:
+                current = self._run
+                if current is not None and current.stop is stop:
+                    self._run = None
+                if self._run is None and cfg.wallet.fence_follows_book:
+                    self._sync_fence_locked(cfg)
 
     def _one_step(self, cfg: config.OptionsConfig, mode: Mode, book: Any, book_store: Any) -> None:
         engine, held = "", ""
@@ -580,6 +664,13 @@ class OptionsRunner:
                     "refused, trading engine up: a live step would sign from the wallet the "
                     f"engine trades through, and the engine is {engine}"
                 )
+                if cfg.wallet.fence_follows_book:
+                    held = (
+                        "waiting for the trading engine to put its fence up: it follows the "
+                        "book within seconds (engine v0.10.53 or later; an older engine never "
+                        f"does -- stop or update it). The engine is {engine}; its fence: "
+                        f"{self._fence(cfg).detail}"
+                    )
                 # As the command line does: the step journal counts the time held.
                 book.journal(ENGINE_REFUSED, engine, now=int(self._clock()))
         report = None

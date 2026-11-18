@@ -5494,3 +5494,40 @@ TEST(WaitToGrow, WholeCoinsLockTheCoinWhenTheWalletLocksTwiceWhatOffersHold) {
     EXPECT_FALSE(tmin::whole_coins_lock_the_coin(0, 0));
     EXPECT_TRUE(tmin::whole_coins_lock_the_coin(0, 5)) << "locked with no offer of ours";
 }
+
+
+// [AUTO-FENCE] options.wallet.engine_fence: true keeps the fence up for the
+// engine's life; auto makes it follow the options book; anything else is off.
+TEST(ConfigParserTest, OptionsEngineFenceReadsTrueAutoAndOff) {
+    const auto with_fence = [](const char* value) {
+        return std::string(kMinimalValidYaml) + R"(
+options:
+  enabled: true
+  network: mainnet
+  quote_asset_id: "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"
+  wallet:
+    share_trading_wallet: true
+    address: "xch1kxxd76v9kwsxrcxgndn3mylnxjhd7klgdns7083zjl247ffge32sr5rsy2"
+    engine_fence: )" + std::string(value) + "\n";
+    };
+    {
+        TempYaml tmp(with_fence("true"));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_TRUE(cfg.options_fence.enabled);
+        EXPECT_FALSE(cfg.options_fence.follow_book);
+    }
+    for (const char* value : {"auto", "Auto", "\"auto\""}) {
+        TempYaml tmp(with_fence(value));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_TRUE(cfg.options_fence.enabled) << value;
+        EXPECT_TRUE(cfg.options_fence.follow_book) << value;
+        EXPECT_EQ(cfg.options_fence.address,
+                  "xch1kxxd76v9kwsxrcxgndn3mylnxjhd7klgdns7083zjl247ffge32sr5rsy2");
+    }
+    for (const char* value : {"false", "sometimes"}) {
+        TempYaml tmp(with_fence(value));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_FALSE(cfg.options_fence.enabled) << value;
+        EXPECT_FALSE(cfg.options_fence.follow_book) << value;
+    }
+}

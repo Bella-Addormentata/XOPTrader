@@ -24,7 +24,13 @@
 //   * fail-closed -- a fence that is on but whose list cannot be had (never
 //     refreshed, refresh failed, stale) makes those calls throw
 //     CoinFenceUnavailable instead of spending: an unknown fence is never
-//     read as an empty one.
+//     read as an empty one;
+//   * [AUTO-FENCE] with `engine_fence: auto` it is up only while the options
+//     book is in use: the GUI keeps data/options_fence.flag while the book
+//     is switched on, has a contract open or a transaction unsettled, and
+//     the engine follows the flag (set_active).  Down, it fences nothing and
+//     the options address's coins are trading funds again; going up, the
+//     list is unknown until refreshed, so nothing spends on an old one.
 //
 // A coin can reach the address between a refresh and a spend (a premium,
 // change from the book).  ChiaWalletRPC::create_offer therefore also reads
@@ -267,10 +273,39 @@ public:
         refresher_ = std::move(refresher);
     }
 
+    /// On: configured and (with `engine_fence: auto`) up.
     [[nodiscard]] bool enabled() const
     {
         std::lock_guard lock(mtx_);
+        return on();
+    }
+
+    /// Configured, whether or not it is up just now.
+    [[nodiscard]] bool configured() const
+    {
+        std::lock_guard lock(mtx_);
         return enabled_;
+    }
+
+    /// [AUTO-FENCE] Up (true) or down (false); true unless set.  Returns
+    /// whether this changed it.  Either way the list is forgotten: going up,
+    /// it is unknown until the next refresh -- never an old list from before
+    /// the fence went down -- and going down there is nothing to hold.
+    bool set_active(bool active)
+    {
+        std::lock_guard lock(mtx_);
+        if (active_ == active) return false;
+        active_ = active;
+        coins_.clear();
+        refreshed_at_.reset();
+        last_error_.clear();
+        return true;
+    }
+
+    [[nodiscard]] bool active() const
+    {
+        std::lock_guard lock(mtx_);
+        return active_;
     }
 
     [[nodiscard]] std::set<std::string> puzzle_hashes() const
@@ -305,7 +340,7 @@ public:
         Clock::time_point now = Clock::now()) const
     {
         std::lock_guard lock(mtx_);
-        if (!enabled_) return std::vector<std::string>{};
+        if (!on()) return std::vector<std::string>{};
         if (!known(now)) return std::nullopt;
         std::vector<std::string> ids;
         ids.reserve(coins_.size());
@@ -330,7 +365,7 @@ public:
     {
         const std::string want = fence_normalise_hex(asset);
         std::lock_guard lock(mtx_);
-        if (!enabled_) return std::pair<std::uint64_t, std::size_t>{0, 0};
+        if (!on()) return std::pair<std::uint64_t, std::size_t>{0, 0};
         if (!known(now)) return std::nullopt;
         std::uint64_t amount = 0;
         std::size_t   count  = 0;
@@ -352,7 +387,7 @@ public:
     {
         {
             std::lock_guard lock(mtx_);
-            if (!enabled_) co_return;
+            if (!on()) co_return;
             if (refreshed_at_ && Clock::now() - *refreshed_at_ <= max_age_) co_return;
         }
         co_await refresh_now();
@@ -365,7 +400,7 @@ public:
         Refresher refresher;
         {
             std::lock_guard lock(mtx_);
-            if (!enabled_) co_return;
+            if (!on()) co_return;
             refresher = refresher_;
         }
         if (!refresher) {
@@ -383,7 +418,7 @@ public:
     {
         std::lock_guard lock(mtx_);
         Snapshot s;
-        s.enabled = enabled_;
+        s.enabled = on();
         s.coin_count = coins_.size();
         s.last_error = last_error_;
         s.refreshed_unix = refreshed_at_ ? refreshed_unix_ : 0.0;
@@ -396,13 +431,17 @@ public:
 
 private:
     /// Caller holds mtx_.
+    [[nodiscard]] bool on() const { return enabled_ && active_; }
+
+    /// Caller holds mtx_.
     [[nodiscard]] bool known(Clock::time_point now) const
     {
-        return enabled_ && !puzzle_hashes_.empty() && refreshed_at_ && now - *refreshed_at_ <= max_age_;
+        return on() && !puzzle_hashes_.empty() && refreshed_at_ && now - *refreshed_at_ <= max_age_;
     }
 
     mutable std::mutex                 mtx_;
     bool                               enabled_{false};
+    bool                               active_{true};
     std::chrono::seconds               max_age_{30};
     std::set<std::string>              puzzle_hashes_;
     std::vector<std::pair<std::string, std::string>> asset_of_;

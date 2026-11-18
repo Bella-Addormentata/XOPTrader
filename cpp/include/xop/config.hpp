@@ -3033,6 +3033,10 @@ struct EngineConfig {
 /// still on -- the fence then refuses every coin-selecting call.
 struct OptionsFenceConfig {
     bool        enabled{false};
+    /// [AUTO-FENCE] `engine_fence: auto`: the fence is up only while the GUI
+    /// says the options book is in use (options_fence.flag beside the
+    /// database); `engine_fence: true` keeps it up for the engine's life.
+    bool        follow_book{false};
     std::string address;              ///< options.wallet.address (bech32m).
     std::string network{"mainnet"};   ///< options.network: address prefix xch / txch.
     std::string quote_asset_id;       ///< options.quote_asset_id: its CAT wrapping is fenced too.

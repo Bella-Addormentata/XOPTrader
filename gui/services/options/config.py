@@ -56,6 +56,13 @@ endpoint (:mod:`engine_guard`); otherwise the rules above apply. With the fence
 the book spends only coins at its own address, so ``fund_from_wallet`` is
 refused; ``target`` keeps the address topped up instead, by ordinary wallet
 sends from the rest of the wallet.
+
+``wallet.engine_fence: auto`` (engine v0.10.53 and later) is the same fence,
+up only while the book is in use: switched on, a contract open, or a
+transaction unsettled. The app keeps ``options_fence.flag`` beside the
+engine's database for as long as that lasts and the engine follows it
+(:func:`fence.set_flag`); with the book off and nothing open the flag goes,
+and the options address's coins are trading funds again.
 """
 
 from __future__ import annotations
@@ -221,8 +228,11 @@ class WalletConfig:
     engine_beside_open_contracts: bool = False
     #: With ``share_trading_wallet``: the engine fences the options address off
     #: and the book may be Live beside it. Off by default; refuses
-    #: ``fund_from_wallet``.
+    #: ``fund_from_wallet``. True for ``engine_fence: true`` and ``auto``.
     engine_fence: bool = False
+    #: [AUTO-FENCE] ``engine_fence: auto``: the fence is up only while the book
+    #: is in use (``fence.set_flag``), not for the engine's whole life.
+    fence_follows_book: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -462,7 +472,9 @@ def parse(root: Any) -> OptionsConfig | None:
         metrics_url = f"http://localhost:{metrics_port}/metrics"
     fund = _flag(wallet_raw, "fund_from_wallet", False)
     beside = _flag(wallet_raw, "engine_beside_open_contracts", False)
-    fence = _flag(wallet_raw, "engine_fence", False)
+    fence_raw = wallet_raw.get("engine_fence")
+    follows = isinstance(fence_raw, str) and fence_raw.strip().lower() == "auto"
+    fence = True if follows else _flag(wallet_raw, "engine_fence", False)
     if fence and not share:
         raise OptionsConfigError(
             "options.wallet.engine_fence needs options.wallet.share_trading_wallet: true; a "
@@ -499,6 +511,7 @@ def parse(root: Any) -> OptionsConfig | None:
         fund_from_wallet=fund,
         engine_beside_open_contracts=beside,
         engine_fence=fence,
+        fence_follows_book=follows,
     )
 
     quote_decimals = int(_number(section, "quote_asset_decimals", 3))
