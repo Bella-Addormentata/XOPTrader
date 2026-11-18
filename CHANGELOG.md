@@ -5,9 +5,9 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.52] — 2026-11-17 — the options book can sell while the engine trades
 
-### An OPTIONS switch in the toolbar, beside DEXIE
+### An OPTIONS switch in the toolbar, beside DEXIE (#241)
 
 The options book can now be switched on and off from the main toolbar, as
 well as from its page:
@@ -26,7 +26,7 @@ well as from its page:
   Options switch in the toolbar" to hide it, which changes nothing else.
   Permuto's switch stays hidden unless its subsystem is enabled, as before.
 
-### The options book can sell while the engine trades, from the same wallet (opt-in)
+### The options book can sell while the engine trades, from the same wallet (opt-in) (#240)
 
 A new switch, `options.wallet.engine_fence`, makes the options address a
 sub-account that every spender leaves alone, so the book no longer has to
@@ -61,7 +61,7 @@ Not yet: premiums and returned collateral are not swept back to the trading
 funds automatically, and the engine sees a top-up as its balance going down
 rather than booking it as a transfer, so keep the target small.
 
-### The options book keeps a record of why it did what it did
+### The options book keeps a record of why it did what it did (#239)
 
 The first mainnet run could be reviewed only from terminal output, and the
 database said what happened but not why. Now:
@@ -104,7 +104,7 @@ database said what happened but not why. Now:
   database from before these tables is left as it is, and a read-only one
   can be reported on.
 
-### The book's range check leaves out the wallet's own offers
+### The book's range check leaves out the wallet's own offers (#239)
 
 The book stops quoting when spot is outside the price range the Dexie book
 can fill. With `share_trading_wallet` on, that range included the wallet's
@@ -115,7 +115,7 @@ out; if the wallet cannot say, every offer counts, as before. When that
 leaves the first page of Dexie's book short of the hedge size, the next
 pages are read too (five at most).
 
-### `status` says whether each unsold contract can be cancelled now
+### `status` says whether each unsold contract can be cancelled now (#239)
 
 A cancel of a call pays the strike back to the options address inside the
 same transaction, so it needs one coin of the quote asset to start from
