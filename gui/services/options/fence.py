@@ -86,22 +86,35 @@ def fenced_address(root: Any) -> tuple[str, str] | None:
     wallet = options.get("wallet")
     if not isinstance(wallet, dict):
         return None
-    if wallet.get("engine_fence") is not True and not follows_book(root):
-        return None
-    if wallet.get("share_trading_wallet") is not True:
+    if _fence_mode(root) is None:
         return None
     prefix = "txch" if str(options.get("network") or "mainnet").strip() == "testnet11" else "xch"
     return str(wallet.get("address") or "").strip(), prefix
 
 
-def follows_book(root: Any) -> bool:
-    """[AUTO-FENCE] Whether ``options.wallet.engine_fence`` is ``auto`` in the config mapping."""
+def _fence_mode(root: Any) -> str | None:
+    """``"auto"``, ``"on"`` or None: ``options.wallet.engine_fence`` as the engine reads it.
+
+    Only for an enabled book sharing the trading wallet. [DEFAULTS] Unset is
+    ``auto`` there; ``false`` (or anything else) is off.
+    """
     if not isinstance(root, dict):
-        return False
+        return None
     options = root.get("options")
-    wallet = options.get("wallet") if isinstance(options, dict) else None
-    raw = wallet.get("engine_fence") if isinstance(wallet, dict) else None
-    return isinstance(raw, str) and raw.strip().lower() == "auto"
+    if not isinstance(options, dict) or options.get("enabled") is not True:
+        return None
+    wallet = options.get("wallet")
+    if not isinstance(wallet, dict) or wallet.get("share_trading_wallet") is not True:
+        return None
+    raw = wallet.get("engine_fence")
+    if raw is None or (isinstance(raw, str) and raw.strip().lower() == "auto"):
+        return "auto"
+    return "on" if raw is True else None
+
+
+def follows_book(root: Any) -> bool:
+    """[AUTO-FENCE] Whether the fence follows the book (``engine_fence: auto``, the default)."""
+    return _fence_mode(root) == "auto"
 
 
 #: ``${VAR}`` and ``${VAR:-default}``, as the engine expands a configured path

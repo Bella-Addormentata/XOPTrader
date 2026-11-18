@@ -1701,6 +1701,8 @@ options:
     # Everything the book owns still lands at `address`: all change, returned
     # collateral and premiums. Bounded by the limits like any mint.
     # live-test's funding still comes from `address` only.
+    # Not used with the engine fence below (the default when the wallet is
+    # shared): it is then ignored, with a warning in the log.
     fund_from_wallet: false
     # [OPTIONAL, default: false; read only with share_trading_wallet] Let the
     # trading ENGINE RUN while contracts sit open; it is stopped only while the
@@ -1724,8 +1726,10 @@ options:
     # engine starts before the Options page takes up its remembered mode, so
     # a book left Live when the app closed comes back Live only if something
     # else still holds the engine; otherwise the page says it was not resumed.
+    # Not needed with the engine fence below (the default when the wallet is
+    # shared): it is then ignored, with a warning in the log.
     engine_beside_open_contracts: false
-    # [OPTIONAL, default: false; needs share_trading_wallet] THE ENGINE FENCE.
+    # [OPTIONAL, default: auto with share_trading_wallet, else off] THE ENGINE FENCE.
     # Makes `address` a sub-account the engine and the app leave alone, so the
     # book can be Live WHILE the engine trades, from the same wallet:
     #   - the engine (v0.10.52+) lists every unspent coin at `address`, and at
@@ -1756,7 +1760,10 @@ options:
     # engine offer still holding the address's coins to be refreshed or to
     # expire. The command line raises the flag too, but leaves lowering it to
     # the app.
-    engine_fence: false
+    # `auto` is what an unset engine_fence means once share_trading_wallet is
+    # on; `false` keeps the rules above instead (engine stopped while the book
+    # acts). Read only with share_trading_wallet.
+    engine_fence: auto
 
   # [OPTIONAL; used with wallet.engine_fence] The sub-account's balance
   # target, in whole units. Collateral locked in open contracts counts as held.
@@ -1765,6 +1772,11 @@ options:
   # (one at a time per asset; a dry run only says so). Sweeping premiums back
   # is not automatic yet. Keep it well under the engine's rolling-loss limit
   # (risk.window_loss): the engine sees a top-up as its balance going down.
+  # Unset, with the fence on, it comes from limits below: xch is
+  # max_locked_xch plus one contract_xch, quote is 2 plus max_locked_quote when
+  # put_strikes_pct are written. With max_locked_xch unset or unlimited there
+  # is no target, so nothing moves into `address` without a cap you chose.
+  # `target: false` turns top-ups off.
   # target:
   #   xch: 1.5          # collateral for the grid + fees
   #   quote: 2          # wUSDC.b: a cancel's seed coin (+ put collateral)

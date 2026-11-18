@@ -78,6 +78,7 @@ def _config(
             "key_path": "k",
             "fingerprint": 42,
             "share_trading_wallet": True,
+            "engine_fence": False,  # the unfenced shared mode; the fence is the default now
             "address": "xch1kxxd76v9kwsxrcxgndn3mylnxjhd7klgdns7083zjl247ffge32sr5rsy2",
         }
         chia["wallet_fingerprint"] = 42

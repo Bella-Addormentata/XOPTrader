@@ -3499,8 +3499,11 @@ OptionsFenceConfig parse_options_fence(const YAML::Node& root)
     const YAML::Node wallet = options["wallet"];
     if (!wallet || !wallet.IsMap()) return cfg;
     // [AUTO-FENCE] `auto` (any case, surrounding blanks ignored, as the GUI
-    // reads it): up only while the options book is in use.
-    std::string mode = text(wallet, "engine_fence");
+    // reads it): up only while the options book is in use.  [DEFAULTS] Unset
+    // is `auto` for a book that shares this wallet, as the GUI reads it too.
+    const YAML::Node fence_node = wallet["engine_fence"];
+    const bool fence_unset = !fence_node || fence_node.IsNull();
+    std::string mode = fence_unset ? std::string{"auto"} : text(wallet, "engine_fence");
     const std::size_t first = mode.find_first_not_of(" \t\r\n");
     const std::size_t last  = mode.find_last_not_of(" \t\r\n");
     mode = first == std::string::npos ? std::string{} : mode.substr(first, last - first + 1);
@@ -3509,8 +3512,10 @@ OptionsFenceConfig parse_options_fence(const YAML::Node& root)
     const bool follow_book = mode == "auto";
     if (!follow_book && !flag(wallet, "engine_fence")) return cfg;
     if (!flag(options, "enabled") || !flag(wallet, "share_trading_wallet")) {
-        spdlog::warn("[Config] options.wallet.engine_fence is set but the options book is "
-                     "off or does not share this wallet -- no fence");
+        if (!fence_unset && !follow_book) {  // `auto` means "when shared"
+            spdlog::warn("[Config] options.wallet.engine_fence is set but the options book is "
+                         "off or does not share this wallet -- no fence");
+        }
         return cfg;
     }
     cfg.enabled        = true;

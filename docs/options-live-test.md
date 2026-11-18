@@ -202,6 +202,15 @@ a stale refresh), the book stops signing beside it and says why, as before.
 
 #### The fence that follows the book: `engine_fence: auto`
 
+This is the default whenever `share_trading_wallet` is on (0.10.53 and later):
+an unset `engine_fence` means `auto`, for the app and the engine alike, and
+`engine_fence: false` keeps the older rules. Under the fence `fund_from_wallet`
+and `engine_beside_open_contracts` are not used and are ignored with a warning,
+so a config set up for 0.10.51 works as it is. Without `options.target` the
+target comes from the limits: `max_locked_xch` plus one contract in XCH, and 2
+units of the quote asset (plus `max_locked_quote` when puts are written); with
+no XCH cap there is no target, and `target: false` turns top-ups off.
+
 With `engine_fence: auto` (engine v0.10.53 or later) the fence is up only while
 the book is in use: switched on (Rehearse or Live), a contract open, or a
 transaction unsettled. The app keeps `options_fence.flag` beside the engine's
