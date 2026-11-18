@@ -5,6 +5,42 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### The engine's fence can follow the options book: `engine_fence: auto`
+
+`options.wallet.engine_fence: auto` is the 0.10.52 fence, up only while the
+options book is in use instead of for the engine's whole life:
+
+- **Up while the book is in use**: switched on (Rehearse or Live), a contract
+  open, or a transaction unsettled. The app keeps `options_fence.flag` beside
+  the engine's database for as long as that lasts, as the Dexie switch keeps
+  `pause.flag`, and the engine follows it on its fast poll (`[OPTIONS-FENCE]
+  UP` / `DOWN` in its log, `xop_options_fence_enabled` on its metrics). A
+  flag that cannot be read counts as there: the fence fails up.
+- **Down once the book is off with nothing open**: the coins at the options
+  address are trading funds again, so spare XCH and premiums there go back to
+  work for Dexie. The next time the book is switched on, `options.target`
+  tops the address back up.
+- **Live beside a running engine is not refused at the switch**: switching
+  on raises the flag, and each Live step waits until the engine reports the
+  fence up. Going up, the engine lists the address's coins afresh; it never
+  spends on a list from before the fence went down. An engine offer made
+  while the fence was down that still holds one of those coins makes the book
+  wait until it is refreshed or expires, as before.
+- The app's own spends (bridges, claims, Dexie takes) follow the flag too.
+  The command line raises it for the commands that sign, but leaves lowering
+  it to the app.
+- **A flag that cannot be written blocks Live**: the switch refuses, and a
+  Live step does not sign until it can be written. The flag names the
+  process that raised it, and every step writes it again; the app lowers it
+  only when no other live process raised it last and no step is in
+  progress, so a run from a terminal keeps it up.
+
+`engine_fence: true` keeps the fence up for the engine's life, as in 0.10.52.
+An engine older than 0.10.53 does not read `auto` and fences nothing, so the
+book signs nothing beside it.
+
 ## [0.10.52] — 2026-11-17 — the options book can sell while the engine trades
 
 ### An OPTIONS switch in the toolbar, beside DEXIE (#241)

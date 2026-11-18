@@ -2015,6 +2015,19 @@ private:
     /// puzzle hashes, the full-node refresher, the wallet hook.
     void setup_coin_fence();
 
+    /// [AUTO-FENCE] engine_fence: auto -- data/options_fence.flag, kept by the
+    /// GUI while the options book is in use.  Resolved once in the
+    /// constructor, beside pause.flag.
+    std::filesystem::path options_fence_flag_path_;
+
+    /// [AUTO-FENCE] Put the fence up or down to follow the flag; a flag that
+    /// cannot be read counts as there.  Returns whether it moved.
+    bool sync_options_fence_flag();
+
+    /// [OPTIONS-FENCE] The fence's state on the metrics endpoint, for the GUI
+    /// and the options book.  No-op without a fence or a metrics server.
+    void publish_options_fence_metrics();
+
     /// Dexie aggregator REST client (shared with OfferManager for submission).
     std::shared_ptr<rpc::DexieClient> dexie_;
 

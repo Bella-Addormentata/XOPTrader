@@ -26,6 +26,7 @@ confirmation, and off is Off. Its chip is :func:`header_status`.
 
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 from typing import Any, Final
@@ -64,6 +65,8 @@ KEY_MODE: Final[str] = "options/mode"
 
 _REFRESH_MS: Final[int] = 2_000
 _BLOCKER_EVERY: Final[int] = 5  # refreshes between looks at the engine-start blocker
+#: [AUTO-FENCE] Refreshes between checks of the engine's fence flag while the book is off.
+_FENCE_CHECK_EVERY: Final[int] = 30
 _CONTRACT_COLUMNS: Final[tuple[str, ...]] = (
     "Contract",
     "Status",
@@ -73,6 +76,8 @@ _CONTRACT_COLUMNS: Final[tuple[str, ...]] = (
 )
 
 Mode = options_runner.Mode
+
+_log = logging.getLogger(__name__)
 
 
 def _contracts_open(count: int) -> str:
@@ -277,6 +282,14 @@ class OptionsWidget(QWidget):
                 remembered = str(self._settings.value(KEY_MODE, Mode.OFF.value))
                 if remembered in (Mode.REHEARSE.value, Mode.LIVE.value):
                     self._start(Mode(remembered), confirm=False, why="as when the app last closed")
+            # [AUTO-FENCE] Not resumed, or not asked to: the engine's fence flag
+            # follows the book's record (a contract open keeps it up), not
+            # whatever the last session left. A run that started raised it.
+            if self._runner.mode is Mode.OFF and hasattr(self._runner, "sync_fence"):
+                try:
+                    self._runner.sync_fence()
+                except Exception:  # noqa: BLE001 - the flag is best effort; the book checks
+                    _log.exception("[Options] the engine's fence flag could not be checked")
         self._timer.start()
         self.refresh()
 
@@ -332,6 +345,12 @@ class OptionsWidget(QWidget):
             wallet = options_runner.load_options(self._config_path).wallet
         except options_runner.RunnerError:
             wallet = None
+        if wallet is not None and wallet.share_trading_wallet and wallet.fence_follows_book:
+            return (
+                "With engine_fence: auto, the trading engine puts its fence up over the options "
+                "address while the book is in use, and keeps trading beside it; the book signs "
+                "only once the engine reports the fence up, within seconds."
+            )
         if wallet is not None and wallet.share_trading_wallet and wallet.engine_fence:
             return (
                 "With the engine fence on, the trading engine keeps trading while the book is "
@@ -441,6 +460,18 @@ class OptionsWidget(QWidget):
         self._show_contracts(snap.contracts)
         self._show_recent(snap.recent, snap.recent_count)
         self._refreshes += 1
+        if (
+            self._refreshes % _FENCE_CHECK_EVERY == 0
+            and snap.mode is Mode.OFF
+            and not snap.running
+            and hasattr(self._runner, "sync_fence")
+        ):
+            # [AUTO-FENCE] A flag a terminal run raised comes down once that
+            # process is gone and the book has nothing open.
+            try:
+                self._runner.sync_fence()
+            except Exception:  # noqa: BLE001 - best effort; the book checks every step
+                _log.exception("[Options] the engine's fence flag could not be checked")
         if self._config_path is not None and self._refreshes % _BLOCKER_EVERY == 1:
             blocker = options_runner.engine_start_blocker(self._config_path)
             self._engine_block.setText(f"Engine start is held: {blocker}" if blocker else "")

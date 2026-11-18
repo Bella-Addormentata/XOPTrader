@@ -324,3 +324,104 @@ TEST(CoinFenceState, RefreshNowIgnoresTheAgeAndRecordsTheWallClock)
     EXPECT_EQ(calls, 2);
     EXPECT_GT(fence.snapshot().refreshed_unix, 1.7e9);
 }
+
+
+// -- [AUTO-FENCE] engine_fence: auto -- the fence follows the options book --------
+
+TEST(CoinFenceAuto, DownFencesNothingAndHoldsNothing)
+{
+    rpc::CoinFence fence;
+    fence.configure({kPuzzle}, std::chrono::seconds(30));
+    fence.update({{"aa", kPuzzle, 5}});
+    ASSERT_TRUE(fence.set_active(false));
+    EXPECT_TRUE(fence.configured());
+    EXPECT_FALSE(fence.enabled());
+    ASSERT_TRUE(fence.exclusions()) << "down is known to fence nothing, not unknown";
+    EXPECT_TRUE(fence.exclusions()->empty());
+    const auto held = fence.held("xch");
+    ASSERT_TRUE(held);
+    EXPECT_EQ(held->first, 0U);
+    EXPECT_FALSE(fence.is_fenced_coin("aa")) << "going down forgets the list";
+    const auto snap = fence.snapshot();
+    EXPECT_FALSE(snap.enabled);
+    EXPECT_FALSE(snap.fresh) << "a fence that is down never reports itself holding";
+}
+
+TEST(CoinFenceAuto, GoingUpIsUnknownUntilRefreshedNeverAnOldList)
+{
+    rpc::CoinFence fence;
+    fence.configure({kPuzzle}, std::chrono::seconds(30));
+    fence.update({{"aa", kPuzzle, 5}});
+    fence.set_active(false);
+    ASSERT_TRUE(fence.set_active(true));
+    EXPECT_TRUE(fence.enabled());
+    EXPECT_FALSE(fence.exclusions()) << "nothing may spend on a list from before it went down";
+    EXPECT_FALSE(fence.held("xch"));
+    fence.update({{"bb", kPuzzle, 7}});
+    ASSERT_TRUE(fence.exclusions());
+    EXPECT_EQ(*fence.exclusions(), (std::vector<std::string>{"bb"}));
+}
+
+TEST(CoinFenceAuto, SetActiveSaysWhetherItMovedAndUpIsTheDefault)
+{
+    rpc::CoinFence fence;
+    fence.configure({kPuzzle}, std::chrono::seconds(30));
+    EXPECT_TRUE(fence.active()) << "engine_fence: true never calls set_active";
+    EXPECT_FALSE(fence.set_active(true));
+    EXPECT_TRUE(fence.set_active(false));
+    EXPECT_FALSE(fence.set_active(false));
+    EXPECT_FALSE(fence.active());
+}
+
+TEST(CoinFenceAuto, ADownFenceDoesNotRefresh)
+{
+    boost::asio::io_context ioc;
+    rpc::CoinFence fence;
+    fence.configure({kPuzzle}, std::chrono::seconds(30));
+    fence.set_active(false);
+    int calls = 0;
+    fence.set_refresher([&calls]() -> boost::asio::awaitable<std::vector<rpc::FencedCoin>> {
+        ++calls;
+        co_return std::vector<rpc::FencedCoin>{};
+    });
+    auto a = boost::asio::co_spawn(ioc, fence.ensure_fresh(), boost::asio::use_future);
+    auto b = boost::asio::co_spawn(ioc, fence.refresh_now(), boost::asio::use_future);
+    ioc.run();
+    a.get();
+    b.get();
+    EXPECT_EQ(calls, 0) << "down, the full node is not asked";
+}
+
+TEST(CoinFenceWiring, TheEngineFollowsTheOptionsFenceFlag)
+{
+    std::ifstream in(XOP_TESTS_ENGINE_CPP, std::ios::binary);
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    const std::string engine = buffer.str();
+
+    const std::string setup = engine.substr(engine.find("void Engine::setup_coin_fence()"));
+    const std::string setup_body = setup.substr(0, setup.find("\n}"));
+    EXPECT_NE(setup_body.find("follow_book"), std::string::npos);
+    EXPECT_NE(setup_body.find("set_active(false)"), std::string::npos)
+        << "auto starts down until the flag is read";
+
+    // (Line endings vary by checkout: look a little way past the assignment.)
+    const std::size_t flag_at =
+        engine.find("options_fence_flag_path_ = db_dir / \"options_fence.flag\";");
+    ASSERT_NE(flag_at, std::string::npos);
+    EXPECT_NE(engine.substr(flag_at, 160).find("sync_options_fence_flag();"), std::string::npos)
+        << "the flag is read in the constructor, before anything can spend";
+
+    const std::string poll = engine.substr(engine.find("asio::awaitable<void> Engine::poll_loop_coro()"));
+    EXPECT_NE(poll.substr(0, poll.find("\n}")).find("sync_options_fence_flag()"), std::string::npos)
+        << "the fast poll follows the flag";
+
+    const std::string beat = engine.substr(engine.find("asio::awaitable<void> Engine::on_new_block_coro("));
+    const std::string beat_head = beat.substr(0, beat.find("ensure_fresh()"));
+    EXPECT_NE(beat_head.find("sync_options_fence_flag()"), std::string::npos)
+        << "each heartbeat follows the flag before it refreshes the list";
+
+    const std::string sync = engine.substr(engine.find("bool Engine::sync_options_fence_flag()"));
+    EXPECT_NE(sync.substr(0, sync.find("\n}")).find("want = ec ? true : there;"), std::string::npos)
+        << "a flag that cannot be read counts as there: the fence fails up";
+}

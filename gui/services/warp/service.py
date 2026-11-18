@@ -7558,7 +7558,12 @@ class _WarpWorker(QObject):
 
         fenced = fence_mod.fenced_address(self._config)
         if fenced is not None:
-            client.set_fence(fence_mod.WalletFence(client._post, *fenced).coin_ids)
+            active = None
+            if fence_mod.follows_book(self._config):
+                # [AUTO-FENCE] Up only while the options book is in use.
+                flag = fence_mod.flag_path(self._config_home(), self._config)
+                active = lambda: fence_mod.flag_up(flag)  # noqa: E731
+            client.set_fence(fence_mod.WalletFence(client._post, *fenced, active=active).coin_ids)
         return client
 
     def _settle_takes_quietly(self, engine: "WarpEngine") -> None:

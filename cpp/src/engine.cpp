@@ -1202,6 +1202,11 @@ Engine::Engine(const AppConfig& config, bool dry_run,
         config_reload_result_path_ = db_dir / "config_reload.result.json";
         // [STOPDRAIN] The GUI's Cancel All button.
         cancel_all_flag_path_ = db_dir / "cancel_all.flag";
+        // [AUTO-FENCE] The options book in use (engine_fence: auto), read
+        // here first so the fence is where the book wants it before anything
+        // can spend.
+        options_fence_flag_path_ = db_dir / "options_fence.flag";
+        sync_options_fence_flag();
         // [STOPDRAIN review #7] Graceful-close request. [shutdown-flag-race]
         // It is addressed to one engine process: a leftover written for any
         // other process -- including a predecessor that held this same PID --
@@ -3762,6 +3767,13 @@ asio::awaitable<void> Engine::poll_loop_coro()
             // operator who pauses during an outage gets a log line and a GUI
             // status instead of silence.
             check_pause_flag();
+            // [AUTO-FENCE] The options book switched on or settled: follow it
+            // now, and when the fence went up, list its coins and publish it
+            // straight away, so the book does not wait a heartbeat to act.
+            if (sync_options_fence_flag() && coin_fence_ && coin_fence_->enabled()) {
+                co_await coin_fence_->refresh_now();
+                publish_options_fence_metrics();
+            }
             // [STOPDRAIN] Same fast path: an operator's Cancel All must
             // not wait behind a slow heartbeat.
             check_cancel_all_flag();
@@ -4742,9 +4754,59 @@ void Engine::setup_coin_fence()
             co_return coins;
         });
     wallet_->set_coin_fence(coin_fence_);
+    if (oc.follow_book) {
+        // [AUTO-FENCE] Down until the constructor reads the flag (just below
+        // the flag paths), before anything can spend.
+        coin_fence_->set_active(false);
+        spdlog::warn("[Engine] [OPTIONS-FENCE] AUTO for {} ({} puzzle hash(es)): up while the "
+                     "options book is in use (options_fence.flag), and then every wallet spend "
+                     "leaves the options sub-account's coins alone",
+                     oc.address, hashes.size());
+        return;
+    }
     spdlog::warn("[Engine] [OPTIONS-FENCE] ON for {} ({} puzzle hash(es)): every wallet spend "
                  "leaves the options sub-account's coins alone",
                  oc.address, hashes.size());
+}
+
+// ---------------------------------------------------------------------------
+// [AUTO-FENCE] sync_options_fence_flag
+// ---------------------------------------------------------------------------
+// engine_fence: auto -- the fence follows the options book.  The GUI keeps
+// options_fence.flag beside the database while the book is switched on, has
+// a contract open or a transaction unsettled (gui/services/options/runner.py),
+// and removes it once the book is off with nothing open.  Pure filesystem,
+// like pause.flag, so it is read on the fast poll too.  A flag that cannot be
+// read counts as there: the fence fails up, never down.
+bool Engine::sync_options_fence_flag()
+{
+    if (!coin_fence_ || !config_.options_fence.follow_book) return false;
+    bool want = true;
+    if (!options_fence_flag_path_.empty()) {
+        std::error_code ec;
+        const bool there = std::filesystem::exists(options_fence_flag_path_, ec);
+        want = ec ? true : there;
+    }
+    if (!coin_fence_->set_active(want)) return false;
+    if (want) {
+        spdlog::warn("[Engine] [OPTIONS-FENCE] UP: the options book is in use ({}) -- every "
+                     "wallet spend leaves the options sub-account's coins alone",
+                     options_fence_flag_path_.string());
+    } else {
+        spdlog::warn("[Engine] [OPTIONS-FENCE] DOWN: the options book is off with nothing "
+                     "open -- the options address's coins are trading funds again");
+    }
+    publish_options_fence_metrics();
+    return true;
+}
+
+void Engine::publish_options_fence_metrics()
+{
+    if (!coin_fence_ || !metrics_ || !metrics_->is_running()) return;
+    const auto snap = coin_fence_->snapshot();
+    metrics_->update_options_fence(snap.enabled, snap.fresh, snap.coin_count,
+                                   snap.age_seconds, snap.refreshed_unix,
+                                   options_fence_identity_);
 }
 
 asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
@@ -4772,7 +4834,10 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // wallet RPC is not touched), and its state on the metrics endpoint for
     // the GUI and the options book.  A failure leaves the fence unknown: the
     // wallet client then refuses every coin-selecting call until it is known.
-    if (coin_fence_) {
+    // [AUTO-FENCE] Down (engine_fence: auto, the book not in use), it fences
+    // nothing and needs no list; its state is published all the same.
+    sync_options_fence_flag();
+    if (coin_fence_ && coin_fence_->enabled()) {
         co_await coin_fence_->ensure_fresh();
         const auto snap = coin_fence_->snapshot();
         if (!snap.fresh) {
@@ -4780,12 +4845,8 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
                          "known ({}) -- coin-selecting wallet calls are refused until they are",
                          snap.last_error.empty() ? std::string{"not refreshed"} : snap.last_error);
         }
-        if (metrics_ && metrics_->is_running()) {
-            metrics_->update_options_fence(snap.enabled, snap.fresh, snap.coin_count,
-                                           snap.age_seconds, snap.refreshed_unix,
-                                           options_fence_identity_);
-        }
     }
+    publish_options_fence_metrics();
     wallet_skip_warned_this_cycle_ = false;
     // [SEED-FAIL-CLOSED review round 6] Not synced until this heartbeat's Step 8
     // says so (engine.hpp).

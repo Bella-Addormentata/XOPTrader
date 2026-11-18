@@ -1745,6 +1745,17 @@ options:
     #     its fence on and refreshed in the last 2 minutes; otherwise the
     #     rules above apply.
     # Set `target` below to keep the sub-account funded.
+    # `auto` (engine v0.10.53+): the same fence, up only while the book is in
+    # use -- switched on, a contract open, or a transaction unsettled. The app
+    # keeps data/options_fence.flag (beside the engine's database, where the
+    # Dexie switch's pause.flag goes) for as long as that lasts, and the
+    # engine follows it within seconds. With the book off and nothing open
+    # the flag goes, and the coins at `address` are trading funds again; the
+    # next time the book is switched on, `target` tops it back up. A Live book
+    # signs only once the engine reports the fence up, and waits for any
+    # engine offer still holding the address's coins to be refreshed or to
+    # expire. The command line raises the flag too, but leaves lowering it to
+    # the app.
     engine_fence: false
 
   # [OPTIONAL; used with wallet.engine_fence] The sub-account's balance

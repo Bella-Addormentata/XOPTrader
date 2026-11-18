@@ -15,13 +15,32 @@ itself, so a CAT wallet opened later is covered at the next refresh.
 
 Fail-closed: a fence that is on but cannot list its coins raises
 :class:`FenceUnavailableError`, and the client refuses the spend.
+
+[AUTO-FENCE] With ``engine_fence: auto`` the fence is up only while the options
+book is in use. The book (:mod:`runner`) keeps :data:`FLAG_NAME` beside the
+engine's database while it is switched on, has a contract open or a
+transaction unsettled; the engine follows the flag, and so does this client
+(``WalletFence(active=...)``). A flag that cannot be read counts as up.
 """
 
 from __future__ import annotations
 
+import logging
+import os
+import re
+import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
+
+#: [AUTO-FENCE] The flag the engine follows with ``engine_fence: auto``: kept
+#: beside its database, where the Dexie switch's pause.flag is.
+FLAG_NAME = "options_fence.flag"
+#: The engine's database when config.yaml names none (EngineBridge's default).
+_DEFAULT_ENGINE_DB = "data/xop_trader.db"
 
 #: Wallet RPC endpoints that make the wallet select coins.
 SPENDING = frozenset(
@@ -67,10 +86,185 @@ def fenced_address(root: Any) -> tuple[str, str] | None:
     wallet = options.get("wallet")
     if not isinstance(wallet, dict):
         return None
-    if wallet.get("engine_fence") is not True or wallet.get("share_trading_wallet") is not True:
+    if wallet.get("engine_fence") is not True and not follows_book(root):
+        return None
+    if wallet.get("share_trading_wallet") is not True:
         return None
     prefix = "txch" if str(options.get("network") or "mainnet").strip() == "testnet11" else "xch"
     return str(wallet.get("address") or "").strip(), prefix
+
+
+def follows_book(root: Any) -> bool:
+    """[AUTO-FENCE] Whether ``options.wallet.engine_fence`` is ``auto`` in the config mapping."""
+    if not isinstance(root, dict):
+        return False
+    options = root.get("options")
+    wallet = options.get("wallet") if isinstance(options, dict) else None
+    raw = wallet.get("engine_fence") if isinstance(wallet, dict) else None
+    return isinstance(raw, str) and raw.strip().lower() == "auto"
+
+
+#: ``${VAR}`` and ``${VAR:-default}``, as the engine expands a configured path
+#: (config.cpp expand_env_vars).
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _engine_path(text: str) -> str:
+    """A configured path as the engine reads it: ``${VAR}`` references, blanks, then ``~``.
+
+    An unset ``${VAR}`` with no default is left as written: the engine refuses
+    such a config and does not start, so there is no fence to follow.
+    """
+
+    def ref(match: re.Match[str]) -> str:
+        value = os.environ.get(match.group(1))
+        if value is not None:
+            return value
+        return match.group(2) if match.group(2) is not None else match.group(0)
+
+    expanded = _ENV_REF.sub(ref, text).strip()
+    if expanded.startswith("~"):
+        home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+        if home:
+            return home + expanded[1:]
+    return expanded
+
+
+def flag_path(home: Path | str | None, root: Any = None) -> Path:
+    """[AUTO-FENCE] Where the engine looks for :data:`FLAG_NAME`: beside its database.
+
+    ``database.path`` of the config mapping ``root`` (``data/xop_trader.db``
+    when unset), expanded as the engine expands it, relative to ``home``,
+    config.yaml's folder: the engine's working directory when the app starts
+    it, and the folder the app's own pause flag is written in (EngineBridge).
+    """
+    raw = ""
+    if isinstance(root, dict) and isinstance(root.get("database"), dict):
+        raw = str(root["database"].get("path") or "")
+    database = Path(_engine_path(raw) or _DEFAULT_ENGINE_DB)
+    if not database.is_absolute() and home is not None:
+        database = Path(home) / database
+    return database.parent / FLAG_NAME
+
+
+def flag_up(path: Path) -> bool:
+    """Whether the flag is there. One that cannot be read counts as there: the fence fails up."""
+    try:
+        return Path(path).exists()
+    except OSError:
+        return True
+
+
+def _exists(path: Path) -> bool:
+    """Whether the flag is there, strictly: one that cannot be read is not known to be up."""
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def flag_owner(path: Path) -> int | None:
+    """The process the flag was last raised by, or None when it does not say or cannot be read."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() == "pid":
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+    return None
+
+
+def process_gone(pid: int) -> bool:
+    """Whether no process has ``pid`` any more. False when that cannot be told.
+
+    Observes only: on Windows ``OpenProcess(SYNCHRONIZE)`` and a zero wait,
+    never ``os.kill``, which is TerminateProcess there.
+    """
+    if pid <= 0 or pid == os.getpid():
+        return False
+    if sys.platform == "win32":
+        import ctypes
+        import ctypes.wintypes as wintypes
+
+        synchronize = 0x00100000
+        wait_object_0 = 0x00000000
+        error_invalid_parameter = 87  # no process has this id
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(synchronize, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == error_invalid_parameter
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == wait_object_0
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)  # signal 0 delivers nothing on POSIX
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False  # someone else's process, alive
+    return False
+
+
+def raise_flag(path: Path, why: str) -> bool:
+    """Raise the flag as this process's, or refresh it; whether it is up afterwards.
+
+    Written every time, so the flag names the process that acted last: the
+    app lowers a flag only once that process is gone (:func:`process_gone`).
+    False when it could not be written and is not there: the caller must not
+    act Live, since nothing else then keeps the app's own spends off the
+    options address's coins.
+    """
+    path = Path(path)
+    was = _exists(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"pid={os.getpid()}\nwhy=the options book is in use: {why}\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        log.warning("[options] the fence flag %s could not be written: %s", path, exc)
+        return _exists(path)
+    if not was:
+        log.info("[options] fence flag raised (%s): %s", why, path)
+    return True
+
+
+def lower_flag(path: Path) -> bool:
+    """Remove the flag; whether it is gone afterwards. Never raises: a failure is logged.
+
+    A flag that cannot be removed stays up, which keeps the fence up: the
+    safe side.
+    """
+    path = Path(path)
+    try:
+        if path.exists():
+            path.unlink()
+            log.info("[options] fence flag lowered, the book is off with nothing open: %s", path)
+        return True
+    except OSError as exc:
+        log.warning("[options] the fence flag %s could not be removed: %s", path, exc)
+        return False
+
+
+def set_flag(path: Path, up: bool, why: str = "") -> bool:
+    """Raise (:func:`raise_flag`) or lower (:func:`lower_flag`) the flag; whether it moved."""
+    path = Path(path)
+    was = _exists(path)
+    if up:
+        return raise_flag(path, why) and not was
+    return lower_flag(path) and was
 
 
 def _sdk() -> Any:
@@ -95,12 +289,15 @@ class WalletFence:
         *,
         max_age: float = 0.0,
         clock: Callable[[], float] = time.monotonic,
+        active: Callable[[], bool] | None = None,
     ) -> None:
         self._rpc = rpc
         self._address = address
         self._prefix = prefix
         self._max_age = max_age
         self._clock = clock
+        #: [AUTO-FENCE] Whether the fence is up just now; None = always.
+        self._active = active
         self._ids: list[str] | None = None
         self._at = 0.0
 
@@ -180,7 +377,13 @@ class WalletFence:
         return wallets
 
     def coin_ids(self) -> list[str]:
-        """0x-hex ids of every spendable coin at the sub-account. Raises FenceUnavailableError."""
+        """0x-hex ids of every spendable coin at the sub-account. Raises FenceUnavailableError.
+
+        [AUTO-FENCE] None while the fence is down: the options address's
+        coins are then the wallet's like any other.
+        """
+        if self._active is not None and not self._active():
+            return []
         now = self._clock()
         if self._ids is not None and self._max_age > 0 and now - self._at <= self._max_age:
             return list(self._ids)
