@@ -641,6 +641,26 @@ def test_a_refused_toolbar_switch_names_the_reason_and_stays_off(app, tmp_path, 
         _close(page, app)
 
 
+@pytest.mark.parametrize("from_toolbar", [True, False])
+def test_answering_no_after_a_refusal_reports_no_refusal(app, tmp_path, monkeypatch, from_toolbar):
+    """A declined retry is the operator's own choice: the old reason may no longer be true."""
+    runner = RunnerDouble(refuse="Live refused: the trading engine is RUNNING")
+    page = _page(app, tmp_path, runner)
+    try:
+        _answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        assert "Live refused" in page.switch_from_header(True)
+
+        asked = _answer(monkeypatch, QMessageBox.StandardButton.No)
+        if from_toolbar:
+            assert page.switch_from_header(True) == ""
+        else:
+            page._buttons[Mode.LIVE].click()
+        assert asked == ["Options: go Live"]
+        assert page.header_status()[1].text == "off"
+    finally:
+        _close(page, app)
+
+
 def test_the_toolbar_switch_does_not_ask_when_options_are_not_set_up(app, tmp_path, monkeypatch):
     runner = RunnerDouble()
     page = _page(app, tmp_path, runner, config={"options": False})

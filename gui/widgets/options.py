@@ -354,6 +354,9 @@ class OptionsWidget(QWidget):
         )
 
     def _start(self, mode: Mode, *, confirm: bool, why: str) -> None:
+        # A new attempt: the last one's refusal no longer stands. Answering no
+        # below is the operator's own choice, not a refusal to report again.
+        self._refusal = ""
         if confirm:
             reply = QMessageBox.question(
                 self,
