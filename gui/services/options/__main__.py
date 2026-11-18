@@ -218,16 +218,23 @@ _ACTING = frozenset({"step", "run", "withdraw-all", "live-test"})
 _FENCE_WAIT_SECONDS = 30.0
 
 
-def _raise_fence_flag(cfg: config.OptionsConfig, config_path: str, what: str) -> None:
+#: [AUTO-FENCE] The flag this process raised, refreshed before each step.
+_fence_flag: Path | None = None
+
+
+def _raise_fence_flag(cfg: config.OptionsConfig, config_path: str, what: str) -> str | None:
     """[AUTO-FENCE] Raise the engine's fence flag for ``what``, and wait for the fence.
 
-    Only with ``engine_fence: auto``. The command line raises the flag but
-    never lowers it: the app does, once the book is off with nothing open,
-    and a book the app is running may still need it. A running engine is
-    given a little time to put the fence up; each signature checks it again.
+    Only with ``engine_fence: auto``, and only for what signs: a dry run does
+    not, except ``live-test``, which always does. The command line raises the
+    flag but never lowers it: the app does, once the book is off with nothing
+    open and this process is gone. A running engine is given a little time to
+    put the fence up; each signature checks it again. Returns why ``what``
+    must not run, when the flag could not be written.
     """
-    if not cfg.wallet.fence_follows_book or cfg.dry_run:
-        return
+    global _fence_flag
+    if not cfg.wallet.fence_follows_book or (cfg.dry_run and what != "live-test"):
+        return None
     from gui.services.config_split import load_merged
     from gui.services.options.runner import fence_identity
 
@@ -236,16 +243,23 @@ def _raise_fence_flag(cfg: config.OptionsConfig, config_path: str, what: str) ->
         root = load_merged(path)
     except Exception:  # noqa: BLE001 - the default database's folder
         root = None
-    fence_mod.set_flag(fence_mod.flag_path(path.parent, root), True, f"{what} (command line)")
+    flag = fence_mod.flag_path(path.parent, root)
+    if not fence_mod.raise_flag(flag, f"{what} (command line)"):
+        return (
+            f"the engine's fence flag could not be written at {flag}; {what} does not sign "
+            "without it"
+        )
+    _fence_flag = flag
     state = engine_guard.engine_state(cfg.wallet.engine_metrics_url)
     if not state.running:
-        return
+        return None
     identity = fence_identity(cfg)
     deadline = time.monotonic() + _FENCE_WAIT_SECONDS
     while time.monotonic() < deadline:
         if engine_guard.fence_state(cfg.wallet.engine_metrics_url).holds_for(identity):
-            return
+            return None
         time.sleep(2.0)
+    return None
 
 
 def _engine_refusal(
@@ -441,6 +455,12 @@ def _guarded_step(
     seen: dict[str, Any] | None = None,
 ) -> bool:
     """One step, unless the shared-wallet guard forbids it. False if refused."""
+    if _fence_flag is not None and not fence_mod.raise_flag(_fence_flag, "step (command line)"):
+        # [review] Refreshed each step: it names this process while it acts.
+        message = f"the engine's fence flag could not be written at {_fence_flag}"
+        print(f"  note: {message}; nothing is signed until it can be")
+        log.warning("[options] %s", message, extra=REPORTED)
+        return False
     state = _shared_wallet_banner(cfg, book_store, seen)
     # A dry-run step signs nothing, so only a live one needs the engine down.
     refusal = None if cfg.dry_run else _engine_refusal(state, "a live step", cfg)
@@ -1165,7 +1185,11 @@ def main(argv: list[str] | None = None) -> int:
             handlers.append(_log_to_file(path))
             log.info("[options] %s, config %s", args.command, args.config)
         if args.command in _ACTING:
-            _raise_fence_flag(cfg, args.config, args.command)
+            refusal = _raise_fence_flag(cfg, args.config, args.command)
+            if refusal is not None:
+                print(f"refused: {refusal}", file=sys.stderr)
+                log.warning("[options] %s", refusal, extra=REPORTED)
+                return 3
         if args.command == "report":
             return _report(cfg, args.since, args.csv, args.config, path)
         if args.command == "status":

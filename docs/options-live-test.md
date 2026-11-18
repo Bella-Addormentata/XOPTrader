@@ -221,6 +221,13 @@ address, the book also waits for that offer to be refreshed or to expire
 step 1; in step 2 the metrics read `xop_options_fence_enabled 0` until the
 book is switched on, then `1`.
 
+The flag names the process that raised it (`pid=` in the file), and every step
+writes it again. The app lowers it only when no other live process raised it
+last and no step is in progress, so a run from a terminal keeps it up; the
+Options page checks again about once a minute while the book is off. If the
+flag cannot be written, Live is refused at the switch and each Live step is
+held until it can be.
+
 Two things to know once contracts are out:
 
 - **Setting `dry_run: true` again stops all spending**, housekeeping included.

@@ -77,6 +77,10 @@ class Mode(enum.StrEnum):
     LIVE = "live"
 
 
+def live_mode(mode: Mode) -> bool:
+    return mode is Mode.LIVE
+
+
 class RunnerError(RuntimeError):
     """The switch cannot be moved as asked; the message says why."""
 
@@ -479,9 +483,16 @@ class OptionsRunner:
             target=self._loop, args=(cfg, mode, stop), name=f"options-{mode.value}", daemon=True
         )
         with self._fence_lock:
-            self._run = _Run(thread=thread, stop=stop, mode=mode)
             if cfg.wallet.fence_follows_book:
-                fence.set_flag(self._fence_flag(), True, f"switched on ({mode.value})")
+                flag = self._fence_flag()
+                if not fence.raise_flag(flag, f"switched on ({mode.value})") and live_mode(mode):
+                    # [review] Nothing else would keep the app's own spends off
+                    # the options coins while the book signs.
+                    raise RunnerError(
+                        f"Live refused: the engine's fence flag could not be written at {flag}; "
+                        "the book does not sign without it"
+                    )
+            self._run = _Run(thread=thread, stop=stop, mode=mode)
         _set_book(self._config_path, live=mode is Mode.LIVE)
         with self._lock:
             self._snapshot = dataclasses.replace(
@@ -572,21 +583,51 @@ class OptionsRunner:
             self._sync_fence_locked(cfg)
 
     def _sync_fence_locked(self, cfg: config.OptionsConfig) -> None:
-        """Caller holds ``_fence_lock``. An unreadable record keeps the flag up."""
+        """Caller holds ``_fence_lock``. An unreadable record keeps the flag up.
+
+        [review] The flag is lowered only when nothing could still be using
+        the book: no run here, nothing open or unsettled in the record, no
+        other process mid-step (the record is checked again holding the
+        book's acting lock), and no other live process that raised it last --
+        a run from a terminal, between its steps.
+        """
+        flag = self._fence_flag()
         if self._run is not None:
-            why: str | None = f"switched on ({self._run.mode.value})"
-        elif not Path(cfg.database_path).exists():
-            why = None
-        else:
-            try:
-                book_store = store.OptionStore(cfg.database_path)
-                try:
-                    why = in_use_reason(book_store)
-                finally:
-                    book_store.close()
-            except Exception as exc:  # noqa: BLE001 - fail up
-                why = f"its record could not be read ({exc})"
-        fence.set_flag(self._fence_flag(), why is not None, why or "")
+            fence.raise_flag(flag, f"switched on ({self._run.mode.value})")
+            return
+        if not Path(cfg.database_path).exists():
+            if self._raised_elsewhere(flag):
+                return
+            fence.lower_flag(flag)
+            return
+        try:
+            book_store = store.OptionStore(cfg.database_path)
+        except Exception as exc:  # noqa: BLE001 - fail up
+            fence.raise_flag(flag, f"its record could not be read ({exc})")
+            return
+        try:
+            why = in_use_reason(book_store)
+            if why is not None:
+                if not fence.flag_up(flag):
+                    fence.raise_flag(flag, why)
+                return
+            if self._raised_elsewhere(flag):
+                return
+            with book_store.acting():
+                if in_use_reason(book_store) is None:
+                    fence.lower_flag(flag)
+        except store.BusyError:
+            return  # another process is mid-step: the flag stays
+        except Exception as exc:  # noqa: BLE001 - fail up
+            fence.raise_flag(flag, f"its record could not be read ({exc})")
+        finally:
+            book_store.close()
+
+    @staticmethod
+    def _raised_elsewhere(flag: Path) -> bool:
+        """Whether the flag was last raised by another process that is still alive."""
+        owner = fence.flag_owner(flag)
+        return owner is not None and owner != os.getpid() and not fence.process_gone(owner)
 
     def _engine(self, cfg: config.OptionsConfig) -> engine_guard.EngineState:
         check = self._engine_state or engine_guard.engine_state
@@ -656,6 +697,18 @@ class OptionsRunner:
 
     def _one_step(self, cfg: config.OptionsConfig, mode: Mode, book: Any, book_store: Any) -> None:
         engine, held = "", ""
+        if cfg.wallet.fence_follows_book:
+            # [review] Refreshed every step, so the flag names this process
+            # while it acts; a Live step does not sign without it.
+            flag = self._fence_flag()
+            if not fence.raise_flag(flag, f"switched on ({mode.value})") and live_mode(mode):
+                held = (
+                    f"the engine's fence flag could not be written at {flag}; nothing is "
+                    "signed until it can be"
+                )
+                book.journal(ENGINE_REFUSED, held, now=int(self._clock()))
+                self._record(cfg, book_store, None, engine, held)
+                return
         if cfg.wallet.share_trading_wallet:
             state = self._engine(cfg)
             engine = state.describe()

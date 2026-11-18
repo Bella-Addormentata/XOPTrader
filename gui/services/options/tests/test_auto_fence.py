@@ -9,6 +9,9 @@ removes it once the book is off with nothing open. The engine follows the flag
 from __future__ import annotations
 
 import dataclasses
+import os
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -286,3 +289,113 @@ def test_the_command_line_raises_the_flag_and_leaves_lowering_to_the_app(
     monkeypatch.setattr(engine_guard, "fence_state", lambda url: engine_guard.parse_fence(""))
     refusal = cli._engine_refusal(UP, "a live step", cfg)
     assert refusal is not None and "follows options_fence.flag" in refusal
+
+
+# -- review of #243 ----------------------------------------------------------------------
+
+
+def test_a_flag_that_cannot_be_written_refuses_live_at_the_switch(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(fence, "raise_flag", lambda path, why: False)
+    run = runner.OptionsRunner(_config(tmp_path), build=_builder([]), engine_state=lambda url: DOWN)
+    with pytest.raises(runner.RunnerError, match="fence flag could not be written"):
+        run.start(runner.Mode.LIVE)
+    assert run.snapshot().mode is runner.Mode.OFF
+
+
+def test_a_flag_that_cannot_be_written_holds_each_live_step(tmp_path, monkeypatch) -> None:
+    """Engine stopped: the metrics guard has nothing to say, so the flag is the only fence."""
+    made: list[FakeBook] = []
+    run = runner.OptionsRunner(
+        _config(tmp_path), interval=0.02, build=_builder(made), engine_state=lambda url: DOWN
+    )
+    try:
+        run.start(runner.Mode.LIVE)
+        monkeypatch.setattr(fence, "raise_flag", lambda path, why: False)
+        _wait(lambda: "fence flag could not be written" in run.snapshot().held)
+        steps = made[0].steps
+        _wait(lambda: run.snapshot().steps >= 3)
+        assert made[0].steps == steps, "nothing signs without the flag"
+    finally:
+        run.stop()
+
+
+def test_a_flag_another_live_process_raised_stays_up(tmp_path) -> None:
+    """A run from a terminal, between its steps, before it has anything open."""
+    flag = _flag(tmp_path)
+    flag.parent.mkdir(parents=True)
+    flag.write_text(f"pid={os.getppid()}\nwhy=the options book is in use: run\n", encoding="utf-8")
+    runner.OptionsRunner(_config(tmp_path), build=_builder([])).sync_fence()
+    assert flag.exists()
+
+
+def test_a_flag_whose_process_is_gone_comes_down(tmp_path) -> None:
+    done = subprocess.run(
+        [sys.executable, "-c", "import os; print(os.getpid())"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    gone = int(done.stdout.strip())
+    assert fence.process_gone(gone)
+    assert not fence.process_gone(os.getpid()) and not fence.process_gone(os.getppid())
+    flag = _flag(tmp_path)
+    flag.parent.mkdir(parents=True)
+    flag.write_text(f"pid={gone}\n", encoding="utf-8")
+    runner.OptionsRunner(_config(tmp_path), build=_builder([])).sync_fence()
+    assert not flag.exists()
+
+
+def test_a_book_mid_step_elsewhere_keeps_the_flag_up(tmp_path) -> None:
+    db = tmp_path / "book.db"
+    flag = _flag(tmp_path)
+    fence.raise_flag(flag, "a step")
+    other = store.OptionStore(str(db))
+    try:
+        with other.acting():  # another process's step, as far as the lock can tell
+            runner.OptionsRunner(_config(tmp_path, db=str(db)), build=_builder([])).sync_fence()
+            assert flag.exists()
+    finally:
+        other.close()
+    runner.OptionsRunner(_config(tmp_path, db=str(db)), build=_builder([])).sync_fence()
+    assert not flag.exists()
+
+
+def test_the_flag_names_the_process_that_raised_it(tmp_path) -> None:
+    flag = _flag(tmp_path)
+    assert fence.raise_flag(flag, "switched on (live)")
+    assert fence.flag_owner(flag) == os.getpid()
+    flag.write_text("written by hand\n", encoding="utf-8")
+    assert fence.flag_owner(flag) is None
+
+
+def test_the_flag_path_expands_as_the_engine_reads_database_path(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XOP_TEST_DATA", str(tmp_path / "from-env"))
+    monkeypatch.delenv("XOP_TEST_UNSET", raising=False)
+    assert (
+        fence.flag_path(tmp_path, {"database": {"path": "${XOP_TEST_DATA}/trader.db"}})
+        == tmp_path / "from-env" / "options_fence.flag"
+    )
+    assert (
+        fence.flag_path(tmp_path, {"database": {"path": " ${XOP_TEST_UNSET:-db}/x.db "}})
+        == tmp_path / "db" / "options_fence.flag"
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert (
+        fence.flag_path(tmp_path, {"database": {"path": "~/xop/trader.db"}})
+        == tmp_path / "home" / "xop" / "options_fence.flag"
+    )
+
+
+def test_live_test_raises_the_flag_even_in_a_dry_run(tmp_path, monkeypatch) -> None:
+    """live-test signs whatever options.dry_run says."""
+    from gui.services.options import __main__ as cli
+
+    path = _config(tmp_path)
+    cfg = dataclasses.replace(cli._load(str(path)), dry_run=True)
+    monkeypatch.setattr(engine_guard, "engine_state", lambda url: DOWN)
+    assert cli._raise_fence_flag(cfg, str(path), "live-test") is None
+    assert _flag(tmp_path).exists()
+
+    monkeypatch.setattr(fence, "raise_flag", lambda path, why: False)
+    refusal = cli._raise_fence_flag(dataclasses.replace(cfg, dry_run=False), str(path), "step")
+    assert refusal is not None and "could not be written" in refusal

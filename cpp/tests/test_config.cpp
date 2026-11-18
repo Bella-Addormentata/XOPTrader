@@ -5516,7 +5516,8 @@ options:
         EXPECT_TRUE(cfg.options_fence.enabled);
         EXPECT_FALSE(cfg.options_fence.follow_book);
     }
-    for (const char* value : {"auto", "Auto", "\"auto\""}) {
+    // [review] Blanks around it too, as the GUI reads it: both must agree.
+    for (const char* value : {"auto", "Auto", "\"auto\"", "\" Auto \""}) {
         TempYaml tmp(with_fence(value));
         const auto cfg = xop::load_config(tmp.path());
         EXPECT_TRUE(cfg.options_fence.enabled) << value;

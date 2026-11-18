@@ -31,6 +31,11 @@ options book is in use instead of for the engine's whole life:
 - The app's own spends (bridges, claims, Dexie takes) follow the flag too.
   The command line raises it for the commands that sign, but leaves lowering
   it to the app.
+- **A flag that cannot be written blocks Live**: the switch refuses, and a
+  Live step does not sign until it can be written. The flag names the
+  process that raised it, and every step writes it again; the app lowers it
+  only when no other live process raised it last and no step is in
+  progress, so a run from a terminal keeps it up.
 
 `engine_fence: true` keeps the fence up for the engine's life, as in 0.10.52.
 An engine older than 0.10.53 does not read `auto` and fences nothing, so the
