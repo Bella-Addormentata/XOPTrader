@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.services.venue_control import (
+    StatusChip,
     SwitchInputs,
     VenueState,
     resolve_chip,
@@ -37,7 +38,7 @@ from gui.services.venue_control import (
 )
 from gui.theme import COLORS as _C
 
-__all__ = ["VenueSwitch"]
+__all__ = ["OptionsSwitch", "VenueSwitch"]
 
 _TONE_STYLE = {
     "ok": ("#123f22", _C.PROFIT_GREEN),
@@ -167,3 +168,82 @@ class VenueSwitch(QWidget):
             "QLabel { background: %s; color: %s; border-radius: 8px; "
             "padding: 2px 8px; font-size: 11px; }" % (bg, fg)
         )
+
+
+class OptionsSwitch(QWidget):
+    """[OPTIONS] The toolbar control for the options book: slider + status chip.
+
+    The same look as a venue's switch and the same split: the slider shows
+    whether the book is switched on, the chip what it is doing. The book has
+    three positions on its page (Off / Rehearse / Live); from the toolbar, on
+    is Live -- after the page's own confirmation -- and off is Off. A book
+    rehearsing reads on, and its chip says it signs nothing.
+
+    Unlike a venue's switch, turning this on can be refused (Live beside an
+    engine that shares the wallet, unfenced): the slider then stays off and
+    the chip names the reason. A refused on is not kept as an intent to apply
+    later, because a book that went Live by itself once the engine stopped
+    would be a trade nobody asked for at that moment.
+
+    ``status`` returns ``(on, chip)``; the Options page supplies it
+    (``OptionsWidget.header_status``).
+    """
+
+    #: Emitted with the NEW position on every click.
+    toggleRequested = Signal(bool)  # noqa: N815 - matches Qt naming
+
+    def __init__(
+        self,
+        status: Callable[[], tuple[bool, StatusChip]],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._status = status
+
+        self._toggle = _IntentToggle(self)
+        self._toggle.clicked.connect(self._on_clicked)
+
+        name = QLabel("OPTIONS", self)
+        name.setStyleSheet(
+            f"color: {_C.TEXT_PRIMARY}; font-weight: bold; font-size: 12px;")
+
+        self._chip = QLabel("", self)
+        self._chip.setStyleSheet(VenueSwitch._chip_style("idle"))
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 0, 4, 0)
+        lay.setSpacing(6)
+        lay.addWidget(self._toggle)
+        lay.addWidget(name)
+        lay.addWidget(self._chip)
+
+        self.refresh()
+
+    def is_on(self) -> bool:
+        """What the slider shows. For tests."""
+        return self._toggle.isChecked()
+
+    def status_text(self) -> str:
+        """What the chip currently says. For tests."""
+        return self._chip.text()
+
+    def refresh(self) -> None:
+        """Re-read the book and repaint. Cheap: the page's snapshot, under a lock."""
+        on, chip = self._status()
+        self._toggle.setChecked(on)
+        self._chip.setText(chip.text)
+        self._chip.setStyleSheet(VenueSwitch._chip_style(chip.tone))
+        self._chip.setToolTip(chip.tooltip)
+        self._toggle.setToolTip(
+            f"Options book: {'ON' if on else 'OFF'}. Click to switch it "
+            f"{'off' if on else 'on'} -- on is Live, after a confirmation; "
+            "Rehearse is on the Options page.")
+
+    def click(self) -> None:
+        """Flip the slider programmatically (tests, shortcuts)."""
+        self._toggle.click()
+
+    def _on_clicked(self) -> None:
+        on, _chip = self._status()
+        self.toggleRequested.emit(not on)
+        self.refresh()

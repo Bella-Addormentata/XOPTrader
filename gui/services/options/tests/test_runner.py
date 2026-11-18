@@ -216,6 +216,32 @@ def test_a_book_that_cannot_start_puts_the_switch_back_off(tmp_path) -> None:
     _wait(lambda: not run.snapshot().running)
     snap = run.snapshot()
     assert snap.mode is runner.Mode.OFF and "certificate not found" in snap.held
+    # What the toolbar's chip reads as "could not start".
+    assert snap.start_error == snap.held
+
+
+def test_the_next_start_clears_a_failed_one_and_a_failing_step_is_not_one(tmp_path) -> None:
+    made: list[FakeBook] = []
+    good = _builder(made, fail=True)
+    calls: list[int] = []
+
+    def flaky(cfg: Any) -> Any:
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("certificate not found")
+        return good(cfg)
+
+    run = runner.OptionsRunner(_write(tmp_path, db=":memory:"), interval=0.02, build=flaky)
+    run.start(runner.Mode.REHEARSE)
+    _wait(lambda: not run.snapshot().running)
+    assert run.snapshot().start_error
+
+    run.start(runner.Mode.REHEARSE)
+    assert run.snapshot().start_error == ""
+    _wait(lambda: run.snapshot().steps >= 2)
+    run.stop()
+    snap = run.snapshot()
+    assert snap.held.startswith("step failed") and snap.start_error == ""
 
 
 def _record_minting_contract(db: Path) -> None:

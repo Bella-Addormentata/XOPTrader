@@ -7,6 +7,25 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### An OPTIONS switch in the toolbar, beside DEXIE
+
+The options book can now be switched on and off from the main toolbar, as
+well as from its page:
+
+- **On is Live**, after the same confirmation as the page's Live button, and
+  **off** is Off, after the step in progress. Rehearse stays on the Options
+  page; a book rehearsing reads on, and its chip says it signs nothing.
+- **The chip says what the book is doing**: live (with the open contracts
+  it knows of), rehearsing, held (with the reason in its tooltip), stopping,
+  refused, could not start, or not set up.
+- **A refused switch-on** (Live beside an unfenced engine that shares the
+  wallet) leaves the slider off and names the reason in the chip and the
+  status bar. It is not kept as an intent to apply later: a book that went
+  Live by itself once the engine stopped would be a trade nobody asked for.
+- **Shown by default.** Settings > Advanced > Subsystems has "Show the
+  Options switch in the toolbar" to hide it, which changes nothing else.
+  Permuto's switch stays hidden unless its subsystem is enabled, as before.
+
 ### The options book can sell while the engine trades, from the same wallet (opt-in)
 
 A new switch, `options.wallet.engine_fence`, makes the options address a

@@ -43,7 +43,7 @@ from gui import stop_offers
 from gui.services.venue_control import SwitchInputs
 from gui.widgets.sidebar import Sidebar
 from gui.widgets.status_bar import StatusBar
-from gui.widgets.venue_switch import VenueSwitch
+from gui.widgets.venue_switch import OptionsSwitch, VenueSwitch
 
 # -- Placeholder imports for widgets that will be created later -------------
 # Each of these will live in gui/widgets/<name>.py once implemented.
@@ -426,6 +426,9 @@ class MainWindow(QMainWindow):
         # AttributeError rather than reading None.
         self._permuto_widget: Optional[QWidget] = None
         self._permuto_switch: Optional[QWidget] = None
+        # [OPTIONS] The options book's toolbar switch (built in _build_toolbar).
+        self._options_switch: QWidget | None = None
+        self._options_switch_action = None
 
         # -- Settings persistence -------------------------------------------
         self._settings = QSettings(_ORG_NAME, _APP_NAME)
@@ -1991,6 +1994,21 @@ class MainWindow(QMainWindow):
             self._on_dexie_cancel_all)
         toolbar.addWidget(self._dexie_switch)
 
+        # [OPTIONS] The options book's on/off, beside dexie's: on is Live
+        # (after the Options page's own confirmation), off is Off, and the
+        # chip says what the book is doing. Built always -- unlike Permuto
+        # there is no secrets read or venue traffic to keep from happening,
+        # it only reads the page's snapshot -- and shown unless Settings >
+        # Advanced > Subsystems hides it. The page is built after the
+        # toolbar, so until then the chip says it is loading. The ACTION is
+        # what hides, for the same layout-gap reason as Permuto's.
+        from gui.widgets.settings import load_options_switch_visible
+
+        self._options_switch = OptionsSwitch(self._options_switch_status)
+        self._options_switch.toggleRequested.connect(self._on_options_toggle)
+        self._options_switch_action = toolbar.addWidget(self._options_switch)
+        self._options_switch_action.setVisible(load_options_switch_visible())
+
         # [PERMUTO MASTER SWITCH] Not built at all when the subsystem is
         # off, rather than built and hidden. VenueSwitch.__init__ ends in
         # self.refresh(), which calls _gather_permuto, which opens and parses
@@ -2228,6 +2246,13 @@ class MainWindow(QMainWindow):
             OptionsWidget, "Options"
         )
         self._stacked.addWidget(self._options_widget)
+        # The toolbar switch repaints on the page's own refresh (every 2 s once
+        # it has config.yaml), engine or no engine.
+        options_page = self._unwrap(self._options_widget)
+        if self._options_switch is not None:
+            if hasattr(options_page, "status_changed"):
+                options_page.status_changed.connect(self._options_switch.refresh)
+            self._options_switch.refresh()
         # The indices are positional; a page that lands anywhere else means a
         # page was inserted above it without its constant moving with it.
         landed = self._stacked.indexOf(self._options_widget)
@@ -2241,6 +2266,10 @@ class MainWindow(QMainWindow):
                 settings_page, "permuto_enabled_changed"):
             settings_page.permuto_enabled_changed.connect(
                 self._on_permuto_enabled_changed)
+        if settings_page is not None and hasattr(
+                settings_page, "options_switch_visible_changed"):
+            settings_page.options_switch_visible_changed.connect(
+                self._on_options_switch_visible_changed)
         self._splitter.addWidget(self._stacked)
 
         # Bottom area: tab widget (35 %)
@@ -3577,9 +3606,47 @@ class MainWindow(QMainWindow):
                       "cancel-all confirmed and the book is flat")
             self._bridge.resume_trading()
         for switch in (getattr(self, "_dexie_switch", None),
+                       getattr(self, "_options_switch", None),
                        getattr(self, "_permuto_switch", None)):
             if switch is not None:
                 switch.refresh()
+
+    # -- [OPTIONS] the options book's toolbar switch ------------------------
+
+    def _options_switch_status(self):
+        """``(on, chip)`` for the OPTIONS switch, from the Options page."""
+        from gui.services.venue_control import StatusChip
+
+        wrapper = getattr(self, "_options_widget", None)
+        status = getattr(self._unwrap(wrapper), "header_status", None)
+        if callable(status):
+            return status()
+        if wrapper is None:
+            return False, StatusChip(
+                "loading", "idle", "The Options page is not built yet.")
+        return False, StatusChip(
+            "unavailable", "idle",
+            "The Options page could not be loaded; see the log.")
+
+    def _on_options_toggle(self, want_on: bool) -> None:
+        """The OPTIONS switch moved: the Options page does it, as if clicked there."""
+        page = self._unwrap(getattr(self, "_options_widget", None))
+        switch = getattr(page, "switch_from_header", None)
+        if not callable(switch):
+            self._on_switch_refused("the Options page is not available")
+            return
+        why = switch(bool(want_on))
+        if why:
+            self._on_switch_refused(f"Options: {why}")
+
+    def _on_options_switch_visible_changed(self, visible: bool) -> None:
+        """Settings > Advanced > Subsystems showed or hid the OPTIONS switch.
+
+        Only the control: the Options page and a book already running are
+        left as they are.
+        """
+        if self._options_switch_action is not None:
+            self._options_switch_action.setVisible(bool(visible))
 
     def _on_start_stop(self) -> None:
         """Toggle bot running state after user confirmation.

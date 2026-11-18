@@ -146,6 +146,11 @@ switch on while the engine runs. Run the book either from the page or from a
 terminal, not both: they share one database, and the second one to act is
 refused ("another process is acting").
 
+The **OPTIONS** switch in the toolbar, beside DEXIE, is a shortcut to the same
+switch: on is Live, after the same confirmation, and off is Off; Rehearse is
+only on the page. Its chip says what the book is doing, and why it is held or
+refused. Settings > Advanced > Subsystems can hide it.
+
 With `options.wallet.engine_beside_open_contracts: true` (and
 `fund_from_wallet: true`, which it needs) the engine is held only while the
 book acts, not for as long as contracts are open. A day with contracts out then

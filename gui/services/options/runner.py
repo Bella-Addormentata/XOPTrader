@@ -99,6 +99,9 @@ class Snapshot:
     engine: str = ""
     #: Why the last step did nothing, if it was refused or failed.
     held: str = ""
+    #: Why the last run never stepped at all (the book could not be built),
+    #: until the next start. ``held`` says it too, but outlives it.
+    start_error: str = ""
     market: str = ""
     contracts: tuple[ContractView, ...] = ()
     fees_paid_mojos: int = 0
@@ -446,7 +449,13 @@ class OptionsRunner:
         _set_book(self._config_path, live=mode is Mode.LIVE)
         with self._lock:
             self._snapshot = dataclasses.replace(
-                self._snapshot, mode=mode, running=True, stopping=False, held="", steps=0
+                self._snapshot,
+                mode=mode,
+                running=True,
+                stopping=False,
+                held="",
+                start_error="",
+                steps=0,
             )
         self._note(f"switched to {mode.value}")
         thread.start()
@@ -532,7 +541,10 @@ class OptionsRunner:
                 _set_book(self._config_path, live=False)
                 with self._lock:
                     self._snapshot = dataclasses.replace(
-                        self._snapshot, mode=Mode.OFF, held=f"could not start: {exc}"
+                        self._snapshot,
+                        mode=Mode.OFF,
+                        held=f"could not start: {exc}",
+                        start_error=f"could not start: {exc}",
                     )
                 return
             book.step_interval = self._interval  # kept in the journal for the report
