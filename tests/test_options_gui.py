@@ -500,3 +500,395 @@ def test_start_trading_does_not_show_a_running_engine_that_was_refused(app, monk
         window.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         app.processEvents()
+
+
+# --------------------------------------------------------------------------- #
+# The toolbar's OPTIONS switch
+# --------------------------------------------------------------------------- #
+
+
+def _contract(status: str = store.OPEN) -> options_runner.ContractView:
+    return options_runner.ContractView(
+        slot="C110@1",
+        status=status,
+        launcher_id="01" * 32,
+        expiration=2_000_000_000,
+        underlying_amount=500_000_000_000,
+        collateral="0.5 XCH",
+        live_offers=1,
+    )
+
+
+Snap = options_runner.Snapshot
+
+
+@pytest.mark.parametrize(
+    ("snap", "kwargs", "on", "text", "tone"),
+    [
+        (None, {}, False, "loading", "idle"),
+        (Snap(), {}, False, "off", "idle"),
+        (
+            Snap(contracts=(_contract(), _contract(store.CLOSED))),
+            {},
+            False,
+            "off -- 1 contract open",
+            "idle",
+        ),
+        (Snap(mode=Mode.LIVE, running=True), {}, True, "live", "ok"),
+        (
+            Snap(mode=Mode.LIVE, running=True, contracts=(_contract(), _contract(store.SOLD))),
+            {},
+            True,
+            "live -- 2 contracts open",
+            "ok",
+        ),
+        (
+            Snap(mode=Mode.LIVE, running=True, held="refused, trading engine up"),
+            {},
+            True,
+            "live -- held",
+            "warn",
+        ),
+        (
+            Snap(mode=Mode.REHEARSE, running=True),
+            {},
+            True,
+            "rehearsing -- signs nothing",
+            "converging",
+        ),
+        (
+            Snap(mode=Mode.REHEARSE, running=True, held="step failed: boom"),
+            {},
+            True,
+            "rehearsing -- held",
+            "warn",
+        ),
+        (
+            Snap(running=True, stopping=True),
+            {},
+            False,
+            "stopping -- finishing a step",
+            "converging",
+        ),
+        (Snap(), {"setup": "options are not set up"}, False, "not set up", "idle"),
+        (Snap(), {"refusal": "Live refused: the engine is RUNNING"}, False, "refused", "warn"),
+        (Snap(start_error="could not start: boom"), {}, False, "could not start", "warn"),
+    ],
+)
+def test_the_toolbar_chip_says_what_the_book_is_doing(snap, kwargs, on, text, tone):
+    got_on, chip = options_page.header_status(snap, **kwargs)
+    assert (got_on, chip.text, chip.tone) == (on, text, tone)
+    assert chip.tooltip
+
+
+def test_an_off_book_never_claims_no_contracts_are_open():
+    """The record is read only when the book steps: off since launch, it does not know."""
+    _on, chip = options_page.header_status(Snap())
+    assert "no contract" not in chip.tooltip.lower() and chip.text == "off"
+
+
+def test_the_toolbar_switch_asks_the_same_question_before_going_live(app, tmp_path, monkeypatch):
+    runner = RunnerDouble()
+    page = _page(app, tmp_path, runner)
+    try:
+        asked = _answer(monkeypatch, QMessageBox.StandardButton.No)
+        assert page.switch_from_header(True) == ""
+        assert asked == ["Options: go Live"] and runner.starts == []
+        assert page.header_status()[0] is False
+
+        _answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        assert page.switch_from_header(True) == ""
+        assert runner.starts == [Mode.LIVE]
+        on, chip = page.header_status()
+        assert on and chip.text == "live"
+        assert page._buttons[Mode.LIVE].isChecked(), "the page shows what the toolbar did"
+        store_ = QSettings("XOP-tests-options", options_page._SETTINGS_APP)
+        assert store_.value(options_page.KEY_MODE) == "live"
+
+        assert page.switch_from_header(False) == ""
+        assert runner.stops == 1 and page.header_status()[0] is False
+        assert store_.value(options_page.KEY_MODE) == "off"
+    finally:
+        _close(page, app)
+
+
+def test_a_live_book_is_not_asked_again(app, tmp_path, monkeypatch):
+    runner = RunnerDouble()
+    page = _page(app, tmp_path, runner)
+    try:
+        _answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        page.switch_from_header(True)
+        asked = _answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        assert page.switch_from_header(True) == ""
+        assert asked == [] and runner.starts == [Mode.LIVE]
+    finally:
+        _close(page, app)
+
+
+def test_a_refused_toolbar_switch_names_the_reason_and_stays_off(app, tmp_path, monkeypatch):
+    runner = RunnerDouble(refuse="Live refused: the trading engine is RUNNING")
+    page = _page(app, tmp_path, runner)
+    try:
+        _answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        assert "Live refused" in page.switch_from_header(True)
+        on, chip = page.header_status()
+        assert not on and chip.text == "refused" and "Live refused" in chip.tooltip
+        assert page._buttons[Mode.OFF].isChecked()
+
+        page.switch_from_header(False)  # an explicit Off clears it
+        assert page.header_status()[1].text == "off"
+    finally:
+        _close(page, app)
+
+
+@pytest.mark.parametrize("from_toolbar", [True, False])
+def test_answering_no_after_a_refusal_reports_no_refusal(app, tmp_path, monkeypatch, from_toolbar):
+    """A declined retry is the operator's own choice: the old reason may no longer be true."""
+    runner = RunnerDouble(refuse="Live refused: the trading engine is RUNNING")
+    page = _page(app, tmp_path, runner)
+    try:
+        _answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        assert "Live refused" in page.switch_from_header(True)
+
+        asked = _answer(monkeypatch, QMessageBox.StandardButton.No)
+        if from_toolbar:
+            assert page.switch_from_header(True) == ""
+        else:
+            page._buttons[Mode.LIVE].click()
+        assert asked == ["Options: go Live"]
+        assert page.header_status()[1].text == "off"
+    finally:
+        _close(page, app)
+
+
+def test_the_toolbar_switch_does_not_ask_when_options_are_not_set_up(app, tmp_path, monkeypatch):
+    runner = RunnerDouble()
+    page = _page(app, tmp_path, runner, config={"options": False})
+    try:
+        asked = _answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        assert "options.enabled is not true" in page.switch_from_header(True)
+        assert asked == [] and runner.starts == []
+        assert page.header_status()[1].text == "not set up"
+    finally:
+        _close(page, app)
+
+
+def test_the_toolbar_switch_waits_for_the_config(app, monkeypatch):
+    runner = RunnerDouble()
+    page = options_page.OptionsWidget(runner=runner)
+    try:
+        asked = _answer(monkeypatch, QMessageBox.StandardButton.Yes)
+        assert page.switch_from_header(True) == "the options book is not loaded yet"
+        assert asked == [] and runner.starts == []
+        assert page.header_status() == (False, options_page.header_status(None)[1])
+    finally:
+        _close(page, app)
+
+
+def test_a_rehearsing_book_reads_on_and_the_toolbar_switch_turns_it_off(app, tmp_path):
+    runner = RunnerDouble()
+    page = _page(app, tmp_path, runner)
+    try:
+        page._buttons[Mode.REHEARSE].click()
+        on, chip = page.header_status()
+        assert on and chip.text == "rehearsing -- signs nothing"
+        page.switch_from_header(False)
+        assert runner.stops == 1 and not page.header_status()[0]
+    finally:
+        _close(page, app)
+
+
+def test_a_launch_that_could_not_resume_shows_on_the_toolbar_chip(app, tmp_path, monkeypatch):
+    QSettings("XOP-tests-options", options_page._SETTINGS_APP).setValue(
+        options_page.KEY_MODE, "live"
+    )
+    runner = RunnerDouble(refuse="Live refused: the trading engine is RUNNING")
+    page = _page(app, tmp_path, runner)
+    try:
+        on, chip = page.header_status()
+        assert not on and chip.text == "refused"
+        assert chip.tooltip.startswith("Not resumed as when the app last closed")
+    finally:
+        _close(page, app)
+
+
+def test_every_refresh_tells_the_toolbar(app, tmp_path):
+    runner = RunnerDouble()
+    page = _page(app, tmp_path, runner)
+    try:
+        seen: list[int] = []
+        page.status_changed.connect(lambda: seen.append(1))
+        page.refresh()
+        assert seen == [1]
+    finally:
+        _close(page, app)
+
+
+def test_the_options_switch_follows_the_book_not_the_click(app):
+    from gui.services.venue_control import StatusChip
+    from gui.widgets.venue_switch import OptionsSwitch
+
+    state = {"on": False}
+    asked: list[bool] = []
+
+    def status():
+        on = state["on"]
+        return on, StatusChip("live" if on else "off", "ok" if on else "idle", "tip")
+
+    switch = OptionsSwitch(status)
+    switch.toggleRequested.connect(asked.append)
+    try:
+        assert not switch.is_on() and switch.status_text() == "off"
+        switch.click()
+        assert asked == [True]
+        assert not switch.is_on(), "a click the book did not take leaves the slider off"
+        state["on"] = True
+        switch.refresh()
+        assert switch.is_on() and switch.status_text() == "live"
+        switch.click()
+        assert asked == [True, False]
+    finally:
+        switch.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
+
+
+# -- in the main window ------------------------------------------------------
+
+
+@pytest.fixture
+def real_options_switch_setting():
+    """Put the operator's own "options/toolbar_switch" back, whatever a test wrote."""
+    settings = QSettings("XOP", "XOPTrader")
+    settings.sync()
+    saved = settings.value("options/toolbar_switch")
+    yield
+    restore = QSettings("XOP", "XOPTrader")
+    if saved is None:
+        restore.remove("options/toolbar_switch")
+    else:
+        restore.setValue("options/toolbar_switch", saved)
+    restore.sync()
+
+
+def _main_window(monkeypatch, *, shown: bool = True):
+    from gui.widgets import settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "load_permuto_enabled", lambda: False)
+    monkeypatch.setattr(settings_mod, "load_startup_states", lambda: ("adopt", "off"))
+    monkeypatch.setattr(settings_mod, "load_options_switch_visible", lambda: shown)
+    from gui.widgets.main_window import MainWindow
+
+    return MainWindow()
+
+
+def _close_window(window, app) -> None:
+    window._bridge = None
+    window.close()
+    window.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
+
+
+def test_the_toolbar_shows_an_options_switch_by_default_and_permuto_stays_hidden(app, monkeypatch):
+    window = _main_window(monkeypatch)
+    try:
+        assert window._options_switch is not None
+        # The ACTION: a child of a window never shown reports itself hidden anyway.
+        assert window._options_switch_action.isVisible()
+        assert window._permuto_switch is None and window._permuto_switch_action is None
+        # No bridge, so no config.yaml yet: the chip says so rather than guess.
+        assert window._options_switch.status_text() == "loading"
+        assert not window._options_switch.is_on()
+    finally:
+        _close_window(window, app)
+
+
+def test_settings_can_hide_the_options_switch_and_bring_it_back(app, monkeypatch):
+    window = _main_window(monkeypatch, shown=False)
+    try:
+        assert not window._options_switch_action.isVisible()
+        window._on_options_switch_visible_changed(True)
+        assert window._options_switch_action.isVisible()
+        window._on_options_switch_visible_changed(False)
+        assert not window._options_switch_action.isVisible()
+    finally:
+        _close_window(window, app)
+
+
+def test_the_toolbar_switch_drives_the_options_page(app, monkeypatch):
+    window = _main_window(monkeypatch)
+    try:
+        page = window._unwrap(window._options_widget)
+        calls: list[bool] = []
+        monkeypatch.setattr(page, "switch_from_header", lambda on: calls.append(on) or "")
+        window._options_switch.click()
+        assert calls == [True]
+
+        monkeypatch.setattr(page, "switch_from_header", lambda on: "Live refused: engine up")
+        window._options_switch.click()
+        assert "Live refused: engine up" in window.statusBar().currentMessage()
+    finally:
+        _close_window(window, app)
+
+
+def test_the_toolbar_switch_repaints_with_the_page(app, monkeypatch):
+    window = _main_window(monkeypatch)
+    try:
+        page = window._unwrap(window._options_widget)
+        from gui.services.venue_control import StatusChip
+
+        monkeypatch.setattr(page, "header_status", lambda: (True, StatusChip("live", "ok", "tip")))
+        page.status_changed.emit()
+        assert window._options_switch.is_on()
+        assert window._options_switch.status_text() == "live"
+    finally:
+        _close_window(window, app)
+
+
+def test_the_subsystems_box_shows_the_switch_by_default_and_remembers(
+    app, monkeypatch, real_options_switch_setting
+):
+    from gui.widgets import settings as settings_mod
+
+    QSettings("XOP", "XOPTrader").remove("options/toolbar_switch")
+    assert settings_mod.load_options_switch_visible() is True
+    monkeypatch.setattr(settings_mod, "load_permuto_enabled", lambda: False)
+    page = settings_mod.SettingsWidget()
+    try:
+        seen: list[bool] = []
+        page.options_switch_visible_changed.connect(seen.append)
+        assert page._options_switch_box.isChecked()
+        page._options_switch_box.setChecked(False)
+        assert seen == [False]
+        assert settings_mod.load_options_switch_visible() is False
+        page._options_switch_box.setChecked(True)
+        assert seen == [False, True] and settings_mod.load_options_switch_visible() is True
+    finally:
+        page.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        (True, True),
+        (False, False),
+        ("true", True),
+        ("false", False),
+        ("0", False),
+        ("off", False),
+        ("no", False),
+        # Anything unreadable shows it: the default.
+        ("sideways", True),
+        ("", True),
+    ],
+)
+def test_the_switch_loader_reads_every_shape(stored, expected, real_options_switch_setting):
+    from gui.widgets.settings import load_options_switch_visible
+
+    settings = QSettings("XOP", "XOPTrader")
+    settings.setValue("options/toolbar_switch", stored)
+    settings.sync()
+    assert load_options_switch_visible() is expected

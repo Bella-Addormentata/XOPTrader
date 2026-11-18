@@ -18,6 +18,10 @@ This page runs it inside the GUI instead, through
 
 The choice is remembered (QSettings ``options/mode``) and taken up again when
 the app starts; Live again only if the engine is down by then.
+
+The toolbar's OPTIONS switch, beside DEXIE, drives the same switch
+(:meth:`OptionsWidget.switch_from_header`): on is Live, after the same
+confirmation, and off is Off. Its chip is :func:`header_status`.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ import time
 from pathlib import Path
 from typing import Any, Final
 
-from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtCore import QSettings, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
@@ -42,6 +46,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.services.options import runner as options_runner
+from gui.services.venue_control import StatusChip
 from gui.theme import COLORS as _C
 
 PRIMARY_GREEN: Final[str] = _C.PRIMARY_GREEN
@@ -70,8 +75,77 @@ _CONTRACT_COLUMNS: Final[tuple[str, ...]] = (
 Mode = options_runner.Mode
 
 
+def _contracts_open(count: int) -> str:
+    return f"{count} contract{'' if count == 1 else 's'} open"
+
+
+def header_status(
+    snap: options_runner.Snapshot | None, *, setup: str = "", refusal: str = ""
+) -> tuple[bool, StatusChip]:
+    """``(on, chip)`` for the toolbar's OPTIONS switch.
+
+    ``snap`` is the runner's snapshot, or None before the page has
+    config.yaml; ``setup`` is why the options are not usable (the page's own
+    warning), ``refusal`` why the last switch-on was refused. The slider is
+    on while the book runs, Rehearse included; the chip says which.
+
+    It never says "no contracts open": the book reads its record only when it
+    steps, so a book that has not stepped since launch does not know.
+    """
+    if snap is None:
+        return False, StatusChip(
+            "loading", "idle", "The options book is waiting for the app to load config.yaml."
+        )
+    count = snap.open_contracts
+    if snap.mode is not Mode.OFF:
+        live = snap.mode is Mode.LIVE
+        name = "live" if live else "rehearsing"
+        if snap.held:
+            return True, StatusChip(
+                f"{name} -- held",
+                "warn",
+                "The book is on but its last step did nothing: " + snap.held,
+            )
+        if live:
+            return True, StatusChip(
+                "live -- " + _contracts_open(count) if count else "live",
+                "ok",
+                "Live: the book mints, offers and claws back for real, within the limits in "
+                "config.yaml. Switch it off to stop it after the step in progress; offers "
+                "already out expire on their own.",
+            )
+        return True, StatusChip(
+            "rehearsing -- signs nothing",
+            "converging",
+            "Rehearse: the book builds and checks every step and signs nothing. Switch it "
+            "off to stop it; go Live from the Options page.",
+        )
+    if snap.stopping:
+        return False, StatusChip(
+            "stopping -- finishing a step",
+            "converging",
+            "Switched off: the step in progress is finishing, and nothing new starts after it.",
+        )
+    if setup:
+        return False, StatusChip("not set up", "idle", setup)
+    if refusal:
+        return False, StatusChip("refused", "warn", refusal)
+    if snap.start_error:
+        return False, StatusChip("could not start", "warn", snap.start_error)
+    return False, StatusChip(
+        "off -- " + _contracts_open(count) if count else "off",
+        "idle",
+        "The book is off: no new contracts or offers. Contracts already open stay open until "
+        "they expire or are exercised, and the collateral of an expired one is clawed back at "
+        "the book's next Live step.",
+    )
+
+
 class OptionsWidget(QWidget):
     """The Options page. Inert until :meth:`attach` gives it config.yaml."""
+
+    #: After every refresh, so the toolbar's OPTIONS switch repaints with it.
+    status_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None, *, runner: Any = None) -> None:
         super().__init__(parent)
@@ -80,6 +154,10 @@ class OptionsWidget(QWidget):
         self._refreshes = 0
         self._shown_recent = 0
         self._settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        #: Why the options cannot be used (shown in ``_setup``), or "".
+        self._setup_error = ""
+        #: Why the last switch-on was refused, until the next switch; for the toolbar chip.
+        self._refusal = ""
 
         title = QLabel("Options book")
         title.setStyleSheet(f"font-size: 18px; font-weight: 600; color: {TEXT_PRIMARY};")
@@ -176,6 +254,7 @@ class OptionsWidget(QWidget):
         engine-start check, which looks at every book this app has run.
         """
         new_path = Path(config_path)
+        self._refusal = ""
         old = self._runner
         old_path = getattr(old, "config_path", None)
         if old is not None and old_path is not None and Path(old_path) != new_path:
@@ -214,9 +293,38 @@ class OptionsWidget(QWidget):
             # A short wait: a slow step finishes on its own, shown as stopping.
             self._runner.stop(timeout=options_runner.SWITCH_WAIT)
             self._remember(Mode.OFF)
+            self._refusal = ""
         else:
             self._start(mode, confirm=mode is Mode.LIVE, why="")
         self.refresh()
+
+    # -- the toolbar's OPTIONS switch -------------------------------------------
+
+    def switch_from_header(self, on: bool) -> str:
+        """The toolbar switch: on is Live (after the page's confirmation), off is Off.
+
+        Returns why it could not switch on, or "" when it did, or when the
+        confirmation was answered no.
+        """
+        if self._runner is None or self._config_path is None:
+            return "the options book is not loaded yet"
+        if not on:
+            self._on_choose(Mode.OFF)
+            return ""
+        if self._setup_error:
+            return self._setup_error
+        if self._runner.mode is Mode.LIVE:
+            return ""
+        self._on_choose(Mode.LIVE)
+        return self._refusal
+
+    def header_status(self) -> tuple[bool, StatusChip]:
+        """``(on, chip)`` for the toolbar switch; see :func:`header_status`."""
+        if self._runner is None or self._config_path is None:
+            return header_status(None)
+        return header_status(
+            self._runner.snapshot(), setup=self._setup_error, refusal=self._refusal
+        )
 
     def _engine_rule(self) -> str:
         """What going Live means for the trading engine, for the confirmation."""
@@ -246,6 +354,9 @@ class OptionsWidget(QWidget):
         )
 
     def _start(self, mode: Mode, *, confirm: bool, why: str) -> None:
+        # A new attempt: the last one's refusal no longer stands. Answering no
+        # below is the operator's own choice, not a refusal to report again.
+        self._refusal = ""
         if confirm:
             reply = QMessageBox.question(
                 self,
@@ -263,10 +374,13 @@ class OptionsWidget(QWidget):
             self._runner.start(mode)
         except options_runner.RunnerError as exc:
             self._held.setText(str(exc))
+            self._refusal = str(exc)
             if not confirm:  # a resume at startup that could not happen
                 self._held.setText(f"Not resumed {why}: {exc}")
+                self._refusal = f"Not resumed {why}: {exc}"
             self._check(self._runner.mode)
             return
+        self._refusal = ""
         self._remember(mode)
 
     def _remember(self, mode: Mode) -> None:
@@ -282,13 +396,19 @@ class OptionsWidget(QWidget):
             self._buttons[mode].setEnabled(enabled)
         self._setup.setText(why)
         self._setup.setVisible(bool(why))
+        self._setup_error = "" if enabled else why
 
     # -- display ----------------------------------------------------------------
 
     def refresh(self) -> None:
         if self._runner is None:
             return
-        snap = self._runner.snapshot()
+        try:
+            self._show(self._runner.snapshot())
+        finally:
+            self.status_changed.emit()
+
+    def _show(self, snap: Any) -> None:
         self._check(snap.mode)
         when = (
             time.strftime("%H:%M:%S", time.localtime(snap.last_step_at))

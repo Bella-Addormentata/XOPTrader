@@ -184,6 +184,25 @@ def load_curfew_enabled() -> bool:
     return str(raw).strip().lower() not in ("false", "0", "off", "no")
 
 
+def load_options_switch_visible() -> bool:
+    """Whether the toolbar shows the options book's OPTIONS switch.
+
+    Defaults to TRUE, the opposite of Permuto's master switch, because this
+    hides one control and nothing else: the Options page, its Off / Rehearse
+    / Live buttons and a book already running are untouched either way, and
+    showing the switch costs nothing (it reads the page's snapshot). Only an
+    explicit "off" hides it; anything unreadable shows it, the default.
+    """
+    settings = QSettings("XOP", "XOPTrader")
+    settings.sync()
+    settings.beginGroup("options")
+    raw = settings.value("toolbar_switch", True)
+    settings.endGroup()
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in ("false", "0", "off", "no")
+
+
 # yaml-cpp's bool spellings (YAML::convert<bool>): what the engine accepts.
 _YAML_TRUE: Final[frozenset[str]] = frozenset({"true", "yes", "on", "y"})
 _YAML_FALSE: Final[frozenset[str]] = frozenset({"false", "no", "off", "n"})
@@ -491,6 +510,9 @@ class SettingsWidget(QWidget):
     #: switch and the nav entry -- because this page knows nothing about
     #: either. Emitted only on a genuine operator change, never on load.
     permuto_enabled_changed = Signal(bool)
+    #: [OPTIONS] The "Show the Options switch in the toolbar" box moved.
+    #: Payload is the NEW state; MainWindow shows or hides the switch.
+    options_switch_visible_changed = Signal(bool)
     #: [LIVECFG] The operator asked for an engine restart so the settings the
     #: running engine reported as restart-only take effect. MainWindow owns
     #: the stop prompt (keep or cancel the resting offers) and the restart.
@@ -1632,7 +1654,10 @@ class SettingsWidget(QWidget):
     # -------------------------------------------------------------------
 
     def _build_subsystems_group(self) -> QWidget:
-        """The Permuto master switch.
+        """The Permuto master switch, and whether the OPTIONS switch is shown.
+
+        The second is only a display choice (see load_options_switch_visible);
+        everything below is about the first.
 
         Not a trading control. The venue switch in the toolbar says whether
         Permuto is QUOTING; this says whether Permuto is part of this GUI at
@@ -1698,7 +1723,31 @@ class SettingsWidget(QWidget):
 
         self._permuto_enabled_box.toggled.connect(
             self._on_permuto_enabled_toggled)
+
+        # [OPTIONS] Shown by default, unlike Permuto: hiding it hides the
+        # control and nothing else.
+        self._options_switch_box = QCheckBox(
+            "Show the Options switch in the toolbar")
+        self._options_switch_box.setChecked(load_options_switch_visible())
+        self._options_switch_box.setToolTip(
+            "On by default. The OPTIONS switch beside DEXIE turns the options "
+            "book Live (after a confirmation) or Off; Rehearse is on the "
+            "Options page. Hiding the switch changes nothing else: the "
+            "Options page stays, and a book that is running keeps running."
+        )
+        box.addWidget(self._options_switch_box)
+        self._options_switch_box.toggled.connect(
+            self._on_options_switch_toggled)
         return group
+
+    def _on_options_switch_toggled(self, shown: bool) -> None:
+        """Persist the choice, then let MainWindow show or hide the switch."""
+        settings = QSettings("XOP", "XOPTrader")
+        settings.beginGroup("options")
+        settings.setValue("toolbar_switch", bool(shown))
+        settings.endGroup()
+        settings.sync()
+        self.options_switch_visible_changed.emit(bool(shown))
 
     def _on_permuto_enabled_toggled(self, enabled: bool) -> None:
         """Persist the master switch, then let MainWindow act on it.
