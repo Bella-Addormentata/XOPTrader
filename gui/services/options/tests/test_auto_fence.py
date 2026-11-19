@@ -90,8 +90,7 @@ def test_auto_is_the_fence_following_the_book() -> None:
         assert wallet.engine_fence and wallet.fence_follows_book, value
     wallet = _parse(_shared(engine_fence=True)).wallet
     assert wallet.engine_fence and not wallet.fence_follows_book
-    with pytest.raises(config.OptionsConfigError, match="cannot both be on"):
-        _parse(_shared(engine_fence="auto", fund_from_wallet=True))
+    assert not _parse(_shared(engine_fence="auto", fund_from_wallet=True)).wallet.fund_from_wallet
     with pytest.raises(config.OptionsConfigError, match="must be true or false"):
         _parse(_shared(engine_fence="sometimes"))
 

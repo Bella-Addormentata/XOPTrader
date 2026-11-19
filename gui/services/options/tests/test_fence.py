@@ -44,9 +44,16 @@ def _parse(wallet: dict, **section) -> config.OptionsConfig:
 # -- config ---------------------------------------------------------------------
 
 
-def test_the_fence_is_off_by_default_and_needs_the_shared_wallet() -> None:
-    assert not _parse(_shared()).wallet.engine_fence
+def test_the_fence_follows_the_book_by_default_on_a_shared_wallet() -> None:
+    """[DEFAULTS] Sharing the trading wallet is enough: no further setting to find."""
+    wallet = _parse(_shared()).wallet
+    assert wallet.engine_fence and wallet.fence_follows_book
+    assert not _parse(_shared(engine_fence=False)).wallet.engine_fence
     assert _parse(_shared(engine_fence=True)).wallet.engine_fence
+    dedicated = config.parse(
+        {"options": _section(wallet={"port": 9356, "cert_path": "c", "key_path": "k"})}
+    )
+    assert dedicated is not None and not dedicated.wallet.engine_fence
     with pytest.raises(
         config.OptionsConfigError, match="needs options.wallet.share_trading_wallet"
     ):
@@ -59,9 +66,16 @@ def test_the_fence_is_off_by_default_and_needs_the_shared_wallet() -> None:
         )
 
 
-def test_the_fence_refuses_funding_from_the_rest_of_the_wallet() -> None:
-    with pytest.raises(config.OptionsConfigError, match="cannot both be on"):
-        _parse(_shared(engine_fence=True, fund_from_wallet=True))
+def test_the_fence_leaves_funding_from_the_rest_of_the_wallet_unused(caplog) -> None:
+    """[DEFAULTS] The fence wins, with a warning: a config set up for 0.10.51 keeps working."""
+    for fenced in (
+        _shared(fund_from_wallet=True),
+        _shared(engine_fence=True, fund_from_wallet=True),
+    ):
+        wallet = _parse({**fenced, "engine_beside_open_contracts": True}).wallet
+        assert wallet.engine_fence
+        assert not wallet.fund_from_wallet and not wallet.engine_beside_open_contracts
+    assert not _parse(_shared(engine_fence=False, fund_from_wallet=True)).wallet.engine_fence
 
 
 def test_the_target_is_read_in_whole_units() -> None:
@@ -69,11 +83,36 @@ def test_the_target_is_read_in_whole_units() -> None:
     assert parsed.target == config.TargetConfig(
         xch_mojos=1_500_000_000_000, quote_mojos=2_000, tolerance=0.2
     )
-    assert _parse(_shared()).target is None
+    assert _parse(_shared(engine_fence=False)).target is None
+    assert _parse(_shared(), target=False).target is None, "target: false turns top-ups off"
     with pytest.raises(config.OptionsConfigError, match="tolerance_pct must be below 100"):
         _parse(_shared(), target={"xch": 1, "tolerance_pct": 100})
     with pytest.raises(config.OptionsConfigError, match="must be a mapping"):
         _parse(_shared(), target=1.5)
+
+
+def test_the_default_target_comes_from_the_limits() -> None:
+    """[DEFAULTS] max_locked_xch plus one contract; two quote units, plus puts' cap."""
+    calls = _parse(
+        _shared(),
+        contract_xch=0.5,
+        put_strikes_pct=[],
+        limits={"max_locked_xch": 1.0, "max_locked_quote": 1, "max_contracts": 2},
+    )
+    assert calls.target == config.TargetConfig(
+        xch_mojos=1_500_000_000_000, quote_mojos=2_000, tolerance=0.2
+    )
+    puts = _parse(
+        _shared(),
+        contract_xch=0.5,
+        limits={"max_locked_xch": 1.0, "max_locked_quote": 100, "max_contracts": 2},
+    )
+    assert puts.target is not None and puts.target.quote_mojos == 102_000
+    for cap in (None, "unlimited"):
+        uncapped = _parse(_shared(), limits={"max_locked_xch": cap, "max_contracts": 2})
+        assert uncapped.target is None, "nothing moves without a cap the operator chose"
+    written = _parse(_shared(), target={"xch": 3})
+    assert written.target is not None and written.target.xch_mojos == 3 * config.XCH_MOJOS
 
 
 # -- the app's own spends -------------------------------------------------------
@@ -84,7 +123,14 @@ def test_fenced_address_reads_the_switch_from_the_raw_config() -> None:
     assert fence.fenced_address(root) == (ADDRESS, "xch")
     root["options"]["network"] = "testnet11"
     assert fence.fenced_address(root) == (ADDRESS, "txch")
-    assert fence.fenced_address({"options": {"enabled": True, "wallet": _shared()}}) is None
+    assert fence.fenced_address({"options": {"enabled": True, "wallet": _shared()}}) == (
+        ADDRESS,
+        "xch",
+    ), "[DEFAULTS] fenced unless switched off"
+    assert (
+        fence.fenced_address({"options": {"enabled": True, "wallet": _shared(engine_fence=False)}})
+        is None
+    )
     assert (
         fence.fenced_address({"options": {"enabled": False, "wallet": _shared(engine_fence=True)}})
         is None
@@ -367,7 +413,7 @@ def test_a_dry_run_only_says_and_no_fence_means_no_top_up() -> None:
     assert coins.sent == []
     assert sum("dry run: would top up" in line for line in report.actions) == 2
 
-    plain = _parse(_shared(), target={"xch": 1.5, "quote": 2})
+    plain = _parse(_shared(engine_fence=False), target={"xch": 1.5, "quote": 2})
     stub, coins, top_up = _book(plain, loose_xch=0, loose_quote=0)
     top_up(StepReport())
     assert coins.sent == []
@@ -494,3 +540,17 @@ def test_top_ups_wait_while_a_transaction_of_the_book_is_in_flight() -> None:
     )
     top_up(StepReport())
     assert coins.sent == [], "the mint is in flight: its inputs and collateral would count twice"
+
+
+def test_auto_on_a_wallet_of_its_own_is_simply_no_fence() -> None:
+    """The example config says engine_fence: auto; a dedicated wallet must still parse."""
+    dedicated = config.parse(
+        {
+            "options": _section(
+                wallet={"port": 9356, "cert_path": "c", "key_path": "k", "engine_fence": "auto"}
+            )
+        }
+    )
+    assert dedicated is not None
+    assert not dedicated.wallet.engine_fence and not dedicated.wallet.fence_follows_book
+    assert dedicated.target is None

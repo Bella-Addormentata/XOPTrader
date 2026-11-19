@@ -23,6 +23,9 @@ def _shared(**wallet) -> dict:
         "fingerprint": 481655774,
         "share_trading_wallet": True,
         "address": ADDRESS,
+        # The unfenced shared mode this module is about; the fence is the
+        # default now (test_fence.py).
+        "engine_fence": False,
         **wallet,
     }
 

@@ -47,6 +47,9 @@ def _write(
             "key_path": "k",
             "fingerprint": 42,
             "share_trading_wallet": True,
+            # The unfenced shared mode these tests are about: the fence is the
+            # default now (test_fence.py, test_auto_fence.py).
+            "engine_fence": False,
             "address": "xch1kxxd76v9kwsxrcxgndn3mylnxjhd7klgdns7083zjl247ffge32sr5rsy2",
         }
         chia = {"wallet_host": "localhost", "wallet_port": 9256, "wallet_fingerprint": 42}

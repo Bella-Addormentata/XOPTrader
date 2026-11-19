@@ -5532,3 +5532,38 @@ options:
         EXPECT_FALSE(cfg.options_fence.follow_book) << value;
     }
 }
+
+// [DEFAULTS] Unset, the fence follows the book for an enabled book that shares
+// this wallet -- the GUI reads the same default (options/config.py); anything
+// else stays unfenced.
+TEST(ConfigParserTest, OptionsEngineFenceDefaultsToAutoOnASharedWallet) {
+    const auto options = [](const char* enabled, const char* share, const char* fence_line) {
+        return std::string(kMinimalValidYaml) + "\noptions:\n  enabled: " + enabled +
+               "\n  wallet:\n    share_trading_wallet: " + share +
+               "\n    address: \"xch1kxxd76v9kwsxrcxgndn3mylnxjhd7klgdns7083zjl247ffge32sr5rsy2\"\n" +
+               fence_line;
+    };
+    {
+        TempYaml tmp(options("true", "true", ""));
+        const auto cfg = xop::load_config(tmp.path());
+        EXPECT_TRUE(cfg.options_fence.enabled);
+        EXPECT_TRUE(cfg.options_fence.follow_book);
+    }
+    {
+        TempYaml tmp(options("true", "true", "    engine_fence: false\n"));
+        EXPECT_FALSE(xop::load_config(tmp.path()).options_fence.enabled) << "switched off";
+    }
+    {
+        TempYaml tmp(options("true", "false", ""));
+        EXPECT_FALSE(xop::load_config(tmp.path()).options_fence.enabled) << "a wallet of its own";
+    }
+    {
+        // The example config says `auto` either way: on a wallet of its own it is nothing.
+        TempYaml tmp(options("true", "false", "    engine_fence: auto\n"));
+        EXPECT_FALSE(xop::load_config(tmp.path()).options_fence.enabled) << "auto, unshared";
+    }
+    {
+        TempYaml tmp(options("false", "true", ""));
+        EXPECT_FALSE(xop::load_config(tmp.path()).options_fence.enabled) << "options off";
+    }
+}

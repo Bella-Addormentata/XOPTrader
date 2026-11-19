@@ -63,17 +63,37 @@ transaction unsettled. The app keeps ``options_fence.flag`` beside the
 engine's database for as long as that lasts and the engine follows it
 (:func:`fence.set_flag`); with the book off and nothing open the flag goes,
 and the options address's coins are trading funds again.
+
+[DEFAULTS] ``auto`` is the default whenever the book shares the trading wallet
+(``engine_fence: false`` turns it off); the engine reads the same default.
+Under the fence ``fund_from_wallet`` and ``engine_beside_open_contracts`` are
+not used, and are ignored with a warning rather than refused. Without an
+``options.target`` the fence's target comes from the limits
+(:func:`default_target`); ``target: false`` turns top-ups off.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import datetime
+import logging
 import math
 import os
 from typing import Any
 
 from gui.services.options import splash
+
+log = logging.getLogger(__name__)
+
+#: Warnings already given this process: a config is read on every step.
+_WARNED: set[str] = set()
+
+
+def _warn_once(message: str) -> None:
+    if message not in _WARNED:
+        _WARNED.add(message)
+        log.warning("[options] %s", message)
+
 
 XCH_MOJOS = 10**12
 
@@ -473,22 +493,36 @@ def parse(root: Any) -> OptionsConfig | None:
     fund = _flag(wallet_raw, "fund_from_wallet", False)
     beside = _flag(wallet_raw, "engine_beside_open_contracts", False)
     fence_raw = wallet_raw.get("engine_fence")
-    follows = isinstance(fence_raw, str) and fence_raw.strip().lower() == "auto"
-    fence = True if follows else _flag(wallet_raw, "engine_fence", False)
-    if fence and not share:
-        raise OptionsConfigError(
-            "options.wallet.engine_fence needs options.wallet.share_trading_wallet: true; a "
-            "wallet of its own needs no fence"
-        )
+    if fence_raw is None:
+        # [DEFAULTS] Sharing the trading wallet: the fence, following the book.
+        follows = fence = share
+    elif isinstance(fence_raw, str) and fence_raw.strip().lower() == "auto":
+        # `auto` is the fence when the wallet is shared, and nothing on a
+        # wallet of its own: the example config says it either way.
+        follows = fence = share
+    else:
+        follows = False
+        fence = _flag(wallet_raw, "engine_fence", False)
+        if fence and not share:
+            raise OptionsConfigError(
+                "options.wallet.engine_fence needs options.wallet.share_trading_wallet: true; a "
+                "wallet of its own needs no fence"
+            )
     if fence and fund:
         # The fenced engine leaves only the options address alone. A book that
         # also took coins from the rest of the wallet would race the engine for
-        # them again, as on 2026-11-15.
-        raise OptionsConfigError(
-            "options.wallet.engine_fence and fund_from_wallet cannot both be on: with the fence "
-            "the book spends only coins at its own address; set options.target to keep it "
-            "topped up instead"
+        # them again, as on 2026-11-15: the fence wins.
+        _warn_once(
+            "options.wallet.fund_from_wallet is not used with the engine fence: the book spends "
+            "only coins at its own address, and options.target keeps it topped up"
         )
+        fund = False
+    if fence and beside:
+        _warn_once(
+            "options.wallet.engine_beside_open_contracts is not needed with the engine fence: the "
+            "engine runs beside the book whatever it has open"
+        )
+        beside = False
     if share and beside and not fund:
         # A running engine's offers pick coins from the whole wallet, those at
         # the options address included. The book's next cancel or clawback
@@ -650,8 +684,48 @@ def parse(root: Any) -> OptionsConfig | None:
         database_path=str(section.get("database_path") or "data/options_jobs.db").strip(),
         splash=splash_config,
         coingecko_api_key=str(coingecko.get("api_key") or "").strip(),
-        target=_target(section, quote_unit),
+        target=_resolve_target(section, quote_unit, wallet, limits, contract_mojos, bool(puts)),
     )
+
+
+def default_target(
+    limits: Limits, contract_mojos: int, quote_unit: int, puts: bool
+) -> TargetConfig | None:
+    """[DEFAULTS] The fence's target when ``options.target`` is not set: the book's own limits.
+
+    XCH: ``max_locked_xch`` plus one contract -- the most the grid may lock,
+    with room for fees and the next mint. Quote: two units, a cancel's seed
+    coin, plus ``max_locked_quote`` when puts are written. None when
+    ``max_locked_xch`` is not a number: nothing moves into the options
+    address without a cap the operator chose.
+    """
+    if limits.max_locked_xch <= 0:  # UNSET or UNLIMITED
+        return None
+    quote = 2 * quote_unit
+    if puts and limits.max_locked_quote > 0:
+        quote += limits.max_locked_quote
+    return TargetConfig(
+        xch_mojos=limits.max_locked_xch + contract_mojos, quote_mojos=quote, tolerance=0.2
+    )
+
+
+def _resolve_target(
+    section: dict,
+    quote_unit: int,
+    wallet: WalletConfig,
+    limits: Limits,
+    contract_mojos: int,
+    puts: bool,
+) -> TargetConfig | None:
+    """``options.target`` as written; with the fence and none written, :func:`default_target`."""
+    raw = section.get("target")
+    if raw is False:
+        return None  # top-ups off
+    if raw is None:
+        if not wallet.engine_fence:
+            return None
+        return default_target(limits, contract_mojos, quote_unit, puts)
+    return _target(section, quote_unit)
 
 
 def _target(section: dict, quote_unit: int) -> TargetConfig | None:

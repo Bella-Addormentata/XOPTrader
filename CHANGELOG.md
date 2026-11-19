@@ -7,6 +7,23 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Sharing the trading wallet needs no other options settings
+
+- **The fence is the default.** With `options.wallet.share_trading_wallet:
+  true`, an unset `engine_fence` means `auto`, read the same way by the app
+  and the engine. `engine_fence: false` keeps the rules from before the fence.
+- **`fund_from_wallet` and `engine_beside_open_contracts` give way to it.**
+  Under the fence they are ignored with a warning instead of refused, so a
+  config set up for 0.10.51 works without edits.
+- **A target from the limits.** With the fence and no `options.target`, the
+  book keeps its address at `max_locked_xch` plus one contract in XCH, and 2
+  units of the quote asset (plus `max_locked_quote` when puts are written).
+  With no XCH cap there is no target, so nothing moves into the options
+  address without a limit the operator chose; `target: false` turns top-ups
+  off.
+- `config.example.yaml`, which a new install copies, says `engine_fence:
+  auto`.
+
 ### The engine's fence can follow the options book: `engine_fence: auto`
 
 `options.wallet.engine_fence: auto` is the 0.10.52 fence, up only while the
