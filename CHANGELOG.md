@@ -5,9 +5,9 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.53] — 2026-11-19 — the options fence follows the book, and is the default on a shared wallet
 
-### Sharing the trading wallet needs no other options settings
+### Sharing the trading wallet needs no other options settings (#244)
 
 - **The fence is the default.** With `options.wallet.share_trading_wallet:
   true`, an unset `engine_fence` means `auto`, read the same way by the app
@@ -24,7 +24,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `config.example.yaml`, which a new install copies, says `engine_fence:
   auto`.
 
-### The engine's fence can follow the options book: `engine_fence: auto`
+### The engine's fence can follow the options book: `engine_fence: auto` (#243)
 
 `options.wallet.engine_fence: auto` is the 0.10.52 fence, up only while the
 options book is in use instead of for the engine's whole life:
