@@ -5,6 +5,28 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### The options book is set up in Settings
+
+A new **Options** tab in Settings sets the options book up without editing
+config.yaml:
+
+- switching the book on, and the network;
+- the wallet it signs from. Sharing the trading wallet needs only the
+  options address: host, port, key and certificates now default to the
+  Connection tab's. A dedicated wallet shows its own connection fields;
+- the engine fence (follows the book, always on, or off);
+- the top-up target (from the limits, custom, or off), with what "from the
+  limits" works out to;
+- the grid (contract size, expiries, call and put strikes) and the limits.
+
+The options book's own parser judges the tab, so Settings refuses to save a
+setup the book would refuse, and says why. An untouched tab leaves the
+`options:` section exactly as it is; an edited one writes only the keys it
+shows, and the options secrets still go to secrets.yaml. Off, Rehearse and
+Live stay on the Options page.
+
 ## [0.10.53] — 2026-11-19 — the options fence follows the book, and is the default on a shared wallet
 
 ### Sharing the trading wallet needs no other options settings (#244)

@@ -396,6 +396,18 @@ def parse(root: Any) -> OptionsConfig | None:
     wallet_raw = section.get("wallet") or {}
     if not isinstance(wallet_raw, dict):
         raise OptionsConfigError("options.wallet must be a mapping")
+    if _flag(wallet_raw, "share_trading_wallet", False):
+        # [DEFAULTS] Sharing the trading wallet: its own connection (chia.*)
+        # for whatever options.wallet does not write itself.
+        trading = root.get("chia") if isinstance(root.get("chia"), dict) else {}
+        wallet_raw = {
+            "host": trading.get("wallet_host"),
+            "port": trading.get("wallet_port") or 9256,
+            "cert_path": trading.get("wallet_cert_path"),
+            "key_path": trading.get("wallet_key_path"),
+            "fingerprint": trading.get("wallet_fingerprint"),
+            **{key: value for key, value in wallet_raw.items() if value not in (None, "")},
+        }
     mode = str(wallet_raw.get("mode", "dedicated")).strip().lower()
     if mode == "trading":
         raise OptionsConfigError(

@@ -136,6 +136,11 @@ before `run`. `withdraw-all` takes every open offer off the market by spending
 its coin. Stopping `run` is safe: offers already out expire on their own and
 collateral waits to be reclaimed on the next `step` after expiry.
 
+The **Options** tab in Settings sets the book up without editing config.yaml:
+switching it on, the wallet (sharing the trading wallet needs only the options
+address), the fence, the top-up target, the grid and the limits. It refuses to
+save anything the book itself would refuse.
+
 In the app, the Options page does the same without a terminal: **Rehearse**
 steps the book as a dry run whatever `options.dry_run` says, **Live** steps it
 for real after a confirmation, and **Off** stops it after the step in

@@ -99,6 +99,7 @@ from gui.ratio_targets import (
 )
 from gui import stop_offers
 from gui.theme import COLORS, HitTargetCheckBox, fit_row_height
+from gui.widgets.options_settings import OptionsSettingsSection
 from gui.widgets.sub_tabs import SubTabPages
 
 log = logging.getLogger(__name__)
@@ -641,6 +642,7 @@ class SettingsWidget(QWidget):
             ("Startup", self._build_startup_tab),             # 10
             ("Advanced", self._build_advanced_tab),           # 11
             ("Wallet Link", self._build_wallet_link_tab),     # 12
+            ("Options", self._build_options_tab),             # 13
         ]
         for idx, (title_text, builder) in enumerate(tab_builders):
             widget = builder()
@@ -3016,6 +3018,11 @@ class SettingsWidget(QWidget):
     # CoinGecko tab
     # -------------------------------------------------------------------
 
+    def _build_options_tab(self) -> QWidget:
+        """[OPTIONS] The options book's settings: gui/widgets/options_settings.py."""
+        self._options_section = OptionsSettingsSection(lambda: self._mark_dirty(13))
+        return self._options_section.widget
+
     def _build_coingecko_tab(self) -> QWidget:
         """Build the CoinGecko tab: external price reference settings."""
         page = QWidget()
@@ -3640,6 +3647,15 @@ class SettingsWidget(QWidget):
             "path": self._db_path.text(),
         }
 
+        # -- options -- [OPTIONS] Only when config.yaml has the section or the
+        # tab was edited; a malformed list is left to _validate to report.
+        section = getattr(self, "_options_section", None)  # built last
+        if section is not None and section.wants_writing():
+            try:
+                cfg["options"] = section.collect()
+            except ValueError:
+                pass
+
         return cfg
 
     def _redacted_config_for_signal(self) -> dict:
@@ -3915,6 +3931,10 @@ class SettingsWidget(QWidget):
             self._arb_min_confidence.setValue(
                 float(arb.get("min_confidence_threshold", 0.40))
             )
+
+            # -- options -- [OPTIONS]
+            if getattr(self, "_options_section", None) is not None:
+                self._options_section.populate(cfg.get("options"))
 
             # -- coingecko --
             cg = cfg.get("coingecko", {})
@@ -4379,6 +4399,12 @@ class SettingsWidget(QWidget):
             self._wm_gas_reserve, self._wm_source, self._wm_unwrap_cap,
             self._wm_unwrap_unlimited, self._wm_buy, self._wm_premium,
             self._wm_max_spend,
+            # [OPTIONS]
+            *(
+                self._options_section.inputs()
+                if getattr(self, "_options_section", None) is not None
+                else []
+            ),
         ]
         for w in widgets_to_block:
             w.blockSignals(block)
@@ -5071,6 +5097,18 @@ class SettingsWidget(QWidget):
         )
         errors.extend(ratio_errors)
 
+        # [OPTIONS] The options book's own parser judges the Options tab, on
+        # the config as it would be saved (the Connection tab included).
+        section = getattr(self, "_options_section", None)
+        if section is not None and section.wants_writing():
+            from gui.services.config_split import deep_merge  # noqa: WPS433
+
+            merged = copy.deepcopy(self._clean_snapshot or {})
+            edits = self._collect_config_dict()
+            edits.pop("options", None)
+            deep_merge(merged, edits)
+            errors.extend(section.validate(merged))
+
         return errors
 
     # ===================================================================
@@ -5288,6 +5326,9 @@ class SettingsWidget(QWidget):
         cfg_edits = self._collect_config_dict()
         cfg = copy.deepcopy(self._clean_snapshot) if self._clean_snapshot else {}
         deep_merge(cfg, cfg_edits)
+        if "options" in cfg_edits and isinstance(cfg.get("options"), dict):
+            # [OPTIONS] A target from the limits and a blank limit are absences.
+            OptionsSettingsSection.finish(cfg["options"])
 
         # [RATIO-SOT] strategy.ratio_target_by_pair is PATCHED, not rebuilt.
         # This used to REPLACE the map with one derived from the 2-decimal
