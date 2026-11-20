@@ -110,10 +110,6 @@ def _expiry_text(value: Any) -> str:
     return str(value)
 
 
-def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
-
-
 def _number(value: Any, default: float) -> float:
     """[review] A number from config.yaml for a box to show, or ``default``.
 
@@ -183,10 +179,13 @@ class OptionsSettingsSection:
         #: Shared at load: switching sharing ON here clears the dedicated
         #: connection, which would otherwise outlive it unseen.
         self._shared_at_load = False
-        #: [review] Numbers as config.yaml has them, with what their boxes then
-        #: showed. A box shows a few decimals: a value loaded with more is
-        #: written back as it was unless its box is edited.
-        self._loaded_numbers: dict[str, tuple[float, Any]] = {}
+        #: [review] Numbers as config.yaml has them. A box shows a few decimals
+        #: and only numbers: until the operator edits it, a save writes the
+        #: number back as it was (the book's parser judges a malformed one),
+        #: never the box's rounding or fallback.
+        self._loaded_numbers: dict[str, Any] = {}
+        #: The number boxes edited since the last load.
+        self._touched: set[str] = set()
         self.widget = self._build()
 
     # -- building ----------------------------------------------------------------
@@ -311,8 +310,11 @@ class OptionsSettingsSection:
         grid = QGroupBox("Grid")
         grid_form = QFormLayout(grid)
         self.contract_xch = QDoubleSpinBox()
-        self.contract_xch.setRange(0.0001, 1_000_000.0)
+        self.contract_xch.setRange(0.0, 1_000_000.0)
         self.contract_xch.setDecimals(4)
+        # [review] A size config.yaml has malformed shows as not set, not as a
+        # number the book would mint with.
+        self.contract_xch.setSpecialValueText("not set")
         self.contract_xch.setValue(1.0)
         self.contract_xch.setSuffix(" XCH")
         grid_form.addRow("Contract size:", self.contract_xch)
@@ -405,8 +407,19 @@ class OptionsSettingsSection:
             self.expiry_months,
         ):
             spin.valueChanged.connect(self._changed)
+        for key, box in self._number_boxes().items():
+            box.valueChanged.connect(lambda _value, key=key: self._touched.add(key))
         self._sync_rows()
         return page
+
+    def _number_boxes(self) -> dict[str, QDoubleSpinBox | QSpinBox]:
+        """The boxes whose numbers are written back as loaded until edited."""
+        return {
+            "contract_xch": self.contract_xch,
+            "target_xch": self.target_xch,
+            "target_quote": self.target_quote,
+            "target_tolerance": self.target_tolerance,
+        }
 
     def inputs(self) -> list[QWidget]:
         """Every input, for the page's signal blocking while it populates."""
@@ -543,13 +556,17 @@ class OptionsSettingsSection:
                 ("target_tolerance", self.target_tolerance, tolerance, 20.0),
             ):
                 _show_number(box, _number(default if raw is None else raw, default))
-                self._loaded_numbers[key] = (box.value(), raw)
+                self._loaded_numbers[key] = raw
         else:
             self.target_mode.setCurrentIndex(_TARGET_LIMITS)
 
         size = section.get("contract_xch")
-        _show_number(self.contract_xch, _number(size or 1.0, 1.0))
-        self._loaded_numbers["contract_xch"] = (self.contract_xch.value(), size)
+        # None: a new book's size, written once the tab is saved. Malformed,
+        # or not above 0: "not set" (0), and written back as it is for the
+        # book's parser to refuse on Save, with its reason.
+        shown = 1.0 if size is None else max(_number(size, 0.0), 0.0)
+        _show_number(self.contract_xch, shown)
+        self._loaded_numbers["contract_xch"] = size
         expiries = section.get("expiries")
         rule = _rule_counts(expiries)
         listed = expiries if isinstance(expiries, (list, tuple)) else []
@@ -570,13 +587,14 @@ class OptionsSettingsSection:
         for key, field in self.limit_fields.items():
             field.setText(_limit_text(limits.get(key)))
         self._sync_rows()
+        self._touched = set()  # what populating set is not an edit
 
     def _number_out(self, key: str, box: QDoubleSpinBox | QSpinBox, digits: int) -> Any:
-        """[review] What a number box writes: the loaded number while the box shows it."""
-        shown, raw = self._loaded_numbers.get(key, (None, None))
-        value = box.value()
-        if value == shown and _is_number(raw):
+        """[review] What a number box writes: config.yaml's own value until it is edited."""
+        raw = self._loaded_numbers.get(key)
+        if key not in self._touched and raw is not None:
             return raw
+        value = box.value()
         return value if isinstance(box, QSpinBox) else round(value, digits)
 
     def load_from_editor(self, options: Any, on_disk: Any) -> None:

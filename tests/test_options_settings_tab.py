@@ -438,7 +438,8 @@ def test_a_malformed_value_does_not_stop_the_page_loading(panel, tmp_path):
     tab = panel._options_section
     assert tab.target_mode.currentIndex() == _TARGET_CUSTOM
     assert tab.target_xch.value() == 0.0 and tab.target_tolerance.value() == 20
-    assert tab.contract_xch.value() == 1.0
+    assert tab.contract_xch.value() == 0.0, "malformed: shown as not set"
+    assert tab.contract_xch.specialValueText() == "not set"
     assert tab.call_strikes.text() == "110"
     assert tab.expiries.text() == str(10**20)
     assert tab.limit_fields["max_locked_xch"].text() == "inf"
@@ -494,3 +495,22 @@ def test_load_from_editor_writes_the_options_it_imports(panel, tmp_path, monkeyp
     assert panel.save_config(str(cfg_path)) is True, _SAID
     saved = _saved_options(cfg_path)
     assert saved["expiries"] == "monthly" and saved["contract_xch"] == 0.25
+
+
+def test_a_malformed_contract_size_is_never_replaced_by_an_edit_elsewhere(panel, tmp_path):
+    """[review] A size the tab cannot show stays as written, and the book refuses it on
+    Save: an edit elsewhere must not mint with a size nobody chose."""
+    cfg_path = _shared_book(tmp_path, contract_xch="half")
+    before = cfg_path.read_text(encoding="utf-8")
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.contract_xch.value() == 0.0
+
+    tab.limit_fields["max_contracts"].setText("3")  # an edit elsewhere
+    assert panel.save_config(str(cfg_path)) is False
+    assert any("contract_xch" in said for said in _SAID), _SAID
+    assert cfg_path.read_text(encoding="utf-8") == before
+
+    tab.contract_xch.setValue(0.5)
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["contract_xch"] == 0.5
