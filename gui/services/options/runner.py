@@ -466,6 +466,9 @@ class OptionsRunner:
         #: itself and checks the flag under it, so an ending run can never
         #: lower the flag a new one has just raised.
         self._fence_lock = threading.Lock()
+        #: [FEE-COIN] The app is closing with the book on: the run ending
+        #: leaves the flag up (see stop(keep_fence=True)).
+        self._keep_fence = False
 
     @property
     def config_path(self) -> Path:
@@ -522,6 +525,7 @@ class OptionsRunner:
                     "the previous run is still finishing its step; try again in a moment"
                 )
         loaded = self._last_loaded = cfg
+        self._keep_fence = False
         cfg = dataclasses.replace(cfg, dry_run=mode is not Mode.LIVE)
         stop = threading.Event()
         thread = threading.Thread(
@@ -552,17 +556,23 @@ class OptionsRunner:
         self._note(f"switched to {mode.value}")
         thread.start()
 
-    def stop(self, timeout: float = 30.0) -> None:
+    def stop(self, timeout: float = 30.0, *, keep_fence: bool = False) -> None:
         """Stop after the step in progress, if any. Safe at any time.
 
         Offers already out expire on their own (15 minutes by default), and
         collateral waits for the next step after expiry to be clawed back. A
         step that outlives ``timeout`` is left to finish: the run stays tracked
         (``stopping``) until it does, and nothing new starts beside it.
+
+        [FEE-COIN] ``keep_fence``: the app is closing with the book on, and the
+        next start resumes it. The engine's fence flag stays up, so the engine
+        a restart brings up is fenced from its first moment, not only once the
+        next app raises the flag again.
         """
         current = self._run
         if current is None:
             return
+        self._keep_fence = keep_fence
         _set_book(self._config_path, live=False)  # still watched: contracts may stay open
         current.stop.set()
         if current.thread is not threading.current_thread():
@@ -625,7 +635,9 @@ class OptionsRunner:
         if fresh is not None and fresh == current.loaded:
             return None
         self._note("new settings saved: switching off to take them up")
-        self.stop(timeout=SWITCH_WAIT)
+        # [FEE-COIN] Back on in a moment: the fence stays up in between. A
+        # restart refused after all leaves it to the page's next check.
+        self.stop(timeout=SWITCH_WAIT, keep_fence=True)
         return current.mode
 
     # -- the loop (its own thread) -------------------------------------------
@@ -787,7 +799,7 @@ class OptionsRunner:
                 current = self._run
                 if current is not None and current.stop is stop:
                     self._run = None
-                if self._run is None and cfg.wallet.fence_follows_book:
+                if self._run is None and cfg.wallet.fence_follows_book and not self._keep_fence:
                     self._sync_fence_locked(cfg)
 
     def _one_step(self, cfg: config.OptionsConfig, mode: Mode, book: Any, book_store: Any) -> None:

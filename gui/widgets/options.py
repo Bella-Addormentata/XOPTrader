@@ -343,11 +343,15 @@ class OptionsWidget(QWidget):
         self.refresh()
 
     def stop_background_work(self) -> None:
-        """App closing: stop the book after its step. The remembered mode stays."""
+        """App closing: stop the book after its step. The remembered mode stays.
+
+        [FEE-COIN] So does the engine's fence flag: the book resumes at the
+        next start, and the engine started with it must be fenced at once.
+        """
         self._timer.stop()
         self._restart_to = None
         if self._runner is not None:
-            self._runner.stop()
+            self._runner.stop(keep_fence=True)
 
     # -- the switch -------------------------------------------------------------
 

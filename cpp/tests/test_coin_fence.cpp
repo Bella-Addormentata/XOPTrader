@@ -242,6 +242,37 @@ TEST(CoinFenceWiring, EveryCoinSelectingWalletCallAsksTheFence)
     EXPECT_NE(member(src, "create_offer").find("fenced_coins_in_trade_record("), std::string::npos);
 }
 
+TEST(CoinFenceWiring, NoWalletPickedFeeCoinWhileTheFenceHoldsXch)
+{
+    // [FEE-COIN] The wallet ignores excluded_coin_ids for a CAT spend's fee
+    // coin: these calls drop the fee instead, and say what they sent.
+    const std::string src = read_chia_rpc_cpp();
+    ASSERT_FALSE(src.empty());
+    const std::string cancel = member(src, "cancel_offer");
+    EXPECT_NE(cancel.find("fence_safe_cancel_fee("), std::string::npos);
+    EXPECT_LT(cancel.find("fence_safe_cancel_fee("), cancel.find("fence_exclusions("))
+        << "the fee is settled before the exclusions are asked for";
+    for (const char* name : {"cancel_offer", "cancel_offers", "split_coins"}) {
+        EXPECT_NE(member(src, name).find("kFeeUsedKey"), std::string::npos) << name;
+    }
+    EXPECT_NE(member(src, "cancel_offers").find("fence_holds_xch("), std::string::npos);
+    EXPECT_NE(member(src, "split_coins").find("fence_holds_xch("), std::string::npos);
+    EXPECT_NE(member(src, "fence_safe_cancel_fee").find("trade_record_offers_xch("),
+              std::string::npos);
+}
+
+TEST(CoinFenceFeeCoin, AnOfferOfCatsAloneIsToldApartFromAnOfferOfXch)
+{
+    const auto offered = [](json what) { return json{{"summary", {{"offered", what}}}}; };
+    EXPECT_EQ(rpc::trade_record_offers_xch(offered({{"xch", 500000000000}})), true);
+    EXPECT_EQ(rpc::trade_record_offers_xch(offered({{"XCH", 1}})), true);
+    EXPECT_EQ(rpc::trade_record_offers_xch(offered({{kUsdc, 8641}})), false);
+    EXPECT_EQ(rpc::trade_record_offers_xch(offered(json::object())), false);
+    EXPECT_FALSE(rpc::trade_record_offers_xch(json{{"trade_id", "0x01"}}).has_value());
+    EXPECT_FALSE(rpc::trade_record_offers_xch(json{{"summary", "x"}}).has_value());
+    EXPECT_FALSE(rpc::trade_record_offers_xch(json::array()).has_value());
+}
+
 // -- [stage 2] balances leave the sub-account out ---------------------------------
 
 TEST(CoinFenceBalance, HeldIsCountedPerAssetAndUnknownWhenTheFenceIs)

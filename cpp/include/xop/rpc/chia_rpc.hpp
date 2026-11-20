@@ -1039,8 +1039,17 @@ public:
      * it is stale, sends its coins as excluded_coin_ids, and throws
      * CoinFenceUnavailable instead of spending when the list is not known.
      * A null or unconfigured fence changes nothing.
+     *
+     * [FEE-COIN] The wallet ignores those exclusions when it picks the XCH
+     * coin that pays a CAT spend's fee.  While the fence holds XCH, a cancel
+     * of an offer that offers no XCH, a bulk cancel and a CAT coin split are
+     * therefore sent without a fee; the answer's kFeeUsedKey says what was.
      */
     void set_coin_fence(std::shared_ptr<CoinFence> fence) { fence_ = std::move(fence); }
+
+    /// [FEE-COIN] Added to the answers of cancel_offer, cancel_offers and
+    /// split_coins: the fee actually sent, which the fence can lower to 0.
+    static constexpr const char* kFeeUsedKey = "xop_fee_used";
 
     [[nodiscard]] const std::shared_ptr<CoinFence>& coin_fence() const { return fence_; }
 
@@ -1057,6 +1066,17 @@ private:
     /// The fence's coins for a call about to select coins: empty with no
     /// fence; throws CoinFenceUnavailable when it is on but unknown.
     asio::awaitable<std::vector<std::string>> fence_exclusions(const char* what);
+
+    /// [FEE-COIN] Whether the fence holds XCH just now, refreshed when stale;
+    /// a fence that is on but unknown counts as holding.  False with no fence
+    /// or one that is down.
+    asio::awaitable<bool> fence_holds_xch();
+
+    /// [FEE-COIN] The fee a secure cancel of `trade_id` may carry: `fee`, or 0
+    /// while the fence holds XCH and the offer offers none (or cannot be
+    /// read), so the wallet never picks a fee coin at the options address.
+    asio::awaitable<std::uint64_t> fence_safe_cancel_fee(const std::string& trade_id,
+                                                         std::uint64_t      fee);
 
     std::shared_ptr<CoinFence> fence_;
 };

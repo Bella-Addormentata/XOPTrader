@@ -398,3 +398,42 @@ def test_live_test_raises_the_flag_even_in_a_dry_run(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(fence, "raise_flag", lambda path, why: False)
     refusal = cli._raise_fence_flag(dataclasses.replace(cfg, dry_run=False), str(path), "step")
     assert refusal is not None and "could not be written" in refusal
+
+
+def test_closing_the_app_with_the_book_on_leaves_the_flag_up(tmp_path) -> None:
+    """[FEE-COIN] The book resumes at the next start; the engine that start brings
+    up must be fenced from its first moment, not once the new app raises the flag."""
+    made: list[FakeBook] = []
+    run = runner.OptionsRunner(
+        _config(tmp_path), interval=0.02, build=_builder(made), engine_state=lambda url: DOWN
+    )
+    run.start(runner.Mode.REHEARSE)
+    _wait(lambda: bool(made) and made[0].steps >= 1)
+    run.stop(keep_fence=True)
+    _wait(lambda: not run.snapshot().running)
+    assert _flag(tmp_path).exists(), "nothing open, but the app is only restarting"
+
+    run.start(runner.Mode.REHEARSE)  # and a later plain stop lowers it again
+    _wait(lambda: len(made) == 2 and made[1].steps >= 1)
+    run.stop()
+    _wait(lambda: not run.snapshot().running)
+    assert not _flag(tmp_path).exists()
+
+
+def test_a_restart_for_new_settings_keeps_the_flag_up_in_between(tmp_path) -> None:
+    """[FEE-COIN] Stopped only to start again: no moment with the fence down."""
+    yaml = pytest.importorskip("yaml")
+    made: list[FakeBook] = []
+    path = _config(tmp_path)
+    run = runner.OptionsRunner(
+        path, interval=0.02, build=_builder(made), engine_state=lambda url: DOWN
+    )
+    run.start(runner.Mode.REHEARSE)
+    _wait(lambda: bool(made) and made[0].steps >= 1)
+    root = yaml.safe_load(path.read_text(encoding="utf-8"))
+    root["options"]["contract_xch"] = 2
+    path.write_text(yaml.safe_dump(root), encoding="utf-8")
+
+    assert run.stop_for_new_settings() is runner.Mode.REHEARSE
+    _wait(lambda: not run.finishing and not run.snapshot().running)
+    assert _flag(tmp_path).exists(), "nothing open, but the book is about to start again"
