@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -204,6 +206,9 @@ def test_no_answer_at_all_is_a_circuit_api_error() -> None:
         {"fingerprint": 123},
         {"operation": "bid", "args": {"target_puzzle_hash": "ab" * 32}},
         {"list": [{"address": "xch1..."}]},
+        # json.dumps sends a tuple as an array, so tuples are walked too.
+        {"args": ({"address": "xch1..."},)},
+        {"synthetic_pks": ("a" * 96,)},
     ],
 )
 def test_wallet_details_are_refused_before_anything_is_sent(body: dict[str, Any]) -> None:
@@ -307,7 +312,9 @@ def test_probe_saves_every_answer_and_a_summary(tmp_path: Path) -> None:
 
     summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     assert summary["base_url"] == BASE
-    assert summary["answered"] == sum(1 for result in results if result.ok)
+    assert summary["succeeded"] == sum(1 for result in results if result.ok)
+    # Every read but the reset one reached the server, error answers included.
+    assert summary["reached"] == len(READS) - 1
     assert [row["name"] for row in summary["results"]] == [read.name for read in READS]
     assert len(lines) == len(READS) + 1  # a header and one line per read
 
@@ -388,7 +395,10 @@ def test_main_probe_writes_the_folder_and_exits_0(
     )
     assert code == 0
     assert (tmp_path / "p" / "summary.json").exists()
-    assert "1 of" in capsys.readouterr().out
+    # /health answered; the other reads reached the server and got a 404.
+    assert f"1 of {len(READS)} answered OK, {len(READS)} reached the server." in (
+        capsys.readouterr().out
+    )
 
 
 def test_main_exits_1_when_nothing_answered(tmp_path: Path) -> None:
@@ -399,6 +409,25 @@ def test_main_exits_1_when_nothing_answered(tmp_path: Path) -> None:
         sleep=lambda _s: None,
     )
     assert code == 1
+
+
+def test_main_exits_1_when_every_answer_is_an_error_but_keeps_them(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    server = Server({read.path: (503, "maintenance") for read in READS})
+    code = api.main(
+        ["probe", "--base-url", BASE, "--out", str(tmp_path / "p")],
+        transport=server,
+        sleep=lambda _s: None,
+    )
+    assert code == 1
+    assert f"0 of {len(READS)} answered OK, {len(READS)} reached the server." in (
+        capsys.readouterr().out
+    )
+    # The error answers are still saved, for a person to read.
+    assert (tmp_path / "p" / "health.txt").read_text(encoding="utf-8") == "maintenance"
+    summary = json.loads((tmp_path / "p" / "summary.json").read_text(encoding="utf-8"))
+    assert (summary["succeeded"], summary["reached"]) == (0, len(READS))
 
 
 def test_main_refuses_a_bad_base_url(tmp_path: Path) -> None:
@@ -423,6 +452,35 @@ def test_api_module_imports_only_the_standard_library() -> None:
             assert node.level == 0, "a relative import would break the file on its own"
             imported.add((node.module or "").split(".")[0])
     imported.discard("__future__")
-    import sys
-
     assert imported <= set(sys.stdlib_module_names), imported - set(sys.stdlib_module_names)
+
+
+def test_the_file_runs_on_its_own_as_a_script(tmp_path: Path) -> None:
+    # A copy outside the checkout, run isolated (-I: no script folder or
+    # current folder on sys.path), as when api.py is downloaded on its own.
+    copy = tmp_path / "api.py"
+    copy.write_bytes(Path(api.__file__).read_bytes())
+    ran = subprocess.run(  # noqa: S603 -- this interpreter and a copy of api.py, no shell
+        [sys.executable, "-I", str(copy), "probe", "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert ran.returncode == 0, ran.stderr
+    assert "usage: python api.py probe" in ran.stdout
+
+
+def test_the_module_form_runs_in_the_apps_environment() -> None:
+    repo = Path(__file__).resolve().parents[4]
+    ran = subprocess.run(
+        [sys.executable, "-m", "gui.services.circuit", "probe", "--help"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert ran.returncode == 0, ran.stderr
+    assert "usage: python -m gui.services.circuit probe" in ran.stdout

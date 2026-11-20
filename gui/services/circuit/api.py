@@ -13,15 +13,20 @@ reach the server, so :func:`probe` makes one call to each read endpoint in
 :data:`READS` and saves every answer to a folder, to be run once on a machine
 that can::
 
-    python -m gui.services.circuit probe          (from a checkout)
     python api.py probe                           (this file on its own)
+    python -m gui.services.circuit probe          (in the app's environment)
+
+The file on its own needs only Python. The ``-m`` form loads the
+``gui.services`` package first, and that needs the app's own packages (Qt,
+PyYAML), so it works only where the app runs from source.
 
 It takes about a minute. It writes ``circuit_probe_<UTC time>/`` in the current
 folder (``--out`` chooses another): one ``<name>.json`` per endpoint
 (``<name>.txt`` when an answer is not JSON) and ``summary.json`` (each answer's
 status, time, size and shape, and the server's cache and rate-limit headers),
-and prints a line per endpoint. The answers are the protocol's public state;
-nothing in them is yours.
+and prints a line per endpoint. A read that fails is recorded and the probe
+goes on; the exit status is 1 only when no read succeeded (no 2xx answer). The
+answers are the protocol's public state; nothing in them is yours.
 
 RATE LIMIT. circuit-cli waits a minute after being refused and records the
 limit as 20 requests a minute, so requests here are :data:`MIN_INTERVAL_S`
@@ -188,14 +193,17 @@ def urllib_transport(
 
 
 def _wallet_fields(node: Any) -> list[str]:
-    """Names of wallet fields in ``node`` that carry a value, at any depth."""
+    """Names of wallet fields in ``node`` that carry a value, at any depth.
+
+    Tuples are walked like lists, since ``json.dumps`` sends both as arrays.
+    """
     found: list[str] = []
     if isinstance(node, dict):
         for key, value in node.items():
-            if key in WALLET_FIELDS and value not in (None, "", [], {}):
+            if key in WALLET_FIELDS and value not in (None, "", [], (), {}):
                 found.append(str(key))
             found.extend(_wallet_fields(value))
-    elif isinstance(node, list):
+    elif isinstance(node, (list, tuple)):
         for item in node:
             found.extend(_wallet_fields(item))
     return found
@@ -480,7 +488,8 @@ def probe(
         "client": USER_AGENT,
         "started_utc": started,
         "finished_utc": _utc_now(),
-        "answered": sum(1 for result in results if result.ok),
+        "succeeded": sum(1 for result in results if result.ok),
+        "reached": sum(1 for result in results if result.status is not None),
         "results": [dataclasses.asdict(result) for result in results],
         "highlights": highlights(answers),
     }
@@ -496,7 +505,11 @@ def main(
     transport: Transport | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
-    """``probe``: save one answer from each read endpoint. Exit 1 if none answered."""
+    """``probe``: save one answer from each read endpoint.
+
+    Returns 1 when no read succeeded (no 2xx answer, though error answers are
+    still saved), 2 for bad arguments (from argparse), else 0.
+    """
     invoked = os.path.basename(sys.argv[0] or "")
     if invoked in ("__main__.py", ""):
         prog = "python -m gui.services.circuit"
@@ -525,10 +538,14 @@ def main(
     now = _dt.datetime.now(_dt.timezone.utc)  # noqa: UP017 -- see _utc_now
     out = args.out or Path(f"circuit_probe_{now:%Y%m%dT%H%M%SZ}")
     results = probe(api, out)
-    answered = sum(1 for result in results if result.ok)
-    print(f"\n{answered} of {len(results)} answered. Saved in {out.resolve()}")
+    succeeded = sum(1 for result in results if result.ok)
+    reached = sum(1 for result in results if result.status is not None)
+    print(
+        f"\n{succeeded} of {len(results)} answered OK, {reached} reached the server."
+        f" Saved in {out.resolve()}"
+    )
     print("Nothing was signed and no wallet detail was sent. Zip that folder to share it.")
-    return 0 if answered else 1
+    return 0 if succeeded else 1
 
 
 if __name__ == "__main__":
