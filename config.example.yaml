@@ -1633,145 +1633,66 @@ warp:
 # beside this file. Read docs/options-live-test.md before the first live run.
 options:
   enabled: false                         # [OPTIONAL, default: false] master switch
-  # [SAFETY, default: true] Rehearsal. Each step builds the next mint, checks
-  # what it would do to the wallet and reports it. Nothing is signed, sent or
-  # listed, and no contract is recorded. Switched back on over a book that has
-  # contracts out, it still reads the chain and keeps the record right, but it
-  # sends nothing at all: no clawback of expired collateral, no re-push of a
-  # pending transaction. Offers already out stay takeable until they expire.
+  # The easiest way to set the book up is Settings > Options; it writes this
+  # section and refuses anything the book itself would refuse. The Options
+  # page (and the OPTIONS switch in the toolbar) turns the book Off, to
+  # Rehearse or Live. dry_run is only the command line's default: in the app
+  # the switch decides.
   dry_run: true
   network: mainnet                       # mainnet | testnet11
 
-  # The wallet that signs. It must be a SECOND reference-wallet daemon with its
-  # own key: its own CHIA_ROOT, its own RPC port, its own certificates. One
-  # wallet daemon serves one key at a time, so it cannot be the trading wallet,
-  # and pointing this at the trading wallet's port is refused.
-  # mode: trading is parsed and refused: the engine does not yet keep option
-  # coins out of its own offers or book option events.
-  # Every step first selects the wallet's fingerprint and asks whether it is
-  # synced; until it is, the step does nothing and says why.
-  # Its certificate pair and fingerprint go in secrets.yaml, like the chia
-  # ones (options.wallet.cert_path, key_path, fingerprint: see
-  # secrets.example.yaml). The cert pair is REQUIRED; the fingerprint is
-  # RECOMMENDED (without it, whichever key the wallet has open is used).
-  # A Settings save moves them there if they are written here.
+  # THE WALLET. The straightforward way: share the trading wallet. Set an
+  # address of the trading key below and nothing else -- host, port,
+  # certificates and fingerprint come from the chia section. The engine then
+  # fences that address off while the book is in use (engine_fence), so the
+  # book and Dexie trade side by side from one wallet.
+  # A wallet of its own instead: set share_trading_wallet: false, uncomment
+  # host and port for a SECOND reference-wallet daemon (its own CHIA_ROOT,
+  # RPC port and key), and put its cert_path, key_path and fingerprint in
+  # secrets.yaml (see secrets.example.yaml). A Settings save moves them there
+  # if they are written here.
+  # Every step first selects the wallet's key and asks whether it is synced;
+  # until it is, the step does nothing and says why.
   wallet:
-    mode: dedicated
-    host: localhost
-    port: 9356                           # [REQUIRED] the dedicated wallet's rpc_port
-    # The one address used as creator, owner and change. Blank asks the wallet
-    # for its current address the first time and keeps to it from then on (it
-    # is remembered in the options database). ONLY coins at this address are
-    # used: fund it.
+    share_trading_wallet: true
+    # The one address the book mints from and is paid to: ONLY coins there
+    # are the book's. Shared, it is REQUIRED -- pick an address of the trading
+    # key that the engine does not send to itself, e.g. one a Dexie trade paid
+    # into. On a wallet of its own, blank asks that wallet the first time.
     address: ""
-    # [OPTIONAL, default: false] Sign from the TRADING wallet anyway: its
-    # daemon (chia.wallet_host / wallet_port) and its key. Only for a machine
-    # where a second daemon and key are not wanted, and only with the trading
-    # ENGINE STOPPED for as long as any contract is open (or, with
-    # engine_beside_open_contracts below, while the book acts): its offers pick
-    # coins from the whole wallet, so they can spend coins at the options
-    # address, and the collateral and premiums change its balances behind its
-    # back, which its drawdown guard can read as a loss. With this on:
-    #   - the port and fingerprint checks above are lifted, and fingerprint is
-    #     REQUIRED and must be chia.wallet_fingerprint, which must be set too
-    #     (a step logs the wallet in to it; another key would be switched in
-    #     under the engine);
-    #   - host and chia.wallet_host must be this machine (localhost, 127.0.0.1
-    #     or ::1): the engine check below can only see this machine;
-    #   - address is REQUIRED. Blank would take the wallet's current address,
-    #     which is where the engine sends its own coins to itself and spends
-    #     them from. Pick an address of this key that holds funds, e.g. one a
-    #     Dexie trade paid into;
-    #   - status and every step print a warning, and whether the engine is up;
-    #   - a live step, withdraw-all and every live-test spend are REFUSED while
-    #     the engine runs, or while that cannot be told: its metrics endpoint
-    #     answers, or an xop_trader process exists. It is asked again before
-    #     every signature and every push, so an engine started part way through
-    #     a step is caught at the next one. A dry-run step is allowed.
-    share_trading_wallet: false
-    # [OPTIONAL] Where a running engine answers, for the check above.
+    # [A wallet of its own only] the second daemon.
+    # host: localhost
+    # port: 9356
+    # [OPTIONAL] Where a running engine answers, for the engine checks.
     # Default: http://localhost:<monitoring.prometheus_port>/metrics
     engine_metrics_url: ""
-    # [OPTIONAL, default: false] Pay from the whole wallet, not just `address`.
-    # What the options address is short of, in XCH or the quote asset --
-    # collateral, a fee, the seed coins a cancel starts from (a call struck in
-    # the quote asset needs one coin of it) -- comes from the wallet's other
-    # addresses: the smallest single coin that covers it, else the largest
-    # first. Coins the wallet holds for resting offers are not used.
-    # Everything the book owns still lands at `address`: all change, returned
-    # collateral and premiums. Bounded by the limits like any mint.
-    # live-test's funding still comes from `address` only.
-    # Not used with the engine fence below (the default when the wallet is
-    # shared): it is then ignored, with a warning in the log.
-    fund_from_wallet: false
-    # [OPTIONAL, default: false; read only with share_trading_wallet] Let the
-    # trading ENGINE RUN while contracts sit open; it is stopped only while the
-    # book acts. Contracts that sit open are safe beside it: their collateral
-    # is locked in the contract, which the wallet does not spend, and their
-    # offers spend only the option coin. The engine is still held while:
-    #   - the book is Live (switch it Off on the Options page first; a book
-    #     run from a terminal is not seen as Live, but every signature it makes
-    #     still waits for the engine to stop);
-    #   - a step is in progress;
-    #   - a transaction the book sent could still confirm (pending or stalled,
-    #     until a step records its verdict from the chain): the wallet does not
-    #     know those coins are being spent and could hand them to an engine
-    #     offer. Leave the book Live or on Rehearse until its record shows them
-    #     settled; a Rehearse step records verdicts too.
-    # Going Live still needs the engine stopped. The engine can spend the loose
-    # coins at `address` while it runs (premiums, change), so this REQUIRES
-    # fund_from_wallet: true -- the book then pays from the rest of the wallet
-    # when it next acts. The engine sees the book's mints, cancels and
-    # clawbacks as balance changes made while it was stopped. At launch the
-    # engine starts before the Options page takes up its remembered mode, so
-    # a book left Live when the app closed comes back Live only if something
-    # else still holds the engine; otherwise the page says it was not resumed.
-    # Not needed with the engine fence below (the default when the wallet is
-    # shared): it is then ignored, with a warning in the log.
-    engine_beside_open_contracts: false
-    # [OPTIONAL, default: auto with share_trading_wallet, else off] THE ENGINE FENCE.
-    # Makes `address` a sub-account the engine and the app leave alone, so the
-    # book can be Live WHILE the engine trades, from the same wallet:
-    #   - the engine (v0.10.52+) lists every unspent coin at `address`, and at
-    #     its CAT wrappings, from the full node, and sends them as
-    #     excluded_coin_ids on every wallet call that selects coins (offers,
-    #     takes, cancels with a fee, sends, splits). It refuses to spend while
-    #     that list is unknown, and cancels any new offer that holds one of
-    #     them before it is posted. It reports the fence on its metrics
-    #     endpoint (xop_options_fence_*);
-    #   - the engine leaves those coins out of its balances, so its sizing and
-    #     ratio targets see the trading funds only (the Wallet tab's own balance
-    #     view still shows the whole wallet);
-    #   - the app's own spends (bridges, claims, Dexie takes, the book's
-    #     top-ups) exclude them too;
-    #   - the book spends only coins at `address` (fund_from_wallet is refused)
-    #     and may sign beside a running engine only while the engine reports
-    #     its fence on and refreshed in the last 2 minutes; otherwise the
-    #     rules above apply.
-    # Set `target` below to keep the sub-account funded.
-    # `auto` (engine v0.10.53+): the same fence, up only while the book is in
-    # use -- switched on, a contract open, or a transaction unsettled. The app
-    # keeps data/options_fence.flag (beside the engine's database, where the
-    # Dexie switch's pause.flag goes) for as long as that lasts, and the
-    # engine follows it within seconds. With the book off and nothing open
-    # the flag goes, and the coins at `address` are trading funds again; the
-    # next time the book is switched on, `target` tops it back up. A Live book
-    # signs only once the engine reports the fence up, and waits for any
-    # engine offer still holding the address's coins to be refreshed or to
-    # expire. The command line raises the flag too, but leaves lowering it to
-    # the app.
-    # `auto` is what an unset engine_fence means once share_trading_wallet is
-    # on; `false` keeps the rules above instead (engine stopped while the book
-    # acts). Read only with share_trading_wallet.
+    # THE ENGINE FENCE [default: auto with share_trading_wallet, else off].
+    # auto: while the book is in use -- switched on, a contract open, or a
+    # transaction unsettled -- the engine leaves the coins at `address` out of
+    # every wallet spend and out of its balances, and so do the app's own
+    # spends; with the book off and nothing open they are trading funds again.
+    # The app keeps data/options_fence.flag (beside the engine's database,
+    # where the Dexie switch's pause.flag goes) for as long as that lasts, and
+    # the engine (v0.10.53+) follows it within seconds. A Live book signs only
+    # once the engine reports its fence up (xop_options_fence_* on its
+    # metrics), so it can be Live WHILE the engine trades. `true` keeps the
+    # fence up for the engine's whole life.
+    # `false` keeps the rules from before the fence: the engine stays stopped
+    # while the book acts, and the book may pay from the rest of the wallet
+    # (fund_from_wallet: true) and let the engine run beside open contracts
+    # (engine_beside_open_contracts: true). Both are ignored while the fence
+    # is on. See docs/options-live-test.md.
     engine_fence: auto
 
   # [OPTIONAL; used with wallet.engine_fence] The sub-account's balance
   # target, in whole units. Collateral locked in open contracts counts as held.
   # When a figure falls more than tolerance_pct below target, a Live step tops
   # the address up to it with an ordinary wallet send from the trading funds
-  # (one at a time per asset; a dry run only says so). Sweeping premiums back
-  # is not automatic yet. Keep it well under the engine's rolling-loss limit
-  # (risk.window_loss): the engine sees a top-up as its balance going down.
+  # (one at a time per asset; a dry run only says so). With the fence on
+  # auto, the address's coins (premiums included) go back to the trading
+  # funds once the book is off with nothing open. Keep it well under the
+  # engine's rolling-loss limit (risk.window_loss): the engine sees a top-up
+  # as its balance going down.
   # Unset, with the fence on, it comes from limits below: xch is
   # max_locked_xch plus one contract_xch, quote is 2 plus max_locked_quote when
   # put_strikes_pct are written. With max_locked_xch unset or unlimited there
@@ -1788,7 +1709,11 @@ options:
 
   # The grid. One slot per expiry and strike; a slot is refilled when it sells.
   contract_xch: 20                       # [REQUIRED] XCH per contract
-  expiries: []                           # e.g. ["2026-12-01T13:00:00Z", "2026-12-31T13:00:00Z"]
+  # weekly: the next two Fridays at 08:00 UTC, rolling forward on their own
+  # (the crypto options market's time; xchoptions.com has no standard dates).
+  # monthly: the last Friday of the next two months. Or counts of each, e.g.
+  # {weekly: 3, monthly: 1}, or a list of dates, e.g. ["2026-12-04T08:00:00Z"].
+  expiries: weekly
   call_strikes_pct: [100, 110, 120]      # percent of spot, rounded to strike_step
   put_strikes_pct: [80, 90, 100]
   strike_step: 0.05                      # in the quote asset per XCH

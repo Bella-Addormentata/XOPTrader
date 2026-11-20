@@ -934,3 +934,49 @@ def test_the_switch_loader_reads_every_shape(stored, expected, real_options_swit
     settings.setValue("options/toolbar_switch", stored)
     settings.sync()
     assert load_options_switch_visible() is expected
+
+
+# --------------------------------------------------------------------------- #
+# What the page says about the book while it is off
+# --------------------------------------------------------------------------- #
+
+
+def test_an_expired_contract_still_open_says_what_comes_next():
+    item = SimpleNamespace(status=store.OPEN, expiration=1_000)
+    assert options_page._status_text(item, now=999) == store.OPEN
+    said = options_page._status_text(item, now=1_000)
+    assert said.startswith("open, expired") and "next Live step" in said
+    closed = SimpleNamespace(status=store.CLOSED, expiration=1_000)
+    assert options_page._status_text(closed, now=5_000) == store.CLOSED
+
+
+def test_the_page_shows_the_record_s_contracts_while_the_book_is_off(app, tmp_path):
+    class OnRecord(RunnerDouble):
+        def contracts_on_record(self):
+            return (
+                options_runner.ContractView(
+                    slot="C110@1",
+                    status=store.OPEN,
+                    launcher_id="01" * 32,
+                    expiration=1,
+                    underlying_amount=500_000_000_000,
+                    collateral="0.5 XCH",
+                    live_offers=0,
+                ),
+            )
+
+    page = _page(app, tmp_path, OnRecord())
+    try:
+        page.refresh()
+        assert page._contracts.rowCount() == 1
+        assert "expired" in page._contracts.item(0, 1).text()
+    finally:
+        _close(page, app)
+
+
+def test_the_runner_reads_the_record_s_contracts(tmp_path):
+    config_path = _config(tmp_path)
+    _open_contract(config_path)
+    views = options_runner.OptionsRunner(config_path).contracts_on_record()
+    assert [view.slot for view in views] == ["C110@1"]
+    assert views[0].collateral == "0.5 XCH"

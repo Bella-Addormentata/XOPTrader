@@ -74,6 +74,7 @@ not used, and are ignored with a warning rather than refused. Without an
 
 from __future__ import annotations
 
+import calendar
 import dataclasses
 import datetime
 import logging
@@ -327,6 +328,92 @@ class NodeConfig:
         return self.host.strip().strip("[]").lower() in _THIS_MACHINE
 
 
+#: [ROLLING] When a rolling expiry falls: the crypto options market's own time
+#: (Deribit's), Fridays at 08:00 UTC. xchoptions.com has no standard dates.
+EXPIRY_WEEKDAY = 4  # Friday
+EXPIRY_HOUR_UTC = 8
+_MAX_WEEKLY = 12
+_MAX_MONTHLY = 6
+
+
+def _expiry_moment(day: datetime.date) -> datetime.datetime:
+    return datetime.datetime.combine(day, datetime.time(EXPIRY_HOUR_UTC), tzinfo=datetime.UTC)
+
+
+def next_fridays(after: int, count: int) -> list[int]:
+    """The next ``count`` Fridays at 08:00 UTC strictly after ``after`` (Unix seconds)."""
+    start = datetime.datetime.fromtimestamp(after, tz=datetime.UTC).date()
+    first = _expiry_moment(start + datetime.timedelta(days=(EXPIRY_WEEKDAY - start.weekday()) % 7))
+    if first.timestamp() <= after:
+        first += datetime.timedelta(weeks=1)
+    return [int((first + datetime.timedelta(weeks=n)).timestamp()) for n in range(count)]
+
+
+def month_end_fridays(after: int, count: int) -> list[int]:
+    """The last Friday of the next ``count`` months, 08:00 UTC, strictly after ``after``."""
+    moment = datetime.datetime.fromtimestamp(after, tz=datetime.UTC)
+    year, month = moment.year, moment.month
+    out: list[int] = []
+    while len(out) < count:
+        last = datetime.date(year, month, calendar.monthrange(year, month)[1])
+        friday = _expiry_moment(
+            last - datetime.timedelta(days=(last.weekday() - EXPIRY_WEEKDAY) % 7)
+        )
+        if friday.timestamp() > after:
+            out.append(int(friday.timestamp()))
+        month += 1
+        if month > 12:
+            year, month = year + 1, 1
+    return out
+
+
+@dataclasses.dataclass(frozen=True)
+class ExpiryRule:
+    """[ROLLING] ``options.expiries: weekly``: expiries that roll forward on their own.
+
+    The next ``weekly`` Fridays at 08:00 UTC, plus the last Friday of the next
+    ``monthly`` months, worked out afresh at every step. ``weekly`` alone is
+    two weeklies; ``monthly`` alone is two month-ends.
+    """
+
+    weekly: int = 2
+    monthly: int = 0
+
+    def at(self, after: int) -> tuple[int, ...]:
+        """The expiries strictly after ``after``, earliest first."""
+        found = set(next_fridays(after, self.weekly)) | set(month_end_fridays(after, self.monthly))
+        return tuple(sorted(found))
+
+
+def _expiry_rule(raw: Any) -> ExpiryRule | None:
+    """``options.expiries`` as a rule, or None when it is a list of dates."""
+    if isinstance(raw, str):
+        word = raw.strip().lower()
+        if word == "weekly":
+            return ExpiryRule(weekly=2, monthly=0)
+        if word == "monthly":
+            return ExpiryRule(weekly=0, monthly=2)
+        raise OptionsConfigError(
+            f"options.expiries: {raw!r} is not a list of dates, 'weekly' or 'monthly'"
+        )
+    if not isinstance(raw, dict):
+        return None
+    unknown = set(raw) - {"weekly", "monthly"}
+    if unknown:
+        raise OptionsConfigError(
+            f"options.expiries: unknown key(s) {sorted(unknown)}; use weekly and monthly"
+        )
+    counts = {}
+    for key, cap in (("weekly", _MAX_WEEKLY), ("monthly", _MAX_MONTHLY)):
+        value = raw.get(key, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= cap:
+            raise OptionsConfigError(f"options.expiries.{key} must be a whole number, 0 to {cap}")
+        counts[key] = value
+    if counts["weekly"] + counts["monthly"] == 0:
+        raise OptionsConfigError("options.expiries: weekly or monthly must be above 0")
+    return ExpiryRule(**counts)
+
+
 @dataclasses.dataclass(frozen=True)
 class OptionsConfig:
     enabled: bool
@@ -367,10 +454,24 @@ class OptionsConfig:
     #: The app's CoinGecko key (``coingecko.api_key``, kept in secrets.yaml).
     #: Not an options setting; carried here so the price feed can send it.
     coingecko_api_key: str = dataclasses.field(default="", repr=False)
+    #: [ROLLING] ``options.expiries: weekly`` (or a mapping): the expiries roll
+    #: forward on their own and ``expiries`` is empty. None for a list of dates.
+    expiry_rule: ExpiryRule | None = None
 
     @property
     def address_prefix(self) -> str:
         return "xch" if self.network == MAINNET else "txch"
+
+    def expiries_at(self, now: int) -> tuple[int, ...]:
+        """The expiries the grid is built on at ``now``.
+
+        A list of dates as written; a rule's, counted from the end of the stop
+        window, so ``weekly`` keeps two weeklies quotable even the day before
+        the nearer one stops being quoted.
+        """
+        if self.expiry_rule is None:
+            return self.expiries
+        return self.expiry_rule.at(now + self.stop_before_expiry_seconds)
 
 
 def disabled() -> OptionsConfig | None:
@@ -568,10 +669,18 @@ def parse(root: Any) -> OptionsConfig | None:
     if contract_mojos <= 0:
         raise OptionsConfigError("options.contract_xch must be positive")
 
-    expiries_raw = section.get("expiries") or []
-    if not isinstance(expiries_raw, (list, tuple)):
-        raise OptionsConfigError("options.expiries must be a list")
-    expiries = tuple(sorted({_expiry(item) for item in expiries_raw}))
+    expiries_raw = section.get("expiries")
+    expiry_rule = _expiry_rule(expiries_raw)
+    if expiry_rule is not None:
+        expiries: tuple[int, ...] = ()
+    else:
+        expiries_raw = expiries_raw or []
+        if not isinstance(expiries_raw, (list, tuple)):
+            raise OptionsConfigError(
+                "options.expiries must be a list of dates, weekly, monthly, or a mapping of "
+                "weekly and monthly counts"
+            )
+        expiries = tuple(sorted({_expiry(item) for item in expiries_raw}))
     calls = _percents(section.get("call_strikes_pct"), "call_strikes_pct")
     puts = _percents(section.get("put_strikes_pct"), "put_strikes_pct")
 
@@ -696,6 +805,7 @@ def parse(root: Any) -> OptionsConfig | None:
         database_path=str(section.get("database_path") or "data/options_jobs.db").strip(),
         splash=splash_config,
         coingecko_api_key=str(coingecko.get("api_key") or "").strip(),
+        expiry_rule=expiry_rule,
         target=_resolve_target(section, quote_unit, wallet, limits, contract_mojos, bool(puts)),
     )
 

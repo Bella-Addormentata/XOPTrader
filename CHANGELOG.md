@@ -7,6 +7,26 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Options: rolling expiries, a clearer Options page, and a shorter set-up
+
+- **Expiries roll forward on their own.** `options.expiries: weekly` keeps the
+  next two Fridays at 08:00 UTC -- the crypto options market's own time
+  (Deribit's); xchoptions.com has no standard dates -- worked out afresh at
+  every step, so the book never runs out of expiries. `monthly` keeps the
+  last Friday of the next two months, and `{weekly: 3, monthly: 1}` sets the
+  counts. A list of dates still works. The Settings tab offers both, and the
+  example config says `weekly`.
+- **The Options page says more while the book is off.** It shows the
+  contracts on record instead of an empty table, an expired one still open
+  says "expired: its collateral comes back at the next Live step", and once a
+  step has checked its top-ups the page shows the options address against its
+  target ("1 of 1.5 XCH, 2 of 2 quote").
+- **A shorter set-up.** The example config leads with the shared trading
+  wallet (only the options address to give) and the engine fence, and leaves
+  `mode`, `fund_from_wallet` and `engine_beside_open_contracts` -- the rules
+  from before the fence -- to the docs. The options docs start with a quick
+  start.
+
 ### The options book is set up in Settings
 
 A new **Options** tab in Settings sets the options book up without editing

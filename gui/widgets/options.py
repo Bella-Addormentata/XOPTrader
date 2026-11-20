@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.services.options import runner as options_runner
+from gui.services.options import store as options_store
 from gui.services.venue_control import StatusChip
 from gui.theme import COLORS as _C
 
@@ -146,6 +147,13 @@ def header_status(
     )
 
 
+def _status_text(item: Any, now: float) -> str:
+    """A contract's status as the page says it: an expired one still open says what comes next."""
+    if item.expiration <= now and item.status in (options_store.OPEN, options_store.SOLD):
+        return f"{item.status}, expired: its collateral comes back at the next Live step"
+    return item.status
+
+
 class OptionsWidget(QWidget):
     """The Options page. Inert until :meth:`attach` gives it config.yaml."""
 
@@ -163,6 +171,8 @@ class OptionsWidget(QWidget):
         self._setup_error = ""
         #: Why the last switch-on was refused, until the next switch; for the toolbar chip.
         self._refusal = ""
+        #: The record's contracts, read while the book is off (None: not read yet).
+        self._on_record: tuple[Any, ...] | None = None
 
         title = QLabel("Options book")
         title.setStyleSheet(f"font-size: 18px; font-weight: 600; color: {TEXT_PRIMARY};")
@@ -194,6 +204,7 @@ class OptionsWidget(QWidget):
         self._engine = QLabel("")
         self._held = QLabel("")
         self._market = QLabel("")
+        self._sub_account = QLabel("")
         self._fees = QLabel("")
         self._engine_block = QLabel("")
         for label in (
@@ -202,6 +213,7 @@ class OptionsWidget(QWidget):
             self._engine,
             self._held,
             self._market,
+            self._sub_account,
             self._fees,
             self._engine_block,
         ):
@@ -236,6 +248,7 @@ class OptionsWidget(QWidget):
             self._engine,
             self._held,
             self._market,
+            self._sub_account,
             self._fees,
         ):
             layout.addWidget(label)
@@ -452,12 +465,29 @@ class OptionsWidget(QWidget):
         elif snap.mode is not Mode.OFF:
             self._held.setText("")  # running and nothing held; a refusal shown while off stays
         self._market.setText(f"Market: {snap.market}" if snap.market else "")
+        self._sub_account.setText(
+            f"Options address: {snap.sub_account} (held against its target, collateral "
+            "in open contracts counted)"
+            if snap.sub_account
+            else ""
+        )
         self._fees.setText(
             f"Fees paid by the book: {snap.fees_paid_mojos / 1e12:.6f} XCH"
             if snap.fees_paid_mojos
             else ""
         )
-        self._show_contracts(snap.contracts)
+        contracts = snap.contracts
+        if not snap.running and not contracts:
+            # Off since launch: nothing stepped, so show the record's contracts.
+            if self._refreshes % _BLOCKER_EVERY == 0 or self._on_record is None:
+                reader = getattr(self._runner, "contracts_on_record", None)
+                try:
+                    self._on_record = tuple(reader()) if callable(reader) else ()
+                except Exception:  # noqa: BLE001 - display only
+                    _log.debug("[Options] the record could not be read", exc_info=True)
+                    self._on_record = ()
+            contracts = self._on_record
+        self._show_contracts(contracts)
         self._show_recent(snap.recent, snap.recent_count)
         self._refreshes += 1
         if (
@@ -478,10 +508,11 @@ class OptionsWidget(QWidget):
 
     def _show_contracts(self, contracts: tuple[Any, ...]) -> None:
         self._contracts.setRowCount(len(contracts))
+        now = time.time()
         for row, item in enumerate(contracts):
             values = (
                 item.slot,
-                item.status,
+                _status_text(item, now),
                 time.strftime("%Y-%m-%d %H:%M", time.gmtime(item.expiration)),
                 item.collateral,  # in its own asset: XCH for a call, the quote asset for a put
                 str(item.live_offers),

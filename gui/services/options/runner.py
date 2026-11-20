@@ -121,6 +121,9 @@ class Snapshot:
     #: Lines of activity ever written, so a reader can tell what is new once
     #: ``recent`` is full and stops growing.
     recent_count: int = 0
+    #: The options address against its target, as the last step that checked
+    #: its top-ups saw it ("1.2 of 1.5 XCH, 2 of 2 quote"); "" before one has.
+    sub_account: str = ""
 
     @property
     def open_contracts(self) -> int:
@@ -382,6 +385,38 @@ def fence_identity(cfg: config.OptionsConfig) -> str:
         return f"{puzzle_hash.hex()}@{cfg.network}"
     except Exception:  # noqa: BLE001 - unreadable: matches nothing
         return ""
+
+
+def contract_views(cfg: config.OptionsConfig, book_store: Any) -> tuple[ContractView, ...]:
+    """Every contract on record, as the page shows it."""
+
+    def collateral(item: Any) -> str:
+        if item.underlying_asset is None:
+            return f"{int(item.underlying_amount) / config.XCH_MOJOS:g} XCH"
+        return f"{int(item.underlying_amount) / cfg.quote_unit_mojos:g} quote"
+
+    return tuple(
+        ContractView(
+            slot=item.slot,
+            status=item.status,
+            launcher_id=item.launcher_id.hex(),
+            expiration=int(item.expiration),
+            underlying_amount=int(item.underlying_amount),
+            collateral=collateral(item),
+            live_offers=len(book_store.offers(item.launcher_id, "live")),
+        )
+        for item in book_store.contracts()
+    )
+
+
+def sub_account_text(held: dict[str, tuple[int, int]], cfg: config.OptionsConfig) -> str:
+    """``{"XCH": (held, target), ...}`` as "1.2 of 1.5 XCH, 2 of 2 quote"."""
+    parts = []
+    for what, (have, want) in held.items():
+        unit = config.XCH_MOJOS if what == "XCH" else cfg.quote_unit_mojos
+        name = "XCH" if what == "XCH" else "quote"
+        parts.append(f"{have / unit:g} of {want / unit:g} {name}")
+    return ", ".join(parts)
 
 
 # -- the runner ------------------------------------------------------------------
@@ -746,24 +781,8 @@ class OptionsRunner:
             for problem in report.problems:
                 self._note(f"note: {problem}")
 
-        def collateral(item: Any) -> str:
-            if item.underlying_asset is None:
-                return f"{int(item.underlying_amount) / config.XCH_MOJOS:g} XCH"
-            return f"{int(item.underlying_amount) / cfg.quote_unit_mojos:g} quote"
-
         try:
-            contracts = tuple(
-                ContractView(
-                    slot=item.slot,
-                    status=item.status,
-                    launcher_id=item.launcher_id.hex(),
-                    expiration=int(item.expiration),
-                    underlying_amount=int(item.underlying_amount),
-                    collateral=collateral(item),
-                    live_offers=len(book_store.offers(item.launcher_id, "live")),
-                )
-                for item in book_store.contracts()
-            )
+            contracts = contract_views(cfg, book_store)
             fees = sum(int(row.fee or 0) for row in book_store.broadcasts("confirmed"))
         except Exception as exc:  # noqa: BLE001 - the panel keeps what it had
             log.warning("options: could not read the book's record: %s", exc)
@@ -777,6 +796,9 @@ class OptionsRunner:
                 else f"{view.bid:.4f}/{view.ask:.4f}"
             )
             market = f"spot {view.spot:.4f}  sigma {view.sigma:.2f}  dexie {book_text}"
+        sub_account = self._snapshot.sub_account
+        if report is not None and report.sub_account:
+            sub_account = sub_account_text(report.sub_account, cfg)
         with self._lock:
             self._snapshot = dataclasses.replace(
                 self._snapshot,
@@ -787,4 +809,23 @@ class OptionsRunner:
                 market=market or self._snapshot.market,
                 contracts=contracts,
                 fees_paid_mojos=fees,
+                sub_account=sub_account,
             )
+
+    def contracts_on_record(self) -> tuple[ContractView, ...]:
+        """The book's contracts as its record has them: for the page while the book is off.
+
+        A book switched off since launch has not stepped, so its snapshot has
+        no contracts; its record does. Read-only; () when there is none.
+        """
+        try:
+            cfg = load_options(self._config_path)
+        except RunnerError:
+            return ()
+        if not Path(cfg.database_path).exists():
+            return ()
+        book_store = store.OptionStore(cfg.database_path)
+        try:
+            return contract_views(cfg, book_store)
+        finally:
+            book_store.close()

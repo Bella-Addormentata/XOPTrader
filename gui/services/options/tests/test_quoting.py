@@ -407,3 +407,15 @@ def test_the_plan_carries_the_quote_behind_every_ask() -> None:
 
     assert set(plan.quotes) == set(plan.asks) == {contract.launcher_id}
     assert plan.quotes[contract.launcher_id].units == plan.asks[contract.launcher_id]
+
+
+def test_rolling_expiries_build_the_grid_from_the_step_s_own_time() -> None:
+    """[ROLLING] The grid follows the clock: no list of dates to keep up to date."""
+    cfg = _config(expiries="weekly", put_strikes_pct=[])
+    first = quoting.plan(cfg, _market(), [], NOW)
+    later = quoting.plan(cfg, _market(), [], NOW + 14 * DAY)
+    first_expiries = {item.expiration for item in first.mint}
+    later_expiries = {item.expiration for item in later.mint}
+    assert len(first_expiries) == 2 and len(later_expiries) == 2
+    assert first_expiries.isdisjoint(later_expiries), "two weeks on, two new Fridays"
+    assert all(expiry > NOW for expiry in first_expiries)

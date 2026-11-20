@@ -242,6 +242,10 @@ class StepReport:
     chain_requests: int = 0  # requests the step made of the chain's node
     actions: list[str] = dataclasses.field(default_factory=list)
     problems: list[str] = dataclasses.field(default_factory=list)
+    #: The options address against options.target, per asset ("XCH", "quote
+    #: asset"): (held, target) in mojos, collateral in open contracts counted.
+    #: Filled by a step that checked its top-ups.
+    sub_account: dict[str, tuple[int, int]] = dataclasses.field(default_factory=dict)
 
     def did(self, text: str) -> None:
         self.actions.append(text)
@@ -316,6 +320,7 @@ def reserved_coin_ids(book_store: store.OptionStore) -> set[bytes]:
 
 #: [OPTIONS-FENCE] A top-up whose outcome is not known yet.
 _SEND_UNCERTAIN = "uncertain"
+
 
 class OptionsBook:
     def __init__(
@@ -1579,6 +1584,7 @@ class OptionsBook:
             except builder.OptionBuildError as exc:
                 report.problem(f"top-up of {what} skipped: {exc}")
                 continue
+            report.sub_account[what] = (held, want)
             if held >= want * (1.0 - target.tolerance):
                 continue
             short = want - held

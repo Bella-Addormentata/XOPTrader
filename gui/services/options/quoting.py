@@ -263,7 +263,7 @@ def plan(config: OptionsConfig, market: Market, contracts: list[store.Contract],
 
     targets: dict[str, Wanted] = {}
     too_small: set[str] = set()
-    for expiration in config.expiries:
+    for expiration in config.expiries_at(now):
         if expiration - now <= config.stop_before_expiry_seconds:
             continue
         sides = [(CALL, percent) for percent in config.call_strikes_pct]

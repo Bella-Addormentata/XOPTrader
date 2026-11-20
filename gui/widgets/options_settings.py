@@ -50,6 +50,9 @@ FENCE_MODES: tuple[tuple[str, Any], ...] = (
 #: Labels for options.target: from the limits (unset), written, or off (false).
 TARGET_MODES: tuple[str, ...] = ("From my limits", "Custom", "Off")
 _TARGET_LIMITS, _TARGET_CUSTOM, _TARGET_OFF = range(3)
+#: [ROLLING] Labels for options.expiries: a rule that rolls, or a list of dates.
+EXPIRY_MODES: tuple[str, ...] = ("Every Friday, 08:00 UTC (rolling)", "Fixed dates")
+_EXPIRY_ROLLING, _EXPIRY_FIXED = range(2)
 
 #: The dedicated wallet's own connection. Its secrets (dotted under options)
 #: are the ones a save must take from this tab rather than from the files.
@@ -97,6 +100,19 @@ def _expiry_text(value: Any) -> str:
         moment = datetime.datetime.fromtimestamp(float(value), tz=datetime.UTC)
         return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
     return str(value)
+
+
+def _rule_counts(value: Any) -> tuple[int, int] | None:
+    """``options.expiries`` as (weekly, monthly) counts when it is a rule, else None."""
+    if isinstance(value, str):
+        word = value.strip().lower()
+        return {"weekly": (2, 0), "monthly": (0, 2)}.get(word)
+    if isinstance(value, dict):
+        try:
+            return int(value.get("weekly", 0) or 0), int(value.get("monthly", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _limit_text(value: Any) -> str:
@@ -254,10 +270,37 @@ class OptionsSettingsSection:
         self.contract_xch.setValue(1.0)
         self.contract_xch.setSuffix(" XCH")
         grid_form.addRow("Contract size:", self.contract_xch)
+        self.expiry_mode = QComboBox()
+        self.expiry_mode.addItems(list(EXPIRY_MODES))
+        self.expiry_mode.setToolTip(
+            "options.expiries. Rolling: the book keeps the next Fridays at 08:00 UTC (the "
+            "crypto options market's time; xchoptions.com has no standard dates) and moves on "
+            "by itself, so it never runs out of expiries. Fixed: the dates you list."
+        )
+        grid_form.addRow("Expiries:", self.expiry_mode)
+        self.expiry_weeks = QSpinBox()
+        self.expiry_weeks.setRange(0, 12)
+        self.expiry_weeks.setValue(2)
+        self.expiry_weeks.setToolTip("How many weekly Fridays ahead to keep.")
+        self.expiry_months = QSpinBox()
+        self.expiry_months.setRange(0, 6)
+        self.expiry_months.setValue(0)
+        self.expiry_months.setToolTip(
+            "And how many month-ends (the last Friday of a month) ahead, for longer contracts."
+        )
         self.expiries = QLineEdit()
-        self.expiries.setPlaceholderText("2026-12-04T14:00:00Z, 2026-12-11T14:00:00Z")
+        self.expiries.setPlaceholderText("2026-12-04T08:00:00Z, 2026-12-11T08:00:00Z")
         self.expiries.setToolTip("options.expiries: UTC times, comma-separated.")
-        grid_form.addRow("Expiries (UTC):", self.expiries)
+        self._rolling_rows: list[tuple[QLabel, QWidget]] = []
+        self._fixed_rows: list[tuple[QLabel, QWidget]] = []
+        for label, field, rows in (
+            ("Weekly Fridays ahead:", self.expiry_weeks, self._rolling_rows),
+            ("Month-ends ahead:", self.expiry_months, self._rolling_rows),
+            ("Dates (UTC):", self.expiries, self._fixed_rows),
+        ):
+            row_label = QLabel(label)
+            grid_form.addRow(row_label, field)
+            rows.append((row_label, field))
         self.call_strikes = QLineEdit()
         self.call_strikes.setPlaceholderText("110, 120")
         self.call_strikes.setToolTip("options.call_strikes_pct: percent of spot.")
@@ -288,7 +331,7 @@ class OptionsSettingsSection:
 
         for box in (self.enabled, self.share):
             box.toggled.connect(self._changed)
-        for combo in (self.network, self.fence, self.target_mode):
+        for combo in (self.network, self.fence, self.target_mode, self.expiry_mode):
             combo.currentIndexChanged.connect(self._changed)
         for edit in (
             self.address,
@@ -308,6 +351,8 @@ class OptionsSettingsSection:
             self.target_quote,
             self.target_tolerance,
             self.contract_xch,
+            self.expiry_weeks,
+            self.expiry_months,
         ):
             spin.valueChanged.connect(self._changed)
         self._sync_rows()
@@ -331,6 +376,9 @@ class OptionsSettingsSection:
             self.target_quote,
             self.target_tolerance,
             self.contract_xch,
+            self.expiry_mode,
+            self.expiry_weeks,
+            self.expiry_months,
             self.expiries,
             self.call_strikes,
             self.put_strikes,
@@ -355,6 +403,13 @@ class OptionsSettingsSection:
         for label, field in self._custom_rows:
             label.setVisible(custom)
             field.setVisible(custom)
+        rolling = self.expiry_mode.currentIndex() == _EXPIRY_ROLLING
+        for label, field in self._rolling_rows:
+            label.setVisible(rolling)
+            field.setVisible(rolling)
+        for label, field in self._fixed_rows:
+            label.setVisible(not rolling)
+            field.setVisible(not rolling)
         self.target_hint.setText(self._target_hint())
 
     def _target_hint(self) -> str:
@@ -425,8 +480,19 @@ class OptionsSettingsSection:
             self.contract_xch.setValue(float(section.get("contract_xch") or 1.0))
         except (TypeError, ValueError):
             self.contract_xch.setValue(1.0)
-        expiries = section.get("expiries") or []
-        self.expiries.setText(", ".join(_expiry_text(item) for item in expiries))
+        expiries = section.get("expiries")
+        rule = _rule_counts(expiries)
+        if rule is not None:
+            self.expiry_mode.setCurrentIndex(_EXPIRY_ROLLING)
+            self.expiry_weeks.setValue(rule[0])
+            self.expiry_months.setValue(rule[1])
+            self.expiries.setText("")
+        else:
+            listed = expiries if isinstance(expiries, (list, tuple)) else []
+            self.expiry_mode.setCurrentIndex(
+                _EXPIRY_FIXED if listed or expiries else _EXPIRY_ROLLING
+            )
+            self.expiries.setText(", ".join(_expiry_text(item) for item in listed))
         self.call_strikes.setText(
             ", ".join(str(item) for item in (section.get("call_strikes_pct") or []))
         )
@@ -437,6 +503,14 @@ class OptionsSettingsSection:
         for key, field in self.limit_fields.items():
             field.setText(_limit_text(limits.get(key)))
         self._sync_rows()
+
+    def _collect_expiries(self) -> Any:
+        if self.expiry_mode.currentIndex() == _EXPIRY_FIXED:
+            return _text_list(self.expiries.text())
+        weeks, months = self.expiry_weeks.value(), self.expiry_months.value()
+        if (weeks, months) == (2, 0):
+            return "weekly"
+        return {"weekly": weeks, "monthly": months}
 
     def wants_writing(self) -> bool:
         """Whether a save writes ``options:``: only once this tab has been edited."""
@@ -470,7 +544,7 @@ class OptionsSettingsSection:
             "network": self.network.currentText(),
             "wallet": wallet,
             "contract_xch": round(self.contract_xch.value(), 4),
-            "expiries": _text_list(self.expiries.text()),
+            "expiries": self._collect_expiries(),
             "call_strikes_pct": _number_list(self.call_strikes.text()),
             "put_strikes_pct": _number_list(self.put_strikes.text()),
             "limits": {key: _limit_value(field.text()) for key, field in self.limit_fields.items()},

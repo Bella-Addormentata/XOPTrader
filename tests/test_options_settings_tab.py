@@ -29,6 +29,8 @@ from gui.widgets.options_settings import TARGET_MODES  # noqa: E402
 from gui.widgets.settings import SettingsWidget  # noqa: E402
 
 ADDRESS = "xch1kxxd76v9kwsxrcxgndn3mylnxjhd7klgdns7083zjl247ffge32sr5rsy2"
+#: A wallet of its own: the example config shares the trading wallet.
+_DEDICATED = {"share_trading_wallet": False, "host": "localhost", "port": 9356}
 _SECRETS = {
     "chia": {
         "wallet_fingerprint": 481655774,
@@ -154,7 +156,7 @@ def test_editing_the_tab_saves_its_keys_and_keeps_the_rest(panel, tmp_path, monk
     # What the tab does not own is as it was.
     for key in ("quote_asset_id", "quote_asset_decimals", "dry_run", "market", "node"):
         assert after.get(key) == before.get(key), key
-    assert after["wallet"]["mode"] == "dedicated"
+    assert after["wallet"]["engine_metrics_url"] == before["wallet"]["engine_metrics_url"]
     # The options secrets went back to secrets.yaml, not into config.yaml.
     assert "cert_path" not in after["wallet"] and "fingerprint" not in after["wallet"]
 
@@ -197,7 +199,7 @@ def test_a_strike_that_is_not_a_number_is_refused_not_crashed_on(panel, tmp_path
 
 
 def test_a_dedicated_wallet_shows_its_own_connection(panel, tmp_path):
-    panel.load_config(str(_config(tmp_path)))
+    panel.load_config(str(_config(tmp_path, wallet=_DEDICATED)))
     tab = panel._options_section
     assert not tab.share.isChecked() and not tab.fence.isEnabled()
     assert not any(field.isHidden() for _label, field in tab._dedicated_rows)
@@ -212,7 +214,13 @@ def test_a_dedicated_wallet_shows_its_own_connection(panel, tmp_path):
 
 
 def test_switching_to_the_shared_wallet_clears_the_dedicated_connection(panel, tmp_path):
-    cfg_path = _config(tmp_path, enabled=True, contract_xch=0.5, expiries=["2026-12-04T14:00:00Z"])
+    cfg_path = _config(
+        tmp_path,
+        wallet=_DEDICATED,
+        enabled=True,
+        contract_xch=0.5,
+        expiries=["2026-12-04T14:00:00Z"],
+    )
     panel.load_config(str(cfg_path))
     tab = panel._options_section
     assert tab.dedicated_port.value() == 9356 and tab.dedicated_fingerprint.text() == "4242"
@@ -232,6 +240,7 @@ def test_switching_to_the_shared_wallet_clears_the_dedicated_connection(panel, t
 def test_edited_dedicated_secrets_reach_secrets_yaml(panel, tmp_path):
     cfg_path = _config(
         tmp_path,
+        wallet=_DEDICATED,
         enabled=True,
         contract_xch=0.5,
         expiries=["2026-12-04T14:00:00Z"],
@@ -291,3 +300,34 @@ def test_a_book_already_broken_does_not_block_other_saves(panel, tmp_path):
     panel.load_config(str(cfg_path))
     panel._wl_port.setValue(19256)
     assert panel.save_config(str(cfg_path)) is True, _SAID
+
+
+# -- [ROLLING] expiries ----------------------------------------------------------------------
+
+
+def test_rolling_expiries_show_and_save_as_a_rule(panel, tmp_path):
+    cfg_path = _shared_book(tmp_path, expiries="weekly")
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.expiry_mode.currentIndex() == 0
+    assert (tab.expiry_weeks.value(), tab.expiry_months.value()) == (2, 0)
+    assert tab.expiries.isHidden() and not tab.expiry_weeks.isHidden()
+
+    tab.expiry_months.setValue(1)
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["expiries"] == {"weekly": 2, "monthly": 1}
+
+    panel.load_config(str(cfg_path))
+    panel._options_section.expiry_months.setValue(0)
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["expiries"] == "weekly"
+
+
+def test_fixed_dates_are_still_there_for_whoever_wants_them(panel, tmp_path):
+    cfg_path = _shared_book(tmp_path, expiries="weekly")
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    tab.expiry_mode.setCurrentIndex(1)
+    tab.expiries.setText("2026-12-04T08:00:00Z")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["expiries"] == ["2026-12-04T08:00:00Z"]
