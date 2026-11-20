@@ -50,7 +50,9 @@ setup the book would refuse, and says why. An untouched tab leaves the
 `options:` section exactly as it is; an edited one writes only the keys it
 shows, and the options secrets still go to secrets.yaml. Off, Rehearse and
 Live stay on the Options page. Saving new settings while the book runs
-starts it again with them, in the same mode, once its step is over.
+starts it again with them, in the same mode, once its step is over; settings
+that change its wallet, network or record leave it off, for you to switch on
+once the trading engine has them too.
 
 ## [0.10.53] — 2026-11-19 — the options fence follows the book, and is the default on a shared wallet
 

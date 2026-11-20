@@ -65,6 +65,11 @@ DEFAULT_INTERVAL = 60.0
 #: How long a switch from the GUI waits for a step in progress before it says
 #: "try again" rather than hold the window. Closing the app waits longer.
 SWITCH_WAIT = 2.0
+#: [review] Why a run that new settings stopped is not started again by itself.
+WALLET_CHANGED = (
+    "the saved settings change the wallet, network or record the book uses. If the trading "
+    "engine shares the wallet, restart it with them first; then switch the book back on"
+)
 #: Lines of recent activity kept for the panel.
 _HISTORY = 200
 #: The book's log file takes what this package logs, not the whole app's log.
@@ -452,6 +457,8 @@ class OptionsRunner:
         self._clock = clock
         self._lock = threading.Lock()
         self._run: _Run | None = None
+        #: [review] The settings the last run started with, for restart_refusal().
+        self._last_loaded: config.OptionsConfig | None = None
         self._snapshot = Snapshot()
         self._recent: collections.deque[str] = collections.deque(maxlen=_HISTORY)
         #: [AUTO-FENCE] Serialises the flag with the run it answers for: a run
@@ -514,7 +521,7 @@ class OptionsRunner:
                 raise RunnerError(
                     "the previous run is still finishing its step; try again in a moment"
                 )
-        loaded = cfg
+        loaded = self._last_loaded = cfg
         cfg = dataclasses.replace(cfg, dry_run=mode is not Mode.LIVE)
         stop = threading.Event()
         thread = threading.Thread(
@@ -576,6 +583,27 @@ class OptionsRunner:
         """Whether a run told to stop is still in its step: nothing new can start yet."""
         current = self._run
         return current is not None and current.stop.is_set()
+
+    def restart_refusal(self) -> str:
+        """[review] Why a run new settings stopped must not start again by itself, or "".
+
+        Saved settings that change the wallet the book signs from (its daemon,
+        key, address or fence), its network or its record are the operator's
+        to take up. On a shared wallet a step logs the daemon in to the book's
+        key, and the trading engine takes up a new key only when it restarts.
+        """
+        try:
+            fresh = load_options(self._config_path)
+        except RunnerError as exc:
+            return str(exc)
+        last = self._last_loaded
+        if last is not None and (fresh.wallet, fresh.network, fresh.database_path) != (
+            last.wallet,
+            last.network,
+            last.database_path,
+        ):
+            return WALLET_CHANGED
+        return ""
 
     def stop_for_new_settings(self) -> Mode | None:
         """[review] Settings saved config.yaml under a run: stop it if its settings changed.

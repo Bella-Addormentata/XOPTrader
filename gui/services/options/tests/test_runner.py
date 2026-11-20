@@ -624,3 +624,35 @@ def test_settings_that_no_longer_set_the_book_up_stop_it_too(tmp_path) -> None:
     assert run.stop_for_new_settings() is runner.Mode.REHEARSE
     _wait(lambda: not run.finishing)
     assert run.mode is runner.Mode.OFF
+
+
+def test_a_new_wallet_network_or_record_is_not_restarted_by_itself(tmp_path) -> None:
+    """[review] On a shared wallet a step logs the daemon in to the book's key: a
+    save that changes the wallet is the operator's to take up, not a restart's."""
+    path = _write(tmp_path, db=":memory:")
+    run = runner.OptionsRunner(path, interval=0.02, build=_builder([]))
+    assert run.restart_refusal() == ""  # nothing ran yet: nothing to compare with
+    run.start(runner.Mode.REHEARSE)
+    _wait(lambda: run.snapshot().steps >= 1)
+
+    _save(path, contract_xch=2)
+    assert run.restart_refusal() == "", "a grid change starts again by itself"
+
+    root = yaml.safe_load(path.read_text(encoding="utf-8"))
+    root["options"]["wallet"]["port"] = 9357
+    path.write_text(yaml.safe_dump(root), encoding="utf-8")
+    assert run.restart_refusal() == runner.WALLET_CHANGED
+
+    _save(path, contract_xch=1)
+    root = yaml.safe_load(path.read_text(encoding="utf-8"))
+    root["options"]["wallet"]["port"] = 9356
+    root["options"]["network"] = "testnet11"
+    path.write_text(yaml.safe_dump(root), encoding="utf-8")
+    assert run.restart_refusal() == runner.WALLET_CHANGED
+
+    _save(path, network="mainnet", database_path=str(tmp_path / "other.db"))
+    assert run.restart_refusal() == runner.WALLET_CHANGED
+
+    _save(path, enabled=False)
+    assert "options.enabled is not true" in run.restart_refusal()
+    run.stop()

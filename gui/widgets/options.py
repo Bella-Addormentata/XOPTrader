@@ -288,8 +288,9 @@ class OptionsWidget(QWidget):
         [review] Called again when Settings saves the file the book runs on: a
         running book reads its settings when it starts, so one whose settings
         changed is stopped after its step and started again, in the same mode,
-        with the saved ones. Settings that no longer set the book up leave it
-        off, and the page says why.
+        with the saved ones. Settings that no longer set the book up, or that
+        change its wallet, network or record, leave it off, and the page says
+        why.
         """
         new_path = Path(config_path)
         self._refusal = ""
@@ -490,6 +491,13 @@ class OptionsWidget(QWidget):
             )
             return
         self._restart_to = None
+        refusal = getattr(self._runner, "restart_refusal", None)
+        why = refusal() if callable(refusal) else ""
+        if why:
+            # [review] The operator's to switch on again, and remembered off.
+            self._remember(Mode.OFF)
+            self._held.setText(f"Switched off, not started again: {why}.")
+            return
         self._start(mode, confirm=False, why="with the saved settings")
 
     def _show(self, snap: Any) -> None:

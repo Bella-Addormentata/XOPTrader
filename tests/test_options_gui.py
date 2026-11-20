@@ -1016,11 +1016,15 @@ def test_the_record_is_read_from_a_copy_never_upgraded_in_place(tmp_path):
 class _SavedOver(RunnerDouble):
     """A runner whose settings a save changed (or not); ``slow``: mid-step when stopped."""
 
-    def __init__(self, *, changed: bool = True, slow: bool = False) -> None:
+    def __init__(self, *, changed: bool = True, slow: bool = False, refusal: str = "") -> None:
         super().__init__()
         self.changed = changed
         self.slow = slow
+        self.refusal = refusal
         self.finishing = False
+
+    def restart_refusal(self) -> str:
+        return self.refusal
 
     def stop_for_new_settings(self):
         if self.mode is Mode.OFF or not self.changed:
@@ -1097,6 +1101,26 @@ def test_settings_that_switch_the_book_off_leave_it_off(app, tmp_path, monkeypat
         _saved(page, tmp_path)
 
         assert runner.starts == [Mode.LIVE] and runner.mode is Mode.OFF
+        assert (
+            QSettings("XOP-tests-options", options_page._SETTINGS_APP).value(options_page.KEY_MODE)
+            == "off"
+        )
+    finally:
+        _close(page, app)
+
+
+def test_a_new_wallet_is_the_operator_s_to_switch_on(app, tmp_path, monkeypatch):
+    """[review] A save that changes the book's wallet stops it and leaves it off."""
+    _answer(monkeypatch, QMessageBox.StandardButton.Yes)
+    runner = _SavedOver(refusal=options_runner.WALLET_CHANGED)
+    page = _page(app, tmp_path, runner)
+    try:
+        page._buttons[Mode.LIVE].click()
+
+        _saved(page, tmp_path)
+
+        assert runner.starts == [Mode.LIVE] and runner.mode is Mode.OFF
+        assert "not started again" in page._held.text()
         assert (
             QSettings("XOP-tests-options", options_page._SETTINGS_APP).value(options_page.KEY_MODE)
             == "off"
