@@ -589,7 +589,7 @@ class OptionsSettingsSection:
             _show_number(self.expiry_months, months)
         calls = section.get("call_strikes_pct")
         puts = section.get("put_strikes_pct")
-        if calls is None and puts is None:
+        if "call_strikes_pct" not in section and "put_strikes_pct" not in section:
             # [DEFAULTS] What the book writes with no strikes written: shown, so
             # a save keeps both sides instead of writing none.
             from gui.services.options import config as options_config

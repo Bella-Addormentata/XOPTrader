@@ -409,6 +409,12 @@ def test_a_side_written_alone_keeps_the_other_off() -> None:
     del puts_only["call_strikes_pct"]
     assert config.parse({"options": puts_only}).call_strikes_pct == ()
     assert _parse(call_strikes_pct=[], put_strikes_pct=[]).call_strikes_pct == ()
+    # [review] A list written null is written: empty, as before, not the defaults.
+    nulls = _parse(call_strikes_pct=None, put_strikes_pct=None)
+    assert (nulls.call_strikes_pct, nulls.put_strikes_pct) == ((), ())
+    null_calls = _section(call_strikes_pct=None)
+    del null_calls["put_strikes_pct"]
+    assert config.parse({"options": null_calls}).put_strikes_pct == ()
 
 
 def test_the_example_config_writes_both_sides() -> None:

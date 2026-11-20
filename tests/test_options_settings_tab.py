@@ -531,3 +531,16 @@ def test_a_config_with_no_strikes_shows_and_saves_both_sides(panel, tmp_path):
     assert panel.save_config(str(cfg_path)) is True, _SAID
     saved = _saved_options(cfg_path)
     assert saved["call_strikes_pct"] == [110, 120] and saved["put_strikes_pct"] == [90, 80]
+
+
+def test_strike_lists_written_null_stay_blank_and_save_empty(panel, tmp_path):
+    """[review] Written null is written: no defaults put in by an edit elsewhere."""
+    cfg_path = _shared_book(tmp_path, call_strikes_pct=None, put_strikes_pct=None)
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.call_strikes.text() == "" and tab.put_strikes.text() == ""
+
+    tab.limit_fields["max_contracts_per_expiry"].setText("4")  # an edit elsewhere
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    saved = _saved_options(cfg_path)
+    assert saved["call_strikes_pct"] == [] and saved["put_strikes_pct"] == []
