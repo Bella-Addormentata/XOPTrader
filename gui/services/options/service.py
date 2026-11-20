@@ -357,7 +357,10 @@ class OptionsBook:
         self._spot = 0.0
         self._looked_at: int | None = None  # when the chain was last read afresh
         self._look_again_until = 0
-        self._held: Any = None  # the wallet's coins as last listed
+        #: The wallet's coins as last listed. Not ``_held``: that is the method
+        #: that sums the sub-account, and an attribute of the same name hid it
+        #: (every top-up failed on a live book, v0.10.52 to v0.10.54).
+        self._coins_seen: Any = None
         self._chain_time: int | None = None  # the chain's clock, read before this step's look
         self._chain_time_asked_at: int | None = None
         self._rate: tuple[int, int] | None = None  # (when asked, mojos per cost)
@@ -393,9 +396,9 @@ class OptionsBook:
         With none of them, this step costs the chain's node nothing.
         """
         held = self._held_now(report)
-        changed = held is not None and self._held is not None and held != self._held
+        changed = held is not None and self._coins_seen is not None and held != self._coins_seen
         if held is not None:
-            self._held = held
+            self._coins_seen = held
         fast = self._config.chain_poll_seconds
         if changed:
             # The node asked may be a block behind the wallet that noticed.
