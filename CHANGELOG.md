@@ -5,9 +5,9 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.54] — 2026-11-20 — the options book is set up in Settings, and its expiries roll on their own
 
-### Options: rolling expiries, a clearer Options page, and a shorter set-up
+### Options: rolling expiries, a clearer Options page, and a shorter set-up (#246)
 
 - **Expiries roll forward on their own.** `options.expiries: weekly` keeps the
   next two Fridays at 08:00 UTC -- the crypto options market's own time
@@ -29,7 +29,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   from before the fence -- to the docs. The options docs start with a quick
   start.
 
-### The options book is set up in Settings
+### The options book is set up in Settings (#246)
 
 A new **Options** tab in Settings sets the options book up without editing
 config.yaml:
