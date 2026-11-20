@@ -353,3 +353,56 @@ def test_a_config_with_no_expiries_shows_weekly(panel, tmp_path):
     tab = panel._options_section
     assert tab.expiry_mode.currentIndex() == 0
     assert (tab.expiry_weeks.value(), tab.expiry_months.value()) == (2, 0)
+
+
+def _dedicated_book(tmp_path: Path) -> Path:
+    return _config(
+        tmp_path,
+        wallet=_DEDICATED,
+        enabled=True,
+        contract_xch=0.5,
+        expiries=["2026-12-04T14:00:00Z"],
+        limits={"max_locked_xch": 1.0, "max_contracts": 2},
+    )
+
+
+def _options_secrets(tmp_path: Path) -> dict:
+    secrets = yaml.safe_load((tmp_path / "secrets.yaml").read_text(encoding="utf-8")) or {}
+    return (secrets.get("options") or {}).get("wallet") or {}
+
+
+def test_after_a_save_a_secret_put_back_is_an_edit_too(panel, tmp_path):
+    """[review] The tab tells its edits from what was saved, not from the load."""
+    cfg_path = _dedicated_book(tmp_path)
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    tab.dedicated_cert.setText("/opt/new.crt")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _options_secrets(tmp_path)["cert_path"] == "/opt/new.crt"
+    assert not tab.wants_writing(), "what was saved is the new baseline"
+
+    tab.dedicated_cert.setText("/opt/w.crt")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _options_secrets(tmp_path)["cert_path"] == "/opt/w.crt"
+
+
+def test_shared_and_back_to_dedicated_across_saves_keeps_the_connection(panel, tmp_path):
+    cfg_path = _dedicated_book(tmp_path)
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    tab.share.setChecked(True)
+    tab.address.setText(ADDRESS)
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _options_secrets(tmp_path) == {}
+
+    tab.share.setChecked(False)  # the same connection, typed back in
+    tab.dedicated_port.setValue(9356)
+    tab.dedicated_fingerprint.setText("4242")
+    tab.dedicated_cert.setText("/opt/w.crt")
+    tab.dedicated_key.setText("/opt/w.key")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _options_secrets(tmp_path) == {
+        "cert_path": "/opt/w.crt",
+        "key_path": "/opt/w.key",
+        "fingerprint": 4242,
+    }

@@ -615,7 +615,9 @@ def split_and_save(
     # blobs it still holds as text. A save must never destroy what it could
     # not read; the operator fixes the file, then saves.
     secrets_path = config_path.parent / "secrets.yaml"
-    if secrets or moving:
+    # [review] A key the caller names in ``edited`` and removed is a change on
+    # its own: with nothing else to write, it must still leave secrets.yaml.
+    if secrets or moving or (edited and secrets_path.is_file()):
         with file_transaction(secrets_path):
             if secrets_path.is_file():
                 existing = None

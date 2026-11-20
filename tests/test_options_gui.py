@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -980,3 +981,123 @@ def test_the_runner_reads_the_record_s_contracts(tmp_path):
     views = options_runner.OptionsRunner(config_path).contracts_on_record()
     assert [view.slot for view in views] == ["C110@1"]
     assert views[0].collateral == "0.5 XCH"
+
+
+def test_the_record_is_read_from_a_copy_never_upgraded_in_place(tmp_path):
+    """[review] Display only: looking at an older book's record does not migrate its file."""
+    if sqlite3.sqlite_version_info < (3, 35, 0):
+        pytest.skip("this SQLite cannot drop a column to make an older record")
+    config_path = _config(tmp_path)
+    _open_contract(config_path)
+    db = config_path.parent / "data" / "options_jobs.db"
+    con = sqlite3.connect(db)
+    con.execute("ALTER TABLE step_log DROP COLUMN interval")  # as an older version left it
+    con.commit()
+    con.close()
+
+    views = options_runner.OptionsRunner(config_path).contracts_on_record()
+
+    assert [view.slot for view in views] == ["C110@1"]
+    con = sqlite3.connect(db)
+    try:
+        columns = {row[1] for row in con.execute("PRAGMA table_info(step_log)")}
+    finally:
+        con.close()
+    assert "interval" not in columns
+
+
+# --------------------------------------------------------------------------- #
+# [review] Settings saving the file the book runs on
+# --------------------------------------------------------------------------- #
+
+
+class _SavedOver(RunnerDouble):
+    """A runner whose settings a save changed (or not); ``slow``: mid-step when stopped."""
+
+    def __init__(self, *, changed: bool = True, slow: bool = False) -> None:
+        super().__init__()
+        self.changed = changed
+        self.slow = slow
+        self.finishing = False
+
+    def stop_for_new_settings(self):
+        if self.mode is Mode.OFF or not self.changed:
+            return None
+        mode = self.mode
+        self.stop()
+        self.finishing = self.slow
+        return mode
+
+
+def _saved(page, tmp_path) -> None:
+    page.attach(tmp_path / "config.yaml", resume=False)  # as MainWindow does after a save
+
+
+def test_saving_new_settings_restarts_the_running_book_with_them(app, tmp_path, monkeypatch):
+    asked = _answer(monkeypatch, QMessageBox.StandardButton.Yes)
+    runner = _SavedOver()
+    page = _page(app, tmp_path, runner)
+    try:
+        page._buttons[Mode.LIVE].click()
+        assert runner.starts == [Mode.LIVE]
+
+        _saved(page, tmp_path)
+
+        assert runner.stops == 1 and runner.starts == [Mode.LIVE, Mode.LIVE]
+        assert runner.mode is Mode.LIVE
+        assert asked == ["Options: go Live"], "the restart asks nothing more"
+    finally:
+        _close(page, app)
+
+
+def test_the_same_settings_saved_again_leave_the_running_book_alone(app, tmp_path, monkeypatch):
+    _answer(monkeypatch, QMessageBox.StandardButton.Yes)
+    runner = _SavedOver(changed=False)
+    page = _page(app, tmp_path, runner)
+    try:
+        page._buttons[Mode.LIVE].click()
+        _saved(page, tmp_path)
+        assert runner.stops == 0 and runner.starts == [Mode.LIVE]
+    finally:
+        _close(page, app)
+
+
+def test_a_restart_waits_for_the_step_in_progress_and_off_cancels_it(app, tmp_path):
+    runner = _SavedOver(slow=True)
+    page = _page(app, tmp_path, runner)
+    try:
+        page._buttons[Mode.REHEARSE].click()
+        _saved(page, tmp_path)
+        assert runner.starts == [Mode.REHEARSE], "not while its step is still going"
+        assert "once the step in progress is over" in page._held.text()
+
+        runner.finishing = False
+        page.refresh()
+        assert runner.starts == [Mode.REHEARSE, Mode.REHEARSE]
+
+        _saved(page, tmp_path)  # saved again, mid-step again
+        page._buttons[Mode.OFF].click()  # the operator's own choice wins
+        runner.finishing = False
+        page.refresh()
+        assert runner.starts == [Mode.REHEARSE, Mode.REHEARSE] and runner.mode is Mode.OFF
+    finally:
+        _close(page, app)
+
+
+def test_settings_that_switch_the_book_off_leave_it_off(app, tmp_path, monkeypatch):
+    _answer(monkeypatch, QMessageBox.StandardButton.Yes)
+    runner = _SavedOver()
+    page = _page(app, tmp_path, runner)
+    try:
+        page._buttons[Mode.LIVE].click()
+        _config(tmp_path, options=False)  # Settings saved the book switched off
+
+        _saved(page, tmp_path)
+
+        assert runner.starts == [Mode.LIVE] and runner.mode is Mode.OFF
+        assert (
+            QSettings("XOP-tests-options", options_page._SETTINGS_APP).value(options_page.KEY_MODE)
+            == "off"
+        )
+    finally:
+        _close(page, app)

@@ -410,3 +410,34 @@ def test_an_edited_file_owned_secret_is_the_callers_and_none_removes_it(tmp_path
     assert wallet == {"cert_path": "/new.crt", "key_path": "/old.key"}
     public = yaml.safe_load(path.read_text(encoding="utf-8"))["options"]["wallet"]
     assert "cert_path" not in public and "fingerprint" not in public
+
+
+@requires_ruamel
+def test_a_removal_alone_still_reaches_secrets_yaml(tmp_path):
+    """[review] An edited key removed is a change even with nothing else to write."""
+    path = tmp_path / "config.yaml"
+    path.write_text("options:\n  wallet:\n    port: 9356\n", encoding="utf-8")
+    (tmp_path / "secrets.yaml").write_text(
+        "options:\n  wallet:\n    fingerprint: 4242\n", encoding="utf-8"
+    )
+    merged = config_split.load_merged(path)
+    del merged["options"]["wallet"]["fingerprint"]
+
+    split_and_save(path, merged, edited=frozenset({"options.wallet.fingerprint"}))
+
+    secrets = yaml.safe_load((tmp_path / "secrets.yaml").read_text(encoding="utf-8")) or {}
+    assert "fingerprint" not in ((secrets.get("options") or {}).get("wallet") or {})
+
+
+@requires_ruamel
+def test_a_removal_with_no_secrets_yaml_writes_none(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("options:\n  wallet:\n    port: 9356\n", encoding="utf-8")
+
+    split_and_save(
+        path,
+        {"options": {"wallet": {"port": 9356}}},
+        edited=frozenset({"options.wallet.fingerprint"}),
+    )
+
+    assert not (tmp_path / "secrets.yaml").exists()

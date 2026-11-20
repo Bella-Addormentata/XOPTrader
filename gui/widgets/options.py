@@ -154,6 +154,17 @@ def _status_text(item: Any, now: float) -> str:
     return item.status
 
 
+def _same_file(first: Any, second: Any) -> bool:
+    """Whether two config.yaml paths name one file, as written or resolved."""
+    a, b = Path(first), Path(second)
+    if a == b:
+        return True
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return False
+
+
 class OptionsWidget(QWidget):
     """The Options page. Inert until :meth:`attach` gives it config.yaml."""
 
@@ -173,6 +184,9 @@ class OptionsWidget(QWidget):
         self._refusal = ""
         #: The record's contracts, read while the book is off (None: not read yet).
         self._on_record: tuple[Any, ...] | None = None
+        #: [review] The mode a save stopped the book in, to start it again in
+        #: with the saved settings once its step is over (None: no restart due).
+        self._restart_to: Mode | None = None
 
         title = QLabel("Options book")
         title.setStyleSheet(f"font-size: 18px; font-weight: 600; color: {TEXT_PRIMARY};")
@@ -270,24 +284,41 @@ class OptionsWidget(QWidget):
         Called again when Settings switches config.yaml: a book running on the
         old file is stopped first (after its step), and is still covered by the
         engine-start check, which looks at every book this app has run.
+
+        [review] Called again when Settings saves the file the book runs on: a
+        running book reads its settings when it starts, so one whose settings
+        changed is stopped after its step and started again, in the same mode,
+        with the saved ones. Settings that no longer set the book up leave it
+        off, and the page says why.
         """
         new_path = Path(config_path)
         self._refusal = ""
         old = self._runner
         old_path = getattr(old, "config_path", None)
-        if old is not None and old_path is not None and Path(old_path) != new_path:
+        saved_over = self._config_path is not None and _same_file(self._config_path, new_path)
+        if old is not None and old_path is not None and not _same_file(old_path, new_path):
+            self._restart_to = None
             old.stop()
             self._runner = None
             self._held.setText(
                 f"Switched to {new_path}; the book on {old_path} was switched off "
                 "(the engine-start check still covers it)."
             )
+        elif old is not None and saved_over:
+            stop_for = getattr(old, "stop_for_new_settings", None)
+            stopped = stop_for() if callable(stop_for) else None
+            if stopped is not None:  # an earlier save's restart still due stays due
+                self._restart_to = stopped
         self._config_path = new_path
         if self._runner is None:
             self._runner = options_runner.OptionsRunner(self._config_path)
         try:
             options_runner.load_options(self._config_path)
         except options_runner.RunnerError as exc:
+            if self._restart_to is not None:
+                # Saved switched off or broken: nothing to start again with.
+                self._restart_to = None
+                self._remember(Mode.OFF)
             self._set_enabled(False, f"{exc}. See docs/options-live-test.md.")
         else:
             self._set_enabled(True, "")
@@ -298,7 +329,11 @@ class OptionsWidget(QWidget):
             # [AUTO-FENCE] Not resumed, or not asked to: the engine's fence flag
             # follows the book's record (a contract open keeps it up), not
             # whatever the last session left. A run that started raised it.
-            if self._runner.mode is Mode.OFF and hasattr(self._runner, "sync_fence"):
+            if (
+                self._restart_to is None
+                and self._runner.mode is Mode.OFF
+                and hasattr(self._runner, "sync_fence")
+            ):
                 try:
                     self._runner.sync_fence()
                 except Exception:  # noqa: BLE001 - the flag is best effort; the book checks
@@ -309,12 +344,14 @@ class OptionsWidget(QWidget):
     def stop_background_work(self) -> None:
         """App closing: stop the book after its step. The remembered mode stays."""
         self._timer.stop()
+        self._restart_to = None
         if self._runner is not None:
             self._runner.stop()
 
     # -- the switch -------------------------------------------------------------
 
     def _on_choose(self, mode: Mode) -> None:
+        self._restart_to = None  # the operator's own choice, over a restart still due
         if mode is Mode.OFF:
             # A short wait: a slow step finishes on its own, shown as stopping.
             self._runner.stop(timeout=options_runner.SWITCH_WAIT)
@@ -435,10 +472,25 @@ class OptionsWidget(QWidget):
     def refresh(self) -> None:
         if self._runner is None:
             return
+        self._finish_restart()
         try:
             self._show(self._runner.snapshot())
         finally:
             self.status_changed.emit()
+
+    def _finish_restart(self) -> None:
+        """[review] Start again, in its mode, the run a save stopped, once its step is over."""
+        mode = self._restart_to
+        if mode is None or self._runner is None:
+            return
+        if getattr(self._runner, "finishing", False):
+            self._held.setText(
+                f"Settings saved: the book starts again ({mode.value}) with them once the step "
+                "in progress is over."
+            )
+            return
+        self._restart_to = None
+        self._start(mode, confirm=False, why="with the saved settings")
 
     def _show(self, snap: Any) -> None:
         self._check(snap.mode)
@@ -492,6 +544,7 @@ class OptionsWidget(QWidget):
         self._refreshes += 1
         if (
             self._refreshes % _FENCE_CHECK_EVERY == 0
+            and self._restart_to is None
             and snap.mode is Mode.OFF
             and not snap.running
             and hasattr(self._runner, "sync_fence")

@@ -5457,6 +5457,10 @@ class SettingsWidget(QWidget):
         # save cannot re-apply this save's edits over a newer on-disk value.
         self._rebase_ratio_cells(merged_targets)
         self._rebase_shutdown_offers(engine_out)
+        # [review] The Options tab tells its next edits from what this save wrote.
+        options_section = getattr(self, "_options_section", None)
+        if options_section is not None and options_section.wants_writing():
+            options_section.rebase(cfg.get("options"))
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._last_saved_time = now
         # [RELOAD] The truthful "does this reach the running engine?"

@@ -510,6 +510,22 @@ class OptionsSettingsSection:
             field.setText(_limit_text(limits.get(key)))
         self._sync_rows()
 
+    def rebase(self, options: Any) -> None:
+        """[review] After a save: show ``options`` as saved and make it the baseline.
+
+        Edits are told from the baseline. Kept at the load, a secret changed
+        and saved, then put back, would count as no edit and the newer value
+        would stay on disk; and switching to sharing and back across two saves
+        would leave the dedicated connection's secrets deleted.
+        """
+        widgets = self.inputs()
+        was = [widget.blockSignals(True) for widget in widgets]
+        try:
+            self.populate(options)
+        finally:
+            for widget, blocked in zip(widgets, was, strict=True):
+                widget.blockSignals(blocked)
+
     def _collect_expiries(self) -> Any:
         mode = self.expiry_mode.currentIndex()
         if mode == _EXPIRY_NONE:
