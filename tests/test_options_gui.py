@@ -971,6 +971,8 @@ def test_the_page_shows_the_record_s_contracts_while_the_book_is_off(app, tmp_pa
         page.refresh()
         assert page._contracts.rowCount() == 1
         assert "expired" in page._contracts.item(0, 1).text()
+        # [review] The line above the table counts the contracts it shows.
+        assert "1 contract(s) open" in page._state.text()
     finally:
         _close(page, app)
 

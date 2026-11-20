@@ -25,7 +25,7 @@ pytest.importorskip("ruamel.yaml")
 
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
-from gui.widgets.options_settings import TARGET_MODES  # noqa: E402
+from gui.widgets.options_settings import _TARGET_CUSTOM, TARGET_MODES  # noqa: E402
 from gui.widgets.settings import SettingsWidget  # noqa: E402
 
 ADDRESS = "xch1kxxd76v9kwsxrcxgndn3mylnxjhd7klgdns7083zjl247ffge32sr5rsy2"
@@ -406,3 +406,91 @@ def test_shared_and_back_to_dedicated_across_saves_keeps_the_connection(panel, t
         "key_path": "/opt/w.key",
         "fingerprint": 4242,
     }
+
+
+def test_the_tab_says_nothing_is_minted_until_all_four_limits_are_set(panel, tmp_path):
+    """[review] The book mints nothing while a limit is unset, so the tab says so."""
+    panel.load_config(str(_shared_book(tmp_path)))  # max per expiry left unset
+    tab = panel._options_section
+    assert "all four limits" in tab.limits_hint.text()
+
+    tab.limit_fields["max_contracts_per_expiry"].setText("2")
+    assert tab.limits_hint.text() == ""
+
+    tab.limit_fields["max_locked_xch"].setText("0.1")  # a contract is 0.5 XCH
+    assert "less than one contract" in tab.limits_hint.text()
+
+
+def test_a_malformed_value_does_not_stop_the_page_loading(panel, tmp_path):
+    """[review] The book's parser says what is wrong with it; the page loads the rest."""
+    cfg_path = _config(
+        tmp_path,
+        enabled=False,
+        target={"xch": "oops", "quote": None, "tolerance_pct": float("inf")},
+        contract_xch="x",
+        expiries=[10**20],
+        call_strikes_pct=110,
+        limits={"max_locked_xch": float("inf")},
+    )
+
+    panel.load_config(str(cfg_path))
+
+    tab = panel._options_section
+    assert tab.target_mode.currentIndex() == _TARGET_CUSTOM
+    assert tab.target_xch.value() == 0.0 and tab.target_tolerance.value() == 20
+    assert tab.contract_xch.value() == 1.0
+    assert tab.call_strikes.text() == "110"
+    assert tab.expiries.text() == str(10**20)
+    assert tab.limit_fields["max_locked_xch"].text() == "inf"
+    assert panel._cg_coin_ids.text(), "the tabs after it loaded too"
+
+
+def test_numbers_the_boxes_cannot_show_are_kept_unless_edited(panel, tmp_path):
+    """[review] A box shows a few decimals: an edit elsewhere must not round its number."""
+    cfg_path = _shared_book(
+        tmp_path,
+        contract_xch=0.123456,
+        target={"xch": 1.23456, "quote": 2, "tolerance_pct": 12.5},
+        limits={
+            "max_locked_xch": 1.0,
+            "max_locked_quote": 1,
+            "max_contracts": 2,
+            "max_contracts_per_expiry": 2,
+        },
+    )
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    tab.limit_fields["max_contracts"].setText("3")  # an edit elsewhere
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    saved = _saved_options(cfg_path)
+    assert saved["contract_xch"] == 0.123456
+    assert saved["target"] == {"xch": 1.23456, "quote": 2, "tolerance_pct": 12.5}
+
+    tab.contract_xch.setValue(0.25)  # edited: the box's value
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["contract_xch"] == 0.25
+
+
+def test_load_from_editor_writes_the_options_it_imports(panel, tmp_path, monkeypatch):
+    """[review] Load from Editor, then Save: the Options tab's imported values are written."""
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+    )
+    cfg_path = _shared_book(tmp_path)
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+
+    panel._on_load_from_editor()  # the editor as loaded: nothing to write
+    assert not tab.wants_writing()
+
+    root = yaml.safe_load(panel._yaml_editor.toPlainText())
+    root["options"]["expiries"] = "monthly"
+    root["options"]["contract_xch"] = 0.25
+    panel._yaml_editor.setPlainText(yaml.safe_dump(root, sort_keys=False))
+    panel._on_load_from_editor()
+
+    assert tab.wants_writing()
+    assert tab.edited_secrets() == frozenset(), "the secrets are told from the files"
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    saved = _saved_options(cfg_path)
+    assert saved["expiries"] == "monthly" and saved["contract_xch"] == 0.25

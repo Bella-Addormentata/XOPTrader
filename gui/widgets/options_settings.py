@@ -102,8 +102,45 @@ def _limit_value(text: str) -> Any:
 def _expiry_text(value: Any) -> str:
     """An expiry as the tab shows it: UTC ISO, also for a Unix time the book accepts."""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        moment = datetime.datetime.fromtimestamp(float(value), tz=datetime.UTC)
+        try:
+            moment = datetime.datetime.fromtimestamp(float(value), tz=datetime.UTC)
+        except (OverflowError, OSError, ValueError):
+            return str(value)  # the book's parser says what is wrong with it
         return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return str(value)
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _number(value: Any, default: float) -> float:
+    """[review] A number from config.yaml for a box to show, or ``default``.
+
+    A malformed value must not stop the Settings page loading: the book's own
+    parser says what is wrong with it when the tab is judged.
+    """
+    if isinstance(value, bool):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _show_number(box: QDoubleSpinBox | QSpinBox, value: float) -> None:
+    """Set ``box`` to ``value``, held within the box's range."""
+    value = min(max(value, box.minimum()), box.maximum())
+    box.setValue(int(value) if isinstance(box, QSpinBox) else value)
+
+
+def _list_text(value: Any) -> str:
+    """A list from config.yaml as the tab shows it; anything else as it is written."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(item) for item in value)
     return str(value)
 
 
@@ -115,7 +152,7 @@ def _rule_counts(value: Any) -> tuple[int, int] | None:
     if isinstance(value, dict):
         try:
             return int(value.get("weekly", 0) or 0), int(value.get("monthly", 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
     return None
 
@@ -125,7 +162,7 @@ def _limit_text(value: Any) -> str:
         return ""
     if isinstance(value, str):
         return value.strip()
-    if isinstance(value, float) and value == int(value):
+    if isinstance(value, float) and math.isfinite(value) and value == int(value):
         return str(int(value))
     return str(value)
 
@@ -146,6 +183,10 @@ class OptionsSettingsSection:
         #: Shared at load: switching sharing ON here clears the dedicated
         #: connection, which would otherwise outlive it unseen.
         self._shared_at_load = False
+        #: [review] Numbers as config.yaml has them, with what their boxes then
+        #: showed. A box shows a few decimals: a value loaded with more is
+        #: written back as it was unless its box is edited.
+        self._loaded_numbers: dict[str, tuple[float, Any]] = {}
         self.widget = self._build()
 
     # -- building ----------------------------------------------------------------
@@ -331,6 +372,10 @@ class OptionsSettingsSection:
             field.setToolTip(f"options.limits.{key}: a number, 'unlimited', or blank (unset).")
             limits_form.addRow(label, field)
             self.limit_fields[key] = field
+        self.limits_hint = QLabel("")
+        self.limits_hint.setWordWrap(True)
+        self.limits_hint.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        limits_form.addRow("", self.limits_hint)
         layout.addWidget(limits)
         layout.addStretch(1)
 
@@ -416,6 +461,22 @@ class OptionsSettingsSection:
             label.setVisible(not rolling)
             field.setVisible(not rolling)
         self.target_hint.setText(self._target_hint())
+        self.limits_hint.setText(self._limits_hint())
+
+    def _limits_hint(self) -> str:
+        """[review] Why nothing would be minted with these limits, or ""."""
+        values: dict[str, Any] = {}
+        for key, field in self.limit_fields.items():
+            try:
+                values[key] = _limit_value(field.text())
+            except ValueError:
+                return ""  # Save says what is wrong with it
+        if any(value is None for value in values.values()):
+            return "Nothing is minted until all four limits are set: a number each, or unlimited."
+        cap = values["max_locked_xch"]
+        if isinstance(cap, (int, float)) and cap < self.contract_xch.value():
+            return "Max XCH locked is less than one contract: nothing is minted."
+        return ""
 
     def _target_hint(self) -> str:
         mode = self.target_mode.currentIndex()
@@ -445,6 +506,7 @@ class OptionsSettingsSection:
     def populate(self, options: Any) -> None:
         """Show ``options:`` (a mapping, or None when config.yaml has none)."""
         self._edited = False
+        self._loaded_numbers = {}
         section = options if isinstance(options, dict) else {}
         wallet = section.get("wallet") if isinstance(section.get("wallet"), dict) else {}
         self.enabled.setChecked(section.get("enabled") is True)
@@ -474,17 +536,20 @@ class OptionsSettingsSection:
             self.target_mode.setCurrentIndex(_TARGET_OFF)
         elif isinstance(target, dict):
             self.target_mode.setCurrentIndex(_TARGET_CUSTOM)
-            self.target_xch.setValue(float(target.get("xch") or 0.0))
-            self.target_quote.setValue(float(target.get("quote") or 0.0))
             tolerance = target.get("tolerance_pct")
-            self.target_tolerance.setValue(int(float(20 if tolerance is None else tolerance)))
+            for key, box, raw, default in (
+                ("target_xch", self.target_xch, target.get("xch"), 0.0),
+                ("target_quote", self.target_quote, target.get("quote"), 0.0),
+                ("target_tolerance", self.target_tolerance, tolerance, 20.0),
+            ):
+                _show_number(box, _number(default if raw is None else raw, default))
+                self._loaded_numbers[key] = (box.value(), raw)
         else:
             self.target_mode.setCurrentIndex(_TARGET_LIMITS)
 
-        try:
-            self.contract_xch.setValue(float(section.get("contract_xch") or 1.0))
-        except (TypeError, ValueError):
-            self.contract_xch.setValue(1.0)
+        size = section.get("contract_xch")
+        _show_number(self.contract_xch, _number(size or 1.0, 1.0))
+        self._loaded_numbers["contract_xch"] = (self.contract_xch.value(), size)
         expiries = section.get("expiries")
         rule = _rule_counts(expiries)
         listed = expiries if isinstance(expiries, (list, tuple)) else []
@@ -497,18 +562,38 @@ class OptionsSettingsSection:
             # A rule, or nothing written: the book reads that as weekly too.
             weeks, months = rule if rule is not None else (2, 0)
             self.expiry_mode.setCurrentIndex(_EXPIRY_ROLLING)
-            self.expiry_weeks.setValue(weeks)
-            self.expiry_months.setValue(months)
-        self.call_strikes.setText(
-            ", ".join(str(item) for item in (section.get("call_strikes_pct") or []))
-        )
-        self.put_strikes.setText(
-            ", ".join(str(item) for item in (section.get("put_strikes_pct") or []))
-        )
+            _show_number(self.expiry_weeks, weeks)
+            _show_number(self.expiry_months, months)
+        self.call_strikes.setText(_list_text(section.get("call_strikes_pct")))
+        self.put_strikes.setText(_list_text(section.get("put_strikes_pct")))
         limits = section.get("limits") if isinstance(section.get("limits"), dict) else {}
         for key, field in self.limit_fields.items():
             field.setText(_limit_text(limits.get(key)))
         self._sync_rows()
+
+    def _number_out(self, key: str, box: QDoubleSpinBox | QSpinBox, digits: int) -> Any:
+        """[review] What a number box writes: the loaded number while the box shows it."""
+        shown, raw = self._loaded_numbers.get(key, (None, None))
+        value = box.value()
+        if value == shown and _is_number(raw):
+            return raw
+        return value if isinstance(box, QSpinBox) else round(value, digits)
+
+    def load_from_editor(self, options: Any, on_disk: Any) -> None:
+        """[review] Load from Editor: show the editor's ``options``, told from ``on_disk``.
+
+        The baselines stay those of the config on disk (the last load or
+        save), so the secrets are told from what the files hold, and the tab
+        counts as edited when the editor's section differs, so a save writes
+        what it shows.
+        """
+        self.populate(on_disk)
+        shown, shared_at_load = self._shown, self._shared_at_load
+        self.populate(options)
+        self._shown, self._shared_at_load = shown, shared_at_load
+        mine = options if isinstance(options, dict) else {}
+        theirs = on_disk if isinstance(on_disk, dict) else {}
+        self._edited = mine != theirs
 
     def rebase(self, options: Any) -> None:
         """[review] After a save: show ``options`` as saved and make it the baseline.
@@ -537,9 +622,9 @@ class OptionsSettingsSection:
                 raise ValueError("fixed expiries need at least one date")
             return dates
         weeks, months = self.expiry_weeks.value(), self.expiry_months.value()
-        if (weeks, months) == (2, 0):
-            return "weekly"
-        return {"weekly": weeks, "monthly": months}
+        # The two named rules are written by name, as config.example.yaml has them.
+        named = {(2, 0): "weekly", (0, 2): "monthly"}.get((weeks, months))
+        return named or {"weekly": weeks, "monthly": months}
 
     def wants_writing(self) -> bool:
         """Whether a save writes ``options:``: only once this tab has been edited."""
@@ -572,7 +657,7 @@ class OptionsSettingsSection:
             "enabled": self.enabled.isChecked(),
             "network": self.network.currentText(),
             "wallet": wallet,
-            "contract_xch": round(self.contract_xch.value(), 4),
+            "contract_xch": self._number_out("contract_xch", self.contract_xch, 4),
             "expiries": self._collect_expiries(),
             "call_strikes_pct": _number_list(self.call_strikes.text()),
             "put_strikes_pct": _number_list(self.put_strikes.text()),
@@ -583,9 +668,9 @@ class OptionsSettingsSection:
             options["target"] = False
         elif mode == _TARGET_CUSTOM:
             options["target"] = {
-                "xch": round(self.target_xch.value(), 4),
-                "quote": round(self.target_quote.value(), 3),
-                "tolerance_pct": self.target_tolerance.value(),
+                "xch": self._number_out("target_xch", self.target_xch, 4),
+                "quote": self._number_out("target_quote", self.target_quote, 3),
+                "tolerance_pct": self._number_out("target_tolerance", self.target_tolerance, 0),
             }
         else:
             options["target"] = None  # removed by finish(): the limits decide

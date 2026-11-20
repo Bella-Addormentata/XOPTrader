@@ -3936,7 +3936,14 @@ class SettingsWidget(QWidget):
 
             # -- options -- [OPTIONS]
             if getattr(self, "_options_section", None) is not None:
-                self._options_section.populate(cfg.get("options"))
+                if ratio_baseline_cfg is None:
+                    self._options_section.populate(cfg.get("options"))
+                else:
+                    # [review] Load from Editor: the editor's values, told
+                    # from the config on disk, so a save writes them.
+                    self._options_section.load_from_editor(
+                        cfg.get("options"), ratio_baseline_cfg.get("options")
+                    )
 
             # -- coingecko --
             cg = cfg.get("coingecko", {})

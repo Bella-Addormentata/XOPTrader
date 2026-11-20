@@ -41,7 +41,9 @@ config.yaml:
 - the engine fence (follows the book, always on, or off);
 - the top-up target (from the limits, custom, or off), with what "from the
   limits" works out to;
-- the grid (contract size, expiries, call and put strikes) and the limits.
+- the grid (contract size, expiries, call and put strikes) and the limits,
+  with a note while they would mint nothing (all four must be set, and the
+  XCH cap must cover a contract).
 
 The options book's own parser judges the tab, so Settings refuses to save a
 setup the book would refuse, and says why. An untouched tab leaves the

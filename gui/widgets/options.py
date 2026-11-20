@@ -494,6 +494,9 @@ class OptionsWidget(QWidget):
 
     def _show(self, snap: Any) -> None:
         self._check(snap.mode)
+        contracts = self._contracts_to_show(snap)
+        # [review] Counted from what the table shows: the record's, while off.
+        open_count = sum(item.status in options_store.ACTIVE for item in contracts)
         when = (
             time.strftime("%H:%M:%S", time.localtime(snap.last_step_at))
             if snap.last_step_at
@@ -502,8 +505,7 @@ class OptionsWidget(QWidget):
         state = {Mode.OFF: "Off", Mode.REHEARSE: "Rehearsing (signs nothing)", Mode.LIVE: "LIVE"}
         shown = "Off (finishing the step in progress)" if snap.stopping else state[snap.mode]
         self._state.setText(
-            f"{shown}  ·  steps {snap.steps}  ·  last step {when}  ·  "
-            f"{snap.open_contracts} contract(s) open"
+            f"{shown}  ·  steps {snap.steps}  ·  last step {when}  ·  {open_count} contract(s) open"
         )
         colour = (
             LOSS_RED
@@ -528,17 +530,6 @@ class OptionsWidget(QWidget):
             if snap.fees_paid_mojos
             else ""
         )
-        contracts = snap.contracts
-        if not snap.running and not contracts:
-            # Off since launch: nothing stepped, so show the record's contracts.
-            if self._refreshes % _BLOCKER_EVERY == 0 or self._on_record is None:
-                reader = getattr(self._runner, "contracts_on_record", None)
-                try:
-                    self._on_record = tuple(reader()) if callable(reader) else ()
-                except Exception:  # noqa: BLE001 - display only
-                    _log.debug("[Options] the record could not be read", exc_info=True)
-                    self._on_record = ()
-            contracts = self._on_record
         self._show_contracts(contracts)
         self._show_recent(snap.recent, snap.recent_count)
         self._refreshes += 1
@@ -558,6 +549,20 @@ class OptionsWidget(QWidget):
         if self._config_path is not None and self._refreshes % _BLOCKER_EVERY == 1:
             blocker = options_runner.engine_start_blocker(self._config_path)
             self._engine_block.setText(f"Engine start is held: {blocker}" if blocker else "")
+
+    def _contracts_to_show(self, snap: Any) -> tuple[Any, ...]:
+        """The run's contracts; off since launch, nothing stepped, so the record's."""
+        contracts = tuple(snap.contracts)
+        if snap.running or contracts:
+            return contracts
+        if self._refreshes % _BLOCKER_EVERY == 0 or self._on_record is None:
+            reader = getattr(self._runner, "contracts_on_record", None)
+            try:
+                self._on_record = tuple(reader()) if callable(reader) else ()
+            except Exception:  # noqa: BLE001 - display only
+                _log.debug("[Options] the record could not be read", exc_info=True)
+                self._on_record = ()
+        return self._on_record
 
     def _show_contracts(self, contracts: tuple[Any, ...]) -> None:
         self._contracts.setRowCount(len(contracts))
