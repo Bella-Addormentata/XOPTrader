@@ -331,3 +331,25 @@ def test_fixed_dates_are_still_there_for_whoever_wants_them(panel, tmp_path):
     tab.expiries.setText("2026-12-04T08:00:00Z")
     assert panel.save_config(str(cfg_path)) is True, _SAID
     assert _saved_options(cfg_path)["expiries"] == ["2026-12-04T08:00:00Z"]
+
+
+def test_none_winds_down_and_a_fixed_list_needs_a_date(panel, tmp_path):
+    cfg_path = _shared_book(tmp_path, expiries="none")
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.expiry_mode.currentIndex() == 2
+    tab.expiry_mode.setCurrentIndex(1)  # Fixed dates, none given
+    tab.expiries.setText("")
+    assert panel.save_config(str(cfg_path)) is False
+    assert _SAID and "at least one date" in _SAID[0]
+    tab.expiry_mode.setCurrentIndex(2)
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["expiries"] == "none"
+
+
+def test_a_config_with_no_expiries_shows_weekly(panel, tmp_path):
+    cfg_path = _shared_book(tmp_path, expiries=[])
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.expiry_mode.currentIndex() == 0
+    assert (tab.expiry_weeks.value(), tab.expiry_months.value()) == (2, 0)

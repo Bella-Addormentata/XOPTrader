@@ -386,15 +386,25 @@ class ExpiryRule:
 
 
 def _expiry_rule(raw: Any) -> ExpiryRule | None:
-    """``options.expiries`` as a rule, or None when it is a list of dates."""
+    """``options.expiries`` as a rule, or None when it is a list of dates (or ``none``).
+
+    [DEFAULTS] Not written, or an empty list, is ``weekly``: a book with no
+    expiries mints nothing and sits idle with nothing to say why. ``none``
+    says so on purpose -- no new contracts, the book only looks after those
+    it has (winding down).
+    """
+    if raw is None or (isinstance(raw, (list, tuple)) and not raw):
+        return ExpiryRule(weekly=2, monthly=0)
     if isinstance(raw, str):
         word = raw.strip().lower()
         if word == "weekly":
             return ExpiryRule(weekly=2, monthly=0)
         if word == "monthly":
             return ExpiryRule(weekly=0, monthly=2)
+        if word == "none":
+            return None
         raise OptionsConfigError(
-            f"options.expiries: {raw!r} is not a list of dates, 'weekly' or 'monthly'"
+            f"options.expiries: {raw!r} is not a list of dates, 'weekly', 'monthly' or 'none'"
         )
     if not isinstance(raw, dict):
         return None
@@ -673,8 +683,9 @@ def parse(root: Any) -> OptionsConfig | None:
     expiry_rule = _expiry_rule(expiries_raw)
     if expiry_rule is not None:
         expiries: tuple[int, ...] = ()
+    elif isinstance(expiries_raw, str):  # none: no new contracts
+        expiries = ()
     else:
-        expiries_raw = expiries_raw or []
         if not isinstance(expiries_raw, (list, tuple)):
             raise OptionsConfigError(
                 "options.expiries must be a list of dates, weekly, monthly, or a mapping of "

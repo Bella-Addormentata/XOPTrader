@@ -50,9 +50,14 @@ FENCE_MODES: tuple[tuple[str, Any], ...] = (
 #: Labels for options.target: from the limits (unset), written, or off (false).
 TARGET_MODES: tuple[str, ...] = ("From my limits", "Custom", "Off")
 _TARGET_LIMITS, _TARGET_CUSTOM, _TARGET_OFF = range(3)
-#: [ROLLING] Labels for options.expiries: a rule that rolls, or a list of dates.
-EXPIRY_MODES: tuple[str, ...] = ("Every Friday, 08:00 UTC (rolling)", "Fixed dates")
-_EXPIRY_ROLLING, _EXPIRY_FIXED = range(2)
+#: [ROLLING] Labels for options.expiries: a rule that rolls, a list of dates, or
+#: none (no new contracts: winding down).
+EXPIRY_MODES: tuple[str, ...] = (
+    "Every Friday, 08:00 UTC (rolling)",
+    "Fixed dates",
+    "None: no new contracts",
+)
+_EXPIRY_ROLLING, _EXPIRY_FIXED, _EXPIRY_NONE = range(3)
 
 #: The dedicated wallet's own connection. Its secrets (dotted under options)
 #: are the ones a save must take from this tab rather than from the files.
@@ -482,17 +487,18 @@ class OptionsSettingsSection:
             self.contract_xch.setValue(1.0)
         expiries = section.get("expiries")
         rule = _rule_counts(expiries)
-        if rule is not None:
-            self.expiry_mode.setCurrentIndex(_EXPIRY_ROLLING)
-            self.expiry_weeks.setValue(rule[0])
-            self.expiry_months.setValue(rule[1])
-            self.expiries.setText("")
+        listed = expiries if isinstance(expiries, (list, tuple)) else []
+        self.expiries.setText(", ".join(_expiry_text(item) for item in listed))
+        if isinstance(expiries, str) and expiries.strip().lower() == "none":
+            self.expiry_mode.setCurrentIndex(_EXPIRY_NONE)
+        elif listed:
+            self.expiry_mode.setCurrentIndex(_EXPIRY_FIXED)
         else:
-            listed = expiries if isinstance(expiries, (list, tuple)) else []
-            self.expiry_mode.setCurrentIndex(
-                _EXPIRY_FIXED if listed or expiries else _EXPIRY_ROLLING
-            )
-            self.expiries.setText(", ".join(_expiry_text(item) for item in listed))
+            # A rule, or nothing written: the book reads that as weekly too.
+            weeks, months = rule if rule is not None else (2, 0)
+            self.expiry_mode.setCurrentIndex(_EXPIRY_ROLLING)
+            self.expiry_weeks.setValue(weeks)
+            self.expiry_months.setValue(months)
         self.call_strikes.setText(
             ", ".join(str(item) for item in (section.get("call_strikes_pct") or []))
         )
@@ -505,8 +511,15 @@ class OptionsSettingsSection:
         self._sync_rows()
 
     def _collect_expiries(self) -> Any:
-        if self.expiry_mode.currentIndex() == _EXPIRY_FIXED:
-            return _text_list(self.expiries.text())
+        mode = self.expiry_mode.currentIndex()
+        if mode == _EXPIRY_NONE:
+            return "none"
+        if mode == _EXPIRY_FIXED:
+            dates = _text_list(self.expiries.text())
+            if not dates:
+                # An empty list reads as weekly: never save one for "fixed".
+                raise ValueError("fixed expiries need at least one date")
+            return dates
         weeks, months = self.expiry_weeks.value(), self.expiry_months.value()
         if (weeks, months) == (2, 0):
             return "weekly"
@@ -624,6 +637,12 @@ class OptionsSettingsSection:
 
     def validate(self, merged_root: dict[str, Any]) -> list[str]:
         """What the options book itself would refuse in ``merged_root`` (empty when fine)."""
+        if self.expiry_mode.currentIndex() == _EXPIRY_FIXED and not _text_list(
+            self.expiries.text()
+        ):
+            return [
+                "Options: fixed expiries need at least one date (or choose Every Friday, or None)"
+            ]
         try:
             options = self.collect()
         except ValueError as exc:

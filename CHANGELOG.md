@@ -14,8 +14,10 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (Deribit's); xchoptions.com has no standard dates -- worked out afresh at
   every step, so the book never runs out of expiries. `monthly` keeps the
   last Friday of the next two months, and `{weekly: 3, monthly: 1}` sets the
-  counts. A list of dates still works. The Settings tab offers both, and the
-  example config says `weekly`.
+  counts. A list of dates still works. Left out, or an empty list, it is
+  `weekly` -- a book with no expiries used to sit idle without saying why --
+  and `none` winds the book down: no new contracts. The Settings tab offers
+  all three, and the example config says `weekly`.
 - **The Options page says more while the book is off.** It shows the
   contracts on record instead of an empty table, an expired one still open
   says "expired: its collateral comes back at the next Live step", and once a

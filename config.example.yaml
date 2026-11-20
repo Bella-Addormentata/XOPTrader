@@ -1713,6 +1713,8 @@ options:
   # (the crypto options market's time; xchoptions.com has no standard dates).
   # monthly: the last Friday of the next two months. Or counts of each, e.g.
   # {weekly: 3, monthly: 1}, or a list of dates, e.g. ["2026-12-04T08:00:00Z"].
+  # Left out (or an empty list) it is weekly; `none` mints no new contracts,
+  # and the book only looks after those it has.
   expiries: weekly
   call_strikes_pct: [100, 110, 120]      # percent of spot, rounded to strike_step
   put_strikes_pct: [80, 90, 100]

@@ -376,3 +376,15 @@ def test_a_list_of_dates_still_works_and_has_no_rule() -> None:
     parsed = _parse(expiries=["2026-12-01T13:00:00Z"])
     assert parsed.expiry_rule is None
     assert parsed.expiries_at(_FRI_0330) == parsed.expiries == (1796130000,)
+
+
+def test_no_expiries_written_is_weekly_and_none_winds_down() -> None:
+    """[DEFAULTS] A book with no expiries used to sit idle without saying why."""
+    section = _section()
+    section.pop("expiries")
+    absent = config.parse({"options": section})
+    assert absent is not None and absent.expiry_rule == config.ExpiryRule(2, 0)
+    assert _parse(expiries=[]).expiry_rule == config.ExpiryRule(2, 0)
+    for word in ("none", "None", " NONE "):
+        winding = _parse(expiries=word)
+        assert winding.expiry_rule is None and winding.expiries_at(_FRI_0330) == ()
