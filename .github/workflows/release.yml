@@ -330,6 +330,7 @@ jobs:
           --exclude-module gui.services.permuto.tests
           --exclude-module gui.services.consolidate.tests
           --exclude-module gui.services.options.tests
+          --exclude-module gui.services.circuit.tests
           --add-data "services/warp/puzzles/*.clsp.hex:gui/services/warp/puzzles"
           --add-data "../scripts/offer_sizing.py:scripts"
           --add-data "../config.example.yaml:."
@@ -441,6 +442,7 @@ jobs:
             '--exclude-module', 'gui.services.permuto.tests',
             '--exclude-module', 'gui.services.consolidate.tests',
             '--exclude-module', 'gui.services.options.tests',
+            '--exclude-module', 'gui.services.circuit.tests',
             # ';' separator to match the --add-binary calls below.
             '--add-data', 'services/warp/puzzles/*.clsp.hex;gui/services/warp/puzzles',
             '--add-data', '../scripts/offer_sizing.py;scripts',
