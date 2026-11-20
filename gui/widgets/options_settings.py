@@ -350,12 +350,18 @@ class OptionsSettingsSection:
             grid_form.addRow(row_label, field)
             rows.append((row_label, field))
         self.call_strikes = QLineEdit()
-        self.call_strikes.setPlaceholderText("110, 120")
-        self.call_strikes.setToolTip("options.call_strikes_pct: percent of spot.")
+        self.call_strikes.setPlaceholderText("none")
+        self.call_strikes.setToolTip(
+            "options.call_strikes_pct: percent of spot; blank for none. With neither list "
+            "written in config.yaml: 110, 120."
+        )
         grid_form.addRow("Call strikes (% of spot):", self.call_strikes)
         self.put_strikes = QLineEdit()
         self.put_strikes.setPlaceholderText("none")
-        self.put_strikes.setToolTip("options.put_strikes_pct: percent of spot; blank for none.")
+        self.put_strikes.setToolTip(
+            "options.put_strikes_pct: percent of spot; blank for none. With neither list "
+            "written in config.yaml: 90, 80."
+        )
         grid_form.addRow("Put strikes (% of spot):", self.put_strikes)
         layout.addWidget(grid)
 
@@ -581,8 +587,17 @@ class OptionsSettingsSection:
             self.expiry_mode.setCurrentIndex(_EXPIRY_ROLLING)
             _show_number(self.expiry_weeks, weeks)
             _show_number(self.expiry_months, months)
-        self.call_strikes.setText(_list_text(section.get("call_strikes_pct")))
-        self.put_strikes.setText(_list_text(section.get("put_strikes_pct")))
+        calls = section.get("call_strikes_pct")
+        puts = section.get("put_strikes_pct")
+        if calls is None and puts is None:
+            # [DEFAULTS] What the book writes with no strikes written: shown, so
+            # a save keeps both sides instead of writing none.
+            from gui.services.options import config as options_config
+
+            calls = list(options_config.DEFAULT_CALL_STRIKES_PCT)
+            puts = list(options_config.DEFAULT_PUT_STRIKES_PCT)
+        self.call_strikes.setText(_list_text(calls))
+        self.put_strikes.setText(_list_text(puts))
         limits = section.get("limits") if isinstance(section.get("limits"), dict) else {}
         for key, field in self.limit_fields.items():
             field.setText(_limit_text(limits.get(key)))

@@ -211,6 +211,12 @@ def _expiry(raw: Any) -> int:
     return int(moment.timestamp())
 
 
+#: [DEFAULTS] With neither strike list written, the book writes both sides,
+#: out of the money: calls above spot and puts below it. ``[]`` turns a side off.
+DEFAULT_CALL_STRIKES_PCT: tuple[int, ...] = (110, 120)
+DEFAULT_PUT_STRIKES_PCT: tuple[int, ...] = (90, 80)
+
+
 def _percents(raw: Any, key: str) -> tuple[int, ...]:
     if raw is None:
         return ()
@@ -692,8 +698,16 @@ def parse(root: Any) -> OptionsConfig | None:
                 "weekly and monthly counts"
             )
         expiries = tuple(sorted({_expiry(item) for item in expiries_raw}))
-    calls = _percents(section.get("call_strikes_pct"), "call_strikes_pct")
-    puts = _percents(section.get("put_strikes_pct"), "put_strikes_pct")
+    calls_raw = section.get("call_strikes_pct")
+    puts_raw = section.get("put_strikes_pct")
+    if calls_raw is None and puts_raw is None:
+        # [DEFAULTS] No strikes written: both sides. A side written alone keeps
+        # the other off, as before, so an existing grid never gains puts or
+        # calls nobody chose.
+        calls, puts = DEFAULT_CALL_STRIKES_PCT, DEFAULT_PUT_STRIKES_PCT
+    else:
+        calls = _percents(calls_raw, "call_strikes_pct")
+        puts = _percents(puts_raw, "put_strikes_pct")
 
     strike_step = _number(section, "strike_step", 0.05)
     if strike_step <= 0:

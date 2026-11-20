@@ -5,6 +5,18 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Calls and puts by default
+
+With no strikes written, the options book now writes both sides, out of the
+money: calls at 110% and 120% of spot and puts at 90% and 80%. Before, a
+config without strike lists minted nothing, and the Settings tab showed the
+call strikes only as a hint, so a save wrote none. The Settings tab shows the
+defaults, and `config.example.yaml` lists the same strikes. A side written on
+its own keeps the other off, as before, so an existing grid gains nothing
+nobody chose; `[]` still turns a side off.
+
 ## [0.10.55] — 2026-11-20 — the options book's steps no longer fail at the top-up
 
 ### The options book's top-up works on a live book (#249)

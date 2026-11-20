@@ -514,3 +514,20 @@ def test_a_malformed_contract_size_is_never_replaced_by_an_edit_elsewhere(panel,
     tab.contract_xch.setValue(0.5)
     assert panel.save_config(str(cfg_path)) is True, _SAID
     assert _saved_options(cfg_path)["contract_xch"] == 0.5
+
+
+def test_a_config_with_no_strikes_shows_and_saves_both_sides(panel, tmp_path):
+    """[DEFAULTS] What the book writes with no strikes written is what the tab shows,
+    so a save keeps calls and puts instead of writing none."""
+    cfg_path = _shared_book(tmp_path)
+    root = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    del root["options"]["call_strikes_pct"], root["options"]["put_strikes_pct"]
+    cfg_path.write_text(yaml.safe_dump(root, sort_keys=False), encoding="utf-8")
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.call_strikes.text() == "110, 120" and tab.put_strikes.text() == "90, 80"
+
+    tab.limit_fields["max_contracts_per_expiry"].setText("4")  # an edit elsewhere
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    saved = _saved_options(cfg_path)
+    assert saved["call_strikes_pct"] == [110, 120] and saved["put_strikes_pct"] == [90, 80]

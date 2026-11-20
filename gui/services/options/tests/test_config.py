@@ -388,3 +388,34 @@ def test_no_expiries_written_is_weekly_and_none_winds_down() -> None:
     for word in ("none", "None", " NONE "):
         winding = _parse(expiries=word)
         assert winding.expiry_rule is None and winding.expiries_at(_FRI_0330) == ()
+
+
+def test_no_strikes_written_means_calls_and_puts() -> None:
+    """[DEFAULTS] Both sides, out of the money, when neither list is written."""
+    section = _section()
+    del section["call_strikes_pct"], section["put_strikes_pct"]
+    parsed = config.parse({"options": section})
+    assert parsed is not None
+    assert parsed.call_strikes_pct == config.DEFAULT_CALL_STRIKES_PCT == (110, 120)
+    assert parsed.put_strikes_pct == config.DEFAULT_PUT_STRIKES_PCT == (90, 80)
+
+
+def test_a_side_written_alone_keeps_the_other_off() -> None:
+    """An existing grid gains no puts (or calls) nobody chose."""
+    calls_only = _section()
+    del calls_only["put_strikes_pct"]
+    assert config.parse({"options": calls_only}).put_strikes_pct == ()
+    puts_only = _section()
+    del puts_only["call_strikes_pct"]
+    assert config.parse({"options": puts_only}).call_strikes_pct == ()
+    assert _parse(call_strikes_pct=[], put_strikes_pct=[]).call_strikes_pct == ()
+
+
+def test_the_example_config_writes_both_sides() -> None:
+    from pathlib import Path
+
+    yaml = pytest.importorskip("yaml")
+    example = Path(__file__).resolve().parents[4] / "config.example.yaml"
+    section = yaml.safe_load(example.read_text(encoding="utf-8"))["options"]
+    assert section["call_strikes_pct"] == list(config.DEFAULT_CALL_STRIKES_PCT)
+    assert section["put_strikes_pct"] == list(config.DEFAULT_PUT_STRIKES_PCT)

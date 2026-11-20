@@ -12,7 +12,8 @@ The straightforward set-up, with the app alone:
    contract's size), Max quote locked, Max contracts and Max per expiry, each a
    number or `unlimited`. Nothing is minted until all four are set; the tab
    says so. Leave the rest as it is: the engine fence follows the book,
-   expiries roll on their own (the next two Fridays at 08:00 UTC), and the
+   expiries roll on their own (the next two Fridays at 08:00 UTC), the grid
+   writes calls at 110% and 120% and puts at 90% and 80% of spot, and the
    top-up target comes from your limits.
 3. **The Options page** (or the OPTIONS switch in the toolbar): Rehearse first,
    to see what the book would mint and list, then Live. With the fence the
