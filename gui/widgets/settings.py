@@ -3654,7 +3654,9 @@ class SettingsWidget(QWidget):
             try:
                 cfg["options"] = section.collect()
             except ValueError:
-                pass
+                # Left out on purpose: _validate reports the field to the
+                # operator; this runs on every keystroke.
+                log.debug("Options tab: not collected yet", exc_info=True)
 
         return cfg
 
@@ -5100,14 +5102,19 @@ class SettingsWidget(QWidget):
         # [OPTIONS] The options book's own parser judges the Options tab, on
         # the config as it would be saved (the Connection tab included).
         section = getattr(self, "_options_section", None)
-        if section is not None and section.wants_writing():
+        if section is not None:
             from gui.services.config_split import deep_merge  # noqa: WPS433
 
             merged = copy.deepcopy(self._clean_snapshot or {})
             edits = self._collect_config_dict()
             edits.pop("options", None)
             deep_merge(merged, edits)
-            errors.extend(section.validate(merged))
+            if section.wants_writing():
+                errors.extend(section.validate(merged))
+            else:
+                # [review] Untouched, the tab still depends on the Connection
+                # tab: refuse a save that would break a book that was fine.
+                errors.extend(section.validate_untouched(self._clean_snapshot or {}, merged))
 
         return errors
 
@@ -5405,7 +5412,12 @@ class SettingsWidget(QWidget):
         try:
             # Ensure parent directory exists.
             resolved.parent.mkdir(parents=True, exist_ok=True)
-            split_and_save(resolved, cfg)
+            section = getattr(self, "_options_section", None)
+            split_and_save(
+                resolved,
+                cfg,
+                edited=section.edited_secrets() if section is not None else frozenset(),
+            )
         except OSError as exc:
             QMessageBox.critical(
                 self,

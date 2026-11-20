@@ -497,6 +497,19 @@ def _leaf(mapping: Any, parts: list[str]) -> Any:
     return mapping
 
 
+def _drop_leaf(mapping: Any, parts: list[str]) -> None:
+    """Remove the value at ``parts`` from ``mapping``, and any mapping that empties."""
+    if not parts or not isinstance(mapping, dict):
+        return
+    if len(parts) == 1:
+        mapping.pop(parts[0], None)
+        return
+    child = mapping.get(parts[0])
+    _drop_leaf(child, parts[1:])
+    if isinstance(child, dict) and not child:
+        mapping.pop(parts[0], None)
+
+
 def _set_leaf(mapping: dict, parts: list[str], value: Any) -> None:
     for part in parts[:-1]:
         mapping = mapping.setdefault(part, {})
@@ -512,13 +525,20 @@ def _read_public(config_path: Path) -> Any:
         return None
 
 
-def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
+def split_and_save(
+    config_path: Path, full: dict[str, Any], *, edited: frozenset[str] = frozenset()
+) -> None:
     """Write public fields to *config_path*, secrets to sibling secrets.yaml.
 
     Fields listed in :data:`SECRET_KEYS` are extracted from *full*
     and written to ``secrets.yaml``.  Everything else goes to
     *config_path*.  Existing secrets.yaml entries that are NOT managed
     by :data:`SECRET_KEYS` are preserved.
+
+    *edited* names :data:`FILE_OWNED_KEYS` the caller's own page changed, as
+    dotted paths (``"options.wallet.cert_path"``): those are taken from
+    *full* like any other secret -- absent or None there removes them --
+    instead of from the files on disk.
 
     Both files are written through :func:`dump_preserving`, so comments
     already in them survive the save.
@@ -548,7 +568,7 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
                 # written by BaseWallet, and must win.
                 holder.pop(leaf)
                 continue
-            if k in file_owned:
+            if k in file_owned and f"{section}.{k}" not in edited:
                 # Stripped from public; its value is read from disk below.
                 holder.pop(leaf)
                 _drop_emptied(src, parents)
@@ -570,6 +590,8 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
     moving: dict[str, Any] = {}
     for section, keys in FILE_OWNED_KEYS.items():
         for k in keys:
+            if f"{section}.{k}" in edited:
+                continue  # the caller's value, above
             parts = [section, *k.split(".")]
             value = _leaf(source, parts)
             if value is not _MISSING:
@@ -615,6 +637,11 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
                         "it -- it may hold key material."
                     )
                 deep_merge(existing, secrets)
+                # An edited key the caller removed (or set to None) goes.
+                for path in edited:
+                    parts = path.split(".")
+                    if _leaf(secrets, parts) in (_MISSING, None):
+                        _drop_leaf(existing, parts)
                 secrets = existing
             # What secrets.yaml already has wins over what is moved in.
             _fill_missing(secrets, moving)

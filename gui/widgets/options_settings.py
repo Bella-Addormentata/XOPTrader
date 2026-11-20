@@ -19,6 +19,7 @@ follows the book, and the target comes from the limits.
 from __future__ import annotations
 
 import copy
+import datetime
 import math
 from collections.abc import Callable
 from typing import Any
@@ -50,12 +51,13 @@ FENCE_MODES: tuple[tuple[str, Any], ...] = (
 TARGET_MODES: tuple[str, ...] = ("From my limits", "Custom", "Off")
 _TARGET_LIMITS, _TARGET_CUSTOM, _TARGET_OFF = range(3)
 
-#: The limits, with how each is scaled for the default-target hint.
-_LIMIT_KEYS: tuple[str, ...] = (
-    "max_locked_xch",
-    "max_locked_quote",
-    "max_contracts",
-    "max_contracts_per_expiry",
+#: The dedicated wallet's own connection. Its secrets (dotted under options)
+#: are the ones a save must take from this tab rather than from the files.
+_DEDICATED_KEYS: tuple[str, ...] = ("host", "port", "fingerprint", "cert_path", "key_path")
+WALLET_SECRETS: tuple[str, ...] = (
+    "options.wallet.cert_path",
+    "options.wallet.key_path",
+    "options.wallet.fingerprint",
 )
 
 
@@ -84,7 +86,17 @@ def _limit_value(text: str) -> Any:
     if text.lower() == "unlimited":
         return "unlimited"
     value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(text)
     return int(value) if value == int(value) else value
+
+
+def _expiry_text(value: Any) -> str:
+    """An expiry as the tab shows it: UTC ISO, also for a Unix time the book accepts."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        moment = datetime.datetime.fromtimestamp(float(value), tz=datetime.UTC)
+        return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return str(value)
 
 
 def _limit_text(value: Any) -> str:
@@ -108,6 +120,11 @@ class OptionsSettingsSection:
         #: Edited since the last load: only then does a save write ``options:``,
         #: so an untouched tab leaves the section exactly as config.yaml has it.
         self._edited = False
+        #: The dedicated connection as loaded, to tell which secrets were edited.
+        self._shown: dict[str, str] = {}
+        #: Shared at load: switching sharing ON here clears the dedicated
+        #: connection, which would otherwise outlive it unseen.
+        self._shared_at_load = False
         self.widget = self._build()
 
     # -- building ----------------------------------------------------------------
@@ -389,6 +406,8 @@ class OptionsSettingsSection:
         self.dedicated_fingerprint.setText("" if fingerprint in (None, "") else str(fingerprint))
         self.dedicated_cert.setText(str(wallet.get("cert_path") or ""))
         self.dedicated_key.setText(str(wallet.get("key_path") or ""))
+        self._shared_at_load = self.share.isChecked()
+        self._shown = self._dedicated_texts()
 
         target = section.get("target")
         if target is False:
@@ -397,7 +416,8 @@ class OptionsSettingsSection:
             self.target_mode.setCurrentIndex(_TARGET_CUSTOM)
             self.target_xch.setValue(float(target.get("xch") or 0.0))
             self.target_quote.setValue(float(target.get("quote") or 0.0))
-            self.target_tolerance.setValue(int(float(target.get("tolerance_pct", 20) or 20)))
+            tolerance = target.get("tolerance_pct")
+            self.target_tolerance.setValue(int(float(20 if tolerance is None else tolerance)))
         else:
             self.target_mode.setCurrentIndex(_TARGET_LIMITS)
 
@@ -406,7 +426,7 @@ class OptionsSettingsSection:
         except (TypeError, ValueError):
             self.contract_xch.setValue(1.0)
         expiries = section.get("expiries") or []
-        self.expiries.setText(", ".join(str(item) for item in expiries))
+        self.expiries.setText(", ".join(_expiry_text(item) for item in expiries))
         self.call_strikes.setText(
             ", ".join(str(item) for item in (section.get("call_strikes_pct") or []))
         )
@@ -428,8 +448,14 @@ class OptionsSettingsSection:
         wallet: dict[str, Any] = {
             "share_trading_wallet": shared,
             "address": self.address.text().strip(),
-            "engine_fence": FENCE_MODES[self.fence.currentIndex()][1],
+            # [review] A wallet of its own has no fence: its disabled control
+            # must not save one the book would refuse.
+            "engine_fence": FENCE_MODES[self.fence.currentIndex()][1] if shared else "auto",
         }
+        if shared and not self._shared_at_load:
+            # [review] Switched to sharing here: the dedicated connection goes,
+            # so the Connection tab's applies (finish() removes the Nones).
+            wallet.update({key: None for key in _DEDICATED_KEYS})
         if not shared:
             fingerprint = self.dedicated_fingerprint.text().strip()
             wallet.update(
@@ -478,9 +504,49 @@ class OptionsSettingsSection:
                 limits.pop(key)
         wallet = options.get("wallet")
         if isinstance(wallet, dict):
-            for key in ("port", "fingerprint"):
+            for key in _DEDICATED_KEYS:
                 if key in wallet and wallet[key] in (None, ""):
                     wallet.pop(key)
+
+    def _dedicated_texts(self) -> dict[str, str]:
+        return {
+            "options.wallet.cert_path": self.dedicated_cert.text().strip(),
+            "options.wallet.key_path": self.dedicated_key.text().strip(),
+            "options.wallet.fingerprint": self.dedicated_fingerprint.text().strip(),
+        }
+
+    def edited_secrets(self) -> frozenset[str]:
+        """[review] The wallet secrets this tab changed, for the save to take from it.
+
+        config_split keeps these from the files unless told otherwise, since
+        nothing else in the app edits them. Switching to sharing here clears
+        them all; on a dedicated wallet, the fields changed since the load.
+        """
+        if not self._edited:
+            return frozenset()
+        if self.share.isChecked():
+            return frozenset() if self._shared_at_load else frozenset(WALLET_SECRETS)
+        now = self._dedicated_texts()
+        return frozenset(key for key in WALLET_SECRETS if now[key] != self._shown.get(key, ""))
+
+    @staticmethod
+    def validate_untouched(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+        """[review] An untouched tab: what a save breaks for the book, if anything.
+
+        Only a book that parsed before and would not after: a problem already
+        in config.yaml is not this save's to block.
+        """
+        from gui.services.options import config as options_config
+
+        try:
+            options_config.parse(copy.deepcopy(before))
+        except options_config.OptionsConfigError:
+            return []
+        try:
+            options_config.parse(copy.deepcopy(after))
+        except options_config.OptionsConfigError as exc:
+            return [f"Options: this change breaks the options book: {exc}"]
+        return []
 
     def validate(self, merged_root: dict[str, Any]) -> list[str]:
         """What the options book itself would refuse in ``merged_root`` (empty when fine)."""

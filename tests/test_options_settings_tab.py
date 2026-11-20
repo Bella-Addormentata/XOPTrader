@@ -92,18 +92,17 @@ def _config(tmp_path: Path, secrets: dict | None = None, **options) -> Path:
 
 def _shared_book(tmp_path: Path, **extra) -> Path:
     # Sharing: the engine's own key and certificates, from the chia section.
-    return _config(
-        tmp_path,
-        secrets={"chia": _SECRETS["chia"]},
-        enabled=True,
-        wallet={"share_trading_wallet": True, "address": ADDRESS},
-        contract_xch=0.5,
-        expiries=["2026-12-04T14:00:00Z"],
-        call_strikes_pct=[110, 120],
-        put_strikes_pct=[],
-        limits={"max_locked_xch": 1.0, "max_locked_quote": 1, "max_contracts": 2},
+    options = {
+        "enabled": True,
+        "wallet": {"share_trading_wallet": True, "address": ADDRESS},
+        "contract_xch": 0.5,
+        "expiries": ["2026-12-04T14:00:00Z"],
+        "call_strikes_pct": [110, 120],
+        "put_strikes_pct": [],
+        "limits": {"max_locked_xch": 1.0, "max_locked_quote": 1, "max_contracts": 2},
         **extra,
-    )
+    }
+    return _config(tmp_path, secrets={"chia": _SECRETS["chia"]}, **options)
 
 
 def _saved_options(cfg_path: Path) -> dict:
@@ -207,3 +206,88 @@ def test_a_dedicated_wallet_shows_its_own_connection(panel, tmp_path):
     tab.share.setChecked(True)
     assert tab.fence.isEnabled()
     assert all(field.isHidden() for _label, field in tab._dedicated_rows)
+
+
+# -- review of #246 ------------------------------------------------------------------------
+
+
+def test_switching_to_the_shared_wallet_clears_the_dedicated_connection(panel, tmp_path):
+    cfg_path = _config(tmp_path, enabled=True, contract_xch=0.5, expiries=["2026-12-04T14:00:00Z"])
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.dedicated_port.value() == 9356 and tab.dedicated_fingerprint.text() == "4242"
+    tab.share.setChecked(True)
+    tab.address.setText(ADDRESS)
+    tab.limit_fields["max_locked_xch"].setText("1")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+
+    wallet = _saved_options(cfg_path)["wallet"]
+    assert "port" not in wallet and "host" not in wallet, "the Connection tab's now"
+    secrets = yaml.safe_load((tmp_path / "secrets.yaml").read_text(encoding="utf-8"))
+    assert not (secrets.get("options") or {}).get("wallet"), "the old key and certificates go"
+    for key, value in _SECRETS["chia"].items():
+        assert secrets["chia"][key] == value, key
+
+
+def test_edited_dedicated_secrets_reach_secrets_yaml(panel, tmp_path):
+    cfg_path = _config(
+        tmp_path,
+        enabled=True,
+        contract_xch=0.5,
+        expiries=["2026-12-04T14:00:00Z"],
+        limits={"max_locked_xch": 1.0, "max_contracts": 2},
+    )
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    tab.dedicated_fingerprint.setText("5151")
+    tab.dedicated_cert.setText("/opt/new.crt")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    wallet = yaml.safe_load((tmp_path / "secrets.yaml").read_text(encoding="utf-8"))["options"][
+        "wallet"
+    ]
+    assert wallet["fingerprint"] == 5151 and wallet["cert_path"] == "/opt/new.crt"
+    assert wallet["key_path"] == "/opt/w.key", "untouched, as it was"
+
+
+def test_a_dedicated_wallet_never_saves_a_fence(panel, tmp_path):
+    panel.load_config(str(_shared_book(tmp_path)))
+    tab = panel._options_section
+    tab.fence.setCurrentIndex(1)  # Always on
+    tab.share.setChecked(False)
+    assert tab.collect()["wallet"]["engine_fence"] == "auto"
+
+
+def test_a_zero_tolerance_stays_zero(panel, tmp_path):
+    panel.load_config(str(_shared_book(tmp_path, target={"xch": 2, "tolerance_pct": 0})))
+    assert panel._options_section.target_tolerance.value() == 0
+
+
+def test_numeric_expiries_show_as_dates(panel, tmp_path):
+    panel.load_config(str(_shared_book(tmp_path, expiries=[1796392800])))
+    assert panel._options_section.expiries.text() == "2026-12-04T14:00:00Z"
+
+
+def test_an_infinite_limit_is_refused_not_crashed_on(panel, tmp_path):
+    cfg_path = _shared_book(tmp_path)
+    panel.load_config(str(cfg_path))
+    panel._options_section.limit_fields["max_locked_xch"].setText("inf")
+    assert panel.save_config(str(cfg_path)) is False
+    assert _SAID and "not a number" in _SAID[0]
+
+
+def test_a_connection_change_that_breaks_the_book_is_refused(panel, tmp_path):
+    cfg_path = _shared_book(tmp_path)
+    panel.load_config(str(cfg_path))
+    panel._wl_host.setText("10.0.0.5")  # the book can only check an engine on this machine
+    assert panel.save_config(str(cfg_path)) is False
+    assert _SAID and "this change breaks the options book" in _SAID[0]
+
+
+def test_a_book_already_broken_does_not_block_other_saves(panel, tmp_path):
+    cfg_path = _shared_book(tmp_path)
+    root = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    root["options"]["wallet"]["address"] = ""  # refused by the book already
+    cfg_path.write_text(yaml.safe_dump(root, sort_keys=False), encoding="utf-8")
+    panel.load_config(str(cfg_path))
+    panel._wl_port.setValue(19256)
+    assert panel.save_config(str(cfg_path)) is True, _SAID

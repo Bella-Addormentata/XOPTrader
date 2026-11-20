@@ -380,3 +380,33 @@ def test_secrets_yaml_wins_when_both_files_carry_a_secret(tmp_path):
 def test_every_file_owned_key_is_a_secret_key():
     for section, keys in config_split.FILE_OWNED_KEYS.items():
         assert keys <= config_split.SECRET_KEYS[section], section
+
+
+@requires_ruamel
+def test_an_edited_file_owned_secret_is_the_callers_and_none_removes_it(tmp_path):
+    """[OPTIONS] The Settings page's Options tab edits the dedicated wallet's
+    secrets: those it names in ``edited`` come from its copy, not the files."""
+    path = tmp_path / "config.yaml"
+    path.write_text("options:\n  wallet:\n    port: 9356\n", encoding="utf-8")
+    (tmp_path / "secrets.yaml").write_text(
+        "options:\n  wallet:\n    cert_path: /old.crt\n    key_path: /old.key\n"
+        "    fingerprint: 4242\n",
+        encoding="utf-8",
+    )
+    merged = config_split.load_merged(path)
+    merged["options"]["wallet"]["cert_path"] = "/new.crt"
+    merged["options"]["wallet"]["fingerprint"] = None
+    merged["options"]["wallet"]["key_path"] = "/ignored.key"  # not named: the file's stays
+
+    split_and_save(
+        path,
+        merged,
+        edited=frozenset({"options.wallet.cert_path", "options.wallet.fingerprint"}),
+    )
+
+    wallet = yaml.safe_load((tmp_path / "secrets.yaml").read_text(encoding="utf-8"))["options"][
+        "wallet"
+    ]
+    assert wallet == {"cert_path": "/new.crt", "key_path": "/old.key"}
+    public = yaml.safe_load(path.read_text(encoding="utf-8"))["options"]["wallet"]
+    assert "cert_path" not in public and "fingerprint" not in public
