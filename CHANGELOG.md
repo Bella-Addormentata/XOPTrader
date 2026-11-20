@@ -5,6 +5,18 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.55] — 2026-11-20 — the options book's steps no longer fail at the top-up
+
+### The options book's top-up works on a live book (#249)
+
+Since v0.10.52, every step of a live book with a top-up target (the default
+when it shares the trading wallet) failed at the top-up check with
+"'frozenset' object is not callable", before it could quote, mint, list or
+refresh its offers. Nothing was sent. The book's cache of the wallet's coins
+had the same name as the method that sums the options address and hid it.
+The cache is renamed, and the top-up tests now run on a real book instead of
+a stand-in that hid the clash.
+
 ## [0.10.54] — 2026-11-20 — the options book is set up in Settings, and its expiries roll on their own
 
 ### Options: rolling expiries, a clearer Options page, and a shorter set-up (#246)
