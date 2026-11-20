@@ -44,6 +44,7 @@ import argparse
 import dataclasses
 import datetime as _dt
 import json
+import math
 import os
 import sys
 import time
@@ -229,6 +230,8 @@ def _retry_after(headers: dict[str, str]) -> float:
     try:
         seconds = float(raw) if raw is not None else WAIT_ON_429_S
     except ValueError:  # an HTTP date, or junk: wait the default
+        seconds = WAIT_ON_429_S
+    if not math.isfinite(seconds):  # "NaN" and "inf" parse as floats; sleep(nan) raises
         seconds = WAIT_ON_429_S
     return min(max(seconds, 1.0), MAX_RETRY_AFTER_S)
 

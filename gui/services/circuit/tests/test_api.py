@@ -170,6 +170,15 @@ def test_retry_after_is_obeyed_and_capped() -> None:
     assert WAIT_ON_429_S in clock.slept
 
 
+@pytest.mark.parametrize("value", ["NaN", "nan", "inf", "-inf"])
+def test_a_retry_after_that_is_not_a_finite_number_waits_the_default(value: str) -> None:
+    # float() takes these, and time.sleep(nan) raises: the probe would stop.
+    clock = Clock()
+    server = Server({"/a": InTurn((429, "", {"Retry-After": value}), (200, {}))})
+    client(server, clock).get("/a")
+    assert clock.slept == [WAIT_ON_429_S]
+
+
 def test_a_second_429_is_returned_not_retried_forever() -> None:
     server = Server({"/a": InTurn((429, "no"), (429, "still no"))})
     with pytest.raises(CircuitApiError) as caught:
