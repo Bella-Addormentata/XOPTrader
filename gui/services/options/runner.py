@@ -65,6 +65,11 @@ DEFAULT_INTERVAL = 60.0
 #: How long a switch from the GUI waits for a step in progress before it says
 #: "try again" rather than hold the window. Closing the app waits longer.
 SWITCH_WAIT = 2.0
+#: [review] Why a run that new settings stopped is not started again by itself.
+WALLET_CHANGED = (
+    "the saved settings change the wallet, network or record the book uses. If the trading "
+    "engine shares the wallet, restart it with them first; then switch the book back on"
+)
 #: Lines of recent activity kept for the panel.
 _HISTORY = 200
 #: The book's log file takes what this package logs, not the whole app's log.
@@ -121,6 +126,9 @@ class Snapshot:
     #: Lines of activity ever written, so a reader can tell what is new once
     #: ``recent`` is full and stops growing.
     recent_count: int = 0
+    #: The options address against its target, as the last step that checked
+    #: its top-ups saw it ("1.2 of 1.5 XCH, 2 of 2 quote"); "" before one has.
+    sub_account: str = ""
 
     @property
     def open_contracts(self) -> int:
@@ -384,6 +392,38 @@ def fence_identity(cfg: config.OptionsConfig) -> str:
         return ""
 
 
+def contract_views(cfg: config.OptionsConfig, book_store: Any) -> tuple[ContractView, ...]:
+    """Every contract on record, as the page shows it."""
+
+    def collateral(item: Any) -> str:
+        if item.underlying_asset is None:
+            return f"{int(item.underlying_amount) / config.XCH_MOJOS:g} XCH"
+        return f"{int(item.underlying_amount) / cfg.quote_unit_mojos:g} quote"
+
+    return tuple(
+        ContractView(
+            slot=item.slot,
+            status=item.status,
+            launcher_id=item.launcher_id.hex(),
+            expiration=int(item.expiration),
+            underlying_amount=int(item.underlying_amount),
+            collateral=collateral(item),
+            live_offers=len(book_store.offers(item.launcher_id, "live")),
+        )
+        for item in book_store.contracts()
+    )
+
+
+def sub_account_text(held: dict[str, tuple[int, int]], cfg: config.OptionsConfig) -> str:
+    """``{"XCH": (held, target), ...}`` as "1.2 of 1.5 XCH, 2 of 2 quote"."""
+    parts = []
+    for what, (have, want) in held.items():
+        unit = config.XCH_MOJOS if what == "XCH" else cfg.quote_unit_mojos
+        name = "XCH" if what == "XCH" else "quote"
+        parts.append(f"{have / unit:g} of {want / unit:g} {name}")
+    return ", ".join(parts)
+
+
 # -- the runner ------------------------------------------------------------------
 
 
@@ -392,6 +432,8 @@ class _Run:
     thread: threading.Thread
     stop: threading.Event
     mode: Mode
+    #: The settings the run started with, as config.yaml gave them.
+    loaded: config.OptionsConfig | None = None
 
 
 class OptionsRunner:
@@ -415,6 +457,8 @@ class OptionsRunner:
         self._clock = clock
         self._lock = threading.Lock()
         self._run: _Run | None = None
+        #: [review] The settings the last run started with, for restart_refusal().
+        self._last_loaded: config.OptionsConfig | None = None
         self._snapshot = Snapshot()
         self._recent: collections.deque[str] = collections.deque(maxlen=_HISTORY)
         #: [AUTO-FENCE] Serialises the flag with the run it answers for: a run
@@ -477,6 +521,7 @@ class OptionsRunner:
                 raise RunnerError(
                     "the previous run is still finishing its step; try again in a moment"
                 )
+        loaded = self._last_loaded = cfg
         cfg = dataclasses.replace(cfg, dry_run=mode is not Mode.LIVE)
         stop = threading.Event()
         thread = threading.Thread(
@@ -492,7 +537,7 @@ class OptionsRunner:
                         f"Live refused: the engine's fence flag could not be written at {flag}; "
                         "the book does not sign without it"
                     )
-            self._run = _Run(thread=thread, stop=stop, mode=mode)
+            self._run = _Run(thread=thread, stop=stop, mode=mode, loaded=loaded)
         _set_book(self._config_path, live=mode is Mode.LIVE)
         with self._lock:
             self._snapshot = dataclasses.replace(
@@ -532,6 +577,56 @@ class OptionsRunner:
             )
         if was is not Mode.OFF:
             self._note("switched off" if finished else "switching off after the step in progress")
+
+    @property
+    def finishing(self) -> bool:
+        """Whether a run told to stop is still in its step: nothing new can start yet."""
+        current = self._run
+        return current is not None and current.stop.is_set()
+
+    def restart_refusal(self) -> str:
+        """[review] Why a run new settings stopped must not start again by itself, or "".
+
+        Saved settings that change the wallet the book signs from (its daemon,
+        key, address or fence), its network or its record are the operator's
+        to take up. On a shared wallet a step logs the daemon in to the book's
+        key, and the trading engine takes up a new key only when it restarts.
+        """
+        try:
+            fresh = load_options(self._config_path)
+        except RunnerError as exc:
+            return str(exc)
+        last = self._last_loaded
+        if last is not None and (fresh.wallet, fresh.network, fresh.database_path) != (
+            last.wallet,
+            last.network,
+            last.database_path,
+        ):
+            return WALLET_CHANGED
+        return ""
+
+    def stop_for_new_settings(self) -> Mode | None:
+        """[review] Settings saved config.yaml under a run: stop it if its settings changed.
+
+        A run reads its settings when it starts, so a change reaches it only by
+        a restart. A run whose settings changed (or that config.yaml no longer
+        sets up) is stopped after its step, with the short wait the switch
+        uses, and its mode is returned for the caller to start again once
+        :attr:`finishing` is over. None, and nothing stopped, when nothing runs
+        or nothing the book reads changed.
+        """
+        current = self._run
+        if current is None or current.stop.is_set():
+            return None
+        try:
+            fresh: config.OptionsConfig | None = load_options(self._config_path)
+        except RunnerError:
+            fresh = None  # switched off or broken: the run must not go on regardless
+        if fresh is not None and fresh == current.loaded:
+            return None
+        self._note("new settings saved: switching off to take them up")
+        self.stop(timeout=SWITCH_WAIT)
+        return current.mode
 
     # -- the loop (its own thread) -------------------------------------------
 
@@ -746,24 +841,8 @@ class OptionsRunner:
             for problem in report.problems:
                 self._note(f"note: {problem}")
 
-        def collateral(item: Any) -> str:
-            if item.underlying_asset is None:
-                return f"{int(item.underlying_amount) / config.XCH_MOJOS:g} XCH"
-            return f"{int(item.underlying_amount) / cfg.quote_unit_mojos:g} quote"
-
         try:
-            contracts = tuple(
-                ContractView(
-                    slot=item.slot,
-                    status=item.status,
-                    launcher_id=item.launcher_id.hex(),
-                    expiration=int(item.expiration),
-                    underlying_amount=int(item.underlying_amount),
-                    collateral=collateral(item),
-                    live_offers=len(book_store.offers(item.launcher_id, "live")),
-                )
-                for item in book_store.contracts()
-            )
+            contracts = contract_views(cfg, book_store)
             fees = sum(int(row.fee or 0) for row in book_store.broadcasts("confirmed"))
         except Exception as exc:  # noqa: BLE001 - the panel keeps what it had
             log.warning("options: could not read the book's record: %s", exc)
@@ -777,6 +856,9 @@ class OptionsRunner:
                 else f"{view.bid:.4f}/{view.ask:.4f}"
             )
             market = f"spot {view.spot:.4f}  sigma {view.sigma:.2f}  dexie {book_text}"
+        sub_account = self._snapshot.sub_account
+        if report is not None and report.sub_account:
+            sub_account = sub_account_text(report.sub_account, cfg)
         with self._lock:
             self._snapshot = dataclasses.replace(
                 self._snapshot,
@@ -787,4 +869,27 @@ class OptionsRunner:
                 market=market or self._snapshot.market,
                 contracts=contracts,
                 fees_paid_mojos=fees,
+                sub_account=sub_account,
             )
+
+    def contracts_on_record(self) -> tuple[ContractView, ...]:
+        """The book's contracts as its record has them: for the page while the book is off.
+
+        A book switched off since launch has not stepped, so its snapshot has
+        no contracts; its record does. () when there is none.
+
+        [review] Read from a copy (:meth:`store.OptionStore.snapshot`): looking
+        never upgrades an older book's file in place, and a record on a
+        read-only disk still shows.
+        """
+        try:
+            cfg = load_options(self._config_path)
+        except RunnerError:
+            return ()
+        if not Path(cfg.database_path).exists():
+            return ()
+        book_store = store.OptionStore.snapshot(cfg.database_path)
+        try:
+            return contract_views(cfg, book_store)
+        finally:
+            book_store.close()

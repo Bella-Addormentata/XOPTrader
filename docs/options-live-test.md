@@ -1,5 +1,32 @@
 # Options: first live run
 
+## Quick start (0.10.54 and later)
+
+The straightforward set-up, with the app alone:
+
+1. **Settings > Options.** Tick "Enable the options book" and "Sign from the
+   trading wallet", and give the options address: an address of the trading
+   key that the engine does not send to itself (one a Dexie trade paid into).
+   Host, port, key and certificates come from the Connection tab.
+2. **Set the four limits** under Limits: Max XCH locked (at least one
+   contract's size), Max quote locked, Max contracts and Max per expiry, each a
+   number or `unlimited`. Nothing is minted until all four are set; the tab
+   says so. Leave the rest as it is: the engine fence follows the book,
+   expiries roll on their own (the next two Fridays at 08:00 UTC), and the
+   top-up target comes from your limits.
+3. **The Options page** (or the OPTIONS switch in the toolbar): Rehearse first,
+   to see what the book would mint and list, then Live. With the fence the
+   engine keeps trading beside it, so the book can simply be left on: it tops
+   its address up, lists, re-prices, cancels unsold contracts before expiry
+   and claws back expired collateral by itself.
+
+Expired contracts still open say so on the Options page ("expired: its
+collateral comes back at the next Live step"), and the page shows the options
+address against its target once a step has checked it.
+
+The rest of this file is the first live run, kept as the reference for what
+each setting does.
+
 `gui/services/options` writes option contracts (CHIP-0045) from a Chia reference
 wallet. Before this checklist it had been run on a simulated chain, against
 chia-blockchain 2.7.5's own signer code, and read-only against mainnet. It had
@@ -135,6 +162,11 @@ Set `dry_run: false` with small limits and run `step` by hand a few times
 before `run`. `withdraw-all` takes every open offer off the market by spending
 its coin. Stopping `run` is safe: offers already out expire on their own and
 collateral waits to be reclaimed on the next `step` after expiry.
+
+The **Options** tab in Settings sets the book up without editing config.yaml:
+switching it on, the wallet (sharing the trading wallet needs only the options
+address), the fence, the top-up target, the grid and the limits. It refuses to
+save anything the book itself would refuse.
 
 In the app, the Options page does the same without a terminal: **Rehearse**
 steps the book as a dry run whatever `options.dry_run` says, **Live** steps it

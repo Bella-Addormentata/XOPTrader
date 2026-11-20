@@ -72,17 +72,14 @@ def test_it_does_not_make_trading_mode_acceptable() -> None:
         _parse(_shared(mode="trading"))
 
 
-@pytest.mark.parametrize(
-    "wallet",
-    [
-        _shared(fingerprint=None),  # whichever key is open
-        _shared(fingerprint=""),
-        _shared(fingerprint=12345),  # another key, switched in under the engine
-    ],
-)
-def test_on_the_engine_s_daemon_it_must_name_the_engine_s_key(wallet) -> None:
+def test_on_the_engine_s_daemon_it_must_name_the_engine_s_key() -> None:
+    # Another key would be switched in under the engine.
     with pytest.raises(config.OptionsConfigError, match="must be the engine's key"):
-        _parse(wallet)
+        _parse(_shared(fingerprint=12345))
+    # [DEFAULTS] Unset, it is the engine's own key (chia.wallet_fingerprint),
+    # never "whichever key is open".
+    for unset in (None, ""):
+        assert _parse(_shared(fingerprint=unset)).wallet.fingerprint == 481655774
 
 
 def test_with_no_trading_key_configured_sharing_is_refused() -> None:
@@ -362,3 +359,30 @@ def test_a_refusal_is_a_signing_error_so_the_book_reports_it_per_action() -> Non
 
     assert issubclass(engine_guard.EngineRunningError, signing.SigningError)
     assert issubclass(engine_guard.EngineRunningError, RuntimeError)  # the CLI's catch-all
+
+
+def test_a_shared_wallet_takes_its_connection_from_the_chia_section() -> None:
+    """[DEFAULTS] Sharing needs only the switch and an address: the rest is chia.*."""
+    chia = {
+        "wallet_host": "localhost",
+        "wallet_port": 9256,
+        "wallet_fingerprint": 481655774,
+        "wallet_cert_path": "/w/private_wallet.crt",
+        "wallet_key_path": "/w/private_wallet.key",
+    }
+    parsed = _parse({"share_trading_wallet": True, "address": ADDRESS}, chia=chia)
+    wallet = parsed.wallet
+    assert (wallet.host, wallet.port, wallet.fingerprint) == ("localhost", 9256, 481655774)
+    assert wallet.cert_path.endswith("private_wallet.crt")
+    assert wallet.key_path.endswith("private_wallet.key")
+    # Written in options.wallet, it still wins.
+    own = _parse(
+        {
+            "share_trading_wallet": True,
+            "address": ADDRESS,
+            "cert_path": "/o/c.crt",
+            "key_path": "k",
+        },
+        chia=chia,
+    )
+    assert own.wallet.cert_path.endswith("c.crt")

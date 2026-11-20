@@ -394,6 +394,12 @@ def test_the_book_tops_its_address_up_to_target_once_at_a_time() -> None:
     top_up(report)
     # 1.0 of 1.5 XCH is below 80% of target; the quote asset is at target.
     assert coins.sent == [(None, 500_000_000_000, 5)]
+    # What the Options page shows: the address against its target.
+    assert report.sub_account == {
+        "XCH": (1_000_000_000_000, 1_500_000_000_000),
+        "quote asset": (2_000, 2_000),
+    }
+    assert runner.sub_account_text(report.sub_account, cfg) == "1 of 1.5 XCH, 2 of 2 quote"
     top_up(StepReport())
     assert len(coins.sent) == 1, "one top-up at a time: the first has not confirmed"
     coins.confirmed["0xtx1"] = True

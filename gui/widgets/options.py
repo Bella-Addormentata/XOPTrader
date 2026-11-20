@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.services.options import runner as options_runner
+from gui.services.options import store as options_store
 from gui.services.venue_control import StatusChip
 from gui.theme import COLORS as _C
 
@@ -146,6 +147,24 @@ def header_status(
     )
 
 
+def _status_text(item: Any, now: float) -> str:
+    """A contract's status as the page says it: an expired one still open says what comes next."""
+    if item.expiration <= now and item.status in (options_store.OPEN, options_store.SOLD):
+        return f"{item.status}, expired: its collateral comes back at the next Live step"
+    return item.status
+
+
+def _same_file(first: Any, second: Any) -> bool:
+    """Whether two config.yaml paths name one file, as written or resolved."""
+    a, b = Path(first), Path(second)
+    if a == b:
+        return True
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return False
+
+
 class OptionsWidget(QWidget):
     """The Options page. Inert until :meth:`attach` gives it config.yaml."""
 
@@ -163,6 +182,11 @@ class OptionsWidget(QWidget):
         self._setup_error = ""
         #: Why the last switch-on was refused, until the next switch; for the toolbar chip.
         self._refusal = ""
+        #: The record's contracts, read while the book is off (None: not read yet).
+        self._on_record: tuple[Any, ...] | None = None
+        #: [review] The mode a save stopped the book in, to start it again in
+        #: with the saved settings once its step is over (None: no restart due).
+        self._restart_to: Mode | None = None
 
         title = QLabel("Options book")
         title.setStyleSheet(f"font-size: 18px; font-weight: 600; color: {TEXT_PRIMARY};")
@@ -194,6 +218,7 @@ class OptionsWidget(QWidget):
         self._engine = QLabel("")
         self._held = QLabel("")
         self._market = QLabel("")
+        self._sub_account = QLabel("")
         self._fees = QLabel("")
         self._engine_block = QLabel("")
         for label in (
@@ -202,6 +227,7 @@ class OptionsWidget(QWidget):
             self._engine,
             self._held,
             self._market,
+            self._sub_account,
             self._fees,
             self._engine_block,
         ):
@@ -236,6 +262,7 @@ class OptionsWidget(QWidget):
             self._engine,
             self._held,
             self._market,
+            self._sub_account,
             self._fees,
         ):
             layout.addWidget(label)
@@ -257,24 +284,42 @@ class OptionsWidget(QWidget):
         Called again when Settings switches config.yaml: a book running on the
         old file is stopped first (after its step), and is still covered by the
         engine-start check, which looks at every book this app has run.
+
+        [review] Called again when Settings saves the file the book runs on: a
+        running book reads its settings when it starts, so one whose settings
+        changed is stopped after its step and started again, in the same mode,
+        with the saved ones. Settings that no longer set the book up, or that
+        change its wallet, network or record, leave it off, and the page says
+        why.
         """
         new_path = Path(config_path)
         self._refusal = ""
         old = self._runner
         old_path = getattr(old, "config_path", None)
-        if old is not None and old_path is not None and Path(old_path) != new_path:
+        saved_over = self._config_path is not None and _same_file(self._config_path, new_path)
+        if old is not None and old_path is not None and not _same_file(old_path, new_path):
+            self._restart_to = None
             old.stop()
             self._runner = None
             self._held.setText(
                 f"Switched to {new_path}; the book on {old_path} was switched off "
                 "(the engine-start check still covers it)."
             )
+        elif old is not None and saved_over:
+            stop_for = getattr(old, "stop_for_new_settings", None)
+            stopped = stop_for() if callable(stop_for) else None
+            if stopped is not None:  # an earlier save's restart still due stays due
+                self._restart_to = stopped
         self._config_path = new_path
         if self._runner is None:
             self._runner = options_runner.OptionsRunner(self._config_path)
         try:
             options_runner.load_options(self._config_path)
         except options_runner.RunnerError as exc:
+            if self._restart_to is not None:
+                # Saved switched off or broken: nothing to start again with.
+                self._restart_to = None
+                self._remember(Mode.OFF)
             self._set_enabled(False, f"{exc}. See docs/options-live-test.md.")
         else:
             self._set_enabled(True, "")
@@ -285,7 +330,11 @@ class OptionsWidget(QWidget):
             # [AUTO-FENCE] Not resumed, or not asked to: the engine's fence flag
             # follows the book's record (a contract open keeps it up), not
             # whatever the last session left. A run that started raised it.
-            if self._runner.mode is Mode.OFF and hasattr(self._runner, "sync_fence"):
+            if (
+                self._restart_to is None
+                and self._runner.mode is Mode.OFF
+                and hasattr(self._runner, "sync_fence")
+            ):
                 try:
                     self._runner.sync_fence()
                 except Exception:  # noqa: BLE001 - the flag is best effort; the book checks
@@ -296,12 +345,14 @@ class OptionsWidget(QWidget):
     def stop_background_work(self) -> None:
         """App closing: stop the book after its step. The remembered mode stays."""
         self._timer.stop()
+        self._restart_to = None
         if self._runner is not None:
             self._runner.stop()
 
     # -- the switch -------------------------------------------------------------
 
     def _on_choose(self, mode: Mode) -> None:
+        self._restart_to = None  # the operator's own choice, over a restart still due
         if mode is Mode.OFF:
             # A short wait: a slow step finishes on its own, shown as stopping.
             self._runner.stop(timeout=options_runner.SWITCH_WAIT)
@@ -422,13 +473,38 @@ class OptionsWidget(QWidget):
     def refresh(self) -> None:
         if self._runner is None:
             return
+        self._finish_restart()
         try:
             self._show(self._runner.snapshot())
         finally:
             self.status_changed.emit()
 
+    def _finish_restart(self) -> None:
+        """[review] Start again, in its mode, the run a save stopped, once its step is over."""
+        mode = self._restart_to
+        if mode is None or self._runner is None:
+            return
+        if getattr(self._runner, "finishing", False):
+            self._held.setText(
+                f"Settings saved: the book starts again ({mode.value}) with them once the step "
+                "in progress is over."
+            )
+            return
+        self._restart_to = None
+        refusal = getattr(self._runner, "restart_refusal", None)
+        why = refusal() if callable(refusal) else ""
+        if why:
+            # [review] The operator's to switch on again, and remembered off.
+            self._remember(Mode.OFF)
+            self._held.setText(f"Switched off, not started again: {why}.")
+            return
+        self._start(mode, confirm=False, why="with the saved settings")
+
     def _show(self, snap: Any) -> None:
         self._check(snap.mode)
+        contracts = self._contracts_to_show(snap)
+        # [review] Counted from what the table shows: the record's, while off.
+        open_count = sum(item.status in options_store.ACTIVE for item in contracts)
         when = (
             time.strftime("%H:%M:%S", time.localtime(snap.last_step_at))
             if snap.last_step_at
@@ -437,8 +513,7 @@ class OptionsWidget(QWidget):
         state = {Mode.OFF: "Off", Mode.REHEARSE: "Rehearsing (signs nothing)", Mode.LIVE: "LIVE"}
         shown = "Off (finishing the step in progress)" if snap.stopping else state[snap.mode]
         self._state.setText(
-            f"{shown}  ·  steps {snap.steps}  ·  last step {when}  ·  "
-            f"{snap.open_contracts} contract(s) open"
+            f"{shown}  ·  steps {snap.steps}  ·  last step {when}  ·  {open_count} contract(s) open"
         )
         colour = (
             LOSS_RED
@@ -452,16 +527,23 @@ class OptionsWidget(QWidget):
         elif snap.mode is not Mode.OFF:
             self._held.setText("")  # running and nothing held; a refusal shown while off stays
         self._market.setText(f"Market: {snap.market}" if snap.market else "")
+        self._sub_account.setText(
+            f"Options address: {snap.sub_account} (held against its target, collateral "
+            "in open contracts counted)"
+            if snap.sub_account
+            else ""
+        )
         self._fees.setText(
             f"Fees paid by the book: {snap.fees_paid_mojos / 1e12:.6f} XCH"
             if snap.fees_paid_mojos
             else ""
         )
-        self._show_contracts(snap.contracts)
+        self._show_contracts(contracts)
         self._show_recent(snap.recent, snap.recent_count)
         self._refreshes += 1
         if (
             self._refreshes % _FENCE_CHECK_EVERY == 0
+            and self._restart_to is None
             and snap.mode is Mode.OFF
             and not snap.running
             and hasattr(self._runner, "sync_fence")
@@ -476,12 +558,27 @@ class OptionsWidget(QWidget):
             blocker = options_runner.engine_start_blocker(self._config_path)
             self._engine_block.setText(f"Engine start is held: {blocker}" if blocker else "")
 
+    def _contracts_to_show(self, snap: Any) -> tuple[Any, ...]:
+        """The run's contracts; off since launch, nothing stepped, so the record's."""
+        contracts = tuple(snap.contracts)
+        if snap.running or contracts:
+            return contracts
+        if self._refreshes % _BLOCKER_EVERY == 0 or self._on_record is None:
+            reader = getattr(self._runner, "contracts_on_record", None)
+            try:
+                self._on_record = tuple(reader()) if callable(reader) else ()
+            except Exception:  # noqa: BLE001 - display only
+                _log.debug("[Options] the record could not be read", exc_info=True)
+                self._on_record = ()
+        return self._on_record
+
     def _show_contracts(self, contracts: tuple[Any, ...]) -> None:
         self._contracts.setRowCount(len(contracts))
+        now = time.time()
         for row, item in enumerate(contracts):
             values = (
                 item.slot,
-                item.status,
+                _status_text(item, now),
                 time.strftime("%Y-%m-%d %H:%M", time.gmtime(item.expiration)),
                 item.collateral,  # in its own asset: XCH for a call, the quote asset for a put
                 str(item.live_offers),

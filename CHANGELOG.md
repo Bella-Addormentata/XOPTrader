@@ -5,6 +5,57 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Options: rolling expiries, a clearer Options page, and a shorter set-up
+
+- **Expiries roll forward on their own.** `options.expiries: weekly` keeps the
+  next two Fridays at 08:00 UTC -- the crypto options market's own time
+  (Deribit's); xchoptions.com has no standard dates -- worked out afresh at
+  every step, so the book never runs out of expiries. `monthly` keeps the
+  last Friday of the next two months, and `{weekly: 3, monthly: 1}` sets the
+  counts. A list of dates still works. Left out, or an empty list, it is
+  `weekly` -- a book with no expiries used to sit idle without saying why --
+  and `none` winds the book down: no new contracts. The Settings tab offers
+  all three, and the example config says `weekly`.
+- **The Options page says more while the book is off.** It shows the
+  contracts on record instead of an empty table, an expired one still open
+  says "expired: its collateral comes back at the next Live step", and once a
+  step has checked its top-ups the page shows the options address against its
+  target ("1 of 1.5 XCH, 2 of 2 quote").
+- **A shorter set-up.** The example config leads with the shared trading
+  wallet (only the options address to give) and the engine fence, and leaves
+  `mode`, `fund_from_wallet` and `engine_beside_open_contracts` -- the rules
+  from before the fence -- to the docs. The options docs start with a quick
+  start.
+
+### The options book is set up in Settings
+
+A new **Options** tab in Settings sets the options book up without editing
+config.yaml:
+
+- switching the book on, and the network;
+- the wallet it signs from. Sharing the trading wallet needs only the
+  options address: host, port, key and certificates now default to the
+  Connection tab's. A dedicated wallet shows its own connection fields;
+- the engine fence (follows the book, always on, or off);
+- the top-up target (from the limits, custom, or off), with what "from the
+  limits" works out to;
+- the grid (contract size, expiries, call and put strikes) and the limits,
+  with a note while they would mint nothing (all four must be set, and the
+  XCH cap must cover a contract).
+
+The options book's own parser judges the tab, so Settings refuses to save a
+setup the book would refuse, and says why. An untouched tab leaves the
+`options:` section exactly as it is; an edited one writes only the keys it
+shows, a number as config.yaml has it until its own field is edited (so an
+edit elsewhere never rounds a contract size or replaces a malformed one),
+and the options secrets still go to secrets.yaml. Off, Rehearse and
+Live stay on the Options page. Saving new settings while the book runs
+starts it again with them, in the same mode, once its step is over; settings
+that change its wallet, network or record leave it off, for you to switch on
+once the trading engine has them too.
+
 ## [0.10.53] — 2026-11-19 — the options fence follows the book, and is the default on a shared wallet
 
 ### Sharing the trading wallet needs no other options settings (#244)

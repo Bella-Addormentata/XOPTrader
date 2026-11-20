@@ -315,3 +315,76 @@ def test_certificate_paths_have_their_home_expanded(monkeypatch) -> None:
         "/home/someone/ca.crt",
     )
     assert _parse().node.ca_cert_path == ""
+
+
+# -- [ROLLING] expiries that roll forward on their own -------------------------------
+
+_FRI_0330 = 1795145400  # 2026-11-20T03:30:00Z, a Friday
+
+
+def _utc(stamp: int) -> str:
+    import datetime
+
+    return datetime.datetime.fromtimestamp(stamp, tz=datetime.UTC).strftime("%a %Y-%m-%d %H:%M")
+
+
+def test_weekly_is_the_next_two_fridays_at_eight_utc() -> None:
+    parsed = _parse(expiries="weekly")
+    assert parsed.expiries == () and parsed.expiry_rule == config.ExpiryRule(2, 0)
+    assert [_utc(x) for x in parsed.expiry_rule.at(_FRI_0330)] == [
+        "Fri 2026-11-20 08:00",
+        "Fri 2026-11-27 08:00",
+    ]
+    # From the end of the stop window (six hours by default): two still quotable.
+    assert [_utc(x) for x in parsed.expiries_at(_FRI_0330)] == [
+        "Fri 2026-11-27 08:00",
+        "Fri 2026-12-04 08:00",
+    ]
+
+
+def test_monthly_is_the_last_friday_of_the_month() -> None:
+    parsed = _parse(expiries="Monthly")
+    assert [_utc(x) for x in parsed.expiry_rule.at(_FRI_0330)] == [
+        "Fri 2026-11-27 08:00",
+        "Fri 2026-12-25 08:00",
+    ]
+    both = _parse(expiries={"weekly": 3, "monthly": 2})
+    assert [_utc(x) for x in both.expiry_rule.at(_FRI_0330)] == [
+        "Fri 2026-11-20 08:00",
+        "Fri 2026-11-27 08:00",
+        "Fri 2026-12-04 08:00",
+        "Fri 2026-12-25 08:00",
+    ]
+
+
+@pytest.mark.parametrize(
+    "raw, message",
+    [
+        ("daily", "is not a list of dates"),
+        ({"weekly": 0, "monthly": 0}, "must be above 0"),
+        ({"weekly": 13}, "0 to 12"),
+        ({"weekly": True}, "whole number"),
+        ({"fortnightly": 1}, "unknown key"),
+    ],
+)
+def test_a_rule_that_makes_no_sense_is_refused(raw, message) -> None:
+    with pytest.raises(config.OptionsConfigError, match=message):
+        _parse(expiries=raw)
+
+
+def test_a_list_of_dates_still_works_and_has_no_rule() -> None:
+    parsed = _parse(expiries=["2026-12-01T13:00:00Z"])
+    assert parsed.expiry_rule is None
+    assert parsed.expiries_at(_FRI_0330) == parsed.expiries == (1796130000,)
+
+
+def test_no_expiries_written_is_weekly_and_none_winds_down() -> None:
+    """[DEFAULTS] A book with no expiries used to sit idle without saying why."""
+    section = _section()
+    section.pop("expiries")
+    absent = config.parse({"options": section})
+    assert absent is not None and absent.expiry_rule == config.ExpiryRule(2, 0)
+    assert _parse(expiries=[]).expiry_rule == config.ExpiryRule(2, 0)
+    for word in ("none", "None", " NONE "):
+        winding = _parse(expiries=word)
+        assert winding.expiry_rule is None and winding.expiries_at(_FRI_0330) == ()
