@@ -72,4 +72,4 @@ ignore = ["S101"]  # allow assert in tests
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests", "gui/services/warp/tests", "gui/services/permuto/tests", "gui/services/consolidate/tests", "gui/services/options/tests"]
+testpaths = ["tests", "gui/services/warp/tests", "gui/services/permuto/tests", "gui/services/consolidate/tests", "gui/services/options/tests", "gui/services/circuit/tests"]
