@@ -829,6 +829,50 @@ def test_a_thread_that_outlasts_the_close_wait_is_left_to_end_not_killed(app, mo
         _close(page, app)
 
 
+def test_what_a_round_left_to_end_on_its_own_had_sent_is_not_shown(app) -> None:
+    import shiboken6
+
+    from gui.widgets import circuit as circuit_mod
+
+    entered, gate = threading.Event(), threading.Event()
+    oracle = json.loads((FIXTURES / "oracle.json").read_text("utf-8"))
+
+    class AnswersOnceThenDeaf(_Deaf):
+        def get(self, path: str) -> Any:
+            if not self.asked:
+                self.asked.append(path)
+                return oracle
+            return super().get(path)
+
+    page = circuit_mod.CircuitWidget(
+        client_factory=lambda stop: AnswersOnceThenDeaf(entered, gate), wall=Clock()
+    )
+    thread = None
+    try:
+        page.set_enabled(True)
+        page.show()
+        # Not drawn yet: the price is on its way to the page as the app closes.
+        assert entered.wait(5), "the round never reached its second read"
+        thread = page._thread
+        page.stop_background_work(timeout_ms=100)
+        assert any(kept is thread for kept, _worker in circuit_mod._ABANDONED)
+        for _ in range(5):
+            app.processEvents()
+            time.sleep(0.01)
+        assert page._answers == {} and page._errors == {}, "a round let go of shows nothing"
+        # Its end will never be heard: it counts as cut short, so the next
+        # open reads again.
+        assert page._round_why == "stopped"
+        assert not page._fresh()
+    finally:
+        gate.set()
+        if thread is not None and shiboken6.isValid(thread):
+            thread.wait(5000)
+        kept = circuit_mod._ABANDONED
+        kept[:] = [pair for pair in kept if pair[0] is not thread]
+        _close(page, app)
+
+
 _CLOSING = """
 import os, sys, threading, time
 os.environ["QT_QPA_PLATFORM"] = "offscreen"

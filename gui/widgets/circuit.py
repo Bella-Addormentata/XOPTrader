@@ -434,6 +434,13 @@ class CircuitWidget(QWidget):
                 pass
         thread.setParent(None)  # a child would die with the page, running
         _ABANDONED.append((thread, worker))
+        # What it sent before it was let go of is still on its way to the
+        # page: a disconnect does not call back what Qt has queued. Its
+        # number is retired so that none of it is shown, and the round counts
+        # as cut short, since its end will never be heard.
+        self._round_id += 1
+        self._round_why = "stopped"
+        self._round_ended_at = self._wall()
         # A later round has its own stop flag and client: clearing the old
         # flag would set the abandoned round going again.
         self._stop = threading.Event()
