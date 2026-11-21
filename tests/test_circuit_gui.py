@@ -454,11 +454,11 @@ def test_closing_the_app_ends_a_read_stuck_past_the_wait_and_still_exits() -> No
 # -- the switch ----------------------------------------------------------------------
 
 
-def test_the_loader_defaults_to_off(real_circuit_setting) -> None:
+def test_the_loader_defaults_to_on(real_circuit_setting) -> None:
     from gui.widgets.settings import load_circuit_enabled
 
     QSettings("XOP", "XOPTrader").remove("circuit/enabled")
-    assert load_circuit_enabled() is False
+    assert load_circuit_enabled() is True
 
 
 @pytest.mark.parametrize(
@@ -473,9 +473,10 @@ def test_the_loader_defaults_to_off(real_circuit_setting) -> None:
         ("false", False),
         ("0", False),
         ("off", False),
-        # Unreadable is off, the default.
-        ("sideways", False),
-        ("", False),
+        ("no", False),
+        # Unreadable is on, the default.
+        ("sideways", True),
+        ("", True),
     ],
 )
 def test_the_loader_reads_every_shape(stored, expected, real_circuit_setting) -> None:
@@ -487,7 +488,7 @@ def test_the_loader_reads_every_shape(stored, expected, real_circuit_setting) ->
     assert load_circuit_enabled() is expected
 
 
-def test_the_subsystems_box_is_off_by_default_and_remembers(app, monkeypatch, real_circuit_setting):
+def test_the_subsystems_box_is_on_by_default_and_remembers(app, monkeypatch, real_circuit_setting):
     from gui.widgets import settings as settings_mod
 
     QSettings("XOP", "XOPTrader").remove("circuit/enabled")
@@ -496,11 +497,11 @@ def test_the_subsystems_box_is_off_by_default_and_remembers(app, monkeypatch, re
     try:
         seen: list[bool] = []
         page.circuit_enabled_changed.connect(seen.append)
-        assert not page._circuit_enabled_box.isChecked()
-        page._circuit_enabled_box.setChecked(True)
-        assert seen == [True] and settings_mod.load_circuit_enabled() is True
+        assert page._circuit_enabled_box.isChecked()
         page._circuit_enabled_box.setChecked(False)
-        assert seen == [True, False] and settings_mod.load_circuit_enabled() is False
+        assert seen == [False] and settings_mod.load_circuit_enabled() is False
+        page._circuit_enabled_box.setChecked(True)
+        assert seen == [False, True] and settings_mod.load_circuit_enabled() is True
     finally:
         page.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
@@ -510,7 +511,8 @@ def test_the_subsystems_box_is_off_by_default_and_remembers(app, monkeypatch, re
 # -- in the main window ------------------------------------------------------------
 
 
-def _main_window(monkeypatch, *, enabled: bool):
+def _main_window(monkeypatch, *, enabled: bool | None):
+    """The main window, its page's client counted; ``enabled`` None reads the real setting."""
     from gui.widgets import circuit as circuit_mod
     from gui.widgets import settings as settings_mod
 
@@ -524,7 +526,8 @@ def _main_window(monkeypatch, *, enabled: bool):
     monkeypatch.setattr(settings_mod, "load_permuto_enabled", lambda: False)
     monkeypatch.setattr(settings_mod, "load_startup_states", lambda: ("adopt", "off"))
     monkeypatch.setattr(settings_mod, "load_options_switch_visible", lambda: True)
-    monkeypatch.setattr(settings_mod, "load_circuit_enabled", lambda: enabled)
+    if enabled is not None:
+        monkeypatch.setattr(settings_mod, "load_circuit_enabled", lambda: enabled)
     from gui.widgets.main_window import MainWindow
 
     return MainWindow(), made
@@ -538,7 +541,7 @@ def _close_window(window, app) -> None:
     app.processEvents()
 
 
-def test_off_by_default_the_page_holds_its_slot_hidden_and_asks_nothing(app, monkeypatch):
+def test_switched_off_the_page_holds_its_slot_hidden_and_asks_nothing(app, monkeypatch):
     from gui.widgets import main_window as mw
     from gui.widgets.circuit import CircuitWidget
 
@@ -589,5 +592,24 @@ def test_switched_on_at_launch_the_entry_is_shown(app, monkeypatch):
         assert window._sidebar.is_page_visible(mw._PAGE_CIRCUIT)
         assert window._unwrap(window._circuit_widget).is_enabled()
         assert made == [], "the window is built; the page is not open"
+    finally:
+        _close_window(window, app)
+
+
+def test_by_default_the_page_is_on_and_the_window_opening_asks_nothing(
+    app, monkeypatch, real_circuit_setting
+):
+    from gui.widgets import main_window as mw
+
+    QSettings("XOP", "XOPTrader").remove("circuit/enabled")
+    window, made = _main_window(monkeypatch, enabled=None)
+    try:
+        window.show()
+        app.processEvents()
+        assert window._sidebar.is_page_visible(mw._PAGE_CIRCUIT)
+        page = window._unwrap(window._circuit_widget)
+        assert page.is_enabled()
+        assert window._stacked.currentIndex() == mw._PAGE_DASHBOARD
+        assert made == [] and not page.fetching(), "the page is not open, so nothing is asked"
     finally:
         _close_window(window, app)

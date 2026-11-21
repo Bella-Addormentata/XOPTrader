@@ -37,10 +37,10 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Circuit DAO: a read-only Circuit page (#225)
 
-- **A Circuit page**, off by default: Settings → Advanced → Subsystems →
-  "Show the Circuit DAO page (read-only)" adds it to the sidebar, before
-  Settings, and takes effect at once both ways. It shows what a market maker
-  trading BYC wants to see of Circuit v1: the XCH price the protocol uses and
+- **A Circuit page** in the sidebar, before Settings, on by default for
+  now. Unticking Settings → Advanced → Subsystems → "Show the Circuit DAO
+  page (read-only)" hides it at once, and ticking it shows it again. It shows
+  what a market maker trading BYC wants to see of Circuit v1: the XCH price the protocol uses and
   the oracle's next one, the stability fee and savings rate, how much XCH is
   locked and BYC borrowed, the liquidation auctions running (price, share of
   the XCH price, time left), the vaults closest to liquidation and how far
@@ -48,7 +48,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   governance coins, the oracle's price announcers, every statute, and a red
   banner if the emergency switch (`BLOCK_ISSUANCE`) is ever set.
 - It asks Circuit's public API only while the page is open: when it opens
-  (unless the last read was under a minute ago), then every three minutes,
+  (unless a whole round started under a minute ago), then every three minutes,
   eight requests a round, 3.2 s apart, on a worker thread. Switched off, it
   asks nothing; away from the page, it starts no new round. It holds no key,
   sends no address and signs nothing.

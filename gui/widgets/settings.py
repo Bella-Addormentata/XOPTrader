@@ -207,18 +207,19 @@ def load_options_switch_visible() -> bool:
 def load_circuit_enabled() -> bool:
     """Whether the read-only Circuit DAO page is switched on (Settings > Subsystems).
 
-    Defaults to FALSE, like Permuto: the page asks a third party's API while
-    it is open, and a machine that never asked for Circuit should not. Only
-    an explicit yes switches it on; anything unreadable leaves it off.
+    Defaults to TRUE, for now: the page only reads, and it asks Circuit's
+    public API only while it is open, so showing it costs nothing until
+    someone opens it. Only an explicit "off" hides it; anything unreadable
+    shows it, the default.
     """
     settings = QSettings("XOP", "XOPTrader")
     settings.sync()
     settings.beginGroup("circuit")
-    raw = settings.value("enabled", False)
+    raw = settings.value("enabled", True)
     settings.endGroup()
     if isinstance(raw, bool):
         return raw
-    return str(raw).strip().lower() in ("true", "1", "on", "yes")
+    return str(raw).strip().lower() not in ("false", "0", "off", "no")
 
 
 # yaml-cpp's bool spellings (YAML::convert<bool>): what the engine accepts.
@@ -1762,17 +1763,18 @@ class SettingsWidget(QWidget):
         self._options_switch_box.toggled.connect(
             self._on_options_switch_toggled)
 
-        # [CIRCUIT] Off by default, like Permuto, but both ways at once: the
-        # page is built either way and asks nothing until it is on and open.
+        # [CIRCUIT] On by default (for now), and both ways at once: the page
+        # is built either way and asks nothing until it is on and open.
         self._circuit_enabled_box = QCheckBox(
             "Show the Circuit DAO page (read-only)")
         self._circuit_enabled_box.setChecked(load_circuit_enabled())
         self._circuit_enabled_box.setToolTip(
-            "Off by default. On adds a Circuit page to the sidebar: BYC "
+            "On by default. Shows a Circuit page in the sidebar: BYC "
             "borrowing, liquidations, auctions and governance, read from "
-            "Circuit's public API (api.circuitdao.com) while the page is "
-            "open, eight requests every three minutes. It holds no key and "
-            "signs nothing. Takes effect at once, both ways."
+            "Circuit's public API (api.circuitdao.com) only while the page "
+            "is open, eight requests every three minutes. It holds no key "
+            "and signs nothing. Off hides the page, and it then asks "
+            "nothing. Takes effect at once, both ways."
         )
         box.addWidget(self._circuit_enabled_box)
         self._circuit_enabled_box.toggled.connect(

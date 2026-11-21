@@ -12,9 +12,9 @@ request body that carries wallet details. It is built on Circuit v1, which is
 still in use; v2 will need changes, and an answer of a new shape leaves its
 section empty with a note rather than breaking the page.
 
-OFF BY DEFAULT (Settings > Advanced > Subsystems). Switched off, the sidebar
-entry is hidden and nothing is asked. Switched on, it reads only while the
-page is open: when it opens (unless a whole round started under a minute
+On by default, for now; Settings > Advanced > Subsystems switches it off.
+Switched off, the sidebar entry is hidden and nothing is asked. Switched on,
+it reads only while the page is open: when it opens (unless a whole round started under a minute
 ago), then every three minutes, eight requests a round
 (:mod:`gui.services.circuit.poll`), on a worker thread. Closed, it starts no
 new round. Building the page asks nothing, so the switch works both ways

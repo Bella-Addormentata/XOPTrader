@@ -9,9 +9,9 @@ each behind its own switch, read-only first. This package starts it:
 * :mod:`poll` is the page's eight reads and the loop that makes them.
 * :mod:`model` turns their answers into what the page shows.
 
-The page is :mod:`gui.widgets.circuit`, off by default (Settings > Advanced >
-Subsystems). Nothing here reads a key, sends an address or builds a
-transaction.
+The page is :mod:`gui.widgets.circuit`, on by default for now (Settings >
+Advanced > Subsystems switches it off). Nothing here reads a key, sends an
+address or builds a transaction.
 """
 
 __all__: list[str] = []
