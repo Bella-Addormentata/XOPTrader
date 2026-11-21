@@ -2749,6 +2749,13 @@ private:
     // revive_market pair runs its own state machine here and is left out
     // of flash_crash_state_. Absent = Normal.
     std::unordered_map<std::string, FlashCrashState> revive_crash_state_;
+    // [WIDEBOOK-ISOLATE 2026-11-21] A pair whose crash only too-wide books
+    // show runs its own state machine here, out of flash_crash_state_, until
+    // it is Normal again or the narrow books confirm the drop. Absent = Normal.
+    std::unordered_map<std::string, FlashCrashState> wide_crash_state_;
+    // [WIDEBOOK-NOQUOTE 2026-11-21] Pairs Step 4 holds back: a book too wide
+    // to price and no usable fair value. For the once-per-episode log lines.
+    std::unordered_set<std::string> wide_book_held_;
 
     // [REVIVE2 2026-10-22] Each revive pair's own trading flows (booked
     // in Step 2 from its fills, in memory, so they restart at zero), valued

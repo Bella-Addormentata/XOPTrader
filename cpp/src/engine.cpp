@@ -5034,6 +5034,7 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
                 // pair's own state: it restarts at Normal, and is judged
                 // again on its full window as soon as its mid returns.
                 revive_crash_state_.erase(pair.name);
+                wide_crash_state_.erase(pair.name);
                 continue;
             }
 
@@ -5107,6 +5108,52 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
                 continue;
             }
 
+            // [WIDEBOOK-ISOLATE 2026-11-21] Operator-approved (Dorkmo). A drop
+            // that only too-wide books show holds back this pair alone. On
+            // 2026-11-20/21 XCH/BYC's book went about 158% wide every two
+            // hours, and each time the global guard stopped every XCH pair
+            // for an hour or more. A drop the narrow books confirm is still
+            // everyone's crash, and ends the pair's own state.
+            {
+                const bool counted_crash = pair_crashing
+                    && PreTradeCheck::series_crashing_counted(
+                           series,
+                           config_.risk.flash_crash_threshold_pct,
+                           config_.risk.flash_crash_window_blocks);
+                const auto wide_it = wide_crash_state_.find(pair.name);
+                const bool held = wide_it != wide_crash_state_.end();
+                if (counted_crash) {
+                    if (held) wide_crash_state_.erase(wide_it);
+                } else if (pair_crashing || held) {
+                    const FlashCrashState st =
+                        held ? wide_it->second : FlashCrashState::Normal;
+                    const FlashCrashState next = revive::next_crash_state(
+                        st, pair_crashing, pair_stable_phase1, pair_stable_phase2);
+                    if (next != st) {
+                        if (next == FlashCrashState::Crash) {
+                            spdlog::warn("[Engine] Flash crash seen only through "
+                                         "{}'s too-wide book -- its own quotes "
+                                         "suspended, the other pairs keep "
+                                         "quoting", pair.name);
+                            alerts_->send_alert(AlertRule::FlashCrash,
+                                "Flash crash seen only through " + pair.name
+                                + "'s too-wide book -- its own offer posting "
+                                  "suspended");
+                        } else {
+                            spdlog::info("[Engine] {} wide-book crash state "
+                                         "{} -> {}", pair.name, to_string(st),
+                                         to_string(next));
+                        }
+                    }
+                    if (next == FlashCrashState::Normal) {
+                        wide_crash_state_.erase(pair.name);
+                    } else {
+                        wide_crash_state_[pair.name] = next;
+                    }
+                    continue;  // out of the global guard while it is held
+                }
+            }
+
             if (pair_crashing) {
                 any_pair_crashing = true;
                 if (crash_pair_name.empty()) crash_pair_name = pair.name;
@@ -5165,6 +5212,12 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             const auto st = revive_crash_state_.find(name);
             if (st != revive_crash_state_.end()
                 && st->second != FlashCrashState::Normal && pcs.quote_valid) {
+                pcs.quote_valid = false;
+            }
+            // [WIDEBOOK-ISOLATE 2026-11-21] Likewise a pair held on its own.
+            const auto wst = wide_crash_state_.find(name);
+            if (wst != wide_crash_state_.end()
+                && wst->second != FlashCrashState::Normal && pcs.quote_valid) {
                 pcs.quote_valid = false;
             }
         }
@@ -7646,6 +7699,48 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         if (mid <= 0.0) {
             pcs.quote_valid = false;
             continue;
+        }
+
+        // [WIDEBOOK-NOQUOTE 2026-11-21] Operator-approved (Dorkmo). A book
+        // too wide to price, and no usable fair value to price from instead:
+        // nothing is posted on the pair until one of them returns (see
+        // PreTradeCheck::book_too_wide_to_quote for the XCH/BYC loss that
+        // asked for it). Resting offers are left as they are, as under the
+        // other gates here. Revive pairs keep their own thin-book rules.
+        if (const PairConfig* pcw = find_pair_config(pair_name);
+            pcw != nullptr && !pcw->revive_market) {
+            const MarketSnapshot wb = state_->get_market(pair_name);
+            const auto wb_fv = market_data_->get_fair_value(pair_name);
+            const bool fv_usable = wb_fv.has_value()
+                && wb_fv->tier != FairValueTier::Unavailable;
+            const double scale = static_cast<double>(kMojosPerXch);
+            if (PreTradeCheck::book_too_wide_to_quote(
+                    wb.spread_bps, config_.risk.flash_crash_max_spread_bps,
+                    wb.best_bid > 0 && wb.best_ask > 0, fv_usable)) {
+                if (wide_book_held_.insert(pair_name).second) {
+                    spdlog::warn("[Engine] Step 4: {} book is {:.0f} bps wide "
+                                 "(bid {:.6f}, ask {:.6f}; max {:.0f}) and it "
+                                 "has no usable fair value -- posting nothing "
+                                 "on it until one returns",
+                                 pair_name, wb.spread_bps,
+                                 static_cast<double>(wb.best_bid) / scale,
+                                 static_cast<double>(wb.best_ask) / scale,
+                                 config_.risk.flash_crash_max_spread_bps);
+                } else {
+                    spdlog::debug("[Engine] Step 4: {} still too wide to price "
+                                  "({:.0f} bps, no fair value) -- no quotes",
+                                  pair_name, wb.spread_bps);
+                }
+                pcs.quote_valid = false;
+                continue;
+            }
+            if (wide_book_held_.erase(pair_name) > 0) {
+                spdlog::info("[Engine] Step 4: {} can be priced again (book "
+                             "{:.0f} bps, fair value {}) -- quoting resumes",
+                             pair_name, wb.spread_bps,
+                             wb_fv.has_value() ? to_string(wb_fv->tier)
+                                               : "none");
+            }
         }
 
         // Resolve pair config for this pair (O(1) map lookup).

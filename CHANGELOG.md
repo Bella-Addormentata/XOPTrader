@@ -25,6 +25,31 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Switching Telegram on in Settings, or pointing it at another chat, sends
   either warning again if it still stands.
 
+### A book too wide to price
+
+- **No quotes on it.** On 2026-11-21 XCH/BYC's Dexie book went 158% wide
+  (bid 0.10, ask 0.90) while its fair value was unavailable. The engine
+  centred its quotes near that book's midpoint, and four asks at 0.49 to
+  0.63 BYC, against a fair price of about 0.87, were taken within minutes:
+  about 11 BYC under cost. A pair whose two-sided book is wider than
+  `risk.flash_crash_max_spread_bps` (2000 bps) and that has no usable fair
+  value now posts nothing until one of them returns. Resting offers stay as
+  they are; revive pairs keep their own thin-book rules.
+- **The flash-crash guard holds back only that pair** when the drop shows
+  only through books that wide. XCH/BYC's book went that wide about every
+  two hours on 2026-11-20 and 21, and each time every XCH pair stopped for
+  an hour or more. A drop the narrower books confirm still stops every pair.
+
+### Offers no longer ask for identical amounts
+
+When a taker combines several offers in one transaction, the wallet pays
+every request for an asset from one coin, and Chia rejects two identical
+outputs of one spend. The wallet also reuses an offer's payment address. So
+two live offers asking for the same amount of the same asset could not be
+taken together. Each new offer now asks for an amount no live offer asks
+for: a bid asks for a base mojo more (never under its tier minimum), an ask
+for a quote mojo less, so only when two would otherwise match.
+
 ## [0.10.56] — 2026-11-20 — the options address's XCH stays put, and calls and puts by default
 
 ### The options address's XCH no longer pays the engine's cancel fees (#250)

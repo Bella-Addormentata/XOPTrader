@@ -563,6 +563,38 @@ public:
     static bool series_crashing(const CrashSeries& s, double threshold,
                                 std::size_t window) noexcept;
 
+    /// [WIDEBOOK-ISOLATE 2026-11-21] series_crashing() with every sample from
+    /// too wide a book left out altogether, as a low too: the drop the
+    /// narrow books show on their own. When series_crashing() trips and this
+    /// does not, the crash is seen only through books too wide to price, and
+    /// the engine holds back that pair alone instead of every pair.
+    [[nodiscard]]
+    static bool series_crashing_counted(const CrashSeries& s, double threshold,
+                                        std::size_t window) noexcept;
+
+    /// [WIDEBOOK-NOQUOTE 2026-11-21] True when a pair is to post nothing this
+    /// heartbeat: its two-sided book is wider than `max_spread_bps`
+    /// (risk.flash_crash_max_spread_bps, the width the crash check stops
+    /// trusting) and there is no usable independent fair value to price it
+    /// from instead. 0 disables; a NaN or unmeasured (0) spread never holds,
+    /// and neither does a one-sided book (the revive and thin-book paths own
+    /// those).
+    ///
+    /// Operator-approved (Dorkmo, 2026-11-21). That morning XCH/BYC's book
+    /// went 158% wide (bid 0.10, ask 0.90) with its fair value Unavailable;
+    /// the ladder centred near the book's midpoint, and four asks at 0.49 to
+    /// 0.63 against a fair price of about 0.87 were taken within minutes,
+    /// about 11.3 BYC under cost.
+    [[nodiscard]]
+    static constexpr bool book_too_wide_to_quote(double spread_bps,
+                                                 double max_spread_bps,
+                                                 bool   two_sided,
+                                                 bool   fair_value_usable) noexcept
+    {
+        return two_sided && !fair_value_usable
+            && max_spread_bps > 0.0 && spread_bps > max_spread_bps;
+    }
+
     /// [WIDEBOOK 2026-10-29] is_stable_after_crash() over the newest
     /// `required_blocks` samples, judging only the counted ones: each must
     /// lie within `stability_band` of the newest counted one, so a thin

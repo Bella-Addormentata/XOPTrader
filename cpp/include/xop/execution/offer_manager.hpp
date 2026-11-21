@@ -55,6 +55,7 @@
 #include "xop/execution/offer_min_input_coin.hpp"
 #include "xop/execution/take_retry.hpp"
 #include "xop/execution/terminal_recheck.hpp"
+#include "xop/execution/unique_request.hpp"
 #include <spdlog/spdlog.h>
 
 #include <chrono>
@@ -1667,6 +1668,11 @@ private:
      */
     json build_offer_dict(const PairConfig& pair,
                           const TierQuote&  tier) const;
+
+    /// [UNIQUE-REQUEST 2026-11-21] What every offer resting in State asks
+    /// for, read with build_offer_dict's formula (unique_request.hpp). An
+    /// offer whose pair is not configured here is left out.
+    std::set<RequestedAmount> live_requested_amounts() const;
 
     /**
      * @brief [T7-10] Create a single merged offer for all same-side tiers.
