@@ -245,14 +245,21 @@ def test_a_failed_read_is_noted_in_its_section(app) -> None:
         page.show()
         _wait_until(app, lambda: not page.fetching() and len(server.calls) == 8)
         assert "7 of 8 answered. Notes in the sections below." in page._status.text()
-        (note,) = page._notes["vaults"]
-        assert not note.isHidden()
-        assert note.text().startswith("vaults: POST /vaults: HTTP 503")
+        # In each section with a figure from it: "BYC borrowed" is under Protocol.
+        assert page._notes["vaults"] == [
+            page._section_notes["Protocol"],
+            page._section_notes["Liquidations"],
+        ]
+        for note in page._notes["vaults"]:
+            assert not note.isHidden()
+            assert note.text().startswith("vaults: POST /vaults: HTTP 503")
         from gui.widgets.circuit import _cells
 
         assert _cells(page._closest) == [["Not read yet"] + [""] * 6]
+        assert page._values["borrowed"].text() == "-"
         # The other sections are filled.
         assert page._values["price"].text().startswith("$0.94")
+        assert page._section_notes["Treasury and auctions"].isHidden()
     finally:
         _close(page, app)
 
@@ -340,7 +347,7 @@ def test_a_vault_list_with_a_flag_missing_keeps_the_last_good_count(app, how) ->
         # Read as "not in bad debt", it would have made it 1.
         assert "7 of 8 answered" in page._status.text()
         assert page._liquidation_summary.text() == summary
-        (note,) = page._notes["vaults"]
+        note = page._section_notes["Liquidations"]
         assert note.text().startswith("vaults: the answer has an unexpected shape")
     finally:
         _close(page, app)
@@ -370,8 +377,37 @@ def test_an_oracle_answer_with_its_queue_garbled_keeps_the_last_good_one(app, ho
         # Read as no queue, it would have said "no newer price than $0.94".
         assert "7 of 8 answered" in page._status.text()
         assert page._values["oracle"].text() == line
-        (note,) = page._notes["oracle"]
+        note = page._section_notes["Protocol"]
         assert note.text().startswith("oracle: the answer has an unexpected shape")
+    finally:
+        _close(page, app)
+
+
+@pytest.mark.parametrize("read, section", [("vaults", "Protocol"), ("oracle", "Liquidations")])
+def test_a_section_showing_an_older_figure_notes_the_read_that_failed(app, read, section) -> None:
+    server = FixtureServer()
+    page, _factory = _page(server)
+    try:
+        page.set_enabled(True)
+        page.show()
+        _wait_until(app, lambda: not page.fetching() and len(server.calls) == 8)
+        from gui.widgets.circuit import _cells
+
+        borrowed, closest = page._values["borrowed"].text(), _cells(page._closest)
+        assert borrowed.startswith("15,268 BYC, in 13 of 15 vaults; all their collateral")
+        assert page._section_notes[section].isHidden()
+
+        server.answers[f"/{read}"] = (503, {"detail": "maintenance"})
+        assert page.refresh()
+        _wait_until(app, lambda: not page.fetching() and len(server.calls) == 16)
+        # "BYC borrowed" is the vaults read's figure, and how far XCH would
+        # have to fall for a vault to be liquidated is measured against the
+        # oracle's price: each stays as it was, beside the read that failed.
+        assert page._values["borrowed"].text() == borrowed
+        assert _cells(page._closest) == closest
+        note = page._section_notes[section]
+        assert not note.isHidden()
+        assert note.text().startswith(f"{read}: POST /{read}: HTTP 503")
     finally:
         _close(page, app)
 
@@ -628,6 +664,101 @@ def test_switching_off_mid_request_ends_the_round_at_once(app) -> None:
         assert page._errors == {} and page._answers == {}, "a dropped request is no failed read"
     finally:
         gate.set()
+        _close(page, app)
+
+
+def test_switched_off_the_answers_already_on_their_way_are_not_shown(app) -> None:
+    from gui.widgets.circuit import CircuitWidget
+
+    entered, gate = threading.Event(), threading.Event()
+    server = FixtureServer()
+
+    def transport(method, url, body, headers, timeout_s):
+        if url.endswith("/vaults"):
+            entered.set()
+            gate.wait(5)
+        return server(method, url, body, headers, timeout_s)
+
+    page = CircuitWidget(
+        client_factory=lambda stop: CircuitApi(
+            "https://api.example.test", min_interval_s=0, transport=transport
+        ),
+        wall=Clock(),
+    )
+    try:
+        page.set_enabled(True)
+        page.show()
+        # Not drawn yet: the price and the statutes are on their way to the page.
+        assert entered.wait(5), "the round never reached the vaults"
+        page.set_enabled(False)
+        gate.set()
+        _wait_until(app, lambda: not page.fetching())
+        assert server.calls == ["/oracle", "/statutes", "/vaults"]
+        assert page._answers == {} and page._errors == {}, "switched off, nothing new is shown"
+        assert page._values["price"].text() == "-"
+    finally:
+        gate.set()
+        _close(page, app)
+
+
+def test_a_round_let_go_of_at_close_does_not_reach_the_round_after_it(app) -> None:
+    import shiboken6
+
+    from gui.widgets.circuit import CircuitWidget
+
+    first_in, first_gate = threading.Event(), threading.Event()
+    second_in, second_gate = threading.Event(), threading.Event()
+    server = FixtureServer()
+
+    def transport(method, url, body, headers, timeout_s):
+        answer = server(method, url, body, headers, timeout_s)
+        if url.endswith("/statutes") and server.calls.count("/statutes") == 1:
+            first_in.set()
+            first_gate.wait(5)
+        elif url.endswith("/oracle") and server.calls.count("/oracle") == 2:
+            second_in.set()
+            second_gate.wait(5)
+        return answer
+
+    page = CircuitWidget(
+        client_factory=lambda stop: CircuitApi(
+            "https://api.example.test", min_interval_s=0, transport=transport
+        ),
+        wall=Clock(),
+    )
+    second = None
+    try:
+        page.set_enabled(True)
+        page.show()
+        assert first_in.wait(5), "the first round never asked"
+        # Stopped and joined before the page heard from it: its answers, its
+        # end and its thread's end are all still on their way to the page.
+        threading.Timer(0.2, first_gate.set).start()
+        page.stop_background_work(timeout_ms=3000)
+        assert not page.fetching()
+        assert page.refresh()
+        second = page._thread
+        assert second_in.wait(5), "the second round never asked"
+        for _ in range(5):
+            app.processEvents()
+            time.sleep(0.01)
+        # Had the first thread's end been taken for this one's, the page
+        # would forget a thread still running, and be destroyed with it.
+        assert page.fetching() and page._thread is second
+        assert page._answers == {} and page._round_seen == 0
+        assert page._status.text() == "Reading Circuit's API: 0 of 8 answers so far."
+
+        second_gate.set()
+        _wait_until(app, lambda: not page.fetching())
+        assert server.calls[2:] == [read.path for read in poll.PAGE_READS]
+        assert page._status.text().startswith("Read at ")
+        assert "8 of 8 answered. The page reads again" in page._status.text()
+    finally:
+        first_gate.set()
+        second_gate.set()
+        if second is not None and shiboken6.isValid(second):
+            second.quit()  # the round's own quit is queued for the page, and it may not come
+            second.wait(5000)
         _close(page, app)
 
 

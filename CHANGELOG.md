@@ -53,12 +53,15 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   eight requests a round, 3.2 s apart, on a worker thread. Switched off, it
   asks nothing; away from the page, it starts no new round. Switching it off
   or closing the app stops a round at once, even in the middle of a request
-  that is slow to answer. It holds no key, sends no address and signs nothing.
+  that is slow to answer, and an answer still on its way is dropped. It holds
+  no key, sends no address and signs nothing.
 - An answer of an unexpected shape (Circuit v2 is coming) or a read that
-  fails leaves a note in its section, which keeps its last good answer; the
-  rest of the page still fills. Answers are checked against Circuit's own API
-  description and the live answers, so a yes/no, name, status, price or ratio
-  that is missing or garbled is a note, never taken as "no" or left blank.
+  fails leaves a note in each section with a figure from it (a failed vault
+  read under Protocol too, beside "BYC borrowed"), and the section keeps its
+  last good answer; the rest of the page still fills. Answers are checked
+  against Circuit's own API description and the live answers, so a yes/no,
+  name, status, price or ratio that is missing or garbled is a note, never
+  taken as "no" or left blank.
 
 ## [0.10.56] — 2026-11-20 — the options address's XCH stays put, and calls and puts by default
 

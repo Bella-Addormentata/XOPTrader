@@ -73,14 +73,19 @@ _ABANDONED: list[tuple[QThread, QObject | None]] = []
 class _RoundWorker(QObject):
     """One round of the page's reads, on the page's worker thread."""
 
-    result = Signal(object)  # poll.Result
-    done = Signal(int, str)  # reads answered, and why the round ended early ("" if it did not)
+    #: The round's number, and one read's outcome (a poll.Result).
+    result = Signal(int, object)
+    #: The round's number, the reads answered, and why it ended early ("" if it did not).
+    done = Signal(int, int, str)
 
-    def __init__(self, api: Any, stop: threading.Event, wall: Callable[[], float]) -> None:
+    def __init__(
+        self, api: Any, stop: threading.Event, wall: Callable[[], float], round_id: int
+    ) -> None:
         super().__init__()
         self._api = api
         self._stop = stop
         self._wall = wall
+        self._round = round_id
 
     @Slot()
     def run(self) -> None:
@@ -88,7 +93,7 @@ class _RoundWorker(QObject):
         try:
             answered = poll.fetch(
                 self._api,
-                on_result=self.result.emit,
+                on_result=self._report,
                 should_stop=self._stop.is_set,
                 wall=self._wall,
             )
@@ -97,7 +102,10 @@ class _RoundWorker(QObject):
         except Exception as exc:  # noqa: BLE001 -- the page reports it; the app goes on
             _log.exception("[Circuit] a round of reads failed")
             why = f"{type(exc).__name__}: {exc}"
-        self.done.emit(answered, why)
+        self.done.emit(self._round, answered, why)
+
+    def _report(self, result: poll.Result) -> None:
+        self.result.emit(self._round, result)
 
 
 def _table(columns: Sequence[str]) -> QTableWidget:
@@ -183,6 +191,8 @@ class CircuitWidget(QWidget):
         self._worker: _RoundWorker | None = None
         #: A round is due as soon as the one still stopping has ended.
         self._round_due = False
+        #: The latest round's number: what an earlier round reports is not shown.
+        self._round_id = 0
         self._answers: dict[str, Any] = {}
         self._answered_at: dict[str, float] = {}
         self._errors: dict[str, str] = {}
@@ -224,11 +234,15 @@ class CircuitWidget(QWidget):
         layout.addWidget(self._status)
         layout.addWidget(self._banner)
 
-        #: Read name -> the notes of the sections built from it.
+        #: Read name -> the notes of the sections showing figures from it.
         self._notes: dict[str, list[QLabel]] = {}
+        #: Section title -> its note.
+        self._section_notes: dict[str, QLabel] = {}
         self._values: dict[str, QLabel] = {}
 
-        protocol, form = self._section("Protocol", ("oracle", "statutes"))
+        # "BYC borrowed" is the vaults read's: a vault read that fails is
+        # noted here too, beside the older figure the section still shows.
+        protocol, form = self._section("Protocol", ("oracle", "statutes", "vaults"))
         for key, label in (
             ("price", "XCH price used"),
             ("oracle", "Oracle"),
@@ -246,7 +260,9 @@ class CircuitWidget(QWidget):
             form.addRow(label, value)
         layout.addWidget(protocol)
 
-        liquidations, box = self._section("Liquidations", ("vaults",), form=False)
+        # An auction's share of the XCH price, and how far XCH would have to
+        # fall, are measured against the oracle's price.
+        liquidations, box = self._section("Liquidations", ("vaults", "oracle"), form=False)
         self._liquidation_summary = QLabel("-")
         self._liquidation_summary.setWordWrap(True)
         box.addWidget(self._liquidation_summary)
@@ -308,6 +324,7 @@ class CircuitWidget(QWidget):
         note.setStyleSheet(f"color: {WARNING_YELLOW};")
         note.hide()
         outer.addWidget(note)
+        self._section_notes[title] = note
         for read in reads:
             self._notes.setdefault(read, []).append(note)
         if form:
@@ -351,12 +368,13 @@ class CircuitWidget(QWidget):
         if self._api is None:
             self._api = self._client_factory(self._stop)
         self._stop.clear()
+        self._round_id += 1
         self._round_started_at = self._wall()
         self._round_seen = 0
         self._round_answered = 0
         self._round_why = ""
         thread = QThread(self)
-        worker = _RoundWorker(self._api, self._stop, self._wall)
+        worker = _RoundWorker(self._api, self._stop, self._wall, self._round_id)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.result.connect(self._on_result)
@@ -447,8 +465,14 @@ class CircuitWidget(QWidget):
             return not self._stop.is_set()  # running on, or being stopped
         return not self._round_why
 
-    @Slot(object)
-    def _on_result(self, result: poll.Result) -> None:
+    @Slot(int, object)
+    def _on_result(self, round_id: int, result: poll.Result) -> None:
+        if round_id != self._round_id or self._stop.is_set():
+            # A round told to stop shows nothing more: an answer already on
+            # its way is dropped, as one that comes as a request is told to
+            # stop is (poll.interruptible). So is one from a round the page
+            # has let go of, which can still arrive once a later round runs.
+            return
         self._round_seen += 1
         error = result.error
         if result.ok:
@@ -471,8 +495,10 @@ class CircuitWidget(QWidget):
             self._errors.pop(result.name, None)
         self._render()
 
-    @Slot(int, str)
-    def _on_done(self, answered: int, why: str) -> None:
+    @Slot(int, int, str)
+    def _on_done(self, round_id: int, answered: int, why: str) -> None:
+        if round_id != self._round_id:
+            return  # a round the page let go of: the one under way is not over
         self._round_ended_at = self._wall()
         if not why and self._round_seen < len(poll.PAGE_READS):
             # poll.fetch() ends a round between two reads once told to stop.
@@ -482,6 +508,13 @@ class CircuitWidget(QWidget):
 
     @Slot()
     def _on_thread_finished(self) -> None:
+        thread = self._thread
+        if thread is not None and not thread.isFinished():
+            # The thread of a round the page stopped and let go of (as it does
+            # at close) ended after a later round had started. That round's
+            # thread runs on: forgotten, it would be destroyed with the page,
+            # running, which aborts the process.
+            return
         self._thread = None
         self._worker = None
         if self._round_due:
