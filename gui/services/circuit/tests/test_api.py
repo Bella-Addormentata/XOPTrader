@@ -62,7 +62,7 @@ class Server:
     def __call__(
         self, method: str, url: str, body: bytes | None, headers: dict[str, str], timeout_s: float
     ) -> tuple[int, dict[str, str], bytes]:
-        path = url[len(BASE):]
+        path = url[len(BASE) :]
         self.calls.append(
             {
                 "method": method,
@@ -239,7 +239,9 @@ def test_only_get_and_post_are_sent() -> None:
     assert server.calls == []
 
 
-@pytest.mark.parametrize("url", ["api.circuitdao.com", "ftp://api.circuitdao.com", "https://", "https://h/?x=1"])
+@pytest.mark.parametrize(
+    "url", ["api.circuitdao.com", "ftp://api.circuitdao.com", "https://", "https://h/?x=1"]
+)
 def test_a_bad_base_url_is_refused(url: str) -> None:
     with pytest.raises(ValueError):
         CircuitApi(url)
@@ -326,6 +328,25 @@ def test_probe_saves_every_answer_and_a_summary(tmp_path: Path) -> None:
     assert summary["reached"] == len(READS) - 1
     assert [row["name"] for row in summary["results"]] == [read.name for read in READS]
     assert len(lines) == len(READS) + 1  # a header and one line per read
+
+
+def test_probe_refuses_a_folder_that_already_holds_files(tmp_path: Path) -> None:
+    (tmp_path / "savings_list.json").write_text("{}", encoding="utf-8")
+    server = Server({"/health": {"status": "ok"}})
+    with pytest.raises(FileExistsError, match="new or empty folder"):
+        api.probe(client(server), tmp_path, [Read("health", "GET", "/health")], echo=print)
+    assert server.calls == []  # refused before anything was asked
+    # A file where the folder should be is refused the same way.
+    with pytest.raises(FileExistsError):
+        api.probe(client(server), tmp_path / "savings_list.json", echo=print)
+
+
+def test_probe_takes_an_existing_empty_folder(tmp_path: Path) -> None:
+    out = tmp_path / "empty"
+    out.mkdir()
+    server = Server({"/health": {"status": "ok"}})
+    api.probe(client(server), out, [Read("health", "GET", "/health")], echo=lambda _line: None)
+    assert (out / "health.json").exists() and (out / "summary.json").exists()
 
 
 def test_probe_highlights_the_block_issuance_statute(tmp_path: Path) -> None:
@@ -437,6 +458,15 @@ def test_main_exits_1_when_every_answer_is_an_error_but_keeps_them(
     assert (tmp_path / "p" / "health.txt").read_text(encoding="utf-8") == "maintenance"
     summary = json.loads((tmp_path / "p" / "summary.json").read_text(encoding="utf-8"))
     assert (summary["succeeded"], summary["reached"]) == (0, len(READS))
+
+
+def test_main_refuses_an_out_folder_that_already_holds_files(tmp_path: Path) -> None:
+    (tmp_path / "summary.json").write_text("{}", encoding="utf-8")
+    server = Server()
+    with pytest.raises(SystemExit) as caught:
+        api.main(["probe", "--base-url", BASE, "--out", str(tmp_path)], transport=server)
+    assert caught.value.code == 2
+    assert server.calls == []
 
 
 def test_main_refuses_a_bad_base_url(tmp_path: Path) -> None:

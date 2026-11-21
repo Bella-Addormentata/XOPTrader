@@ -445,7 +445,16 @@ def probe(
 
     A read that fails is recorded and the probe goes on; ``summary.json``
     lists them all, with :func:`highlights` from the answers that succeeded.
+
+    ``out_dir`` must be new or empty (``FileExistsError`` otherwise, before
+    anything is asked): an answer left from an earlier run would sit beside
+    a ``summary.json`` that does not describe it.
     """
+    if out_dir.exists() and (not out_dir.is_dir() or any(out_dir.iterdir())):
+        raise FileExistsError(
+            f"{out_dir} is not a new or empty folder; give the probe one, so no"
+            " answer from an earlier run sits beside this run's summary"
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
     started = _utc_now()
     seconds = round(len(reads) * MIN_INTERVAL_S)
@@ -530,7 +539,8 @@ def main(
         "--out",
         type=Path,
         default=None,
-        help="folder for the answers (default: circuit_probe_<UTC time> in the current folder)",
+        help="a new or empty folder for the answers"
+        " (default: circuit_probe_<UTC time> in the current folder)",
     )
     run.add_argument(
         "--timeout", type=float, default=30.0, help="seconds to wait for each answer (default 30)"
@@ -542,7 +552,10 @@ def main(
         parser.error(str(exc))
     now = _dt.datetime.now(_dt.timezone.utc)  # noqa: UP017 -- see _utc_now
     out = args.out or Path(f"circuit_probe_{now:%Y%m%dT%H%M%SZ}")
-    results = probe(api, out)
+    try:
+        results = probe(api, out)
+    except FileExistsError as exc:
+        parser.error(str(exc))
     succeeded = sum(1 for result in results if result.ok)
     reached = sum(1 for result in results if result.status is not None)
     print(
