@@ -495,17 +495,22 @@ class AuctionRow:
     can_be_settled: bool | None
 
 
+# Each row checks every field it reads, even where another decides what it
+# shows: a garbled field is a note however the rest of the record reads.
+
+
 def _recharge_row(auction: Mapping[str, Any], now: float) -> AuctionRow:
     bid = auction["last_bid"]
     params = auction["auction_params"]
+    ends = None if params is None else _time(params["auction_expires_at"])
     if bid is not None:
         detail = (
             f"last bid {fmt_units(_number(bid['byc_bid_amount']) / MOJOS_PER_CAT)} BYC for "
             f"{fmt_units(_number(bid['crt_bid_amount']) / MOJOS_PER_CAT)} CRT; the bid stands "
             f"until {fmt_utc(_time(bid['bid_expires_at']), now)}"
         )
-    elif params is not None:
-        detail = f"no bids yet; ends {fmt_utc(_time(params['auction_expires_at']), now)}"
+    elif ends is not None:
+        detail = f"no bids yet; ends {fmt_utc(ends, now)}"
     else:
         detail = "not started"
     return AuctionRow(
@@ -519,9 +524,9 @@ def _recharge_row(auction: Mapping[str, Any], now: float) -> AuctionRow:
 
 def _surplus_row(auction: Mapping[str, Any], now: float) -> AuctionRow:
     lot = fmt_units(_number(auction["byc_lot_amount"]) / MOJOS_PER_CAT)
+    best = fmt_units(_number(auction["crt_bid_amount"]) / MOJOS_PER_CAT)
     bid = auction["last_bid"]
     if bid is not None:
-        best = fmt_units(_number(auction["crt_bid_amount"]) / MOJOS_PER_CAT)
         detail = (
             f"{lot} BYC lot; best bid {best} CRT, standing until "
             f"{fmt_utc(_time(bid['bid_expires_at']), now)}"
@@ -566,8 +571,8 @@ def _bill_row(coin: Mapping[str, Any], now: float) -> BillRow:
             raise TypeError(f"expected the bill's value as text or a whole number, got {value!r}")
         proposal = f"{_text(bill, 'statute_name')} = {value}"
     status = coin.get("status")
+    operation = _optional_text(coin, "operation")
     if status is None:
-        operation = _optional_text(coin, "operation")
         text = f"last step: {operation}" if operation else ""
     else:
         text = _text(status, "status")
@@ -598,7 +603,9 @@ def _bill_spent(coin: Mapping[str, Any]) -> bool:
 def bills_from(answer: Any, now: float) -> tuple[BillRow, ...]:
     if not isinstance(answer, list):
         raise TypeError("the governance list is not a list")
-    return tuple(_bill_row(coin, now) for coin in answer if not _bill_spent(coin))
+    # Every coin is checked, a spent one too, and then only those unspent are shown.
+    rows = [(_bill_row(coin, now), _bill_spent(coin)) for coin in answer]
+    return tuple(row for row, spent in rows if not spent)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -635,9 +642,9 @@ def _announcer_row(announcer: Mapping[str, Any], now: float) -> AnnouncerRow:
 def announcers_from(answer: Any, now: float) -> tuple[AnnouncerRow, ...]:
     if not isinstance(answer, list):
         raise TypeError("the announcer list is not a list")
-    return tuple(
-        _announcer_row(announcer, now) for announcer in answer if not _flag(announcer, "spent")
-    )
+    # Every announcer is checked, a spent one too, and then only those unspent are shown.
+    rows = [(_announcer_row(announcer, now), _flag(announcer, "spent")) for announcer in answer]
+    return tuple(row for row, spent in rows if not spent)
 
 
 # -- the whole page -----------------------------------------------------------

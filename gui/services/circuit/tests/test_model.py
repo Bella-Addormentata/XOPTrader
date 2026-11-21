@@ -519,13 +519,16 @@ def test_a_name_that_is_not_text_is_a_note(answers, read, key, value) -> None:
         ("coin", "bill", "STABILITY_FEE_DF"),
         ("coin", "status", "VETOABLE"),
         ("coin", "operation", 5),
+        ("no status", "operation", 5),
         ("status", "status_expires_at", "soon"),
     ],
 )
 def test_a_governance_coin_of_another_shape_is_a_note(answers, change, key, value) -> None:
+    # The last step shows only when there is no status; it is checked either way.
     coin = copy.deepcopy(BILL_BEING_VOTED_ON)
-    if key == "operation":
-        coin["status"] = None  # the last step shows only when there is no status
+    if change == "no status":
+        coin["status"] = None
+        change = "coin"
     answers["bills"] = [coin]
     assert _refused(answers, "bills") is False, "the answer as the API description has it"
     record = {"coin": coin, "bill": coin["bill"], "status": coin["status"]}[change]
@@ -539,6 +542,50 @@ def test_a_bid_or_auction_settings_of_another_shape_is_a_note(answers, key, valu
     # Read as none, they would say "not started" of an auction under way.
     answers["recharge_auctions"][0][key] = value
     assert _refused(answers, "recharge_auctions")
+
+
+@pytest.mark.parametrize(
+    "params",
+    [{}, [], "x", {"auction_expires_at": "soon"}],
+    ids=["an empty object", "a list", "text", "an end that is no time"],
+)
+def test_auction_settings_of_another_shape_are_a_note_beside_a_bid(answers, params) -> None:
+    # The bid decides what the row says; the settings are checked all the same.
+    auction = answers["recharge_auctions"][0]
+    auction["last_bid"] = {
+        "bid_expires_at": NOW + 600,
+        "byc_bid_amount": 5_000_000,
+        "crt_bid_amount": 120_000_000,
+    }
+    auction["auction_params"] = {"auction_expires_at": NOW + 3600}
+    assert _refused(answers, "recharge_auctions") is False
+    auction["auction_params"] = params
+    assert _refused(answers, "recharge_auctions")
+
+
+@pytest.mark.parametrize("best", ["1500", None, float("nan")], ids=["text", "null", "NaN"])
+def test_a_surplus_auction_s_best_bid_is_checked_with_no_bid_yet(answers, best) -> None:
+    answers["surplus_auctions"] = [dict(copy.deepcopy(SURPLUS_AUCTION), last_bid=None)]
+    assert _refused(answers, "surplus_auctions") is False
+    answers["surplus_auctions"][0]["crt_bid_amount"] = best
+    assert _refused(answers, "surplus_auctions")
+
+
+@pytest.mark.parametrize("read", ["bills", "announcers"])
+def test_a_spent_record_of_another_shape_is_a_note_too(answers, read) -> None:
+    # Spent ones are not shown, but an answer that garbles them is garbled.
+    if read == "bills":
+        answers["bills"] = [copy.deepcopy(BILL_BEING_VOTED_ON)]
+        spent = dict(copy.deepcopy(BILL_BEING_VOTED_ON), spent=True)
+        answers["bills"].append(spent)
+        assert _refused(answers, "bills") is False
+        spent["exitable_at"] = "soon"
+    else:
+        spent = dict(copy.deepcopy(answers["announcers"][0]), spent=True)
+        answers["announcers"].append(spent)
+        assert _refused(answers, "announcers") is False
+        spent["price"] = "97"
+    assert _refused(answers, read)
 
 
 @pytest.mark.parametrize(
