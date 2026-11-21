@@ -43,6 +43,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -180,6 +181,12 @@ enum class AlertRule : std::uint8_t {
 /// Human-readable label for logging.
 const char* to_string(AlertRule rule) noexcept;
 
+/// [review #251] Rules that pace themselves and so skip the per-rule
+/// cooldown: ConfigReload (one per Save), PnlDrawdown (once per step of an
+/// episode) and HedgeImbalance (once per episode per pair).  A cooldown
+/// would drop the one message a latch has already decided is news.
+[[nodiscard]] bool alert_rule_skips_cooldown(AlertRule rule) noexcept;
+
 /// [ALERT-NOISE] When an equity drawdown is news: on reaching a deeper step
 /// of the threshold (5%, 10%, 15%, ...), and again in a new episode once the
 /// drawdown has eased below kResetFraction of the threshold. It used to be
@@ -187,16 +194,30 @@ const char* to_string(AlertRule rule) noexcept;
 class DrawdownAlertLatch {
 public:
     static constexpr double kResetFraction = 0.8;
+    /// [review] Steps are counted with rounding allowed for (0.15 / 0.05
+    /// reads 2.9999999999999996) and bounded, so neither an infinite
+    /// drawdown nor a tiny threshold overflows the conversion.
+    static constexpr double kEpsilon = 1e-9;
+    static constexpr int    kMaxStep = 1000;
 
     /// True when `drawdown` (a fraction of peak equity) should be alerted.
+    /// Not thread-safe: AlertManager holds its lock around it.
     [[nodiscard]] bool should_alert(double drawdown, double threshold) noexcept
     {
-        if (!(threshold > 0.0) || !(drawdown == drawdown)) return false;  // NaN: nothing to say
-        if (drawdown < threshold) {
-            if (drawdown < threshold * kResetFraction) alerted_step_ = 0;
+        if (!std::isfinite(drawdown) || !std::isfinite(threshold) || !(threshold > 0.0)) {
+            return false;  // nothing honest to say
+        }
+        const double ratio = drawdown / threshold;
+        if (!std::isfinite(ratio)) return false;
+        if (ratio + kEpsilon < 1.0) {
+            // Below 80% of the threshold (80% itself not included): the
+            // episode is over, and the next one alerts again.
+            if (ratio < kResetFraction - kEpsilon) alerted_step_ = 0;
             return false;
         }
-        const auto step = static_cast<int>(drawdown / threshold);
+        const double steps = ratio + kEpsilon;
+        const int step = steps >= static_cast<double>(kMaxStep) ? kMaxStep
+                                                                : static_cast<int>(steps);
         if (step <= alerted_step_) return false;
         alerted_step_ = step;
         return true;

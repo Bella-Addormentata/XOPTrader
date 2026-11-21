@@ -43,6 +43,29 @@ TEST(NheWindow, FillsOlderThanTheWindowAreForgotten)
     EXPECT_DOUBLE_EQ(window.nhe(), 1.0) << "no volume: nothing one-sided";
 }
 
+TEST(NheWindow, FillsOutOfHeightOrderAreForgottenToo)
+{
+    // [review #251] A newer fill recorded first must not shield an older one.
+    NheWindow window(100);
+    window.add(200, 5.0);
+    window.add(50, -5.0);
+    window.add(190, 2.0);
+    window.prune(201);
+    EXPECT_EQ(window.fills(), 2U) << "the fill from block 50 is out of the window";
+    EXPECT_DOUBLE_EQ(window.net(), 7.0);
+}
+
+TEST(NheAlertLatch, RecoveryRearmsEvenWithFewFills)
+{
+    // [review #251] Two balanced fills left after the one-sided ones expired.
+    NheAlertLatch latch;
+    EXPECT_TRUE(latch.should_alert(0.1, NheWindow::kMinFills));
+    EXPECT_FALSE(latch.should_alert(1.0, 2)) << "recovered, below the fill count";
+    EXPECT_TRUE(latch.should_alert(0.2, NheWindow::kMinFills)) << "so a new run alerts";
+    latch.reset();  // the pair went quiet
+    EXPECT_TRUE(latch.should_alert(0.2, NheWindow::kMinFills));
+}
+
 TEST(NheAlertLatch, OncePerEpisodeAndOnlyWithEnoughFills)
 {
     NheAlertLatch latch;
@@ -75,10 +98,42 @@ TEST(DrawdownAlertLatch, NothingWithoutAThresholdOrANumber)
     DrawdownAlertLatch latch;
     EXPECT_FALSE(latch.should_alert(0.5, 0.0));
     EXPECT_FALSE(latch.should_alert(std::numeric_limits<double>::quiet_NaN(), 0.05));
+    EXPECT_FALSE(latch.should_alert(std::numeric_limits<double>::infinity(), 0.05));
+    EXPECT_FALSE(latch.should_alert(0.5, std::numeric_limits<double>::infinity()));
+}
+
+TEST(DrawdownAlertLatch, StepsAreExactAtTheirBoundariesAndBounded)
+{
+    // [review #251] 0.15 / 0.05 reads 2.9999999999999996; 0.04 / 0.05 reads
+    // just under 0.8 -- neither may decide a step or the end of an episode.
+    DrawdownAlertLatch latch;
+    EXPECT_TRUE(latch.should_alert(0.05, 0.05));
+    EXPECT_TRUE(latch.should_alert(0.10, 0.05));
+    EXPECT_TRUE(latch.should_alert(0.15, 0.05)) << "exactly 15% is the third step";
+    EXPECT_EQ(latch.alerted_step(), 3);
+    EXPECT_FALSE(latch.should_alert(0.04, 0.05)) << "exactly 4% does not end the episode";
+    EXPECT_EQ(latch.alerted_step(), 3);
+    EXPECT_FALSE(latch.should_alert(0.0399, 0.05));
+    EXPECT_EQ(latch.alerted_step(), 0);
+
+    DrawdownAlertLatch tiny;
+    EXPECT_TRUE(tiny.should_alert(0.5, 1e-12)) << "bounded, not overflowed";
+    EXPECT_EQ(tiny.alerted_step(), DrawdownAlertLatch::kMaxStep);
+    EXPECT_FALSE(tiny.should_alert(0.6, 1e-12));
 }
 
 TEST(AlertRules, HedgeImbalanceIsAWarningOfItsOwn)
 {
     EXPECT_EQ(xop::tier_for_rule(xop::AlertRule::HedgeImbalance), xop::AlertTier::WARNING);
     EXPECT_STREQ(xop::to_string(xop::AlertRule::HedgeImbalance), "HedgeImbalance");
+}
+
+TEST(AlertRules, TheSelfPacedRulesSkipTheCooldown)
+{
+    // [review #251] A latch has already decided these are news.
+    EXPECT_TRUE(xop::alert_rule_skips_cooldown(xop::AlertRule::PnlDrawdown));
+    EXPECT_TRUE(xop::alert_rule_skips_cooldown(xop::AlertRule::HedgeImbalance));
+    EXPECT_TRUE(xop::alert_rule_skips_cooldown(xop::AlertRule::ConfigReload));
+    EXPECT_FALSE(xop::alert_rule_skips_cooldown(xop::AlertRule::SpreadWidening));
+    EXPECT_FALSE(xop::alert_rule_skips_cooldown(xop::AlertRule::ExposureBreach));
 }

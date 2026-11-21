@@ -31,6 +31,7 @@
 #include "xop/config.hpp"
 #include "xop/state.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <deque>
 #include <shared_mutex>
@@ -300,13 +301,16 @@ public:
         fills_.emplace_back(block, signed_size);
     }
 
-    /// Forget fills older than the window at block `now`.
+    /// Forget fills older than the window at block `now`.  [review #251]
+    /// Wherever they sit: fills are not recorded in height order (offers
+    /// come in map order, and a delayed proof settles an older fill late).
     void prune(BlockHeight now)
     {
-        while (!fills_.empty() && now > fills_.front().first
-               && now - fills_.front().first > blocks_) {
-            fills_.pop_front();
-        }
+        fills_.erase(std::remove_if(fills_.begin(), fills_.end(),
+                                    [&](const std::pair<BlockHeight, double>& fill) {
+                                        return now > fill.first && now - fill.first > blocks_;
+                                    }),
+                     fills_.end());
     }
 
     [[nodiscard]] std::size_t fills() const noexcept { return fills_.size(); }
@@ -344,15 +348,20 @@ public:
                                     double target = HedgingManager::nhe_target(),
                                     std::size_t min_fills = NheWindow::kMinFills) noexcept
     {
-        if (fills < min_fills) return false;
+        // [review #251] Recovery first: the minimum fill count gates only a
+        // new alert, never the end of an episode.
         if (nhe >= target) {
             alerted_ = false;
             return false;
         }
+        if (fills < min_fills) return false;
         if (alerted_) return false;
         alerted_ = true;
         return true;
     }
+
+    /// The pair went quiet (its window emptied): the next run alerts afresh.
+    void reset() noexcept { alerted_ = false; }
 
 private:
     bool alerted_{false};

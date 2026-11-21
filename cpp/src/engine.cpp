@@ -20752,7 +20752,11 @@ void Engine::step_run_hedging(BlockHeight block_height)
     // one-sided by nature and used to score 0 -- and page -- on its own.
     for (auto& [pair_name, window] : nhe_windows_) {
         window.prune(block_height);
-        if (window.fills() == 0) continue;
+        if (window.fills() == 0) {
+            // [review #251] Quiet: whatever was latched is over.
+            nhe_latches_[pair_name].reset();
+            continue;
+        }
         const double nhe = window.nhe();
         spdlog::debug("[Engine] Step 10: NHE {} = {:.3f} over {} fill(s) (net {:.0f}, "
                       "volume {:.0f})",

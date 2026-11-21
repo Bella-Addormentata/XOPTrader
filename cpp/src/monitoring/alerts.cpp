@@ -90,6 +90,12 @@ const char* to_string(AlertRule rule) noexcept
     return "UNKNOWN";
 }
 
+bool alert_rule_skips_cooldown(AlertRule rule) noexcept
+{
+    return rule == AlertRule::ConfigReload || rule == AlertRule::PnlDrawdown
+        || rule == AlertRule::HedgeImbalance;
+}
+
 AlertTier tier_for_rule(AlertRule rule) noexcept
 {
     switch (rule) {
@@ -374,7 +380,10 @@ void AlertManager::send_alert(AlertRule rule, const std::string& message)
     // emergency sequence -- a rejected save corrected within the 300s
     // WARNING window -- must deliver BOTH outcomes to an operator who is
     // watching for exactly this message.
-    if (rule != AlertRule::ConfigReload && !check_rate_limit(rule)) {
+    // [review #251] PnlDrawdown and HedgeImbalance are paced by their own
+    // latches, once per step or episode: the cooldown would drop the one
+    // message they have already decided is news.
+    if (!alert_rule_skips_cooldown(rule) && !check_rate_limit(rule)) {
         return;
     }
 
@@ -606,18 +615,35 @@ void AlertManager::start_worker()
 #endif
 
             // Execute the request.
-            CURLcode res = curl_easy_perform(curl);
-            if (res != CURLE_OK) {
-                // Log error WITHOUT the URL (contains secret bot token).
-                spdlog::warn("AlertManager: Telegram POST failed: {}",
-                             curl_easy_strerror(res));
-            } else {
-                long http_code = 0;
-                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-                if (http_code != 200) {
-                    spdlog::warn("AlertManager: Telegram API returned HTTP {}",
-                                 http_code);
+            // [review #251] Retried a few times with a growing pause: alerts
+            // paced once per step or episode are not sent again on their own,
+            // so a passing Telegram outage would otherwise hide them. A 4xx
+            // other than 429 is the request's fault, not the network's.
+            constexpr int kTelegramAttempts = 3;
+            for (int attempt = 1; attempt <= kTelegramAttempts; ++attempt) {
+                bool sent      = false;
+                bool permanent = false;
+                CURLcode res = curl_easy_perform(curl);
+                if (res != CURLE_OK) {
+                    // Log error WITHOUT the URL (contains secret bot token).
+                    spdlog::warn("AlertManager: Telegram POST failed (attempt {}/{}): {}",
+                                 attempt, kTelegramAttempts, curl_easy_strerror(res));
+                } else {
+                    long http_code = 0;
+                    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+                    sent = http_code == 200;
+                    permanent = http_code >= 400 && http_code < 500 && http_code != 429;
+                    if (!sent) {
+                        spdlog::warn("AlertManager: Telegram API returned HTTP {} "
+                                     "(attempt {}/{})",
+                                     http_code, attempt, kTelegramAttempts);
+                    }
                 }
+                if (sent || permanent || attempt == kTelegramAttempts
+                    || send_stop_.load(std::memory_order_acquire)) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(2 * attempt));
             }
 
             curl_easy_cleanup(curl);
@@ -885,7 +911,14 @@ void AlertManager::check_pnl_drawdown(const BotState& state)
                           / state.peak_equity_usd;
 
     // [ALERT-NOISE] Once per 5% step of an episode, not on every cycle.
-    if (drawdown_latch_.should_alert(drawdown, threshold)) {
+    // [review #251] Under mtx_: check_and_alert may run on any thread. The
+    // lock is let go before send_alert, which takes it itself.
+    bool news = false;
+    {
+        std::lock_guard lock(mtx_);
+        news = drawdown_latch_.should_alert(drawdown, threshold);
+    }
+    if (news) {
         send_alert(AlertRule::PnlDrawdown,
             fmt::format("Equity drawdown: {:.1f}% from peak ${:.2f} "
                         "(threshold {:.1f}%)",
