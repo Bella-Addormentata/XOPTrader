@@ -711,7 +711,7 @@ class CircuitWidget(QWidget):
                 model.short_id(row.name),
                 row.kind,
                 row.status or "-",
-                "yes" if row.can_be_settled else "no",
+                "-" if row.can_be_settled is None else "yes" if row.can_be_settled else "no",
                 row.detail,
             )
             for row in auctions

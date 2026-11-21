@@ -312,6 +312,53 @@ def test_a_garbled_answer_keeps_the_last_good_one_and_its_banner(app, how) -> No
         _close(page, app)
 
 
+@pytest.mark.parametrize("how", ["left out", "null"])
+def test_a_vault_list_with_a_flag_missing_keeps_the_last_good_count(app, how) -> None:
+    server = FixtureServer()
+    page, _factory = _page(server)
+    try:
+        page.set_enabled(True)
+        page.show()
+        _wait_until(app, lambda: not page.fetching() and len(server.calls) == 8)
+        summary = page._liquidation_summary.text()
+        assert "2 in bad debt (23.989 BYC)" in summary
+
+        vaults = json.loads(json.dumps(server.answers["/vaults"][1]))
+        vault = next(vault for vault in vaults if vault["in_bad_debt"])
+        if how == "left out":
+            del vault["in_bad_debt"]
+        else:
+            vault["in_bad_debt"] = None
+        server.answers["/vaults"] = (200, vaults)
+        assert page.refresh()
+        _wait_until(app, lambda: not page.fetching() and len(server.calls) == 16)
+        # Read as "not in bad debt", it would have made it 1.
+        assert "7 of 8 answered" in page._status.text()
+        assert page._liquidation_summary.text() == summary
+        (note,) = page._notes["vaults"]
+        assert note.text().startswith("vaults: the answer has an unexpected shape")
+    finally:
+        _close(page, app)
+
+
+def test_an_auction_that_leaves_open_whether_it_can_be_settled_shows_a_dash(app) -> None:
+    server = FixtureServer()
+    server.answers["/recharge_auctions"][1][0]["can_be_settled"] = None
+    page, _factory = _page(server)
+    try:
+        page.set_enabled(True)
+        page.show()
+        _wait_until(app, lambda: not page.fetching() and len(server.calls) == 8)
+        from gui.widgets.circuit import _cells
+
+        assert _cells(page._auctions) == [
+            ["c6164f84...3a5f", "Recharge", "STANDBY", "-", "not started"]
+        ]
+        assert all(note.isHidden() for notes in page._notes.values() for note in notes)
+    finally:
+        _close(page, app)
+
+
 def test_every_row_of_a_table_shows_above_a_horizontal_scroll_bar(app) -> None:
     page, factory = _page()
     tables = (

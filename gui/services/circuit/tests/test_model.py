@@ -182,7 +182,7 @@ def test_a_vault_with_no_debt_has_no_ratio(view) -> None:
     # The server says "inf" for these; the page says nothing.
     raw = [vault for vault in _answers()["vaults"] if vault["debt"] == 0]
     assert raw and all(vault["collateral_ratio"] == "inf" for vault in raw)
-    rows = [model._vault_row(vault, NOW) for vault in raw]
+    rows = [model._vault_row(vault, model._vault_flags(vault), NOW) for vault in raw]
     assert all(row.ratio is None and row.liquidation_usd is None for row in rows)
     assert not {row.name for row in rows} & {row.name for row in view.vaults.closest}
 
@@ -229,17 +229,21 @@ def test_a_recharge_auction_with_a_bid_and_one_without() -> None:
     assert rows[1].detail == "no bids yet; ends 19:22 UTC"
 
 
+#: A surplus auction as Circuit's API description has one (none ran on 2026-11-21).
+SURPLUS_AUCTION = {
+    "name": "cc" * 32,
+    "launcher_id": "dd" * 32,
+    "byc_lot_amount": 50_000,
+    "crt_bid_amount": 1_500_000,
+    "last_bid": {"bid_expires_at": NOW + 1200, "bid_expires_in": 1200, "timestamp": NOW},
+    "expired": False,
+    "can_be_settled": False,
+    "status": "RUNNING",
+}
+
+
 def test_a_surplus_auction_from_the_schema() -> None:
-    auction = {
-        "name": "cc" * 32,
-        "launcher_id": "dd" * 32,
-        "byc_lot_amount": 50_000,
-        "crt_bid_amount": 1_500_000,
-        "last_bid": {"bid_expires_at": NOW + 1200, "bid_expires_in": 1200, "timestamp": NOW},
-        "expired": False,
-        "can_be_settled": False,
-        "status": "RUNNING",
-    }
+    auction = copy.deepcopy(SURPLUS_AUCTION)
     (row,) = model.auctions_from([auction], "surplus", NOW)
     assert row.kind == "Surplus" and row.status == "RUNNING"
     assert row.detail == "50 BYC lot; best bid 1,500 CRT, standing until 18:42 UTC"
@@ -255,17 +259,21 @@ def test_the_governance_coin(view) -> None:
     assert row.exit == "can leave governance"
 
 
+#: A governance coin with a bill up for a vote (the one live on 2026-11-21 has none).
+BILL_BEING_VOTED_ON = {
+    "name": "ee" * 32,
+    "amount": 40_000_000_000,
+    "bill": {"statute_name": "STABILITY_FEE_DF", "value": 10000000900},
+    "status": {"status": "VETOABLE", "status_expires_at": NOW + 1800},
+    "exitable_at": NOW + 3 * 86_400,
+    "operation": "propose",
+    "timestamp": NOW,
+    "spent": False,
+}
+
+
 def test_a_bill_being_voted_on() -> None:
-    coin = {
-        "name": "ee" * 32,
-        "amount": 40_000_000_000,
-        "bill": {"statute_name": "STABILITY_FEE_DF", "value": 10000000900},
-        "status": {"status": "VETOABLE", "status_expires_at": NOW + 1800},
-        "exitable_at": NOW + 3 * 86_400,
-        "operation": "propose",
-        "timestamp": NOW,
-        "spent": False,
-    }
+    coin = copy.deepcopy(BILL_BEING_VOTED_ON)
     (row,) = model.bills_from([coin, dict(coin, spent=True)], NOW)
     assert row.proposal == "STABILITY_FEE_DF = 10000000900"
     assert row.status == "VETOABLE until 18:52 UTC"
@@ -363,61 +371,174 @@ def test_an_answer_of_another_shape_is_a_note_not_a_crash(answers, read, answer)
     assert not others
 
 
-#: The vault flags, read in turn until one is true.
-VAULT_FLAGS = (
-    "in_bad_debt",
-    "in_liquidation",
-    "is_biddable",
-    "is_restartable",
-    "is_startable",
-    "is_liquidatable",
-    "nearing_liquidation",
-    "seized",
-)
+def _item(answers: dict, read: str) -> dict:
+    """The live answer's record for ``read``: the object, or its first entry.
+
+    For the vaults, one in bad debt: that flag alone decides how it is shown,
+    so a check of every other field shows they are all read anyway.
+    """
+    answer = answers[read]
+    if read == "vaults":
+        return next(vault for vault in answer if vault["in_bad_debt"])
+    return answer if isinstance(answer, dict) else answer[0]
+
+
+def _refused(answers: dict, read: str) -> bool:
+    view = model.build_view(answers, now=NOW)
+    others = set(view.problems) - {read}
+    assert not others, "the other sections are untouched"
+    return view.problems.get(read, "").startswith("the answer has an unexpected shape")
+
+
+#: The yes/no fields Circuit's API description says are always given, true or false.
+ALWAYS_TRUE_OR_FALSE = [
+    *(("vaults", flag) for flag in model.VAULT_FLAGS),
+    ("treasury", "is_ring"),
+    ("treasury", "can_rebalance"),
+    ("treasury", "can_start_recharge_auction"),
+    ("treasury", "can_start_surplus_auction"),
+    ("announcers", "valid"),
+    ("announcers", "approved"),
+    ("announcers", "penalizable"),
+    ("announcers", "in_cooldown"),
+    ("announcers", "spent"),
+]
 
 
 @pytest.mark.parametrize(
-    "value", [1, 0, "true", "false", [True]], ids=["1", "0", "text true", "text false", "a list"]
+    "value",
+    [None, 1, 0, "true", "false", [True]],
+    ids=["null", "1", "0", "text true", "text false", "a list"],
 )
+@pytest.mark.parametrize(("read", "key"), [*ALWAYS_TRUE_OR_FALSE, ("bills", "spent")])
+def test_a_yes_or_no_that_is_neither_is_a_note_not_a_no(answers, read, key, value) -> None:
+    item = _item(answers, read)
+    assert isinstance(item[key], bool), "the live answer's own field"
+    item[key] = value
+    assert _refused(answers, read)
+
+
 @pytest.mark.parametrize(
     ("read", "key"),
     [
-        ("vaults", "in_bad_debt"),
-        ("vaults", "is_liquidatable"),
-        ("vaults", "nearing_liquidation"),
-        ("treasury", "can_start_surplus_auction"),
+        *ALWAYS_TRUE_OR_FALSE,
+        ("vaults", "name"),
+        ("vaults", "collateral_ratio"),
+        ("vaults", "liquidation_price"),
+        ("vaults", "auction_price"),
+        ("vaults", "auction_ttl"),
+        ("recharge_auctions", "name"),
+        ("recharge_auctions", "status"),
         ("recharge_auctions", "can_be_settled"),
-        ("bills", "spent"),
-        ("announcers", "valid"),
+        ("recharge_auctions", "last_bid"),
+        ("recharge_auctions", "auction_params"),
+        ("bills", "name"),
+        ("bills", "exitable_at"),
+        ("announcers", "launcher_id"),
     ],
 )
-def test_a_yes_or_no_that_is_neither_is_a_note_not_a_no(answers, read, key, value) -> None:
-    answer = answers[read]
-    if read == "vaults":  # one with every flag false, so that each of them is read
-        item = next(vault for vault in answer if not any(vault[flag] for flag in VAULT_FLAGS))
-    else:
-        item = answer if isinstance(answer, dict) else answer[0]
-    assert isinstance(item[key], bool), "the live answer's own field"
-    item[key] = value
-    view = model.build_view(answers, now=NOW)
-    assert view.problems[read].startswith("the answer has an unexpected shape")
+def test_a_field_the_api_always_gives_left_out_is_a_note(answers, read, key) -> None:
+    # Taken as no (or as nothing), it would replace the last good answer: a
+    # vault in bad debt left out of the count, an auction with no status.
+    item = _item(answers, read)
+    assert key in item, "the live answer's own field"
+    del item[key]
+    assert _refused(answers, read)
 
 
-def test_a_yes_or_no_left_out_is_a_no(answers) -> None:
-    before = len(model.build_view(answers, now=NOW).vaults.bad_debt)
-    vault = next(vault for vault in answers["vaults"] if vault["in_bad_debt"])
-    del vault["in_bad_debt"]
+def test_a_vault_s_every_flag_is_read_even_when_the_first_decides(answers) -> None:
+    vault = _item(answers, "vaults")
+    assert vault["in_bad_debt"] and vault["seized"]
+    vault["is_restartable"] = "no"
+    assert _refused(answers, "vaults")
+
+
+@pytest.mark.parametrize("kind", ["recharge", "surplus"])
+def test_an_auction_may_leave_open_whether_it_can_be_settled(answers, kind) -> None:
+    live = answers["recharge_auctions"][0] if kind == "recharge" else SURPLUS_AUCTION
+    item = copy.deepcopy(live)
+    item["can_be_settled"] = None  # as the API description allows
+    (row,) = model.auctions_from([item], kind, NOW)
+    assert row.can_be_settled is None
+    for value in (1, "yes", [False]):
+        item["can_be_settled"] = value
+        with pytest.raises(TypeError):
+            model.auctions_from([item], kind, NOW)
+
+
+def test_a_governance_coin_may_leave_spent_out(answers) -> None:
+    # The API description gives it a default, false: left out, the coin is shown.
+    del answers["bills"][0]["spent"]
     view = model.build_view(answers, now=NOW)
     assert view.problems == {}
-    assert len(view.vaults.bad_debt) == before - 1
+    assert len(view.bills) == 1
 
 
 @pytest.mark.parametrize("status", [None, 5, ["ok"]], ids=["null", "a number", "a list"])
-def test_a_status_that_is_not_text_is_a_note(answers, status) -> None:
-    answers["statutes"]["status"] = status
-    view = model.build_view(answers, now=NOW)
-    assert view.protocol is None
-    assert view.problems["statutes"].startswith("the answer has an unexpected shape")
+@pytest.mark.parametrize(
+    "where", ["the statutes", "a recharge auction", "a surplus auction", "a bill"]
+)
+def test_a_status_that_is_not_text_is_a_note(answers, where, status) -> None:
+    if where == "the statutes":
+        read, record = "statutes", answers["statutes"]
+    elif where == "a recharge auction":
+        read, record = "recharge_auctions", answers["recharge_auctions"][0]
+    elif where == "a surplus auction":
+        answers["surplus_auctions"] = [copy.deepcopy(SURPLUS_AUCTION)]
+        read, record = "surplus_auctions", answers["surplus_auctions"][0]
+    else:
+        answers["bills"] = [copy.deepcopy(BILL_BEING_VOTED_ON)]
+        read, record = "bills", answers["bills"][0]["status"]
+    assert _refused(answers, read) is False, "the answer as the API description has it"
+    record["status"] = status
+    assert _refused(answers, read)
+
+
+@pytest.mark.parametrize("value", [5, None, ["ee"]], ids=["a number", "null", "a list"])
+@pytest.mark.parametrize(
+    ("read", "key"),
+    [
+        ("vaults", "name"),
+        ("recharge_auctions", "name"),
+        ("bills", "name"),
+        ("announcers", "launcher_id"),
+    ],
+)
+def test_a_name_that_is_not_text_is_a_note(answers, read, key, value) -> None:
+    _item(answers, read)[key] = value
+    assert _refused(answers, read)
+
+
+@pytest.mark.parametrize(
+    ("change", "key", "value"),
+    [
+        ("bill", "value", True),
+        ("bill", "value", 1.5),
+        ("bill", "value", None),
+        ("bill", "statute_name", 5),
+        ("coin", "bill", "STABILITY_FEE_DF"),
+        ("coin", "status", "VETOABLE"),
+        ("coin", "operation", 5),
+        ("status", "status_expires_at", "soon"),
+    ],
+)
+def test_a_governance_coin_of_another_shape_is_a_note(answers, change, key, value) -> None:
+    coin = copy.deepcopy(BILL_BEING_VOTED_ON)
+    if key == "operation":
+        coin["status"] = None  # the last step shows only when there is no status
+    answers["bills"] = [coin]
+    assert _refused(answers, "bills") is False, "the answer as the API description has it"
+    record = {"coin": coin, "bill": coin["bill"], "status": coin["status"]}[change]
+    record[key] = value
+    assert _refused(answers, "bills")
+
+
+@pytest.mark.parametrize("value", [{}, [], 0, ""], ids=["an empty object", "a list", "0", "text"])
+@pytest.mark.parametrize("key", ["last_bid", "auction_params"])
+def test_a_bid_or_auction_settings_of_another_shape_is_a_note(answers, key, value) -> None:
+    # Read as none, they would say "not started" of an auction under way.
+    answers["recharge_auctions"][0][key] = value
+    assert _refused(answers, "recharge_auctions")
 
 
 # -- formatting ---------------------------------------------------------------------

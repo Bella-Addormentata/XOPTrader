@@ -155,15 +155,46 @@ def _optional_time(value: Any) -> float | None:
     return None if value is None else _time(value)
 
 
-def _flag(value: Any) -> bool:
-    """A yes or no: true, false, or left out (no).
+# Circuit's own API description (the openapi.json the probe saved on
+# 2026-11-21) sets out the vaults, the treasury, the auctions, the governance
+# coins and the announcers. Their fields are read as it has them: one it always
+# gives must be there, and null only where it allows null. Anything else is an
+# answer of an unexpected shape, so the older answer stays beside a note.
 
-    Anything else (1, "true") is an answer of an unexpected shape, not a no:
+
+def _flag(record: Mapping[str, Any], key: str) -> bool:
+    """A yes or no the API always gives: true or false.
+
+    Left out, null, 1 or "true" is an answer of an unexpected shape, not a no:
     read as no, a vault in bad debt or open to liquidation would look sound.
     """
+    value = record[key]
+    if isinstance(value, bool):
+        return value
+    raise TypeError(f"expected {key} as true or false, got {value!r}")
+
+
+def _maybe_flag(record: Mapping[str, Any], key: str) -> bool | None:
+    """A yes or no the API may leave open (null): an auction's ``can_be_settled``."""
+    value = record[key]
     if value is None or isinstance(value, bool):
-        return value is True
-    raise TypeError(f"expected true or false, got {value!r}")
+        return value
+    raise TypeError(f"expected {key} as true, false or null, got {value!r}")
+
+
+def _text(record: Mapping[str, Any], key: str) -> str:
+    """A name or a status: always text."""
+    value = record[key]
+    if isinstance(value, str):
+        return value
+    raise TypeError(f"expected {key} as text, got {value!r}")
+
+
+def _optional_text(record: Mapping[str, Any], key: str) -> str | None:
+    value = record.get(key)
+    if value is None or isinstance(value, str):
+        return value
+    raise TypeError(f"expected {key} as text or null, got {value!r}")
 
 
 # -- the sections -------------------------------------------------------------
@@ -254,9 +285,7 @@ def protocol_from(answer: Any) -> Protocol:
     usage = _optional_number(answer.get("current_collateral_usage"))
     cap = _optional_number(answer.get("max_collateral_cap"))
     counter = answer.get("price_update_counter")
-    status = answer["status"]
-    if not isinstance(status, str):  # "ok", or what is wrong: always text
-        raise TypeError(f"expected the status as text, got {status!r}")
+    status = _text(answer, "status")  # "ok", or what is wrong
     return Protocol(
         status=status,
         block_issuance=block_issuance,
@@ -286,43 +315,61 @@ class VaultRow:
     biddable: bool = False
 
 
-def _vault_state(vault: Mapping[str, Any]) -> str:
-    if _flag(vault.get("in_bad_debt")):
+#: A vault's yes/no fields, all of which the API always gives.
+VAULT_FLAGS = (
+    "in_bad_debt",
+    "in_liquidation",
+    "is_biddable",
+    "is_restartable",
+    "is_startable",
+    "is_liquidatable",
+    "nearing_liquidation",
+    "seized",
+)
+
+
+def _vault_flags(vault: Mapping[str, Any]) -> dict[str, bool]:
+    """Every one of a vault's flags, each checked, even where an earlier one decides."""
+    return {key: _flag(vault, key) for key in VAULT_FLAGS}
+
+
+def _vault_state(flags: Mapping[str, bool]) -> str:
+    if flags["in_bad_debt"]:
         return "bad debt"
-    if _flag(vault.get("in_liquidation")):
-        return "auction running" + (", open to bids" if _flag(vault.get("is_biddable")) else "")
-    if _flag(vault.get("is_restartable")):
+    if flags["in_liquidation"]:
+        return "auction running" + (", open to bids" if flags["is_biddable"] else "")
+    if flags["is_restartable"]:
         return "auction can be restarted"
-    if _flag(vault.get("is_startable")):
+    if flags["is_startable"]:
         return "auction can be started"
-    if _flag(vault.get("is_liquidatable")):
+    if flags["is_liquidatable"]:
         return "liquidatable"
-    if _flag(vault.get("nearing_liquidation")):
+    if flags["nearing_liquidation"]:
         return "nearing liquidation"
-    if _flag(vault.get("seized")):
+    if flags["seized"]:
         return "seized"
     return ""
 
 
-def _vault_row(vault: Mapping[str, Any], answered_at: float) -> VaultRow:
+def _vault_row(vault: Mapping[str, Any], flags: Mapping[str, bool], answered_at: float) -> VaultRow:
     debt = _number(vault["debt"]) / MOJOS_PER_CAT
-    raw_ratio = vault.get("collateral_ratio")
+    raw_ratio = vault["collateral_ratio"]
     ratio = None
     if debt > 0 and raw_ratio is not None and not isinstance(raw_ratio, str):
         ratio = _number(raw_ratio)
-    liquidation = _optional_number(vault.get("liquidation_price"))
-    auction = _optional_number(vault.get("auction_price"))
-    ttl = _optional_time(vault.get("auction_ttl"))
+    liquidation = _optional_number(vault["liquidation_price"])
+    auction = _optional_number(vault["auction_price"])
+    ttl = _optional_time(vault["auction_ttl"])
     return VaultRow(
-        name=str(vault["name"]),
+        name=_text(vault, "name"),
         collateral_xch=_number(vault["collateral"]) / MOJOS_PER_XCH,
         debt_byc=debt,
         ratio=ratio,
         liquidation_usd=None if liquidation is None else liquidation / PRICE_SCALE,
-        state=_vault_state(vault),
+        state=_vault_state(flags),
         auction_usd=None if auction is None else auction / PRICE_SCALE,
         auction_ends_at=None if ttl is None else answered_at + ttl,
-        biddable=_flag(vault.get("is_biddable")),
+        biddable=flags["is_biddable"],
     )
 
 
@@ -352,25 +399,20 @@ def vaults_from(answer: Any, answered_at: float) -> Vaults:
     rows = []
     in_auction, waiting, nearing, bad_debt, open_debt = [], [], [], [], []
     for vault in answer:
-        row = _vault_row(vault, answered_at)
+        flags = _vault_flags(vault)
+        row = _vault_row(vault, flags, answered_at)
         rows.append(row)
-        if _flag(vault.get("in_bad_debt")):
+        if flags["in_bad_debt"]:
             bad_debt.append(row)
-        elif _flag(vault.get("in_liquidation")):
+        elif flags["in_liquidation"]:
             in_auction.append(row)
-        elif any(
-            _flag(vault.get(key)) for key in ("is_liquidatable", "is_startable", "is_restartable")
-        ):
+        elif flags["is_liquidatable"] or flags["is_startable"] or flags["is_restartable"]:
             waiting.append(row)
         else:
-            if _flag(vault.get("nearing_liquidation")):
+            if flags["nearing_liquidation"]:
                 nearing.append(row)
             # Listed once: a vault past liquidation is in one of the lists above.
-            if (
-                row.debt_byc > 0
-                and row.liquidation_usd is not None
-                and not _flag(vault.get("seized"))
-            ):
+            if row.debt_byc > 0 and row.liquidation_usd is not None and not flags["seized"]:
                 open_debt.append(row)
     open_debt.sort(key=lambda row: row.liquidation_usd or 0.0, reverse=True)
     return Vaults(
@@ -404,10 +446,10 @@ def treasury_from(answer: Any) -> Treasury:
         minimum_byc=_number(answer["treasury_minimum"]) / MOJOS_PER_CAT,
         maximum_byc=_number(answer["treasury_maximum"]) / MOJOS_PER_CAT,
         coins=int(_number(answer["num_treasury_coins"])),
-        is_ring=_flag(answer.get("is_ring")),
-        can_rebalance=_flag(answer.get("can_rebalance")),
-        can_start_recharge=_flag(answer.get("can_start_recharge_auction")),
-        can_start_surplus=_flag(answer.get("can_start_surplus_auction")),
+        is_ring=_flag(answer, "is_ring"),
+        can_rebalance=_flag(answer, "can_rebalance"),
+        can_start_recharge=_flag(answer, "can_start_recharge_auction"),
+        can_start_surplus=_flag(answer, "can_start_surplus_auction"),
     )
 
 
@@ -419,35 +461,36 @@ class AuctionRow:
     name: str
     status: str
     detail: str
-    can_be_settled: bool
+    #: None where the API leaves it open (null).
+    can_be_settled: bool | None
 
 
 def _recharge_row(auction: Mapping[str, Any], now: float) -> AuctionRow:
-    bid = auction.get("last_bid")
-    params = auction.get("auction_params")
-    if bid:
+    bid = auction["last_bid"]
+    params = auction["auction_params"]
+    if bid is not None:
         detail = (
             f"last bid {fmt_units(_number(bid['byc_bid_amount']) / MOJOS_PER_CAT)} BYC for "
             f"{fmt_units(_number(bid['crt_bid_amount']) / MOJOS_PER_CAT)} CRT; the bid stands "
             f"until {fmt_utc(_time(bid['bid_expires_at']), now)}"
         )
-    elif params:
+    elif params is not None:
         detail = f"no bids yet; ends {fmt_utc(_time(params['auction_expires_at']), now)}"
     else:
         detail = "not started"
     return AuctionRow(
         "Recharge",
-        str(auction["name"]),
-        str(auction.get("status") or ""),
+        _text(auction, "name"),
+        _text(auction, "status"),
         detail,
-        _flag(auction.get("can_be_settled")),
+        _maybe_flag(auction, "can_be_settled"),
     )
 
 
 def _surplus_row(auction: Mapping[str, Any], now: float) -> AuctionRow:
     lot = fmt_units(_number(auction["byc_lot_amount"]) / MOJOS_PER_CAT)
-    bid = auction.get("last_bid")
-    if bid:
+    bid = auction["last_bid"]
+    if bid is not None:
         best = fmt_units(_number(auction["crt_bid_amount"]) / MOJOS_PER_CAT)
         detail = (
             f"{lot} BYC lot; best bid {best} CRT, standing until "
@@ -457,10 +500,10 @@ def _surplus_row(auction: Mapping[str, Any], now: float) -> AuctionRow:
         detail = f"{lot} BYC lot; no bids yet"
     return AuctionRow(
         "Surplus",
-        str(auction["name"]),
-        str(auction.get("status") or ""),
+        _text(auction, "name"),
+        _text(auction, "status"),
         detail,
-        _flag(auction.get("can_be_settled")),
+        _maybe_flag(auction, "can_be_settled"),
     )
 
 
@@ -483,29 +526,33 @@ class BillRow:
 
 
 def _bill_row(coin: Mapping[str, Any], now: float) -> BillRow:
+    # A governance coin's bill, status and last step may be left out (null).
     bill = coin.get("bill")
-    if bill:
-        proposal = f"{bill['statute_name']} = {bill['value']}"
-    else:
+    if bill is None:
         proposal = "no bill"
-    status = coin.get("status")
-    if status:
-        text = str(status["status"])
-        ends = status.get("status_expires_at")
-        if ends is not None:
-            text += f" until {fmt_utc(_time(ends), now)}"
     else:
-        operation = coin.get("operation")
+        value = bill["value"]  # a statute's new value: text or a whole number
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise TypeError(f"expected the bill's value as text or a whole number, got {value!r}")
+        proposal = f"{_text(bill, 'statute_name')} = {value}"
+    status = coin.get("status")
+    if status is None:
+        operation = _optional_text(coin, "operation")
         text = f"last step: {operation}" if operation else ""
-    exitable = coin.get("exitable_at")
+    else:
+        text = _text(status, "status")
+        ends = _optional_time(status["status_expires_at"])
+        if ends is not None:
+            text += f" until {fmt_utc(ends, now)}"
+    exitable = _optional_time(coin["exitable_at"])
     if exitable is None:
         exit_text = ""
-    elif _time(exitable) <= now:
+    elif exitable <= now:
         exit_text = "can leave governance"
     else:
-        exit_text = "can leave " + fmt_from_now(_time(exitable), now)
+        exit_text = "can leave " + fmt_from_now(exitable, now)
     return BillRow(
-        name=str(coin["name"]),
+        name=_text(coin, "name"),
         crt=_number(coin["amount"]) / MOJOS_PER_CAT,
         proposal=proposal,
         status=text,
@@ -513,10 +560,15 @@ def _bill_row(coin: Mapping[str, Any], now: float) -> BillRow:
     )
 
 
+def _bill_spent(coin: Mapping[str, Any]) -> bool:
+    """The API may leave a governance coin's ``spent`` out: then it is false."""
+    return _flag(coin, "spent") if "spent" in coin else False
+
+
 def bills_from(answer: Any, now: float) -> tuple[BillRow, ...]:
     if not isinstance(answer, list):
         raise TypeError("the governance list is not a list")
-    return tuple(_bill_row(coin, now) for coin in answer if not _flag(coin.get("spent")))
+    return tuple(_bill_row(coin, now) for coin in answer if not _bill_spent(coin))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -532,17 +584,17 @@ class AnnouncerRow:
 
 def _announcer_row(announcer: Mapping[str, Any], now: float) -> AnnouncerRow:
     words = []
-    words.append("valid" if _flag(announcer.get("valid")) else "not valid")
-    if not _flag(announcer.get("approved")):
+    words.append("valid" if _flag(announcer, "valid") else "not valid")
+    if not _flag(announcer, "approved"):
         words.append("not approved")
-    if _flag(announcer.get("penalizable")):
+    if _flag(announcer, "penalizable"):
         words.append("can be penalised")
-    if _flag(announcer.get("in_cooldown")):
+    if _flag(announcer, "in_cooldown"):
         words.append("in cooldown")
     expires_at = _time(announcer["expires_at"])
     expires = ("expires " if expires_at >= now else "expired ") + fmt_from_now(expires_at, now)
     return AnnouncerRow(
-        name=str(announcer["launcher_id"]),
+        name=_text(announcer, "launcher_id"),
         price_usd=_number(announcer["price"]) / PRICE_SCALE,
         state=", ".join(words),
         expires=expires,
@@ -554,7 +606,7 @@ def announcers_from(answer: Any, now: float) -> tuple[AnnouncerRow, ...]:
     if not isinstance(answer, list):
         raise TypeError("the announcer list is not a list")
     return tuple(
-        _announcer_row(announcer, now) for announcer in answer if not _flag(announcer.get("spent"))
+        _announcer_row(announcer, now) for announcer in answer if not _flag(announcer, "spent")
     )
 
 
