@@ -116,12 +116,15 @@ def test_the_emergency_switch_keeps_the_value_it_was_given(answers) -> None:
     assert protocol.emergency is True
 
 
-def test_a_fee_too_large_for_a_float_is_no_rate_and_the_rest_still_shows(answers) -> None:
-    answers["statutes"]["implemented_statutes"]["STABILITY_FEE_DF"] = 10**12
+@pytest.mark.parametrize("factor", [10**12, 0, -5], ids=["100 times a minute", "0", "below 0"])
+@pytest.mark.parametrize("name", ["STABILITY_FEE_DF", "INTEREST_DF"])
+def test_a_discount_factor_with_no_yearly_rate_is_a_note(answers, name, factor) -> None:
+    # No float holds the first one's yearly rate, and the others have none.
+    answers["statutes"]["implemented_statutes"][name] = factor
+    assert model.apy_from_df(factor) is None
     view = model.build_view(answers, now=NOW)
-    assert view.problems == {}
-    assert view.protocol.stability_fee_apy is None
-    assert view.protocol.savings_apy == pytest.approx(0.0400, abs=5e-5)
+    assert view.protocol is None
+    assert view.problems["statutes"].startswith("the answer has an unexpected shape")
 
 
 def test_the_vaults_are_counted_and_sorted(view) -> None:
@@ -701,12 +704,38 @@ def test_without_statute_labels_the_statutes_come_in_the_answer_s_order(answers,
 
 @pytest.mark.parametrize(
     "factor",
-    ["10000000801", True, float("nan"), [10000000801]],
-    ids=["text", "true", "NaN", "a list"],
+    ["10000000801", True, float("nan"), [10000000801], None],
+    ids=["text", "true", "NaN", "a list", "null"],
 )
 def test_a_fee_factor_that_is_not_a_number_is_a_note(answers, factor) -> None:
     # Read as no rate, it would replace the rate a good answer gave.
     answers["statutes"]["implemented_statutes"]["STABILITY_FEE_DF"] = factor
+    assert _refused(answers, "statutes")
+
+
+@pytest.mark.parametrize("how", ["left out", "null"])
+@pytest.mark.parametrize(
+    ("where", "key"),
+    [
+        ("statute", "STABILITY_FEE_DF"),
+        ("statute", "INTEREST_DF"),
+        ("statute", "VAULT_LIQUIDATION_RATIO_PCT"),
+        ("statute", "VAULT_LIQUIDATION_PENALTY_BPS"),
+        ("answer", "current_collateral_usage"),
+        ("answer", "max_collateral_cap"),
+        ("answer", "price_update_counter"),
+    ],
+)
+def test_a_protocol_figure_left_out_or_null_is_a_note(answers, where, key, how) -> None:
+    # Every live answer gives them; taken as none, a dash would replace a good figure.
+    record = answers["statutes"]
+    if where == "statute":
+        record = record["implemented_statutes"]
+    assert key in record, "the live answer's own figure"
+    if how == "left out":
+        del record[key]
+    else:
+        record[key] = None
     assert _refused(answers, "statutes")
 
 

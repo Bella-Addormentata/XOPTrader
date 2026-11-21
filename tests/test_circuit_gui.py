@@ -278,12 +278,16 @@ def _garbled_statutes(good: dict, how: str) -> dict:
     garbled = json.loads(json.dumps(good))
     if how == "no emergency switch":
         del garbled["implemented_statutes"]["BLOCK_ISSUANCE"]
+    elif how == "a fee factor null":
+        garbled["implemented_statutes"]["STABILITY_FEE_DF"] = None
     else:  # no status
         del garbled["status"]
     return garbled
 
 
-@pytest.mark.parametrize("how", ["statutes not an object", "no emergency switch", "no status"])
+@pytest.mark.parametrize(
+    "how", ["statutes not an object", "no emergency switch", "no status", "a fee factor null"]
+)
 def test_a_garbled_answer_keeps_the_last_good_one_and_its_banner(app, how) -> None:
     server = FixtureServer()
     server.answers["/statutes"][1]["implemented_statutes"]["BLOCK_ISSUANCE"] = 1
@@ -301,6 +305,7 @@ def test_a_garbled_answer_keeps_the_last_good_one_and_its_banner(app, how) -> No
         assert "7 of 8 answered" in page._status.text()
         assert not page._banner.isHidden(), "the emergency the last good answer showed"
         assert page._values["emergency"].text() == "ON: BLOCK_ISSUANCE is 1"
+        assert page._values["fee"].text().startswith("4.30% a year")
         notes = page._notes["statutes"]
         assert notes and all(
             note.text().startswith("statutes: the answer has an unexpected shape") for note in notes

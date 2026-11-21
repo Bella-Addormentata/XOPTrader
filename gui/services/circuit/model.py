@@ -257,13 +257,13 @@ class Protocol:
     status: str
     #: As the answer gave it (0 or 1), so the page shows it as given.
     block_issuance: int | float
-    stability_fee_apy: float | None
-    savings_apy: float | None
-    liquidation_ratio_pct: float | None
-    liquidation_penalty_pct: float | None
-    collateral_locked_xch: float | None
-    collateral_cap_xch: float | None
-    price_updates: int | None
+    stability_fee_apy: float
+    savings_apy: float
+    liquidation_ratio_pct: float
+    liquidation_penalty_pct: float
+    collateral_locked_xch: float
+    collateral_cap_xch: float
+    price_updates: int
     #: Every statute, in the protocol's order: (index, name, value).
     statutes: tuple[tuple[int, str, Any], ...]
 
@@ -271,6 +271,18 @@ class Protocol:
     def emergency(self) -> bool:
         """BLOCK_ISSUANCE is set: the protocol's core functions are off."""
         return self.block_issuance != 0
+
+
+def _yearly_rate(statutes: Mapping[str, Any], name: str) -> float:
+    """A statute's per-minute discount factor, as a yearly rate.
+
+    It must be a positive number whose yearly rate a float holds: 10**12, say,
+    is 100 times a minute, no rate a protocol sets.
+    """
+    rate = apy_from_df(_number(statutes[name]))
+    if rate is None:
+        raise ValueError(f"expected {name} as a discount factor, got {statutes[name]!r}")
+    return rate
 
 
 def protocol_from(answer: Any) -> Protocol:
@@ -302,23 +314,19 @@ def protocol_from(answer: Any) -> Protocol:
     # Checked, but kept as given, so the page shows 0 or 1, not 0.0 or 1.0.
     # A string "0", false, NaN or a number no float holds is no state at all.
     _number(block_issuance)
-    penalty = _optional_number(statutes.get("VAULT_LIQUIDATION_PENALTY_BPS"))
-    usage = _optional_number(answer.get("current_collateral_usage"))
-    cap = _optional_number(answer.get("max_collateral_cap"))
-    counter = answer.get("price_update_counter")
     status = _text(answer, "status")  # "ok", or what is wrong
+    # The figures the page shows are in every live answer. One left out or
+    # null would put a dash in place of a good figure, so it is a note too.
     return Protocol(
         status=status,
         block_issuance=block_issuance,
-        # A factor that is there must be a number; a yearly rate too large
-        # for a float is no rate, and the rest still shows.
-        stability_fee_apy=apy_from_df(_optional_number(statutes.get("STABILITY_FEE_DF"))),
-        savings_apy=apy_from_df(_optional_number(statutes.get("INTEREST_DF"))),
-        liquidation_ratio_pct=_optional_number(statutes.get("VAULT_LIQUIDATION_RATIO_PCT")),
-        liquidation_penalty_pct=None if penalty is None else penalty / 100,
-        collateral_locked_xch=None if usage is None else usage / MOJOS_PER_XCH,
-        collateral_cap_xch=None if cap is None else cap / MOJOS_PER_XCH,
-        price_updates=None if counter is None else int(_number(counter)),
+        stability_fee_apy=_yearly_rate(statutes, "STABILITY_FEE_DF"),
+        savings_apy=_yearly_rate(statutes, "INTEREST_DF"),
+        liquidation_ratio_pct=_number(statutes["VAULT_LIQUIDATION_RATIO_PCT"]),
+        liquidation_penalty_pct=_number(statutes["VAULT_LIQUIDATION_PENALTY_BPS"]) / 100,
+        collateral_locked_xch=_number(answer["current_collateral_usage"]) / MOJOS_PER_XCH,
+        collateral_cap_xch=_number(answer["max_collateral_cap"]) / MOJOS_PER_XCH,
+        price_updates=int(_number(answer["price_update_counter"])),
         statutes=tuple(order),
     )
 

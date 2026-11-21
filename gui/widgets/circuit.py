@@ -584,16 +584,13 @@ class CircuitWidget(QWidget):
             self._set(
                 "savings", self._rate(protocol.savings_apy, "paid on BYC deposited in savings")
             )
-            parts = []
-            if protocol.liquidation_ratio_pct is not None:
-                parts.append(f"below {protocol.liquidation_ratio_pct:g}% collateral")
-            if protocol.liquidation_penalty_pct is not None:
-                parts.append(f"{protocol.liquidation_penalty_pct:g}% penalty")
-            self._set("liquidation", "; ".join(parts) or "-")
+            self._set(
+                "liquidation",
+                f"below {protocol.liquidation_ratio_pct:g}% collateral; "
+                f"{protocol.liquidation_penalty_pct:g}% penalty",
+            )
             locked, cap = protocol.collateral_locked_xch, protocol.collateral_cap_xch
-            if locked is None:
-                self._set("collateral", "-")
-            elif cap:
+            if cap:
                 self._set(
                     "collateral",
                     f"{model.fmt_units(locked)} XCH locked, of a {model.fmt_units(cap)} XCH cap "
@@ -626,8 +623,8 @@ class CircuitWidget(QWidget):
         self._banner.setVisible(bool(alerts))
 
     @staticmethod
-    def _rate(apy: float | None, what: str) -> str:
-        return "-" if apy is None else f"{model.fmt_pct(apy, 2)} a year, {what}"
+    def _rate(apy: float, what: str) -> str:
+        return f"{model.fmt_pct(apy, 2)} a year, {what}"
 
     def _draw_liquidations(self, view: model.CircuitView, now: float) -> None:
         vaults = view.vaults
