@@ -5,6 +5,39 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.56] — 2026-11-20 — the options address's XCH stays put, and calls and puts by default
+
+### The options address's XCH no longer pays the engine's cancel fees (#250)
+
+Seen live on v0.10.55: three secure cancels of offers of CATs alone paid
+their network fee with XCH from the options address, although the engine
+had told the wallet to leave those coins alone. The Chia wallet picks a CAT
+spend's XCH fee coin itself and ignores the exclusions there. Each time the
+coin went back to the trading funds and the book topped up again. While the
+options fence is up, the engine now sends a cancel of an offer that offers
+no XCH, a bulk cancel and a CAT coin split without a fee, so the wallet
+picks no fee coin; the fee actually sent is what the engine books. Cancels
+of offers of XCH keep their fee, which comes from the offer's own coin.
+
+### The fence stays up across a restart (#250)
+
+Closing the app with the options book on, or a Settings save that restarts
+it, no longer lowers the engine's fence flag in between. The engine a
+restart brings up is fenced from its first moment: on v0.10.55 it had
+cancelled offers before the new app raised the flag again. A flag kept up
+for a restart that does not come, or after options are switched off, still
+comes down once the book has nothing open.
+
+### Calls and puts by default (#250)
+
+With no strikes written, the options book now writes both sides, out of the
+money: calls at 110% and 120% of spot and puts at 90% and 80%. Before, a
+config without strike lists minted nothing, and the Settings tab showed the
+call strikes only as a hint, so a save wrote none. The Settings tab shows the
+defaults, and `config.example.yaml` lists the same strikes. A side written on
+its own keeps the other off, as before, so an existing grid gains nothing
+nobody chose; a list written `[]` or null still turns a side off.
+
 ## [0.10.55] — 2026-11-20 — the options book's steps no longer fail at the top-up
 
 ### The options book's top-up works on a live book (#249)

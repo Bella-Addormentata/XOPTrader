@@ -1716,8 +1716,11 @@ options:
   # Left out (or an empty list) it is weekly; `none` mints no new contracts,
   # and the book only looks after those it has.
   expiries: weekly
-  call_strikes_pct: [100, 110, 120]      # percent of spot, rounded to strike_step
-  put_strikes_pct: [80, 90, 100]
+  # Calls above spot and puts below it, out of the money: the defaults when
+  # neither list is written. `[]` turns a side off. Puts lock the quote asset
+  # (see max_locked_quote), calls lock XCH.
+  call_strikes_pct: [110, 120]           # percent of spot, rounded to strike_step
+  put_strikes_pct: [90, 80]
   strike_step: 0.05                      # in the quote asset per XCH
   # An unsold contract whose strike has drifted this far from its slot is
   # cancelled so its collateral can back a current one.

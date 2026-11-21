@@ -321,6 +321,13 @@ class OptionsWidget(QWidget):
                 self._restart_to = None
                 self._remember(Mode.OFF)
             self._set_enabled(False, f"{exc}. See docs/options-live-test.md.")
+            # [review] A flag kept up for the book (a restart, the last session)
+            # still comes down once nothing needs it.
+            if self._runner.mode is Mode.OFF and hasattr(self._runner, "sync_fence"):
+                try:
+                    self._runner.sync_fence()
+                except Exception:  # noqa: BLE001 - best effort, as below
+                    _log.exception("[Options] the engine's fence flag could not be checked")
         else:
             self._set_enabled(True, "")
             if resume:
@@ -343,21 +350,28 @@ class OptionsWidget(QWidget):
         self.refresh()
 
     def stop_background_work(self) -> None:
-        """App closing: stop the book after its step. The remembered mode stays."""
+        """App closing: stop the book after its step. The remembered mode stays.
+
+        [FEE-COIN] So does the engine's fence flag: the book resumes at the
+        next start, and the engine started with it must be fenced at once.
+        """
         self._timer.stop()
         self._restart_to = None
         if self._runner is not None:
-            self._runner.stop()
+            self._runner.stop(keep_fence=True)
 
     # -- the switch -------------------------------------------------------------
 
     def _on_choose(self, mode: Mode) -> None:
+        restart_due = self._restart_to is not None
         self._restart_to = None  # the operator's own choice, over a restart still due
         if mode is Mode.OFF:
             # A short wait: a slow step finishes on its own, shown as stopping.
             self._runner.stop(timeout=options_runner.SWITCH_WAIT)
             self._remember(Mode.OFF)
             self._refusal = ""
+            if restart_due:
+                self._settle_fence()  # [review] the flag kept up for it follows the book
         else:
             self._start(mode, confirm=mode is Mode.LIVE, why="")
         self.refresh()
@@ -494,11 +508,22 @@ class OptionsWidget(QWidget):
         refusal = getattr(self._runner, "restart_refusal", None)
         why = refusal() if callable(refusal) else ""
         if why:
-            # [review] The operator's to switch on again, and remembered off.
+            # [review] The operator's to switch on again, and remembered off;
+            # the flag kept up for the restart follows the book again.
             self._remember(Mode.OFF)
             self._held.setText(f"Switched off, not started again: {why}.")
+            self._settle_fence()
             return
         self._start(mode, confirm=False, why="with the saved settings")
+
+    def _settle_fence(self) -> None:
+        settle = getattr(self._runner, "settle_fence", None)
+        if not callable(settle):
+            return
+        try:
+            settle()
+        except Exception:  # noqa: BLE001 - best effort; the page's next check tries again
+            _log.exception("[Options] the engine's fence flag could not be checked")
 
     def _show(self, snap: Any) -> None:
         self._check(snap.mode)
