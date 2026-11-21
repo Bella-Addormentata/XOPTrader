@@ -341,6 +341,36 @@ def test_a_vault_list_with_a_flag_missing_keeps_the_last_good_count(app, how) ->
         _close(page, app)
 
 
+@pytest.mark.parametrize("how", ["left out", "null", "a price in it null"])
+def test_an_oracle_answer_with_its_queue_garbled_keeps_the_last_good_one(app, how) -> None:
+    server = FixtureServer()
+    page, _factory = _page(server)
+    try:
+        page.set_enabled(True)
+        page.show()
+        _wait_until(app, lambda: not page.fetching() and len(server.calls) == 8)
+        line = page._values["oracle"].text()
+        assert line.startswith("newest price $0.96")
+
+        oracle = json.loads(json.dumps(server.answers["/oracle"][1]))
+        if how == "left out":
+            del oracle["price_infos"]
+        elif how == "null":
+            oracle["price_infos"] = None
+        else:
+            oracle["price_infos"].append(None)
+        server.answers["/oracle"] = (200, oracle)
+        assert page.refresh()
+        _wait_until(app, lambda: not page.fetching() and len(server.calls) == 16)
+        # Read as no queue, it would have said "no newer price than $0.94".
+        assert "7 of 8 answered" in page._status.text()
+        assert page._values["oracle"].text() == line
+        (note,) = page._notes["oracle"]
+        assert note.text().startswith("oracle: the answer has an unexpected shape")
+    finally:
+        _close(page, app)
+
+
 def test_an_auction_that_leaves_open_whether_it_can_be_settled_shows_a_dash(app) -> None:
     server = FixtureServer()
     server.answers["/recharge_auctions"][1][0]["can_be_settled"] = None

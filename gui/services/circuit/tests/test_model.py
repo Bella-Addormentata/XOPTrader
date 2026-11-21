@@ -541,6 +541,128 @@ def test_a_bid_or_auction_settings_of_another_shape_is_a_note(answers, key, valu
     assert _refused(answers, "recharge_auctions")
 
 
+@pytest.mark.parametrize(
+    ("debt", "ratio"),
+    [
+        (True, "1.91"),
+        (True, "inf"),
+        (True, None),
+        (True, True),
+        (False, "1.91"),
+        (False, None),
+        (False, ""),
+    ],
+    ids=[
+        "debt, text",
+        "debt, inf",
+        "debt, null",
+        "debt, true",
+        "no debt, text",
+        "no debt, null",
+        "no debt, empty text",
+    ],
+)
+def test_a_collateral_ratio_of_another_shape_is_a_note(answers, debt, ratio) -> None:
+    # Read as no ratio, a vault with debt would show none in place of its own.
+    vault = next(vault for vault in answers["vaults"] if (vault["debt"] > 0) == debt)
+    vault["collateral_ratio"] = ratio
+    assert _refused(answers, "vaults")
+
+
+def test_a_vault_with_no_debt_may_give_its_ratio_as_a_number(answers) -> None:
+    vault = next(vault for vault in answers["vaults"] if vault["debt"] == 0)
+    vault["collateral_ratio"] = 0.0
+    assert model.build_view(answers, now=NOW).problems == {}
+    assert model._vault_row(vault, model._vault_flags(vault), NOW).ratio is None
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("price_infos", None),
+        ("price_infos", {}),
+        ("price_infos", "96"),
+        ("price_infos", [None]),
+        ("price_infos", [[96]]),
+        ("price_infos", [[96, NOW, 1]]),
+        ("price_infos", [{"price": 96, "at": NOW}]),
+        ("price_infos", [["96", NOW]]),
+        ("last_matured_price_info", [94]),
+        ("last_matured_price_info", "94"),
+        ("statutes_price_info", {"price": 94}),
+    ],
+)
+def test_an_oracle_price_or_queue_of_another_shape_is_a_note(answers, key, value) -> None:
+    # Read as no queue, the page would say there is "no newer price".
+    answers["oracle"][key] = value
+    assert _refused(answers, "oracle")
+
+
+@pytest.mark.parametrize("key", ["price_infos", "last_matured_price_info", "statutes_price_info"])
+def test_an_oracle_answer_that_leaves_a_price_out_is_a_note(answers, key) -> None:
+    del answers["oracle"][key]
+    assert _refused(answers, "oracle")
+
+
+def test_an_oracle_with_no_price_yet_is_not_a_note(answers) -> None:
+    answers["oracle"].update(last_matured_price_info=None, price_infos=[], statutes_price_info=None)
+    view = model.build_view(answers, now=NOW)
+    assert view.problems == {}
+    assert view.oracle.matured is None and view.oracle.queued == ()
+    assert view.oracle.protocol_price is None
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        "BLOCK_ISSUANCE",
+        {"BLOCK_ISSUANCE": 43},
+        [["BLOCK_ISSUANCE"]],
+        [[43, "BLOCK_ISSUANCE"]],
+        [["NO_SUCH_STATUTE", 0]],
+        [["BLOCK_ISSUANCE", "43"]],
+        [["BLOCK_ISSUANCE", 43.0]],
+        [["BLOCK_ISSUANCE", True]],
+    ],
+    ids=[
+        "text",
+        "an object",
+        "a name alone",
+        "the wrong way round",
+        "no such statute",
+        "a text index",
+        "a fractional index",
+        "a yes/no index",
+    ],
+)
+def test_statute_labels_of_another_shape_are_a_note(answers, labels) -> None:
+    answers["statutes"]["statute_labels"] = labels
+    assert _refused(answers, "statutes")
+
+
+@pytest.mark.parametrize("labels", ["left out", None, []], ids=["left out", "null", "empty"])
+def test_without_statute_labels_the_statutes_come_in_the_answer_s_order(answers, labels) -> None:
+    if labels == "left out":
+        del answers["statutes"]["statute_labels"]
+    else:
+        answers["statutes"]["statute_labels"] = labels
+    view = model.build_view(answers, now=NOW)
+    assert view.problems == {}
+    names = [name for _index, name, _value in view.protocol.statutes]
+    assert names == list(answers["statutes"]["implemented_statutes"])
+
+
+@pytest.mark.parametrize(
+    "factor",
+    ["10000000801", True, float("nan"), [10000000801]],
+    ids=["text", "true", "NaN", "a list"],
+)
+def test_a_fee_factor_that_is_not_a_number_is_a_note(answers, factor) -> None:
+    # Read as no rate, it would replace the rate a good answer gave.
+    answers["statutes"]["implemented_statutes"]["STABILITY_FEE_DF"] = factor
+    assert _refused(answers, "statutes")
+
+
 # -- formatting ---------------------------------------------------------------------
 
 

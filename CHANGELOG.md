@@ -57,8 +57,8 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - An answer of an unexpected shape (Circuit v2 is coming) or a read that
   fails leaves a note in its section, which keeps its last good answer; the
   rest of the page still fills. Answers are checked against Circuit's own API
-  description, so a yes/no, name or status that is missing or garbled is a
-  note, never taken as "no" or left blank.
+  description and the live answers, so a yes/no, name, status, price or ratio
+  that is missing or garbled is a note, never taken as "no" or left blank.
 
 ## [0.10.56] — 2026-11-20 — the options address's XCH stays put, and calls and puts by default
 

@@ -206,11 +206,17 @@ class PricePoint:
     at: int
 
 
-def _point(raw: Any) -> PricePoint | None:
-    if raw is None:
-        return None
+def _price_pair(raw: Any) -> PricePoint:
+    """A ``[price, unix time]`` pair, as every price in these answers comes."""
+    if not isinstance(raw, list) or len(raw) != 2:
+        raise TypeError(f"expected a [price, time] pair, got {raw!r}")
     price, at = raw
     return PricePoint(_number(price) / PRICE_SCALE, int(_time(at)))
+
+
+def _point(raw: Any) -> PricePoint | None:
+    """A price pair, or null: the oracle has none of that kind yet."""
+    return None if raw is None else _price_pair(raw)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -227,15 +233,21 @@ class Oracle:
 
 
 def oracle_from(answer: Any) -> Oracle:
+    # Every key is there in the live answer, a price left open as null. The
+    # queue is a list, empty when no price waits: one left out or garbled
+    # would have the page say there is "no newer price", so it is a note.
     delay = int(_time(answer["price_delay"]))
-    matured = _point(answer.get("last_matured_price_info"))
+    matured = _point(answer["last_matured_price_info"])
+    infos = answer["price_infos"]
+    if not isinstance(infos, list):
+        raise TypeError(f"expected price_infos as a list, got {infos!r}")
     queued = []
-    for raw in answer.get("price_infos") or ():
-        point = _point(raw)
-        if point is not None and (matured is None or point.at > matured.at):
+    for raw in infos:
+        point = _price_pair(raw)
+        if matured is None or point.at > matured.at:
             queued.append((point, point.at + delay))
     queued.sort(key=lambda item: item[0].at)
-    return Oracle(_point(answer.get("statutes_price_info")), matured, tuple(queued), delay)
+    return Oracle(_point(answer["statutes_price_info"]), matured, tuple(queued), delay)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -266,13 +278,22 @@ def protocol_from(answer: Any) -> Protocol:
     if not isinstance(statutes, Mapping):
         raise TypeError("implemented_statutes is not an object")
     order: list[tuple[int, str, Any]] = []
+    # [[name, index], ...], each naming a statute; without them, the
+    # statutes are listed in the order the answer gives them.
     labels = answer.get("statute_labels")
+    if labels is not None and not isinstance(labels, list):
+        raise TypeError(f"expected statute_labels as a list, got {labels!r}")
     if labels:
-        for name, index in labels:
-            order.append((int(_number(index)), str(name), statutes.get(name)))
+        for label in labels:
+            if not isinstance(label, list) or len(label) != 2:
+                raise TypeError(f"expected a statute label as [name, index], got {label!r}")
+            name, index = label
+            if not isinstance(name, str) or isinstance(index, bool) or not isinstance(index, int):
+                raise TypeError(f"expected a statute label as [name, index], got {label!r}")
+            order.append((index, name, statutes[name]))
         order.sort()
     else:
-        order = [(i, str(name), value) for i, (name, value) in enumerate(statutes.items())]
+        order = [(i, name, value) for i, (name, value) in enumerate(statutes.items())]
     # The emergency switch and the status must both be there. An answer
     # without either says nothing of an emergency, and taken as the latest
     # answer it would hide one that an older answer showed: it is of an
@@ -289,8 +310,10 @@ def protocol_from(answer: Any) -> Protocol:
     return Protocol(
         status=status,
         block_issuance=block_issuance,
-        stability_fee_apy=apy_from_df(statutes.get("STABILITY_FEE_DF")),
-        savings_apy=apy_from_df(statutes.get("INTEREST_DF")),
+        # A factor that is there must be a number; a yearly rate too large
+        # for a float is no rate, and the rest still shows.
+        stability_fee_apy=apy_from_df(_optional_number(statutes.get("STABILITY_FEE_DF"))),
+        savings_apy=apy_from_df(_optional_number(statutes.get("INTEREST_DF"))),
         liquidation_ratio_pct=_optional_number(statutes.get("VAULT_LIQUIDATION_RATIO_PCT")),
         liquidation_penalty_pct=None if penalty is None else penalty / 100,
         collateral_locked_xch=None if usage is None else usage / MOJOS_PER_XCH,
@@ -353,10 +376,17 @@ def _vault_state(flags: Mapping[str, bool]) -> str:
 
 def _vault_row(vault: Mapping[str, Any], flags: Mapping[str, bool], answered_at: float) -> VaultRow:
     debt = _number(vault["debt"]) / MOJOS_PER_CAT
+    # A number, or "inf" for a vault with no debt (as all 214 were on 2026-11-21).
     raw_ratio = vault["collateral_ratio"]
-    ratio = None
-    if debt > 0 and raw_ratio is not None and not isinstance(raw_ratio, str):
-        ratio = _number(raw_ratio)
+    if isinstance(raw_ratio, str):
+        if raw_ratio != "inf" or debt > 0:
+            raise ValueError(
+                f'expected collateral_ratio as a number, or "inf" with no debt, got {raw_ratio!r}'
+            )
+        ratio = None
+    else:
+        number = _number(raw_ratio)
+        ratio = number if debt > 0 else None
     liquidation = _optional_number(vault["liquidation_price"])
     auction = _optional_number(vault["auction_price"])
     ttl = _optional_time(vault["auction_ttl"])
