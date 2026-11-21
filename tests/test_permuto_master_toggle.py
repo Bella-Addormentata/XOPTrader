@@ -218,9 +218,9 @@ def test_disabled_builds_no_toolbar_switch(app, monkeypatch):
 def test_disabled_hides_the_sidebar_entry_without_renumbering(app, monkeypatch):
     """The nav entry goes; the INDEX stays.
 
-    _PAGE_SETTINGS is 11 because Permuto is 9 and Options 10. Shortening
-    _NAV_ITEMS is the one implementation that satisfies "hide the tab" and
-    breaks everything downstream of it.
+    _PAGE_SETTINGS is 12 because Permuto is 9, Options 10 and Circuit 11.
+    Shortening _NAV_ITEMS is the one implementation that satisfies "hide the
+    tab" and breaks everything downstream of it.
     """
     from gui.widgets import main_window as mw
     from gui.widgets.sidebar import _NAV_ITEMS
@@ -229,11 +229,12 @@ def test_disabled_hides_the_sidebar_entry_without_renumbering(app, monkeypatch):
     try:
         assert not window._sidebar.is_page_visible(mw._PAGE_PERMUTO)
         assert window._sidebar.is_page_visible(mw._PAGE_SETTINGS)
-        assert len(_NAV_ITEMS) == 12
+        assert len(_NAV_ITEMS) == 13
         assert _NAV_ITEMS[mw._PAGE_PERMUTO][0] == "Permuto"
         assert _NAV_ITEMS[mw._PAGE_OPTIONS][0] == "Options"
+        assert _NAV_ITEMS[mw._PAGE_CIRCUIT][0] == "Circuit"
         assert _NAV_ITEMS[mw._PAGE_SETTINGS][0] == "Settings"
-        assert window._stacked.count() == 12
+        assert window._stacked.count() == 13
         assert window._stacked.widget(mw._PAGE_OPTIONS) is (
             window._options_widget)
         assert window._stacked.widget(mw._PAGE_SETTINGS) is (
@@ -470,7 +471,7 @@ def test_enabled_still_builds_the_whole_subsystem(app, monkeypatch):
         assert window._sidebar.is_page_visible(mw._PAGE_PERMUTO)
         assert isinstance(window._stacked.widget(mw._PAGE_PERMUTO),
                           PermutoWidget)
-        assert window._stacked.count() == 12  # Options (10) sits before Settings
+        assert window._stacked.count() == 13  # Options (10) and Circuit (11) sit before Settings
         assert reads, "the enabled subsystem never read its identity"
 
         inputs = window._gather_permuto()

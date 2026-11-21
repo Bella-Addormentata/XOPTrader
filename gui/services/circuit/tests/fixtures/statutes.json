@@ -1,0 +1,551 @@
+{
+ "implemented_statutes": {
+  "ORACLE_LAUNCHER_ID": "4b0e9b217ebe82787a35baa58412564ed3ba5faacd510802fd883eb1ccc12f34",
+  "STABILITY_FEE_DF": 10000000801,
+  "INTEREST_DF": 10000000746,
+  "CUSTOM_CONDITIONS": "80",
+  "ORACLE_M_OF_N": 2,
+  "ORACLE_PRICE_UPDATE_DELAY": 21600,
+  "ORACLE_PRICE_UPDATE_RATIO_BPS": 200,
+  "PRICE_DELAY": 3600,
+  "VAULT_MINIMUM_DEBT": 0,
+  "VAULT_LIQUIDATION_RATIO_PCT": 166,
+  "VAULT_LIQUIDATION_PENALTY_BPS": 1300,
+  "VAULT_INITIATOR_INCENTIVE_FLAT": 0,
+  "VAULT_INITIATOR_INCENTIVE_BPS": 0,
+  "VAULT_AUCTION_TTL": 1050,
+  "VAULT_AUCTION_STARTING_PRICE_FACTOR_BPS": 11000,
+  "VAULT_AUCTION_PRICE_TTL": 150,
+  "VAULT_AUCTION_PRICE_DECREASE_BPS": 500,
+  "VAULT_AUCTION_MINIMUM_PRICE_FACTOR_BPS": 6900,
+  "VAULT_AUCTION_MINIMUM_BID_FLAT": 1000000,
+  "VAULT_AUCTION_MINIMUM_BID_BPS": 1000,
+  "TREASURY_MINIMUM": 0,
+  "TREASURY_MAXIMUM": 950000,
+  "TREASURY_MINIMUM_DELTA": 0,
+  "TREASURY_REBALANCE_RATIO_PCT": 4,
+  "AUCTIONS_MINIMUM_PRICE_INCREASE_BPS": 500,
+  "RECHARGE_AUCTION_TTL": 86400,
+  "RECHARGE_AUCTION_MINIMUM_CRT_PRICE": 10000000,
+  "RECHARGE_AUCTION_BID_TTL": 1200,
+  "RECHARGE_AUCTION_MINIMUM_BID": 1000000,
+  "RECHARGE_AUCTION_MAXIMUM_BID": 10000000,
+  "SURPLUS_AUCTION_LOT": 50000,
+  "SURPLUS_AUCTION_BID_TTL": 1200,
+  "ANNOUNCER_REWARDS_INTERVAL_PRICE_UPDATES": 250,
+  "ANNOUNCER_REWARDS_PER_INTERVAL": 0,
+  "ANNOUNCER_MINIMUM_DEPOSIT_MOJOS": 0,
+  "ANNOUNCER_MAXIMUM_VALUE_TTL": 900,
+  "ANNOUNCER_PENALTY_INTERVAL_MINUTES": 15,
+  "ANNOUNCER_PENALTY_PER_INTERVAL_BPS": 500,
+  "ANNOUNCER_DISAPPROVAL_MAXIMUM_PENALTY_BPS": 2500,
+  "ANNOUNCER_DISAPPROVAL_COOLDOWN_INTERVAL": 7776000,
+  "GOVERNANCE_BILL_PROPOSAL_FEE_MOJOS": 0,
+  "GOVERNANCE_IMPLEMENTATION_INTERVAL": 21600,
+  "GOVERNANCE_COOLDOWN_INTERVAL": 900,
+  "BLOCK_ISSUANCE": 0
+ },
+ "full_implemented_statutes": {
+  "ORACLE_LAUNCHER_ID": {
+   "value": "4b0e9b217ebe82787a35baa58412564ed3ba5faacd510802fd883eb1ccc12f34",
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1800,
+   "implementation_delay": 500,
+   "max_delta": 0
+  },
+  "STABILITY_FEE_DF": {
+   "value": 10000000801,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1800,
+   "implementation_delay": 1,
+   "max_delta": 400
+  },
+  "INTEREST_DF": {
+   "value": 10000000746,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1800,
+   "implementation_delay": 1,
+   "max_delta": 400
+  },
+  "CUSTOM_CONDITIONS": {
+   "value": "80",
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1800,
+   "implementation_delay": 1800,
+   "max_delta": 0
+  },
+  "ORACLE_M_OF_N": {
+   "value": 2,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "ORACLE_PRICE_UPDATE_DELAY": {
+   "value": 21600,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "ORACLE_PRICE_UPDATE_RATIO_BPS": {
+   "value": 200,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "PRICE_DELAY": {
+   "value": 3600,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "VAULT_MINIMUM_DEBT": {
+   "value": 0,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "VAULT_LIQUIDATION_RATIO_PCT": {
+   "value": 166,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "VAULT_LIQUIDATION_PENALTY_BPS": {
+   "value": 1300,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "VAULT_INITIATOR_INCENTIVE_FLAT": {
+   "value": 0,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1800,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "VAULT_INITIATOR_INCENTIVE_BPS": {
+   "value": 0,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1800,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "VAULT_AUCTION_TTL": {
+   "value": 1050,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1800,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "VAULT_AUCTION_STARTING_PRICE_FACTOR_BPS": {
+   "value": 11000,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1800,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "VAULT_AUCTION_PRICE_TTL": {
+   "value": 150,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "VAULT_AUCTION_PRICE_DECREASE_BPS": {
+   "value": 500,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "VAULT_AUCTION_MINIMUM_PRICE_FACTOR_BPS": {
+   "value": 6900,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1800,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "VAULT_AUCTION_MINIMUM_BID_FLAT": {
+   "value": 1000000,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "VAULT_AUCTION_MINIMUM_BID_BPS": {
+   "value": 1000,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "TREASURY_MINIMUM": {
+   "value": 0,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "TREASURY_MAXIMUM": {
+   "value": 950000,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1800,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "TREASURY_MINIMUM_DELTA": {
+   "value": 0,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1800,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "TREASURY_REBALANCE_RATIO_PCT": {
+   "value": 4,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "AUCTIONS_MINIMUM_PRICE_INCREASE_BPS": {
+   "value": 500,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "RECHARGE_AUCTION_TTL": {
+   "value": 86400,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "RECHARGE_AUCTION_MINIMUM_CRT_PRICE": {
+   "value": 10000000,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "RECHARGE_AUCTION_BID_TTL": {
+   "value": 1200,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "RECHARGE_AUCTION_MINIMUM_BID": {
+   "value": 1000000,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "RECHARGE_AUCTION_MAXIMUM_BID": {
+   "value": 10000000,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "SURPLUS_AUCTION_LOT": {
+   "value": 50000,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1800,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "SURPLUS_AUCTION_BID_TTL": {
+   "value": 1200,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "ANNOUNCER_REWARDS_INTERVAL_PRICE_UPDATES": {
+   "value": 250,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "ANNOUNCER_REWARDS_PER_INTERVAL": {
+   "value": 0,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1800,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "ANNOUNCER_MINIMUM_DEPOSIT_MOJOS": {
+   "value": 0,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "ANNOUNCER_MAXIMUM_VALUE_TTL": {
+   "value": 900,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "ANNOUNCER_PENALTY_INTERVAL_MINUTES": {
+   "value": 15,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "ANNOUNCER_PENALTY_PER_INTERVAL_BPS": {
+   "value": 500,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "ANNOUNCER_DISAPPROVAL_MAXIMUM_PENALTY_BPS": {
+   "value": 2500,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "ANNOUNCER_DISAPPROVAL_COOLDOWN_INTERVAL": {
+   "value": 7776000,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "GOVERNANCE_BILL_PROPOSAL_FEE_MOJOS": {
+   "value": 0,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "GOVERNANCE_IMPLEMENTATION_INTERVAL": {
+   "value": 21600,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "GOVERNANCE_COOLDOWN_INTERVAL": {
+   "value": 900,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1800,
+   "implementation_delay": 1,
+   "max_delta": 0
+  },
+  "BLOCK_ISSUANCE": {
+   "value": 0,
+   "threshold_amount_to_propose": 30000000000,
+   "veto_interval": 1,
+   "implementation_delay": 1,
+   "max_delta": 0
+  }
+ },
+ "statute_labels": [
+  [
+   "ORACLE_LAUNCHER_ID",
+   0
+  ],
+  [
+   "STABILITY_FEE_DF",
+   1
+  ],
+  [
+   "INTEREST_DF",
+   2
+  ],
+  [
+   "CUSTOM_CONDITIONS",
+   3
+  ],
+  [
+   "ORACLE_M_OF_N",
+   4
+  ],
+  [
+   "ORACLE_PRICE_UPDATE_DELAY",
+   5
+  ],
+  [
+   "ORACLE_PRICE_UPDATE_RATIO_BPS",
+   6
+  ],
+  [
+   "PRICE_DELAY",
+   7
+  ],
+  [
+   "VAULT_MINIMUM_DEBT",
+   8
+  ],
+  [
+   "VAULT_LIQUIDATION_RATIO_PCT",
+   9
+  ],
+  [
+   "VAULT_LIQUIDATION_PENALTY_BPS",
+   10
+  ],
+  [
+   "VAULT_INITIATOR_INCENTIVE_FLAT",
+   11
+  ],
+  [
+   "VAULT_INITIATOR_INCENTIVE_BPS",
+   12
+  ],
+  [
+   "VAULT_AUCTION_TTL",
+   13
+  ],
+  [
+   "VAULT_AUCTION_STARTING_PRICE_FACTOR_BPS",
+   14
+  ],
+  [
+   "VAULT_AUCTION_PRICE_TTL",
+   15
+  ],
+  [
+   "VAULT_AUCTION_PRICE_DECREASE_BPS",
+   16
+  ],
+  [
+   "VAULT_AUCTION_MINIMUM_PRICE_FACTOR_BPS",
+   17
+  ],
+  [
+   "VAULT_AUCTION_MINIMUM_BID_FLAT",
+   18
+  ],
+  [
+   "VAULT_AUCTION_MINIMUM_BID_BPS",
+   19
+  ],
+  [
+   "TREASURY_MINIMUM",
+   20
+  ],
+  [
+   "TREASURY_MAXIMUM",
+   21
+  ],
+  [
+   "TREASURY_MINIMUM_DELTA",
+   22
+  ],
+  [
+   "TREASURY_REBALANCE_RATIO_PCT",
+   23
+  ],
+  [
+   "AUCTIONS_MINIMUM_PRICE_INCREASE_BPS",
+   24
+  ],
+  [
+   "RECHARGE_AUCTION_TTL",
+   25
+  ],
+  [
+   "RECHARGE_AUCTION_MINIMUM_CRT_PRICE",
+   26
+  ],
+  [
+   "RECHARGE_AUCTION_BID_TTL",
+   27
+  ],
+  [
+   "RECHARGE_AUCTION_MINIMUM_BID",
+   28
+  ],
+  [
+   "RECHARGE_AUCTION_MAXIMUM_BID",
+   29
+  ],
+  [
+   "SURPLUS_AUCTION_LOT",
+   30
+  ],
+  [
+   "SURPLUS_AUCTION_BID_TTL",
+   31
+  ],
+  [
+   "ANNOUNCER_REWARDS_INTERVAL_PRICE_UPDATES",
+   32
+  ],
+  [
+   "ANNOUNCER_REWARDS_PER_INTERVAL",
+   33
+  ],
+  [
+   "ANNOUNCER_MINIMUM_DEPOSIT_MOJOS",
+   34
+  ],
+  [
+   "ANNOUNCER_MAXIMUM_VALUE_TTL",
+   35
+  ],
+  [
+   "ANNOUNCER_PENALTY_INTERVAL_MINUTES",
+   36
+  ],
+  [
+   "ANNOUNCER_PENALTY_PER_INTERVAL_BPS",
+   37
+  ],
+  [
+   "ANNOUNCER_DISAPPROVAL_MAXIMUM_PENALTY_BPS",
+   38
+  ],
+  [
+   "ANNOUNCER_DISAPPROVAL_COOLDOWN_INTERVAL",
+   39
+  ],
+  [
+   "GOVERNANCE_BILL_PROPOSAL_FEE_MOJOS",
+   40
+  ],
+  [
+   "GOVERNANCE_IMPLEMENTATION_INTERVAL",
+   41
+  ],
+  [
+   "GOVERNANCE_COOLDOWN_INTERVAL",
+   42
+  ],
+  [
+   "BLOCK_ISSUANCE",
+   43
+  ]
+ ],
+ "prev_announce": true,
+ "cumulative_sf_df": 10344577380,
+ "cumulative_ir_df": 10318464536,
+ "price_info": [
+  94,
+  1795271101
+ ],
+ "price_update_counter": 3085,
+ "fee_per_costs": {
+  "fast": 1.0,
+  "medium": 0.1
+ },
+ "max_collateral_cap": 1000000000000000000,
+ "current_collateral_usage": 67657120441273261,
+ "status": "ok"
+}
