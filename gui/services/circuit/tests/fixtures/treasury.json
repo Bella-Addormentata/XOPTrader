@@ -1,0 +1,33 @@
+{
+ "treasury_coins": [
+  {
+   "name": "97802d565a34f193bbe5e37f6fb59d8150ba1996151e173f72dec3cdf09bbcef",
+   "launcher_id": "cf6cdefe425fc5192191dd2f6ae2bc6b65539383cb258a7f5a3a4bfb7fde1f1f",
+   "ring_prev_launcher_id": "77f74abbc69d7a68c083470b929d793e67b823960ab82680e77b312139e6b366",
+   "amount": 432971
+  },
+  {
+   "name": "0a6e3cd7eeeb459aece95ef02c7302807cc0828f38dde9f3efe85e5ff7e37b6d",
+   "launcher_id": "eef965c26121b7ca78fa99665de6db8ef89b5a42ca2bd3774d9016db0c656a61",
+   "ring_prev_launcher_id": "cf6cdefe425fc5192191dd2f6ae2bc6b65539383cb258a7f5a3a4bfb7fde1f1f",
+   "amount": 155844
+  },
+  {
+   "name": "40f7d94ca3fde2d64ca6df20fd11d3b1b8b35c7706d76702a1c819e600b4f48e",
+   "launcher_id": "77f74abbc69d7a68c083470b929d793e67b823960ab82680e77b312139e6b366",
+   "ring_prev_launcher_id": "eef965c26121b7ca78fa99665de6db8ef89b5a42ca2bd3774d9016db0c656a61",
+   "amount": 379704
+  }
+ ],
+ "is_ring": true,
+ "num_treasury_coins": 3,
+ "treasury_balance": 968519,
+ "min_coin_amount": 155844,
+ "max_coin_amount": 432971,
+ "treasury_minimum": 0,
+ "treasury_maximum": 950000,
+ "rebalance_ratio_pct": 4,
+ "can_rebalance": true,
+ "can_start_recharge_auction": false,
+ "can_start_surplus_auction": false
+}

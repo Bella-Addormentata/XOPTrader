@@ -204,6 +204,23 @@ def load_options_switch_visible() -> bool:
     return str(raw).strip().lower() not in ("false", "0", "off", "no")
 
 
+def load_circuit_enabled() -> bool:
+    """Whether the read-only Circuit DAO page is switched on (Settings > Subsystems).
+
+    Defaults to FALSE, like Permuto: the page asks a third party's API while
+    it is open, and a machine that never asked for Circuit should not. Only
+    an explicit yes switches it on; anything unreadable leaves it off.
+    """
+    settings = QSettings("XOP", "XOPTrader")
+    settings.sync()
+    settings.beginGroup("circuit")
+    raw = settings.value("enabled", False)
+    settings.endGroup()
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("true", "1", "on", "yes")
+
+
 # yaml-cpp's bool spellings (YAML::convert<bool>): what the engine accepts.
 _YAML_TRUE: Final[frozenset[str]] = frozenset({"true", "yes", "on", "y"})
 _YAML_FALSE: Final[frozenset[str]] = frozenset({"false", "no", "off", "n"})
@@ -514,6 +531,9 @@ class SettingsWidget(QWidget):
     #: [OPTIONS] The "Show the Options switch in the toolbar" box moved.
     #: Payload is the NEW state; MainWindow shows or hides the switch.
     options_switch_visible_changed = Signal(bool)
+    #: [CIRCUIT] The "Show the Circuit DAO page" box moved. Payload is the
+    #: NEW state; MainWindow shows or hides the page and its sidebar entry.
+    circuit_enabled_changed = Signal(bool)
     #: [LIVECFG] The operator asked for an engine restart so the settings the
     #: running engine reported as restart-only take effect. MainWindow owns
     #: the stop prompt (keep or cancel the resting offers) and the restart.
@@ -1656,10 +1676,11 @@ class SettingsWidget(QWidget):
     # -------------------------------------------------------------------
 
     def _build_subsystems_group(self) -> QWidget:
-        """The Permuto master switch, and whether the OPTIONS switch is shown.
+        """The Permuto master switch, whether the OPTIONS switch is shown, and the Circuit page.
 
-        The second is only a display choice (see load_options_switch_visible);
-        everything below is about the first.
+        The second is only a display choice (see load_options_switch_visible),
+        and the third is load_circuit_enabled; everything below is about the
+        first.
 
         Not a trading control. The venue switch in the toolbar says whether
         Permuto is QUOTING; this says whether Permuto is part of this GUI at
@@ -1740,7 +1761,32 @@ class SettingsWidget(QWidget):
         box.addWidget(self._options_switch_box)
         self._options_switch_box.toggled.connect(
             self._on_options_switch_toggled)
+
+        # [CIRCUIT] Off by default, like Permuto, but both ways at once: the
+        # page is built either way and asks nothing until it is on and open.
+        self._circuit_enabled_box = QCheckBox(
+            "Show the Circuit DAO page (read-only)")
+        self._circuit_enabled_box.setChecked(load_circuit_enabled())
+        self._circuit_enabled_box.setToolTip(
+            "Off by default. On adds a Circuit page to the sidebar: BYC "
+            "borrowing, liquidations, auctions and governance, read from "
+            "Circuit's public API (api.circuitdao.com) while the page is "
+            "open, eight requests every three minutes. It holds no key and "
+            "signs nothing. Takes effect at once, both ways."
+        )
+        box.addWidget(self._circuit_enabled_box)
+        self._circuit_enabled_box.toggled.connect(
+            self._on_circuit_enabled_toggled)
         return group
+
+    def _on_circuit_enabled_toggled(self, enabled: bool) -> None:
+        """Persist the choice, then let MainWindow show or hide the page."""
+        settings = QSettings("XOP", "XOPTrader")
+        settings.beginGroup("circuit")
+        settings.setValue("enabled", bool(enabled))
+        settings.endGroup()
+        settings.sync()
+        self.circuit_enabled_changed.emit(bool(enabled))
 
     def _on_options_switch_toggled(self, shown: bool) -> None:
         """Persist the choice, then let MainWindow show or hide the switch."""

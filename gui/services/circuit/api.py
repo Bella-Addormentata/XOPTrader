@@ -250,6 +250,7 @@ class CircuitApi:
         transport: Transport | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        user_agent: str = USER_AGENT,
     ) -> None:
         cleaned = base_url.strip().rstrip("/")
         parts = urllib.parse.urlsplit(cleaned)
@@ -263,6 +264,7 @@ class CircuitApi:
         self._transport = transport or urllib_transport
         self._clock = clock
         self._sleep = sleep
+        self._user_agent = user_agent
         self._last_start: float | None = None
 
     def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Answer:
@@ -283,7 +285,7 @@ class CircuitApi:
             )
         url = f"{self.base_url}/{path.lstrip('/')}"
         payload = None if body is None else json.dumps(body).encode("utf-8")
-        headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+        headers = {"Accept": "application/json", "User-Agent": self._user_agent}
         if payload is not None:
             headers["Content-Type"] = "application/json"
         for attempt in (1, 2):

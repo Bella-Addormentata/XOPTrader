@@ -1,0 +1,12 @@
+[
+ {
+  "name": "c6164f84d082ce714c3ae5234578757738fe3f6e203016900b6ed380dcb23a5f",
+  "launcher_id": "a3b0e5dd0550aa332d42d743dc1233841a5e97119b6e795d8a4813dcd2e07aab",
+  "launch_height": 8135381,
+  "auction_params": null,
+  "last_bid": null,
+  "expired": null,
+  "can_be_settled": false,
+  "status": "STANDBY"
+ }
+]
