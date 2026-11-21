@@ -434,6 +434,12 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
 
         result.coins_created = plan.batch;
         result.fee_paid      = fee;
+        // [FEE-COIN] A CAT split goes without a fee while the options fence
+        // holds XCH: book what the wallet client sent.
+        if (split_resp.contains(rpc::ChiaWalletRPC::kFeeUsedKey)
+            && split_resp[rpc::ChiaWalletRPC::kFeeUsedKey].is_number_integer()) {
+            result.fee_paid = split_resp[rpc::ChiaWalletRPC::kFeeUsedKey].get<Mojo>();
+        }
         result.success       = true;
 
         // Extract transaction ID if available.

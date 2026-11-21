@@ -7,6 +7,24 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Two alerts that fired on nearly every cycle
+
+- **Natural Hedge Efficiency** was worked out per heartbeat from that block's
+  fills alone, summed across pairs in different base units. A block with a
+  single fill is one-sided by nature and scored 0, so a CRITICAL
+  "ExposureBreach" went out on almost every fill. It is now worked out per
+  pair, over about three hours of blocks, needs at least six fills, and goes
+  out as a WARNING of its own, `HedgeImbalance`, naming the pair: once when
+  the pair turns one-sided, then at most once per three hours while it stays
+  so. A restarted engine reads the last three hours of fills back from the
+  trade log.
+- **The equity drawdown warning** went out on every cycle while the drawdown
+  stayed above 5%. It now goes out when the drawdown reaches a deeper 5% step
+  (5%, 10%, 15%, ...), again in a new episode once it has eased below 4%, and
+  as a reminder every six hours while it stays above 5%.
+- Switching Telegram on in Settings, or pointing it at another chat, sends
+  either warning again if it still stands.
+
 ### Circuit DAO: a read-only server check (#225)
 
 - **`python -m gui.services.circuit probe`** asks Circuit's public API
@@ -17,6 +35,51 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   requests a minute. `gui/services/circuit/api.py` also runs on its own
   (`python api.py probe`) with any Python 3.10 or later. Nothing in the app
   uses it yet.
+
+## [0.10.56] — 2026-11-20 — the options address's XCH stays put, and calls and puts by default
+
+### The options address's XCH no longer pays the engine's cancel fees (#250)
+
+Seen live on v0.10.55: three secure cancels of offers of CATs alone paid
+their network fee with XCH from the options address, although the engine
+had told the wallet to leave those coins alone. The Chia wallet picks a CAT
+spend's XCH fee coin itself and ignores the exclusions there. Each time the
+coin went back to the trading funds and the book topped up again. While the
+options fence is up, the engine now sends a cancel of an offer that offers
+no XCH, a bulk cancel and a CAT coin split without a fee, so the wallet
+picks no fee coin; the fee actually sent is what the engine books. Cancels
+of offers of XCH keep their fee, which comes from the offer's own coin.
+
+### The fence stays up across a restart (#250)
+
+Closing the app with the options book on, or a Settings save that restarts
+it, no longer lowers the engine's fence flag in between. The engine a
+restart brings up is fenced from its first moment: on v0.10.55 it had
+cancelled offers before the new app raised the flag again. A flag kept up
+for a restart that does not come, or after options are switched off, still
+comes down once the book has nothing open.
+
+### Calls and puts by default (#250)
+
+With no strikes written, the options book now writes both sides, out of the
+money: calls at 110% and 120% of spot and puts at 90% and 80%. Before, a
+config without strike lists minted nothing, and the Settings tab showed the
+call strikes only as a hint, so a save wrote none. The Settings tab shows the
+defaults, and `config.example.yaml` lists the same strikes. A side written on
+its own keeps the other off, as before, so an existing grid gains nothing
+nobody chose; a list written `[]` or null still turns a side off.
+
+## [0.10.55] — 2026-11-20 — the options book's steps no longer fail at the top-up
+
+### The options book's top-up works on a live book (#249)
+
+Since v0.10.52, every step of a live book with a top-up target (the default
+when it shares the trading wallet) failed at the top-up check with
+"'frozenset' object is not callable", before it could quote, mint, list or
+refresh its offers. Nothing was sent. The book's cache of the wallet's coins
+had the same name as the method that sums the options address and hid it.
+The cache is renamed, and the top-up tests now run on a real book instead of
+a stand-in that hid the clash.
 
 ## [0.10.54] — 2026-11-20 — the options book is set up in Settings, and its expiries roll on their own
 

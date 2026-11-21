@@ -182,6 +182,25 @@ inline std::uint32_t bech32_polymod(const std::vector<std::uint8_t>& values)
     return base;
 }
 
+/// [FEE-COIN] Whether a get_offer trade record offers XCH.  A secure cancel of
+/// one pays its fee from the offer's own XCH coin, and the wallet selects no
+/// other coin.  An offer of CATs alone has its XCH fee coin picked by the
+/// wallet, which ignores excluded_coin_ids there (chia 2.7.4, seen live on
+/// 2026-11-20: two such cancels paid their fee with the options address's
+/// XCH).  std::nullopt when the record does not say.
+[[nodiscard]] inline std::optional<bool> trade_record_offers_xch(const nlohmann::json& trade_record)
+{
+    if (!trade_record.is_object()) return std::nullopt;
+    const auto summary = trade_record.find("summary");
+    if (summary == trade_record.end() || !summary->is_object()) return std::nullopt;
+    const auto offered = summary->find("offered");
+    if (offered == summary->end() || !offered->is_object()) return std::nullopt;
+    for (const auto& item : offered->items()) {
+        if (fence_normalise_hex(item.key()) == "xch") return true;
+    }
+    return false;
+}
+
 /// The coins of a create_offer_for_ids answer's trade record that sit at a
 /// fenced puzzle hash, as "0x<parent>/<amount>" descriptions; empty when
 /// none.  std::nullopt when the record does not list its coins at all: the

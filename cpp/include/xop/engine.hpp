@@ -877,6 +877,15 @@ private:
     /// netting, and statistical pairs hedging suggestions.
     void step_run_hedging(BlockHeight block_height);
 
+    /// [review #251] Reads each pair's last NHE window of maker fills back
+    /// from trade_log, once, before Step 2 feeds that pair anything.
+    void seed_nhe_windows(BlockHeight block_height);
+
+    /// [review #251] seed_nhe_windows, then every window pruned at
+    /// `block_height` and the latch of each emptied one re-armed: before
+    /// Step 2 adds this heartbeat's fills.
+    void refresh_nhe_windows(BlockHeight block_height);
+
     /// Step 11: Mark-to-market inventory, attribute spread/inventory/fee
     /// PnL, and persist a snapshot to the Database.
     void step_update_pnl(BlockHeight block_height);
@@ -2899,13 +2908,19 @@ private:
     /// loss.  Bounded by one loss window per entry.
     std::unordered_map<std::string, BlockHeight> pnl_window_rebase_assets_;
 
-    // [T3-08] NHE (Natural Hedge Efficiency) accumulators for step 10.
-    // These running totals track net inventory change and total traded
-    // volume across all pairs for the NHE computation.
-    // Reset each cycle; fed from step 2 fill data.
-    // ISO/IEC 5055: deterministic zero-initialization.
-    double nhe_net_inventory_change_{0.0};
-    double nhe_total_volume_{0.0};
+    // [T3-08] NHE (Natural Hedge Efficiency) for step 10.
+    // [ALERT-NOISE] Per pair, over a rolling window of blocks (NheWindow),
+    // fed from step 2 fill data; it used to be one block's fills, summed
+    // across pairs.  The latch sends a HedgeImbalance when a pair turns
+    // one-sided, then at most once per window while it stays so.
+    std::unordered_map<std::string, NheWindow>     nhe_windows_;
+    std::unordered_map<std::string, NheAlertLatch> nhe_latches_;
+    /// [review #251] Pairs whose window was read back from trade_log, or that
+    /// Step 2 has fed since the start: reading them back again would count a
+    /// fill twice.
+    std::unordered_set<std::string> nhe_seeded_;
+    /// [review #251] AlertManager::delivery_epoch() the latches were armed at.
+    std::uint64_t nhe_delivery_epoch_{0};
 
     // [T5-CR1] VPIN validation gate (Andersen & Bondarenko 2014).
     // Runtime tracker that measures whether VPIN activations (vpin_mult > 1.0)

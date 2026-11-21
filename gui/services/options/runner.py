@@ -138,6 +138,27 @@ class Snapshot:
 # -- config ----------------------------------------------------------------------
 
 
+def _options_as_if_on(config_path: Path) -> config.OptionsConfig | None:
+    """[review] config.yaml's options read as if they were switched on, or None.
+
+    For the fence flag alone: a book switched off since a flag went up still
+    names the record and the fence mode that decide whether it comes down.
+    """
+    from gui.services.config_split import load_merged
+
+    try:
+        root = load_merged(Path(config_path))
+        section = root.get("options") if isinstance(root, dict) else None
+        if not isinstance(section, dict):
+            return None
+        parsed = config.parse({**root, "options": {**section, "enabled": True}})
+        if parsed is None:
+            return None
+        return config.resolve_database_path(parsed, config_path)
+    except Exception:  # noqa: BLE001 - no settings to follow: the flag stays as it is
+        return None
+
+
 def load_options(config_path: Path) -> config.OptionsConfig:
     """The ``options:`` section of config.yaml with secrets.yaml over it, or RunnerError."""
     from gui.services.config_split import load_merged
@@ -466,6 +487,12 @@ class OptionsRunner:
         #: itself and checks the flag under it, so an ending run can never
         #: lower the flag a new one has just raised.
         self._fence_lock = threading.Lock()
+        #: [FEE-COIN] The app is closing with the book on: the run ending
+        #: leaves the flag up (see stop(keep_fence=True)).
+        self._keep_fence = False
+        #: [review] The flag the last run raised (beside the engine's database
+        #: as config.yaml then had it), judged with that run's book.
+        self._last_flag: Path | None = None
 
     @property
     def config_path(self) -> Path:
@@ -522,6 +549,7 @@ class OptionsRunner:
                     "the previous run is still finishing its step; try again in a moment"
                 )
         loaded = self._last_loaded = cfg
+        self._keep_fence = False
         cfg = dataclasses.replace(cfg, dry_run=mode is not Mode.LIVE)
         stop = threading.Event()
         thread = threading.Thread(
@@ -529,7 +557,7 @@ class OptionsRunner:
         )
         with self._fence_lock:
             if cfg.wallet.fence_follows_book:
-                flag = self._fence_flag()
+                flag = self._last_flag = self._fence_flag()
                 if not fence.raise_flag(flag, f"switched on ({mode.value})") and live_mode(mode):
                     # [review] Nothing else would keep the app's own spends off
                     # the options coins while the book signs.
@@ -552,17 +580,23 @@ class OptionsRunner:
         self._note(f"switched to {mode.value}")
         thread.start()
 
-    def stop(self, timeout: float = 30.0) -> None:
+    def stop(self, timeout: float = 30.0, *, keep_fence: bool = False) -> None:
         """Stop after the step in progress, if any. Safe at any time.
 
         Offers already out expire on their own (15 minutes by default), and
         collateral waits for the next step after expiry to be clawed back. A
         step that outlives ``timeout`` is left to finish: the run stays tracked
         (``stopping``) until it does, and nothing new starts beside it.
+
+        [FEE-COIN] ``keep_fence``: the app is closing with the book on, and the
+        next start resumes it. The engine's fence flag stays up, so the engine
+        a restart brings up is fenced from its first moment, not only once the
+        next app raises the flag again.
         """
         current = self._run
         if current is None:
             return
+        self._keep_fence = keep_fence
         _set_book(self._config_path, live=False)  # still watched: contracts may stay open
         current.stop.set()
         if current.thread is not threading.current_thread():
@@ -625,7 +659,9 @@ class OptionsRunner:
         if fresh is not None and fresh == current.loaded:
             return None
         self._note("new settings saved: switching off to take them up")
-        self.stop(timeout=SWITCH_WAIT)
+        # [FEE-COIN] Back on in a moment: the fence stays up in between. A
+        # restart refused after all leaves it to the page's next check.
+        self.stop(timeout=SWITCH_WAIT, keep_fence=True)
         return current.mode
 
     # -- the loop (its own thread) -------------------------------------------
@@ -666,57 +702,93 @@ class OptionsRunner:
 
         Up while a run is on or the record has a contract open or a transaction
         unsettled; down otherwise. Only with ``engine_fence: auto``. Never
-        raises: options not set up leave the flag as it is.
+        raises: options that cannot be read at all leave the flag as it is.
+
+        [review] With options switched off, or the fence no longer following
+        the book, a flag this app left up (for a restart, say) still follows
+        the book it was raised for: the settings the last run had, or
+        config.yaml's read as if the book were on.
         """
-        try:
-            cfg = load_options(self._config_path)
-        except RunnerError:
-            return
-        if not cfg.wallet.fence_follows_book:
+        books = self._fence_books()
+        if not books:
             return
         with self._fence_lock:
-            self._sync_fence_locked(cfg)
+            self._keep_fence = False
+            self._sync_fence_locked(books)
 
-    def _sync_fence_locked(self, cfg: config.OptionsConfig) -> None:
+    def settle_fence(self) -> None:
+        """[review] A restart that is not to happen: the flag follows the book again.
+
+        ``stop(keep_fence=True)`` left the flag up for a run that does not
+        come (its settings refused, or switched off meanwhile).
+        """
+        self.sync_fence()
+
+    def _fence_books(self, *also: config.OptionsConfig) -> list[config.OptionsConfig]:
+        """[review] The books the flag answers to, one per record.
+
+        config.yaml's as it is now (or read as if switched on), the book the
+        last run had, and ``also``: a save can switch the record or the fence
+        mode under a flag raised for the old book, which must still be judged
+        by that book's record.
+        """
+        try:
+            current: config.OptionsConfig | None = load_options(self._config_path)
+        except RunnerError:
+            current = _options_as_if_on(self._config_path)
+        books: list[config.OptionsConfig] = []
+        for cfg in (*also, current, self._last_loaded):
+            if cfg is None or not cfg.wallet.fence_follows_book:
+                continue
+            if all(Path(cfg.database_path) != Path(b.database_path) for b in books):
+                books.append(cfg)
+        return books
+
+    def _sync_fence_locked(self, books: list[config.OptionsConfig]) -> None:
         """Caller holds ``_fence_lock``. An unreadable record keeps the flag up.
 
         [review] The flag is lowered only when nothing could still be using
-        the book: no run here, nothing open or unsettled in the record, no
-        other process mid-step (the record is checked again holding the
-        book's acting lock), and no other live process that raised it last --
-        a run from a terminal, between its steps.
+        any of ``books``: no run here, nothing open or unsettled in any of
+        their records, no other process mid-step (each record is checked
+        again holding its acting lock), and no other live process that raised
+        it last -- a run from a terminal, between its steps. The flag beside
+        the engine's database as config.yaml has it now, and the one the last
+        run raised (a save can move it), are judged alike.
         """
-        flag = self._fence_flag()
+        flags = [self._fence_flag()]
+        if self._last_flag is not None and self._last_flag not in flags:
+            flags.append(self._last_flag)
         if self._run is not None:
-            fence.raise_flag(flag, f"switched on ({self._run.mode.value})")
+            for flag in flags:
+                fence.raise_flag(flag, f"switched on ({self._run.mode.value})")
             return
-        if not Path(cfg.database_path).exists():
-            if self._raised_elsewhere(flag):
-                return
-            fence.lower_flag(flag)
-            return
+        records: list[store.OptionStore] = []
         try:
-            book_store = store.OptionStore(cfg.database_path)
-        except Exception as exc:  # noqa: BLE001 - fail up
-            fence.raise_flag(flag, f"its record could not be read ({exc})")
-            return
-        try:
-            why = in_use_reason(book_store)
+            for cfg in books:
+                if Path(cfg.database_path).exists():
+                    records.append(store.OptionStore(cfg.database_path))
+            why = next((r for r in map(in_use_reason, records) if r is not None), None)
             if why is not None:
-                if not fence.flag_up(flag):
-                    fence.raise_flag(flag, why)
+                for flag in flags:
+                    if not fence.flag_up(flag):
+                        fence.raise_flag(flag, why)
                 return
-            if self._raised_elsewhere(flag):
-                return
-            with book_store.acting():
-                if in_use_reason(book_store) is None:
-                    fence.lower_flag(flag)
+            for flag in flags:
+                if self._raised_elsewhere(flag):
+                    continue
+                with contextlib.ExitStack() as held:
+                    for record in records:
+                        held.enter_context(record.acting())
+                    if all(in_use_reason(record) is None for record in records):
+                        fence.lower_flag(flag)
         except store.BusyError:
             return  # another process is mid-step: the flag stays
         except Exception as exc:  # noqa: BLE001 - fail up
-            fence.raise_flag(flag, f"its record could not be read ({exc})")
+            for flag in flags:
+                fence.raise_flag(flag, f"its record could not be read ({exc})")
         finally:
-            book_store.close()
+            for record in records:
+                record.close()
 
     @staticmethod
     def _raised_elsewhere(flag: Path) -> bool:
@@ -787,8 +859,8 @@ class OptionsRunner:
                 current = self._run
                 if current is not None and current.stop is stop:
                     self._run = None
-                if self._run is None and cfg.wallet.fence_follows_book:
-                    self._sync_fence_locked(cfg)
+                if self._run is None and cfg.wallet.fence_follows_book and not self._keep_fence:
+                    self._sync_fence_locked(self._fence_books(cfg))
 
     def _one_step(self, cfg: config.OptionsConfig, mode: Mode, book: Any, book_store: Any) -> None:
         engine, held = "", ""

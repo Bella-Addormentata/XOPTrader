@@ -398,3 +398,132 @@ def test_live_test_raises_the_flag_even_in_a_dry_run(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(fence, "raise_flag", lambda path, why: False)
     refusal = cli._raise_fence_flag(dataclasses.replace(cfg, dry_run=False), str(path), "step")
     assert refusal is not None and "could not be written" in refusal
+
+
+def test_closing_the_app_with_the_book_on_leaves_the_flag_up(tmp_path) -> None:
+    """[FEE-COIN] The book resumes at the next start; the engine that start brings
+    up must be fenced from its first moment, not once the new app raises the flag."""
+    made: list[FakeBook] = []
+    run = runner.OptionsRunner(
+        _config(tmp_path), interval=0.02, build=_builder(made), engine_state=lambda url: DOWN
+    )
+    run.start(runner.Mode.REHEARSE)
+    _wait(lambda: bool(made) and made[0].steps >= 1)
+    run.stop(keep_fence=True)
+    _wait(lambda: not run.snapshot().running)
+    assert _flag(tmp_path).exists(), "nothing open, but the app is only restarting"
+
+    run.start(runner.Mode.REHEARSE)  # and a later plain stop lowers it again
+    _wait(lambda: len(made) == 2 and made[1].steps >= 1)
+    run.stop()
+    _wait(lambda: not run.snapshot().running)
+    assert not _flag(tmp_path).exists()
+
+
+def test_a_restart_for_new_settings_keeps_the_flag_up_in_between(tmp_path) -> None:
+    """[FEE-COIN] Stopped only to start again: no moment with the fence down."""
+    yaml = pytest.importorskip("yaml")
+    made: list[FakeBook] = []
+    path = _config(tmp_path)
+    run = runner.OptionsRunner(
+        path, interval=0.02, build=_builder(made), engine_state=lambda url: DOWN
+    )
+    run.start(runner.Mode.REHEARSE)
+    _wait(lambda: bool(made) and made[0].steps >= 1)
+    root = yaml.safe_load(path.read_text(encoding="utf-8"))
+    root["options"]["contract_xch"] = 2
+    path.write_text(yaml.safe_dump(root), encoding="utf-8")
+
+    assert run.stop_for_new_settings() is runner.Mode.REHEARSE
+    _wait(lambda: not run.finishing and not run.snapshot().running)
+    assert _flag(tmp_path).exists(), "nothing open, but the book is about to start again"
+
+
+def _switch_options_off(path: Path) -> None:
+    yaml = pytest.importorskip("yaml")
+    root = yaml.safe_load(path.read_text(encoding="utf-8"))
+    root["options"]["enabled"] = False
+    path.write_text(yaml.safe_dump(root), encoding="utf-8")
+
+
+def test_a_restart_that_does_not_come_brings_the_flag_down(tmp_path) -> None:
+    """[review] Options switched off by the save: no restart, and nothing open."""
+    made: list[FakeBook] = []
+    path = _config(tmp_path)
+    run = runner.OptionsRunner(
+        path, interval=0.02, build=_builder(made), engine_state=lambda url: DOWN
+    )
+    run.start(runner.Mode.REHEARSE)
+    _wait(lambda: bool(made) and made[0].steps >= 1)
+    _switch_options_off(path)
+
+    assert run.stop_for_new_settings() is runner.Mode.REHEARSE
+    _wait(lambda: not run.finishing and not run.snapshot().running)
+    assert _flag(tmp_path).exists(), "kept up while the restart was due"
+
+    run.settle_fence()
+    assert not _flag(tmp_path).exists(), "the last run's book has nothing open"
+
+
+def test_a_flag_the_last_session_left_comes_down_with_options_switched_off(tmp_path) -> None:
+    """[review] A new app, options off since: the flag still follows the book."""
+    made: list[FakeBook] = []
+    path = _config(tmp_path)
+    first = runner.OptionsRunner(
+        path, interval=0.02, build=_builder(made), engine_state=lambda url: DOWN
+    )
+    first.start(runner.Mode.REHEARSE)
+    _wait(lambda: bool(made) and made[0].steps >= 1)
+    first.stop(keep_fence=True)  # the app closing with the book on
+    _wait(lambda: not first.snapshot().running)
+    assert _flag(tmp_path).exists()
+    _switch_options_off(path)
+
+    runner.OptionsRunner(path, build=_builder([])).sync_fence()  # the next app's page
+
+    assert not _flag(tmp_path).exists()
+
+
+def test_a_new_record_does_not_release_a_flag_the_old_book_still_needs(tmp_path) -> None:
+    """[review] A save moves options.database_path: the restart is refused, and the
+    old book's open contract keeps the flag up, whatever the new record says."""
+    yaml = pytest.importorskip("yaml")
+    old = tmp_path / "book.db"
+    _record_open_contract(old)
+    made: list[FakeBook] = []
+    path = _config(tmp_path, db=str(old))
+    run = runner.OptionsRunner(
+        path, interval=0.02, build=_builder(made), engine_state=lambda url: DOWN
+    )
+    run.start(runner.Mode.REHEARSE)
+    _wait(lambda: bool(made) and made[0].steps >= 1)
+    root = yaml.safe_load(path.read_text(encoding="utf-8"))
+    root["options"]["database_path"] = str(tmp_path / "elsewhere.db")  # missing: nothing open
+    path.write_text(yaml.safe_dump(root), encoding="utf-8")
+
+    assert run.stop_for_new_settings() is runner.Mode.REHEARSE
+    _wait(lambda: not run.finishing and not run.snapshot().running)
+    assert run.restart_refusal() == runner.WALLET_CHANGED
+    run.settle_fence()
+
+    assert _flag(tmp_path).exists(), "the old book has a contract open"
+
+
+def test_the_old_record_released_with_the_new_one_lets_the_flag_down(tmp_path) -> None:
+    yaml = pytest.importorskip("yaml")
+    made: list[FakeBook] = []
+    path = _config(tmp_path, db=str(tmp_path / "book.db"))
+    run = runner.OptionsRunner(
+        path, interval=0.02, build=_builder(made), engine_state=lambda url: DOWN
+    )
+    run.start(runner.Mode.REHEARSE)
+    _wait(lambda: bool(made) and made[0].steps >= 1)
+    root = yaml.safe_load(path.read_text(encoding="utf-8"))
+    root["options"]["database_path"] = str(tmp_path / "elsewhere.db")
+    path.write_text(yaml.safe_dump(root), encoding="utf-8")
+
+    assert run.stop_for_new_settings() is runner.Mode.REHEARSE
+    _wait(lambda: not run.finishing and not run.snapshot().running)
+    run.settle_fence()
+
+    assert not _flag(tmp_path).exists(), "neither record has anything open"

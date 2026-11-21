@@ -349,9 +349,20 @@ def test_live_beside_a_fenced_engine(tmp_path) -> None:
 
 
 class FakeCoins:
-    def __init__(self) -> None:
+    def __init__(self, loose_xch: int = 0, loose_quote: int = 0) -> None:
         self.sent: list[tuple] = []
         self.confirmed: dict[str, bool] = {}
+        self.loose_xch = loose_xch
+        self.loose_quote = loose_quote
+
+    def xch_coins(self):
+        return [types.SimpleNamespace(amount=self.loose_xch)]
+
+    def cats(self, asset_id):
+        return [types.SimpleNamespace(coin=types.SimpleNamespace(amount=self.loose_quote))]
+
+    def held(self, asset_ids):
+        return frozenset({b"\x01" * 32})
 
     def send_to_address(self, *, asset_id, amount, fee):
         self.sent.append((asset_id, amount, fee))
@@ -364,22 +375,41 @@ class FakeCoins:
 
 
 def _book(cfg, loose_xch: int, loose_quote: int):
+    """A real OptionsBook over fakes. A stand-in object once hid that the book's
+    own coin cache shadowed the method the top-up calls."""
     from gui.services.options import store
     from gui.services.options.service import OptionsBook
 
-    book_store = store.OptionStore(":memory:")
-    coins = FakeCoins()
-    stub = types.SimpleNamespace(_config=cfg, _store=book_store, _coins=coins)
-    stub._listed = lambda what, asset_id=None: (
-        [types.SimpleNamespace(amount=loose_xch)]
-        if asset_id is None
-        else [types.SimpleNamespace(coin=types.SimpleNamespace(amount=loose_quote))]
+    coins = FakeCoins(loose_xch, loose_quote)
+    book = OptionsBook(
+        cfg,
+        book_store=store.OptionStore(":memory:"),
+        wallet=None,
+        coins=coins,
+        chain_reader=None,
+        market=lambda: None,
     )
-    stub._held = lambda asset_id: OptionsBook._held(stub, asset_id)
-    stub._top_up_fee = lambda: OptionsBook._top_up_fee(stub)
-    stub._TOP_UP_FEE = OptionsBook._TOP_UP_FEE
-    stub._TOP_UP_FORGET_SECONDS = OptionsBook._TOP_UP_FORGET_SECONDS
-    return stub, coins, lambda report, act=True: OptionsBook._top_up(stub, 100, report, act=act)
+    return book, coins, lambda report, act=True: book._top_up(100, report, act=act)
+
+
+def test_no_attribute_of_a_book_hides_one_of_its_methods() -> None:
+    """Live on v0.10.54 every step failed at the top-up: the book's cache of its
+    listed coins, an attribute named ``_held``, hid the method ``_held()``."""
+    from gui.services.options.service import OptionsBook, StepReport
+
+    book, coins, top_up = _book(
+        _parse(_shared(engine_fence=True), target={"xch": 1.5, "quote": 2}),
+        loose_xch=1_000_000_000_000,
+        loose_quote=2_000,
+    )
+    hidden = [name for name in vars(book) if callable(getattr(OptionsBook, name, None))]
+    assert hidden == []
+
+    report = StepReport()
+    assert book._held_now(report) is not None  # what a step's look keeps
+    book._coins_seen = book._held_now(report)
+    top_up(report)
+    assert report.sub_account["XCH"] == (1_000_000_000_000, 1_500_000_000_000)
 
 
 def test_the_book_tops_its_address_up_to_target_once_at_a_time() -> None:

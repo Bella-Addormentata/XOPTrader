@@ -85,8 +85,15 @@ const char* to_string(AlertRule rule) noexcept
         case AlertRule::CancelUnresolved:     return "CancelUnresolved";
         case AlertRule::FeeBudgetBound:       return "FeeBudgetBound";
         case AlertRule::FeeBudgetUnfunded:    return "FeeBudgetUnfunded";
+        case AlertRule::HedgeImbalance:       return "HedgeImbalance";
     }
     return "UNKNOWN";
+}
+
+bool alert_rule_skips_cooldown(AlertRule rule) noexcept
+{
+    return rule == AlertRule::ConfigReload || rule == AlertRule::PnlDrawdown
+        || rule == AlertRule::HedgeImbalance;
 }
 
 AlertTier tier_for_rule(AlertRule rule) noexcept
@@ -122,6 +129,9 @@ AlertTier tier_for_rule(AlertRule rule) noexcept
         // still clear the node's floor.  Nothing is stuck and nothing stops;
         // the budget is mis-sized and wants raising.
         case AlertRule::FeeBudgetUnfunded:
+        // [ALERT-NOISE] One-sided flow on a pair is a thing to look at, not a
+        // page: the exposure limits and breakers act on what it leads to.
+        case AlertRule::HedgeImbalance:
             return AlertTier::WARNING;
 
         // A quote stablecoin leaving its peg mis-values the entire book and
@@ -234,6 +244,13 @@ void AlertManager::set_credentials(const std::string& bot_token,
         chat_id_    = chat_id;
         now_enabled = !bot_token_.empty() && !chat_id_.empty();
         enabled_.store(now_enabled, std::memory_order_release);
+        // [review #251] What the latches passed while Telegram was off, or
+        // sent to the old chat, never reached this one: they re-arm, and a
+        // warning that still stands goes out again.
+        if (now_enabled) {
+            drawdown_latch_.reset();
+            delivery_epoch_.fetch_add(1, std::memory_order_acq_rel);
+        }
     }
     spdlog::info("AlertManager: Telegram credentials updated from the saved "
                  "config -- alerts {}", now_enabled ? "enabled" : "disabled "
@@ -370,7 +387,10 @@ void AlertManager::send_alert(AlertRule rule, const std::string& message)
     // emergency sequence -- a rejected save corrected within the 300s
     // WARNING window -- must deliver BOTH outcomes to an operator who is
     // watching for exactly this message.
-    if (rule != AlertRule::ConfigReload && !check_rate_limit(rule)) {
+    // [review #251] PnlDrawdown and HedgeImbalance are paced by their own
+    // latches (news, or a reminder hours later): the cooldown would drop the
+    // one message they have already decided to send.
+    if (!alert_rule_skips_cooldown(rule) && !check_rate_limit(rule)) {
         return;
     }
 
@@ -602,6 +622,9 @@ void AlertManager::start_worker()
 #endif
 
             // Execute the request.
+            // [review #251] One attempt: a retry here would hold every later
+            // alert behind it, CRITICAL ones included. The self-paced rules
+            // send a standing warning again hours later instead.
             CURLcode res = curl_easy_perform(curl);
             if (res != CURLE_OK) {
                 // Log error WITHOUT the URL (contains secret bot token).
@@ -880,7 +903,16 @@ void AlertManager::check_pnl_drawdown(const BotState& state)
     const double drawdown = (state.peak_equity_usd - state.equity_usd)
                           / state.peak_equity_usd;
 
-    if (drawdown > threshold) {
+    // [ALERT-NOISE] Once per 5% step of an episode, not on every cycle,
+    // and again every DrawdownAlertLatch::kRemindAfter while it stands.
+    // [review #251] Under mtx_: check_and_alert may run on any thread. The
+    // lock is let go before send_alert, which takes it itself.
+    bool news = false;
+    {
+        std::lock_guard lock(mtx_);
+        news = drawdown_latch_.should_alert(drawdown, threshold, Clock::now());
+    }
+    if (news) {
         send_alert(AlertRule::PnlDrawdown,
             fmt::format("Equity drawdown: {:.1f}% from peak ${:.2f} "
                         "(threshold {:.1f}%)",

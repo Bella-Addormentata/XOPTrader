@@ -134,7 +134,7 @@ class RunnerDouble:
         self.mode = mode
         self.snap = options_runner.Snapshot(mode=mode, running=True)
 
-    def stop(self, timeout: float | None = None) -> None:
+    def stop(self, timeout: float | None = None, *, keep_fence: bool = False) -> None:
         self.stops += 1
         self.mode = Mode.OFF
         self.snap = options_runner.Snapshot()
@@ -333,10 +333,20 @@ def test_a_new_config_from_settings_stops_the_old_book_and_follows_the_new_file(
 
 
 def test_closing_the_app_stops_the_book(app, tmp_path):
-    runner = RunnerDouble()
+    class Kept(RunnerDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.kept: list[bool] = []
+
+        def stop(self, timeout=None, *, keep_fence=False):
+            self.kept.append(keep_fence)
+            super().stop(timeout)
+
+    runner = Kept()
     page = _page(app, tmp_path, runner)
     page.stop_background_work()
     assert runner.stops == 1
+    assert runner.kept == [True], "the fence flag stays up for the book's next start"
     _close(page, app)
 
 
@@ -1026,6 +1036,11 @@ class _SavedOver(RunnerDouble):
     def restart_refusal(self) -> str:
         return self.refusal
 
+    settled = 0
+
+    def settle_fence(self) -> None:
+        self.settled += 1
+
     def stop_for_new_settings(self):
         if self.mode is Mode.OFF or not self.changed:
             return None
@@ -1121,6 +1136,7 @@ def test_a_new_wallet_is_the_operator_s_to_switch_on(app, tmp_path, monkeypatch)
 
         assert runner.starts == [Mode.LIVE] and runner.mode is Mode.OFF
         assert "not started again" in page._held.text()
+        assert runner.settled == 1, "the flag kept up for the restart follows the book again"
         assert (
             QSettings("XOP-tests-options", options_page._SETTINGS_APP).value(options_page.KEY_MODE)
             == "off"
