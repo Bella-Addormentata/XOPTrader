@@ -98,9 +98,10 @@ def interruptible(transport: Transport, stop: threading.Event) -> Transport:
     The caller waits for the answer or for ``stop``, whichever comes first.
     Once ``stop`` is set it raises :class:`Stopped` within :data:`STOP_POLL_S`
     and leaves the request to finish, or time out, on its own thread, whose
-    answer is dropped. That thread touches nothing of Qt's and does not keep
-    the app from exiting, so closing the app never waits on a slow read, nor
-    has to kill the thread that asked for it.
+    answer is dropped: so is one that comes back as ``stop`` is set. That
+    thread touches nothing of Qt's and does not keep the app from exiting, so
+    closing the app never waits on a slow read, nor has to kill the thread
+    that asked for it.
     """
 
     def call(
@@ -114,7 +115,7 @@ def interruptible(transport: Transport, stop: threading.Event) -> Transport:
         def run() -> None:
             try:
                 outcome.append((True, transport(method, url, body, headers, timeout_s)))
-            except BaseException as exc:  # noqa: BLE001 -- handed back to the caller
+            except Exception as exc:  # noqa: BLE001 -- handed back to the caller
                 outcome.append((False, exc))
             finally:
                 finished.set()
@@ -122,7 +123,11 @@ def interruptible(transport: Transport, stop: threading.Event) -> Transport:
         threading.Thread(target=run, name="circuit-page-request", daemon=True).start()
         while not finished.wait(STOP_POLL_S):
             if stop.is_set():
-                raise Stopped()
+                break
+        if stop.is_set():  # an answer, or a failure, that came as it was told is dropped too
+            raise Stopped()
+        if not outcome:  # it ended on what no request raises (SystemExit, say)
+            raise RuntimeError("the request ended without an answer")
         answered, value = outcome[0]
         if not answered:
             raise value

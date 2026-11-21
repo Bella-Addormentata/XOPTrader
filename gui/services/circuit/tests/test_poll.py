@@ -115,6 +115,47 @@ def test_a_request_on_a_thread_of_its_own_hands_back_its_answer_or_its_failure()
     assert [call[1] for call in transport.calls] == ["/oracle", "/treasury"]
 
 
+@pytest.mark.parametrize("fails", [False, True], ids=["an answer", "a failure"])
+def test_what_comes_back_as_the_page_is_told_to_stop_is_dropped(fails) -> None:
+    stop = threading.Event()
+
+    def told_to_stop_meanwhile(method, url, body, headers, timeout_s):
+        stop.set()  # switched off while the answer is on its way
+        if fails:
+            raise TimeoutError("timed out")
+        return 200, {}, b'{"price": 1}'
+
+    client = CircuitApi(
+        "https://api.example.test",
+        min_interval_s=0,
+        transport=poll.interruptible(told_to_stop_meanwhile, stop),
+    )
+    results: list[poll.Result] = []
+    with pytest.raises(poll.Stopped):
+        poll.fetch(client, on_result=results.append, should_stop=stop.is_set)
+    assert results == [], "a round stopped reports nothing more"
+
+
+# The request's thread ends on SystemExit, which pytest's thread hook reports.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_request_thread_that_ends_without_an_answer_is_no_answer() -> None:
+    threads: list[threading.Thread] = []
+
+    def leaves(method, url, body, headers, timeout_s):
+        threads.append(threading.current_thread())
+        raise SystemExit  # no request raises it; it only ends the thread
+
+    client = CircuitApi(
+        "https://api.example.test",
+        min_interval_s=0,
+        transport=poll.interruptible(leaves, threading.Event()),
+    )
+    with pytest.raises(CircuitApiError, match="the request ended without an answer"):
+        client.post("/oracle")
+    for thread in threads:  # done within this test, so its report is this test's
+        thread.join(5)
+
+
 def test_a_request_under_way_is_left_behind_the_moment_the_page_is_told_to_stop() -> None:
     stop, entered, gate = threading.Event(), threading.Event(), threading.Event()
     asked_on: list[threading.Thread] = []
