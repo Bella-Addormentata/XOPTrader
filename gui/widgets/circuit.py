@@ -106,7 +106,20 @@ def _table(columns: Sequence[str]) -> QTableWidget:
     header = table.horizontalHeader()
     header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
     header.setStretchLastSection(True)
+    # Columns wider than the table bring a scroll bar in under the rows, at
+    # any resize: the table grows by its height, and gives it back after.
+    table.horizontalScrollBar().rangeChanged.connect(lambda _low, _high: _fit_height(table))
     return table
+
+
+def _fit_height(table: QTableWidget) -> None:
+    """Make ``table`` tall enough for every row, and the horizontal scroll bar if it shows."""
+    height = table.horizontalHeader().height() + 2 * table.frameWidth()
+    height += sum(table.rowHeight(r) for r in range(table.rowCount()))
+    bar = table.horizontalScrollBar()
+    if bar.maximum() > bar.minimum():
+        height += bar.sizeHint().height()
+    table.setFixedHeight(height + 2)
 
 
 def _fill(table: QTableWidget, rows: Sequence[Sequence[str]], empty: str) -> None:
@@ -126,9 +139,7 @@ def _fill(table: QTableWidget, rows: Sequence[Sequence[str]], empty: str) -> Non
             table.setItem(0, c, QTableWidgetItem(""))
         if table.columnCount() > 1:
             table.setSpan(0, 0, 1, table.columnCount())
-    height = table.horizontalHeader().height() + 2 * table.frameWidth()
-    height += sum(table.rowHeight(r) for r in range(table.rowCount()))
-    table.setFixedHeight(height + 2)
+    _fit_height(table)
 
 
 def _cells(table: QTableWidget) -> list[list[str]]:
@@ -403,13 +414,25 @@ class CircuitWidget(QWidget):
     @Slot(object)
     def _on_result(self, result: poll.Result) -> None:
         self._round_seen += 1
+        error = result.error
         if result.ok:
+            # Checked before it replaces the last good answer: one of an
+            # unexpected shape counts as a failed read, so the page keeps
+            # the older answer (and, say, the emergency banner it carried)
+            # beside a note, instead of emptying the section.
+            try:
+                model.section_from(
+                    result.name, result.data, now=self._wall(), answered_at=result.at
+                )
+            except model.SHAPE_ERRORS as exc:
+                error = model.shape_problem(exc)
+        if error:
+            self._errors[result.name] = error
+        else:
             self._round_answered += 1
             self._answers[result.name] = result.data
             self._answered_at[result.name] = result.at
             self._errors.pop(result.name, None)
-        else:
-            self._errors[result.name] = result.error
         self._render()
 
     @Slot(int, str)

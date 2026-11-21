@@ -272,6 +272,16 @@ def test_an_announcer_in_trouble() -> None:
 # -- answers that are missing, failed or of another shape ------------------------
 
 
+def test_one_section_is_built_or_refused_on_its_own(answers) -> None:
+    treasury = model.section_from("treasury", answers["treasury"], now=NOW)
+    assert treasury == model.build_view(answers, now=NOW).treasury
+    with pytest.raises(model.SHAPE_ERRORS) as raised:
+        model.section_from("statutes", {"implemented_statutes": []}, now=NOW)
+    assert model.shape_problem(raised.value).startswith("the answer has an unexpected shape")
+    with pytest.raises(KeyError):
+        model.section_from("savings", {}, now=NOW)
+
+
 def test_a_read_not_made_yet_leaves_its_section_empty_without_a_note() -> None:
     view = model.build_view({}, now=NOW)
     assert view.oracle is None and view.vaults is None and view.problems == {}
@@ -307,6 +317,10 @@ def test_an_older_answer_stays_with_a_note_when_the_latest_read_failed(answers) 
         ("vaults", [{"name": "x", "debt": float("inf"), "collateral": 1}]),
         # An integer too big for a float.
         ("treasury", {"treasury_balance": 10**400}),
+        # Times and spans no calendar holds: they would break the page's formatters.
+        ("oracle", {"price_delay": 1e308}),
+        ("announcers", [{"launcher_id": "x", "price": 94, "expires_at": 1e300, "deposit": 1}]),
+        ("bills", [{"name": "x", "amount": 1000, "exitable_at": -5}]),
     ],
 )
 def test_an_answer_of_another_shape_is_a_note_not_a_crash(answers, read, answer) -> None:
@@ -364,6 +378,7 @@ def test_times() -> None:
     assert model.fmt_utc(NOW - 2 * 86_400, NOW) == "2026-11-19 18:22 UTC"
     # A time no calendar holds (a garbled answer) is shown, not raised.
     assert model.fmt_utc(1e20, NOW) == "unix time 100000000000000000000"
+    assert model.fmt_utc(10**400, NOW) == f"unix time {10**400}"
 
 
 def test_ids_rates_and_shares() -> None:

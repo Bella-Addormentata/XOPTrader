@@ -90,7 +90,7 @@ def fmt_utc(at: float, now: float) -> str:
     try:
         when = _dt.datetime.fromtimestamp(at, _dt.timezone.utc)  # noqa: UP017 -- 3.10, as api.py
     except (OverflowError, OSError, ValueError):
-        return f"unix time {at:.0f}"
+        return f"unix time {at:.0f}" if isinstance(at, float) else f"unix time {at}"
     if abs(at - now) < 86_400:
         return when.strftime("%H:%M UTC")
     return when.strftime("%Y-%m-%d %H:%M UTC")
@@ -138,6 +138,23 @@ def _optional_number(value: Any) -> float | None:
     return None if value is None else _number(value)
 
 
+#: The last second of 9999, the end of Python's calendar: a time or a span in
+#: an answer past it (or below 0) is not one, and would break the formatters.
+MAX_TIME = 253_402_300_799
+
+
+def _time(value: Any) -> float:
+    """A Unix time, or a span in seconds, from an answer; ``ValueError`` outside 0..MAX_TIME."""
+    number = _number(value)
+    if not 0 <= number <= MAX_TIME:
+        raise ValueError(f"expected a time, got {value!r}")
+    return number
+
+
+def _optional_time(value: Any) -> float | None:
+    return None if value is None else _time(value)
+
+
 def _flag(value: Any) -> bool:
     return value is True
 
@@ -155,7 +172,7 @@ def _point(raw: Any) -> PricePoint | None:
     if raw is None:
         return None
     price, at = raw
-    return PricePoint(_number(price) / PRICE_SCALE, int(_number(at)))
+    return PricePoint(_number(price) / PRICE_SCALE, int(_time(at)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -172,7 +189,7 @@ class Oracle:
 
 
 def oracle_from(answer: Any) -> Oracle:
-    delay = int(_number(answer["price_delay"]))
+    delay = int(_time(answer["price_delay"]))
     matured = _point(answer.get("last_matured_price_info"))
     queued = []
     for raw in answer.get("price_infos") or ():
@@ -281,7 +298,7 @@ def _vault_row(vault: Mapping[str, Any], answered_at: float) -> VaultRow:
         ratio = _number(raw_ratio)
     liquidation = _optional_number(vault.get("liquidation_price"))
     auction = _optional_number(vault.get("auction_price"))
-    ttl = _optional_number(vault.get("auction_ttl"))
+    ttl = _optional_time(vault.get("auction_ttl"))
     return VaultRow(
         name=str(vault["name"]),
         collateral_xch=_number(vault["collateral"]) / MOJOS_PER_XCH,
@@ -398,10 +415,10 @@ def _recharge_row(auction: Mapping[str, Any], now: float) -> AuctionRow:
         detail = (
             f"last bid {fmt_units(_number(bid['byc_bid_amount']) / MOJOS_PER_CAT)} BYC for "
             f"{fmt_units(_number(bid['crt_bid_amount']) / MOJOS_PER_CAT)} CRT; the bid stands "
-            f"until {fmt_utc(_number(bid['bid_expires_at']), now)}"
+            f"until {fmt_utc(_time(bid['bid_expires_at']), now)}"
         )
     elif params:
-        detail = f"no bids yet; ends {fmt_utc(_number(params['auction_expires_at']), now)}"
+        detail = f"no bids yet; ends {fmt_utc(_time(params['auction_expires_at']), now)}"
     else:
         detail = "not started"
     return AuctionRow(
@@ -420,7 +437,7 @@ def _surplus_row(auction: Mapping[str, Any], now: float) -> AuctionRow:
         best = fmt_units(_number(auction["crt_bid_amount"]) / MOJOS_PER_CAT)
         detail = (
             f"{lot} BYC lot; best bid {best} CRT, standing until "
-            f"{fmt_utc(_number(bid['bid_expires_at']), now)}"
+            f"{fmt_utc(_time(bid['bid_expires_at']), now)}"
         )
     else:
         detail = f"{lot} BYC lot; no bids yet"
@@ -462,17 +479,17 @@ def _bill_row(coin: Mapping[str, Any], now: float) -> BillRow:
         text = str(status["status"])
         ends = status.get("status_expires_at")
         if ends is not None:
-            text += f" until {fmt_utc(_number(ends), now)}"
+            text += f" until {fmt_utc(_time(ends), now)}"
     else:
         operation = coin.get("operation")
         text = f"last step: {operation}" if operation else ""
     exitable = coin.get("exitable_at")
     if exitable is None:
         exit_text = ""
-    elif _number(exitable) <= now:
+    elif _time(exitable) <= now:
         exit_text = "can leave governance"
     else:
-        exit_text = "can leave " + fmt_from_now(_number(exitable), now)
+        exit_text = "can leave " + fmt_from_now(_time(exitable), now)
     return BillRow(
         name=str(coin["name"]),
         crt=_number(coin["amount"]) / MOJOS_PER_CAT,
@@ -508,7 +525,7 @@ def _announcer_row(announcer: Mapping[str, Any], now: float) -> AnnouncerRow:
         words.append("can be penalised")
     if _flag(announcer.get("in_cooldown")):
         words.append("in cooldown")
-    expires_at = _number(announcer["expires_at"])
+    expires_at = _time(announcer["expires_at"])
     expires = ("expires " if expires_at >= now else "expired ") + fmt_from_now(expires_at, now)
     return AnnouncerRow(
         name=str(announcer["launcher_id"]),
@@ -577,6 +594,47 @@ _SECTIONS = {
     "announcers": "announcers",
 }
 
+#: What building a section raises on an answer of an unexpected shape.
+SHAPE_ERRORS: tuple[type[Exception], ...] = (
+    AttributeError,
+    KeyError,
+    IndexError,
+    TypeError,
+    ValueError,
+    ArithmeticError,  # OverflowError, ZeroDivisionError
+)
+
+
+def shape_problem(exc: BaseException) -> str:
+    """The note a section shows for an answer of an unexpected shape."""
+    return f"the answer has an unexpected shape ({type(exc).__name__}: {exc})"
+
+
+def section_from(read: str, answer: Any, *, now: float, answered_at: float | None = None) -> Any:
+    """One read's section, built from its answer.
+
+    Raises one of :data:`SHAPE_ERRORS` for an answer of an unexpected shape,
+    so the page can check an answer before it replaces the last good one.
+    ``answered_at`` is when it came (default ``now``).
+    """
+    if read == "oracle":
+        return oracle_from(answer)
+    if read == "statutes":
+        return protocol_from(answer)
+    if read == "vaults":
+        return vaults_from(answer, now if answered_at is None else answered_at)
+    if read == "treasury":
+        return treasury_from(answer)
+    if read == "recharge_auctions":
+        return auctions_from(answer, "recharge", now)
+    if read == "surplus_auctions":
+        return auctions_from(answer, "surplus", now)
+    if read == "bills":
+        return bills_from(answer, now)
+    if read == "announcers":
+        return announcers_from(answer, now)
+    raise KeyError(f"no section is built from the read {read!r}")
+
 
 def build_view(
     answers: Mapping[str, Any],
@@ -600,33 +658,10 @@ def build_view(
             if read in errors:
                 problems[read] = errors[read]
             continue
-        answer = answers[read]
         try:
-            if read == "oracle":
-                value: Any = oracle_from(answer)
-            elif read == "statutes":
-                value = protocol_from(answer)
-            elif read == "vaults":
-                value = vaults_from(answer, answered_at.get(read, now))
-            elif read == "treasury":
-                value = treasury_from(answer)
-            elif read == "recharge_auctions":
-                value = auctions_from(answer, "recharge", now)
-            elif read == "surplus_auctions":
-                value = auctions_from(answer, "surplus", now)
-            elif read == "bills":
-                value = bills_from(answer, now)
-            else:
-                value = announcers_from(answer, now)
-        except (
-            AttributeError,
-            KeyError,
-            IndexError,
-            TypeError,
-            ValueError,
-            ArithmeticError,  # OverflowError, ZeroDivisionError
-        ) as exc:
-            problems[read] = f"the answer has an unexpected shape ({type(exc).__name__}: {exc})"
+            value = section_from(read, answers[read], now=now, answered_at=answered_at.get(read))
+        except SHAPE_ERRORS as exc:
+            problems[read] = shape_problem(exc)
             continue
         built[field] = value
         if read in errors:

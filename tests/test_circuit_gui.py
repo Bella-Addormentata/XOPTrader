@@ -272,6 +272,68 @@ def test_the_emergency_switch_is_a_banner(app) -> None:
         _close(page, app)
 
 
+def test_a_garbled_answer_keeps_the_last_good_one_and_its_banner(app) -> None:
+    server = FixtureServer()
+    server.answers["/statutes"][1]["implemented_statutes"]["BLOCK_ISSUANCE"] = 1
+    page, _factory = _page(server)
+    try:
+        page.set_enabled(True)
+        page.show()
+        _wait_until(app, lambda: not page.fetching() and len(server.calls) == 8)
+        assert not page._banner.isHidden()
+
+        server.answers["/statutes"] = (200, {"status": "ok", "implemented_statutes": []})
+        assert page.refresh()
+        _wait_until(app, lambda: not page.fetching() and len(server.calls) == 16)
+        # Answered, but of another shape: a failed read, not a new answer.
+        assert "7 of 8 answered" in page._status.text()
+        assert not page._banner.isHidden(), "the emergency the last good answer showed"
+        assert page._values["emergency"].text() == "ON: BLOCK_ISSUANCE is 1"
+        notes = page._notes["statutes"]
+        assert notes and all(
+            note.text().startswith("statutes: the answer has an unexpected shape") for note in notes
+        )
+        from gui.widgets.circuit import _cells
+
+        assert len(_cells(page._statutes)) == 44
+    finally:
+        _close(page, app)
+
+
+def test_every_row_of_a_table_shows_above_a_horizontal_scroll_bar(app) -> None:
+    page, factory = _page()
+    tables = (
+        page._auctions_running,
+        page._closest,
+        page._auctions,
+        page._bills,
+        page._announcers,
+        page._statutes,
+    )
+
+    def spare(table) -> int:
+        """The table's room for rows, less the rows: 0 to a few pixels, never below."""
+        rows = sum(table.rowHeight(r) for r in range(table.rowCount()))
+        return table.viewport().height() - rows
+
+    try:
+        page.set_enabled(True)
+        page.resize(420, 1200)
+        page.show()
+        _wait_until(app, lambda: not page.fetching() and len(factory.server.calls) == 8)
+        app.processEvents()
+        assert page._closest.horizontalScrollBar().isVisible(), "narrow enough for the bar"
+        assert all(0 <= spare(table) <= 4 for table in tables), [spare(t) for t in tables]
+
+        page.resize(1800, 1200)
+        app.processEvents()
+        assert not page._closest.horizontalScrollBar().isVisible()
+        # Wide again, the room the bar took is given back.
+        assert all(0 <= spare(table) <= 4 for table in tables), [spare(t) for t in tables]
+    finally:
+        _close(page, app)
+
+
 def test_an_answer_without_the_emergency_switch_says_unknown_not_off(app) -> None:
     server = FixtureServer()
     del server.answers["/statutes"][1]["implemented_statutes"]["BLOCK_ISSUANCE"]
