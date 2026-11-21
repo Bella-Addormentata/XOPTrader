@@ -85,6 +85,7 @@ const char* to_string(AlertRule rule) noexcept
         case AlertRule::CancelUnresolved:     return "CancelUnresolved";
         case AlertRule::FeeBudgetBound:       return "FeeBudgetBound";
         case AlertRule::FeeBudgetUnfunded:    return "FeeBudgetUnfunded";
+        case AlertRule::HedgeImbalance:       return "HedgeImbalance";
     }
     return "UNKNOWN";
 }
@@ -122,6 +123,9 @@ AlertTier tier_for_rule(AlertRule rule) noexcept
         // still clear the node's floor.  Nothing is stuck and nothing stops;
         // the budget is mis-sized and wants raising.
         case AlertRule::FeeBudgetUnfunded:
+        // [ALERT-NOISE] One-sided flow on a pair is a thing to look at, not a
+        // page: the exposure limits and breakers act on what it leads to.
+        case AlertRule::HedgeImbalance:
             return AlertTier::WARNING;
 
         // A quote stablecoin leaving its peg mis-values the entire book and
@@ -880,7 +884,8 @@ void AlertManager::check_pnl_drawdown(const BotState& state)
     const double drawdown = (state.peak_equity_usd - state.equity_usd)
                           / state.peak_equity_usd;
 
-    if (drawdown > threshold) {
+    // [ALERT-NOISE] Once per 5% step of an episode, not on every cycle.
+    if (drawdown_latch_.should_alert(drawdown, threshold)) {
         send_alert(AlertRule::PnlDrawdown,
             fmt::format("Equity drawdown: {:.1f}% from peak ${:.2f} "
                         "(threshold {:.1f}%)",

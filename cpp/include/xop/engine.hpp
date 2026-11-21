@@ -2899,13 +2899,12 @@ private:
     /// loss.  Bounded by one loss window per entry.
     std::unordered_map<std::string, BlockHeight> pnl_window_rebase_assets_;
 
-    // [T3-08] NHE (Natural Hedge Efficiency) accumulators for step 10.
-    // These running totals track net inventory change and total traded
-    // volume across all pairs for the NHE computation.
-    // Reset each cycle; fed from step 2 fill data.
-    // ISO/IEC 5055: deterministic zero-initialization.
-    double nhe_net_inventory_change_{0.0};
-    double nhe_total_volume_{0.0};
+    // [T3-08] NHE (Natural Hedge Efficiency) for step 10.
+    // [ALERT-NOISE] Per pair, over a rolling window of blocks (NheWindow),
+    // fed from step 2 fill data; it used to be one block's fills, summed
+    // across pairs.  The latch sends one HedgeImbalance per episode.
+    std::unordered_map<std::string, NheWindow>     nhe_windows_;
+    std::unordered_map<std::string, NheAlertLatch> nhe_latches_;
 
     // [T5-CR1] VPIN validation gate (Andersen & Bondarenko 2014).
     // Runtime tracker that measures whether VPIN activations (vpin_mult > 1.0)

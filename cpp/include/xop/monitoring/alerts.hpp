@@ -164,15 +164,49 @@ enum class AlertRule : std::uint8_t {
                                // the 60 s cooldown drop whichever arrived
                                // second.
 
-    LedgerDivergence     = 16  // Books and wallet disagree beyond tolerance.
+    LedgerDivergence     = 16, // Books and wallet disagree beyond tolerance.
                                // Its own rule so accounting noise can never
                                // rate-limit or masquerade as ExposureBreach,
                                // which is CRITICAL tier and already carries
                                // three unrelated risk conditions.
+
+    HedgeImbalance       = 24  // [ALERT-NOISE] One pair's fills have been one-
+                               // sided over the hedge-efficiency window
+                               // (risk::NheWindow). A WARNING of its own:
+                               // it used to go out as ExposureBreach, CRITICAL,
+                               // on almost every fill.
 };
 
 /// Human-readable label for logging.
 const char* to_string(AlertRule rule) noexcept;
+
+/// [ALERT-NOISE] When an equity drawdown is news: on reaching a deeper step
+/// of the threshold (5%, 10%, 15%, ...), and again in a new episode once the
+/// drawdown has eased below kResetFraction of the threshold. It used to be
+/// sent on every cycle the drawdown stayed above 5%.
+class DrawdownAlertLatch {
+public:
+    static constexpr double kResetFraction = 0.8;
+
+    /// True when `drawdown` (a fraction of peak equity) should be alerted.
+    [[nodiscard]] bool should_alert(double drawdown, double threshold) noexcept
+    {
+        if (!(threshold > 0.0) || !(drawdown == drawdown)) return false;  // NaN: nothing to say
+        if (drawdown < threshold) {
+            if (drawdown < threshold * kResetFraction) alerted_step_ = 0;
+            return false;
+        }
+        const auto step = static_cast<int>(drawdown / threshold);
+        if (step <= alerted_step_) return false;
+        alerted_step_ = step;
+        return true;
+    }
+
+    [[nodiscard]] int alerted_step() const noexcept { return alerted_step_; }
+
+private:
+    int alerted_step_{0};
+};
 
 /// Map each rule to its severity tier.
 AlertTier tier_for_rule(AlertRule rule) noexcept;
@@ -419,6 +453,9 @@ private:
     // Per-rule configurable thresholds (indexed by AlertRule cast to uint8_t).
     // Defaults are set in the constructor.
     std::unordered_map<std::uint8_t, double> thresholds_;
+
+    // [ALERT-NOISE] Rule 10 fires once per 5% step of an episode.
+    DrawdownAlertLatch drawdown_latch_;
 
     // -- Default threshold constants -----------------------------------------
 

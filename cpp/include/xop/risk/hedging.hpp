@@ -31,9 +31,12 @@
 #include "xop/config.hpp"
 #include "xop/state.hpp"
 
+#include <cstddef>
+#include <deque>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace xop {
@@ -270,6 +273,89 @@ private:
     [[nodiscard]]
     static AssetId find_best_buy_candidate(
         const std::unordered_map<AssetId, double>& deviations);
+};
+
+// ---------------------------------------------------------------------------
+// [ALERT-NOISE] NheWindow -- Natural Hedge Efficiency of ONE pair, over a
+// rolling window of blocks.
+//
+// It used to be worked out per heartbeat, from that block's fills alone and
+// summed across pairs in different base units.  A block with a single fill is
+// one-sided by nature, so it scored 0 and a CRITICAL alert went out on almost
+// every fill.  Over a window, with a minimum number of fills, a low score
+// means what it says: the pair keeps filling on one side.
+// ---------------------------------------------------------------------------
+class NheWindow {
+public:
+    /// About three hours of blocks.
+    static constexpr BlockHeight kDefaultBlocks = 576;
+    /// Fewer fills than this say nothing about balance.
+    static constexpr std::size_t kMinFills = 6;
+
+    explicit NheWindow(BlockHeight blocks = kDefaultBlocks) noexcept : blocks_(blocks) {}
+
+    /// One fill: + for a buy of the base asset, - for a sale, in base units.
+    void add(BlockHeight block, double signed_size)
+    {
+        fills_.emplace_back(block, signed_size);
+    }
+
+    /// Forget fills older than the window at block `now`.
+    void prune(BlockHeight now)
+    {
+        while (!fills_.empty() && now > fills_.front().first
+               && now - fills_.front().first > blocks_) {
+            fills_.pop_front();
+        }
+    }
+
+    [[nodiscard]] std::size_t fills() const noexcept { return fills_.size(); }
+
+    [[nodiscard]] double net() const noexcept
+    {
+        double sum = 0.0;
+        for (const auto& fill : fills_) sum += fill.second;
+        return sum;
+    }
+
+    [[nodiscard]] double volume() const noexcept
+    {
+        double sum = 0.0;
+        for (const auto& fill : fills_) sum += fill.second < 0.0 ? -fill.second : fill.second;
+        return sum;
+    }
+
+    [[nodiscard]] double nhe() const noexcept
+    {
+        return HedgingManager::compute_nhe(net(), volume());
+    }
+
+private:
+    BlockHeight blocks_;
+    std::deque<std::pair<BlockHeight, double>> fills_;
+};
+
+/// [ALERT-NOISE] Says when a pair's low hedge efficiency is news: once per
+/// episode, from the first window with enough fills below the target; the
+/// episode ends when the window is back at or above it.
+class NheAlertLatch {
+public:
+    [[nodiscard]] bool should_alert(double nhe, std::size_t fills,
+                                    double target = HedgingManager::nhe_target(),
+                                    std::size_t min_fills = NheWindow::kMinFills) noexcept
+    {
+        if (fills < min_fills) return false;
+        if (nhe >= target) {
+            alerted_ = false;
+            return false;
+        }
+        if (alerted_) return false;
+        alerted_ = true;
+        return true;
+    }
+
+private:
+    bool alerted_{false};
 };
 
 }  // namespace xop

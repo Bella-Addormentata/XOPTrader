@@ -4856,9 +4856,8 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // failed restart is retried from poll_loop_coro, not here: this heartbeat
     // runs only once a height has been read.
 
-    // [T3-08] Reset NHE accumulators for this cycle.
-    nhe_net_inventory_change_ = 0.0;
-    nhe_total_volume_         = 0.0;
+    // [T3-08] [ALERT-NOISE] NHE is kept per pair over a rolling window
+    // (nhe_windows_), pruned in Step 10: nothing to reset per cycle.
     // [SEED-FAIL-CLOSED review round 9] This heartbeat's posting pause.
     // [review round 12] It starts from every asset a fill moved that no
     // validated Step 8 read has reconciled since -- whatever a skipped Step 8
@@ -7155,13 +7154,10 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         // Total volume accumulates the absolute fill size.
         // These accumulators are consumed by step_run_hedging (Step 10).
         // ISO/IEC 5055: double conversion to prevent integer overflow.
-        double fill_size_d = static_cast<double>(fill.size);
-        if (fill.side == Side::Bid) {
-            nhe_net_inventory_change_ += fill_size_d;
-        } else {
-            nhe_net_inventory_change_ -= fill_size_d;
-        }
-        nhe_total_volume_ += fill_size_d;
+        // [ALERT-NOISE] Per pair, so base units never mix.
+        const double fill_size_d = static_cast<double>(fill.size);
+        nhe_windows_.try_emplace(fill.pair_name).first->second.add(
+            fill.block_height, fill.side == Side::Bid ? fill_size_d : -fill_size_d);
 
         // [T5-CR3] Notify the strategy that a fill occurred so that the
         // exponential-decay tau resets to tau_max.  Without this call,
@@ -20739,10 +20735,10 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
 }
 
 // Step 10: Run hedging layer (compute skew, NHE).
-// [T3-08] Now calls compute_nhe() with actual fill data from Step 2
-// accumulators (nhe_net_inventory_change_, nhe_total_volume_) and
-// alerts when NHE drops below the 0.70 target.
-void Engine::step_run_hedging([[maybe_unused]] BlockHeight block_height)
+// [T3-08] Computes NHE from the fills Step 2 records, and alerts when it
+// stays below the 0.70 target.  [ALERT-NOISE] Per pair, over a rolling
+// window (nhe_windows_), once per episode (nhe_latches_).
+void Engine::step_run_hedging(BlockHeight block_height)
 {
     // Layer 1: inventory-based skew (already applied in step 7 via
     // LiquidityEngine::apply_inventory_skew).
@@ -20752,27 +20748,30 @@ void Engine::step_run_hedging([[maybe_unused]] BlockHeight block_height)
     // A high NHE (close to 1.0) means fills are balanced (buys ~ sells).
     // A low NHE means the engine is accumulating one-sided inventory.
     // ISO/IEC 5055: uses the actual fill accumulators from Step 2.
-    double nhe = HedgingManager::compute_nhe(
-        nhe_net_inventory_change_, nhe_total_volume_);
+    // [ALERT-NOISE] Per pair, over the window: a block's single fill is
+    // one-sided by nature and used to score 0 -- and page -- on its own.
+    for (auto& [pair_name, window] : nhe_windows_) {
+        window.prune(block_height);
+        if (window.fills() == 0) continue;
+        const double nhe = window.nhe();
+        spdlog::debug("[Engine] Step 10: NHE {} = {:.3f} over {} fill(s) (net {:.0f}, "
+                      "volume {:.0f})",
+                      pair_name, nhe, window.fills(), window.net(), window.volume());
 
-    if (nhe_total_volume_ > 0.0) {
-        spdlog::info("[Engine] Step 10: NHE={:.3f} (net_inv_change={:.0f}, "
-                     "total_vol={:.0f})",
-                     nhe, nhe_net_inventory_change_, nhe_total_volume_);
-
-        // [T3-08] Alert when NHE drops below the 0.70 target.
-        // Low NHE indicates the engine is consistently accumulating
-        // one-sided inventory, which increases adverse selection risk.
-        // ISO/IEC 27001:2022: alert for operational visibility.
-        if (nhe < HedgingManager::nhe_target()) {
-            spdlog::warn("[Engine] Step 10: NHE {:.3f} < target {:.2f} "
-                         "-- one-sided inventory accumulation detected",
-                         nhe, HedgingManager::nhe_target());
-            alerts_->send_alert(AlertRule::ExposureBreach,
-                "Natural Hedge Efficiency " + std::to_string(nhe) +
-                " below target " +
-                std::to_string(HedgingManager::nhe_target()) +
-                " -- review inventory balance");
+        // [T3-08] Alert when NHE stays below the 0.70 target: the pair keeps
+        // filling on one side, which increases adverse selection risk.
+        if (nhe_latches_[pair_name].should_alert(nhe, window.fills())) {
+            spdlog::warn("[Engine] Step 10: NHE {} {:.3f} < target {:.2f} over {} fills "
+                         "-- one-sided flow",
+                         pair_name, nhe, HedgingManager::nhe_target(), window.fills());
+            if (alerts_) {
+                alerts_->send_alert(AlertRule::HedgeImbalance,
+                    fmt::format("Natural Hedge Efficiency {:.2f} on {} over the last {} "
+                                "fills (target {:.2f}) -- one-sided flow: review inventory "
+                                "balance",
+                                nhe, pair_name, window.fills(),
+                                HedgingManager::nhe_target()));
+            }
         }
     }
 
@@ -20823,7 +20822,7 @@ void Engine::step_run_hedging([[maybe_unused]] BlockHeight block_height)
     }
 
     spdlog::debug("[Engine] Step 10: hedging layer complete; {} positions tracked, "
-                  "NHE={:.3f}", positions.size(), nhe);
+                  "NHE kept for {} pair(s)", positions.size(), nhe_windows_.size());
 }
 
 // ---------------------------------------------------------------------------
