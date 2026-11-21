@@ -40,18 +40,20 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A Circuit page** in the sidebar, before Settings, on by default for
   now. Unticking Settings → Advanced → Subsystems → "Show the Circuit DAO
   page (read-only)" hides it at once, and ticking it shows it again. It shows
-  what a market maker trading BYC wants to see of Circuit v1: the XCH price the protocol uses and
-  the oracle's next one, the stability fee and savings rate, how much XCH is
-  locked and BYC borrowed, the liquidation auctions running (price, share of
-  the XCH price, time left), the vaults closest to liquidation and how far
-  XCH would have to fall, bad debt, the treasury and its auctions,
-  governance coins, the oracle's price announcers, every statute, and a red
-  banner if the emergency switch (`BLOCK_ISSUANCE`) is ever set.
+  what a market maker trading BYC wants to see of Circuit v1: the XCH price
+  the protocol uses and the oracle's next one, the stability fee and savings
+  rate, how much XCH is locked and BYC borrowed, the liquidation auctions
+  running (price, share of the XCH price, time left), the vaults closest to
+  liquidation and how far XCH would have to fall, bad debt, the treasury and
+  its auctions, governance coins, the oracle's price announcers, every
+  statute, and a red banner if the emergency switch (`BLOCK_ISSUANCE`) is
+  ever set.
 - It asks Circuit's public API only while the page is open: when it opens
   (unless a whole round started under a minute ago), then every three minutes,
   eight requests a round, 3.2 s apart, on a worker thread. Switched off, it
-  asks nothing; away from the page, it starts no new round. It holds no key,
-  sends no address and signs nothing.
+  asks nothing; away from the page, it starts no new round. Switching it off
+  or closing the app stops a round at once, even in the middle of a request
+  that is slow to answer. It holds no key, sends no address and signs nothing.
 - An answer of an unexpected shape (Circuit v2 is coming) or a read that
   fails leaves a note in its section; the rest of the page still fills.
 

@@ -14,8 +14,8 @@ section empty with a note rather than breaking the page.
 
 On by default, for now; Settings > Advanced > Subsystems switches it off.
 Switched off, the sidebar entry is hidden and nothing is asked. Switched on,
-it reads only while the page is open: when it opens (unless a whole round started under a minute
-ago), then every three minutes, eight requests a round
+it reads only while the page is open: when it opens (unless a whole round
+started under a minute ago), then every three minutes, eight requests a round
 (:mod:`gui.services.circuit.poll`), on a worker thread. Closed, it starts no
 new round. Building the page asks nothing, so the switch works both ways
 without a restart.
@@ -63,6 +63,11 @@ REDRAW_EVERY_MS: Final[int] = 15_000
 STOP_WAIT_MS: Final[int] = 3_000
 
 _log = logging.getLogger(__name__)
+
+#: The page's threads that outlived the close wait, with their workers. Held
+#: only so that Qt never destroys a QThread still running, which aborts the
+#: process; nothing reads this. As permuto's are (gui/services/permuto/live.py).
+_ABANDONED: list[tuple[QThread, QObject | None]] = []
 
 
 class _RoundWorker(QObject):
@@ -367,8 +372,18 @@ class CircuitWidget(QWidget):
     def stop_background_work(self, timeout_ms: int = STOP_WAIT_MS) -> None:
         """App closing: stop the round under way, waiting at most ``timeout_ms``.
 
-        A QThread destroyed while it runs aborts the process (qFatal), so this
-        waits for it, and as a last resort terminates it: it only reads.
+        The page's thread stops at once, even mid-request: the request itself
+        runs on a daemon thread of its own (:func:`poll.interruptible`), left
+        to finish on its own. A QThread destroyed while it runs aborts the
+        process (qFatal), so this waits for it.
+
+        Should it still be running after the wait, it is never terminated:
+        terminate() can land while the thread holds Python's lock, and the
+        close then hangs for ever (permuto's live.py found this). It is
+        detached from the page instead and kept, so that destroying the
+        window does not destroy it. Were it still running when Python itself
+        exits, Qt would abort the process there, after the window, the
+        settings and the engine have all closed.
         """
         self._round_timer.stop()
         self._redraw_timer.stop()
@@ -379,11 +394,30 @@ class CircuitWidget(QWidget):
             return
         thread.quit()
         if not thread.wait(timeout_ms):
-            _log.warning("[Circuit] a read did not stop in %d ms; ending its thread", timeout_ms)
-            thread.terminate()
-            thread.wait(1000)
+            _log.warning(
+                "[Circuit] the page's thread did not stop in %d ms; it is left to end on its own",
+                timeout_ms,
+            )
+            self._abandon(thread, self._worker)
         self._thread = None
         self._worker = None
+
+    def _abandon(self, thread: QThread, worker: _RoundWorker | None) -> None:
+        """Leave a thread that would not stop to end on its own, apart from the page."""
+        links: list[tuple[Any, Any]] = [(thread.finished, self._on_thread_finished)]
+        if worker is not None:
+            links += [(worker.result, self._on_result), (worker.done, self._on_done)]
+        for signal, slot in links:  # nothing it does later reaches the page
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):  # already gone
+                pass
+        thread.setParent(None)  # a child would die with the page, running
+        _ABANDONED.append((thread, worker))
+        # A later round has its own stop flag and client: clearing the old
+        # flag would set the abandoned round going again.
+        self._stop = threading.Event()
+        self._api = None
 
     def showEvent(self, event: Any) -> None:  # noqa: N802 -- Qt's name
         super().showEvent(event)

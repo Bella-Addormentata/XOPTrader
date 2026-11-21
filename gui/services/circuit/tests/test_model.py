@@ -87,6 +87,30 @@ def test_an_answer_without_the_emergency_switch_leaves_it_unknown(answers) -> No
     assert protocol.emergency is None, "not known, so neither on nor off"
 
 
+@pytest.mark.parametrize(
+    "value",
+    # Not one of them says whether the switch is on: the string "0" would read
+    # as on, false as off, NaN and Infinity as on.
+    ["0", "1", False, True, float("nan"), float("inf"), 10**400, [0], {"value": 0}],
+    ids=["text 0", "text 1", "false", "true", "NaN", "Infinity", "huge", "a list", "an object"],
+)
+def test_an_emergency_switch_that_is_not_a_number_is_a_note_not_a_state(answers, value) -> None:
+    answers["statutes"]["implemented_statutes"]["BLOCK_ISSUANCE"] = value
+    view = model.build_view(answers, now=NOW)
+    assert view.protocol is None, "neither on nor off is shown"
+    assert view.problems["statutes"].startswith("the answer has an unexpected shape")
+
+
+def test_the_emergency_switch_keeps_the_value_it_was_given(answers) -> None:
+    answers["statutes"]["implemented_statutes"]["BLOCK_ISSUANCE"] = 0.0
+    protocol = model.build_view(answers, now=NOW).protocol
+    assert protocol.block_issuance == 0 and protocol.emergency is False
+    answers["statutes"]["implemented_statutes"]["BLOCK_ISSUANCE"] = 2
+    protocol = model.build_view(answers, now=NOW).protocol
+    assert protocol.block_issuance == 2 and type(protocol.block_issuance) is int
+    assert protocol.emergency is True
+
+
 def test_a_fee_too_large_for_a_float_is_no_rate_and_the_rest_still_shows(answers) -> None:
     answers["statutes"]["implemented_statutes"]["STABILITY_FEE_DF"] = 10**12
     view = model.build_view(answers, now=NOW)
@@ -332,6 +356,63 @@ def test_an_answer_of_another_shape_is_a_note_not_a_crash(answers, read, answer)
     # The other sections are untouched.
     others = set(view.problems) - {read}
     assert not others
+
+
+#: The vault flags, read in turn until one is true.
+VAULT_FLAGS = (
+    "in_bad_debt",
+    "in_liquidation",
+    "is_biddable",
+    "is_restartable",
+    "is_startable",
+    "is_liquidatable",
+    "nearing_liquidation",
+    "seized",
+)
+
+
+@pytest.mark.parametrize(
+    "value", [1, 0, "true", "false", [True]], ids=["1", "0", "text true", "text false", "a list"]
+)
+@pytest.mark.parametrize(
+    ("read", "key"),
+    [
+        ("vaults", "in_bad_debt"),
+        ("vaults", "is_liquidatable"),
+        ("vaults", "nearing_liquidation"),
+        ("treasury", "can_start_surplus_auction"),
+        ("recharge_auctions", "can_be_settled"),
+        ("bills", "spent"),
+        ("announcers", "valid"),
+    ],
+)
+def test_a_yes_or_no_that_is_neither_is_a_note_not_a_no(answers, read, key, value) -> None:
+    answer = answers[read]
+    if read == "vaults":  # one with every flag false, so that each of them is read
+        item = next(vault for vault in answer if not any(vault[flag] for flag in VAULT_FLAGS))
+    else:
+        item = answer if isinstance(answer, dict) else answer[0]
+    assert isinstance(item[key], bool), "the live answer's own field"
+    item[key] = value
+    view = model.build_view(answers, now=NOW)
+    assert view.problems[read].startswith("the answer has an unexpected shape")
+
+
+def test_a_yes_or_no_left_out_is_a_no(answers) -> None:
+    before = len(model.build_view(answers, now=NOW).vaults.bad_debt)
+    vault = next(vault for vault in answers["vaults"] if vault["in_bad_debt"])
+    del vault["in_bad_debt"]
+    view = model.build_view(answers, now=NOW)
+    assert view.problems == {}
+    assert len(view.vaults.bad_debt) == before - 1
+
+
+@pytest.mark.parametrize("status", [None, 5, ["ok"]], ids=["null", "a number", "a list"])
+def test_a_status_that_is_not_text_is_a_note(answers, status) -> None:
+    answers["statutes"]["status"] = status
+    view = model.build_view(answers, now=NOW)
+    assert view.protocol is None
+    assert view.problems["statutes"].startswith("the answer has an unexpected shape")
 
 
 # -- formatting ---------------------------------------------------------------------

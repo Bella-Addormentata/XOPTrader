@@ -156,7 +156,14 @@ def _optional_time(value: Any) -> float | None:
 
 
 def _flag(value: Any) -> bool:
-    return value is True
+    """A yes or no: true, false, or left out (no).
+
+    Anything else (1, "true") is an answer of an unexpected shape, not a no:
+    read as no, a vault in bad debt or open to liquidation would look sound.
+    """
+    if value is None or isinstance(value, bool):
+        return value is True
+    raise TypeError(f"expected true or false, got {value!r}")
 
 
 # -- the sections -------------------------------------------------------------
@@ -239,13 +246,20 @@ def protocol_from(answer: Any) -> Protocol:
         order.sort()
     else:
         order = [(i, str(name), value) for i, (name, value) in enumerate(statutes.items())]
+    block_issuance = statutes.get(BLOCK_ISSUANCE)
+    # Checked, but kept as given, so the page shows 0 or 1, not 0.0 or 1.0.
+    # A string "0", false, NaN or a number no float holds is no state at all.
+    _optional_number(block_issuance)
     penalty = _optional_number(statutes.get("VAULT_LIQUIDATION_PENALTY_BPS"))
     usage = _optional_number(answer.get("current_collateral_usage"))
     cap = _optional_number(answer.get("max_collateral_cap"))
     counter = answer.get("price_update_counter")
+    status = answer.get("status", "")
+    if not isinstance(status, str):  # "ok", or what is wrong: always text
+        raise TypeError(f"expected the status as text, got {status!r}")
     return Protocol(
-        status=str(answer.get("status", "")),
-        block_issuance=statutes.get(BLOCK_ISSUANCE),
+        status=status,
+        block_issuance=block_issuance,
         stability_fee_apy=apy_from_df(statutes.get("STABILITY_FEE_DF")),
         savings_apy=apy_from_df(statutes.get("INTEREST_DF")),
         liquidation_ratio_pct=_optional_number(statutes.get("VAULT_LIQUIDATION_RATIO_PCT")),

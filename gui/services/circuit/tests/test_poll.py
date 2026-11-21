@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.server
 import json
 import threading
+import time
 from typing import Any
 
 import pytest
@@ -95,6 +96,62 @@ def test_the_page_s_client_stops_waiting_the_moment_it_is_told() -> None:
         client.post("/statutes")
     assert len(transport.calls) == 1
     assert transport.calls[0][3]["User-Agent"] == poll.PAGE_USER_AGENT
+
+
+def test_a_request_on_a_thread_of_its_own_hands_back_its_answer_or_its_failure() -> None:
+    stop = threading.Event()
+    transport = Transport({"/oracle": (200, {"price": 1}), "/treasury": TimeoutError("timed out")})
+    client = CircuitApi(
+        "https://api.example.test",
+        min_interval_s=0,
+        transport=poll.interruptible(transport, stop),
+    )
+    assert client.post("/oracle") == {"price": 1}
+    with pytest.raises(CircuitApiError, match=r"no answer \(TimeoutError: timed out\)"):
+        client.post("/treasury")
+    stop.set()
+    with pytest.raises(poll.Stopped):  # once stopped, nothing more is sent
+        client.post("/oracle")
+    assert [call[1] for call in transport.calls] == ["/oracle", "/treasury"]
+
+
+def test_a_request_under_way_is_left_behind_the_moment_the_page_is_told_to_stop() -> None:
+    stop, entered, gate = threading.Event(), threading.Event(), threading.Event()
+    asked_on: list[threading.Thread] = []
+
+    def stuck(method, url, body, headers, timeout_s):
+        asked_on.append(threading.current_thread())
+        entered.set()
+        gate.wait(10)  # far longer than the page waits on closing
+        return 200, {}, b"{}"
+
+    client = poll.page_client(stop, transport=stuck)
+    results: list[poll.Result] = []
+    stopped: list[poll.Stopped] = []
+
+    def a_round() -> None:
+        try:
+            poll.fetch(client, on_result=results.append, should_stop=stop.is_set)
+        except poll.Stopped as exc:
+            stopped.append(exc)
+
+    caller = threading.Thread(target=a_round)
+    caller.start()
+    try:
+        assert entered.wait(5), "the round never asked"
+        told = time.monotonic()
+        stop.set()
+        caller.join(2)
+        assert not caller.is_alive(), "the round waited on the request"
+        assert time.monotonic() - told < 1
+        # Stopped passes the client's "no answer" handling: the read did not fail.
+        assert stopped and results == []
+        # The request carries on alone, on a daemon thread: it keeps no one waiting.
+        (request,) = asked_on
+        assert request is not caller and request.daemon and request.is_alive()
+    finally:
+        gate.set()
+        caller.join(5)
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):

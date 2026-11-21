@@ -462,55 +462,184 @@ def test_closing_the_app_joins_the_round(app) -> None:
 
 
 #: A page whose first read never answers in time, closed as the app closes it.
-_STUCK_ROUND = """
-import os, sys, threading
+def test_switching_off_mid_request_ends_the_round_at_once(app) -> None:
+    from gui.widgets.circuit import CircuitWidget
+
+    entered, gate = threading.Event(), threading.Event()
+    server = FixtureServer()
+
+    def transport(method, url, body, headers, timeout_s):
+        entered.set()
+        gate.wait(10)
+        return server(method, url, body, headers, timeout_s)
+
+    # The page's own client: each request runs on a daemon thread of its own.
+    page = CircuitWidget(
+        client_factory=lambda stop: poll.page_client(stop, transport=transport), wall=Clock()
+    )
+    try:
+        page.set_enabled(True)
+        page.show()
+        assert entered.wait(5), "the round never asked"
+        told = time.monotonic()
+        page.set_enabled(False)
+        _wait_until(app, lambda: not page.fetching())
+        assert time.monotonic() - told < 1, "the round waited on the request"
+        assert page._errors == {} and page._answers == {}, "a dropped request is no failed read"
+    finally:
+        gate.set()
+        _close(page, app)
+
+
+class _Deaf:
+    """A client whose reads do not hear the page's stop: only the gate ends them."""
+
+    def __init__(self, entered: threading.Event, gate: threading.Event) -> None:
+        self.entered, self.gate = entered, gate
+        self.asked: list[str] = []
+
+    def get(self, path: str) -> Any:
+        self.asked.append(path)
+        self.entered.set()
+        self.gate.wait(10)
+        return {}
+
+    def post(self, path: str, body: Any = None) -> Any:
+        return self.get(path)
+
+
+def test_a_thread_that_outlasts_the_close_wait_is_left_to_end_not_killed(app, monkeypatch) -> None:
+    import shiboken6
+    from PySide6.QtCore import QThread
+
+    from gui.widgets import circuit as circuit_mod
+
+    killed: list[Any] = []
+    # terminate() can land while the thread holds Python's lock and hang the close.
+    monkeypatch.setattr(QThread, "terminate", lambda self: killed.append(self))
+    entered, gate = threading.Event(), threading.Event()
+    clients: list[_Deaf] = []
+
+    def factory(stop: threading.Event) -> _Deaf:
+        clients.append(_Deaf(entered, gate))
+        return clients[-1]
+
+    page = circuit_mod.CircuitWidget(client_factory=factory, wall=Clock())
+    thread = None
+    try:
+        page.set_enabled(True)
+        page.show()
+        assert entered.wait(5), "the round never asked"
+        thread = page._thread
+        page.stop_background_work(timeout_ms=100)
+        assert not killed, "a thread running Python was terminated"
+        assert not page.fetching()
+        assert thread.isRunning(), "it is left to end on its own"
+        assert thread.parent() is None, "as the page's child it would be destroyed running"
+        assert any(kept is thread for kept, _worker in circuit_mod._ABANDONED)
+
+        gate.set()
+        assert thread.wait(5000), "it ends once its read does"
+        app.processEvents()
+        assert clients[0].asked == ["/oracle"], "it stopped after the read it was in"
+        assert page._answers == {} and page._errors == {}, "nothing it did later reached the page"
+
+        # A later round has a client and a stop flag of its own.
+        assert page.refresh()
+        _wait_until(app, lambda: not page.fetching())
+        assert len(clients) == 2 and len(clients[1].asked) == 8
+        assert clients[0].asked == ["/oracle"], "the abandoned round did not start again"
+    finally:
+        gate.set()
+        if thread is not None and shiboken6.isValid(thread):
+            thread.wait(5000)
+        kept = circuit_mod._ABANDONED
+        kept[:] = [pair for pair in kept if pair[0] is not thread]
+        _close(page, app)
+
+
+_CLOSING = """
+import os, sys, threading, time
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 import shiboken6
 from PySide6.QtWidgets import QApplication
-from gui.services.circuit.api import CircuitApi
-from gui.widgets.circuit import CircuitWidget
+from gui.services.circuit import poll
+from gui.widgets import circuit
 
 app = QApplication(sys.argv)
-entered = threading.Event()
+entered, gate = threading.Event(), threading.Event()
 
-def transport(method, url, body, headers, timeout_s):
+def stuck(method, url, body, headers, timeout_s):
     entered.set()
-    threading.Event().wait(30)  # far past the page's wait
+    gate.wait(30)  # far past the page's wait
     raise TimeoutError("no answer")
 
-page = CircuitWidget(client_factory=lambda stop: CircuitApi(
-    "https://api.example.test", min_interval_s=0, transport=transport))
+class Deaf:
+    def get(self, path):
+        entered.set()
+        gate.wait(30)
+        return {}
+
+    def post(self, path, body=None):
+        return self.get(path)
+
+if sys.argv[1] == "stuck request":  # the page's own client
+    factory = lambda stop: poll.page_client(stop, transport=stuck)
+else:  # a client that does not hear the stop: the page's thread itself is held
+    factory = lambda stop: Deaf()
+page = circuit.CircuitWidget(client_factory=factory)
 page.set_enabled(True)
 page.show()
 if not entered.wait(5):
     sys.exit("the round never asked")
-page.stop_background_work(timeout_ms=200)
+told = time.monotonic()
+page.stop_background_work(timeout_ms=1000)
+print(f"stopped in {time.monotonic() - told:.2f} s", flush=True)
 if page.fetching():
     sys.exit("the round still counts as running")
-# As the app's exit does when its window goes: the page, and its thread with
-# it, destroyed at once. A thread still running here aborts the process.
+# As the app's exit does when its window goes: the page destroyed at once, with
+# its children. A QThread destroyed while it runs aborts the process.
 shiboken6.delete(page)
 print("closed", flush=True)
+if sys.argv[1] == "deaf client":
+    gate.set()  # its read ends, and the thread left running ends on its own
+    for thread, _worker in circuit._ABANDONED:
+        if not thread.wait(5000):
+            sys.exit("the thread left running did not end")
+    print("ended", flush=True)
 """
 
 
-def test_closing_the_app_ends_a_read_stuck_past_the_wait_and_still_exits() -> None:
+def _close_in_a_child(case: str) -> tuple[subprocess.CompletedProcess, float]:
     # In a child process: a QThread destroyed while it runs aborts the whole
     # process (qFatal), which would take this test run with it.
     started = time.monotonic()
     ran = subprocess.run(  # noqa: S603 -- this interpreter, our own code, no shell
-        [sys.executable, "-c", _STUCK_ROUND],
+        [sys.executable, "-c", _CLOSING, case],
         cwd=REPO,
         capture_output=True,
         text=True,
         timeout=60,
         check=False,
     )
-    took = time.monotonic() - started
+    return ran, time.monotonic() - started
+
+
+def test_closing_the_app_mid_request_stops_at_once_and_exits_cleanly() -> None:
+    ran, took = _close_in_a_child("stuck request")
     assert ran.returncode == 0, ran.stderr
     assert "closed" in ran.stdout
-    assert "did not stop in 200 ms; ending its thread" in ran.stderr
-    assert took < 20, f"exiting waited on the stuck read ({took:.1f} s)"
+    stopped = float(ran.stdout.split("stopped in ", 1)[1].split(" s", 1)[0])
+    assert stopped < 0.9, f"closing waited on the stuck request ({stopped} s)"
+    assert "did not stop" not in ran.stderr
+    assert took < 20, f"exiting waited on the stuck request ({took:.1f} s)"
+
+
+def test_closing_the_app_leaves_a_thread_that_will_not_stop_to_end_on_its_own() -> None:
+    ran, _took = _close_in_a_child("deaf client")
+    assert ran.returncode == 0, ran.stderr
+    assert "closed" in ran.stdout and "ended" in ran.stdout
+    assert "did not stop in 1000 ms; it is left to end on its own" in ran.stderr
 
 
 # -- the switch ----------------------------------------------------------------------

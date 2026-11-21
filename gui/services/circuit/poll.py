@@ -6,6 +6,10 @@ worker thread, about every three minutes while it is open. With the client's
 under three requests a minute while it is showing and none while it is not.
 The bodies are the probe's (:data:`gui.services.circuit.api.READS`), checked
 against the live server on 2026-11-21.
+
+Each request runs on a daemon thread of its own (:func:`interruptible`), so
+the page's worker thread stops as soon as it is told to, even in the middle of
+a request that is slow to answer.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from gui.services.circuit.api import (
     CircuitApi,
     CircuitApiError,
     Read,
+    Transport,
 )
 
 #: The page's reads, most useful first: the price, the settings, the vaults
@@ -43,10 +48,17 @@ PAGE_READS: tuple[Read, ...] = tuple(
 PAGE_USER_AGENT = "XOPTrader-circuit-page/1"
 #: Seconds to wait for one answer.
 PAGE_TIMEOUT_S = 20.0
+#: How often a request's caller looks at the stop flag while it waits.
+STOP_POLL_S = 0.1
 
 
-class Stopped(Exception):  # noqa: N818 -- an outcome, not an error
-    """The page was closed or switched off while a round was running."""
+class Stopped(BaseException):  # noqa: N818 -- an outcome, not an error
+    """The page was closed or switched off while a round was running.
+
+    A ``BaseException``, as ``KeyboardInterrupt`` is, so that the client's
+    "any transport failure is no answer" (``except Exception``) lets it
+    through: a request stopped is not a read that failed.
+    """
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,8 +92,47 @@ def requests_transport(
     return response.status_code, dict(response.headers), response.content
 
 
+def interruptible(transport: Transport, stop: threading.Event) -> Transport:
+    """``transport`` with each request on a daemon thread of its own.
+
+    The caller waits for the answer or for ``stop``, whichever comes first.
+    Once ``stop`` is set it raises :class:`Stopped` within :data:`STOP_POLL_S`
+    and leaves the request to finish, or time out, on its own thread, whose
+    answer is dropped. That thread touches nothing of Qt's and does not keep
+    the app from exiting, so closing the app never waits on a slow read, nor
+    has to kill the thread that asked for it.
+    """
+
+    def call(
+        method: str, url: str, body: bytes | None, headers: dict[str, str], timeout_s: float
+    ) -> tuple[int, dict[str, str], bytes]:
+        if stop.is_set():
+            raise Stopped()
+        finished = threading.Event()
+        outcome: list[tuple[bool, Any]] = []
+
+        def run() -> None:
+            try:
+                outcome.append((True, transport(method, url, body, headers, timeout_s)))
+            except BaseException as exc:  # noqa: BLE001 -- handed back to the caller
+                outcome.append((False, exc))
+            finally:
+                finished.set()
+
+        threading.Thread(target=run, name="circuit-page-request", daemon=True).start()
+        while not finished.wait(STOP_POLL_S):
+            if stop.is_set():
+                raise Stopped()
+        answered, value = outcome[0]
+        if not answered:
+            raise value
+        return value
+
+    return call
+
+
 def page_client(stop: threading.Event, *, transport: Any = None) -> CircuitApi:
-    """The page's client: its waits between requests end as soon as ``stop`` is set."""
+    """The page's client: its waits, and a request under way, end once ``stop`` is set."""
 
     def sleep(seconds: float) -> None:
         if stop.wait(seconds):
@@ -90,7 +141,7 @@ def page_client(stop: threading.Event, *, transport: Any = None) -> CircuitApi:
     return CircuitApi(
         DEFAULT_BASE_URL,
         timeout_s=PAGE_TIMEOUT_S,
-        transport=transport or requests_transport,
+        transport=interruptible(transport or requests_transport, stop),
         sleep=sleep,
         user_agent=PAGE_USER_AGENT,
     )
@@ -107,8 +158,8 @@ def fetch(
     """Make each read in turn and report each outcome; returns how many answered.
 
     A read that fails is reported and the round goes on. :class:`Stopped`
-    from the client's wait passes through, as does ``should_stop`` turning
-    true between two reads (the round just ends).
+    from the client (its wait, or a request under way) passes through, and
+    ``should_stop`` turning true between two reads just ends the round.
     """
     answered = 0
     for read in reads:
