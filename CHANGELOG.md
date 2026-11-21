@@ -10,7 +10,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Circuit DAO: a read-only server check (#225)
 
 - **`python -m gui.services.circuit probe`** asks Circuit's public API
-  (api.circuitdao.com) one read-only question per endpoint, 16 in about a
+  (api.circuitdao.com) one read-only question per endpoint, 15 in about a
   minute, and saves every answer in a `circuit_probe_<UTC time>/` folder, so
   the planned Circuit page is built against the server's real answers. It
   sends no key and no address, signs nothing, and stays under the API's 20

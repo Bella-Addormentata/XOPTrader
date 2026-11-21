@@ -162,7 +162,9 @@ READS: tuple[Read, ...] = (
     Read("surplus_auctions", "POST", "/surplus_auctions", {}),
     Read("recharge_auctions", "POST", "/recharge_auctions", {}),
     Read("vaults", "POST", "/vaults", {}),
-    Read("savings_list", "POST", "/savings/list", {}),
+    # Not /savings/list: it works on one wallet's deposit and withdrawal
+    # (asked with {}, the server answered 422 for missing "amount" and
+    # "treasury_withdraw_amount" on 2026-11-21), so it is no protocol read.
     Read("bills", "POST", "/bills", {"synthetic_pks": [], "include_spent_coins": False}),
     Read("announcers", "POST", "/announcers", {"approved": True, "include_spent_coins": False}),
     Read("registry", "POST", "/registry", {}),
