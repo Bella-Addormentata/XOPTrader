@@ -20,6 +20,7 @@
 using xop::DrawdownAlertLatch;
 using xop::NheAlertLatch;
 using xop::NheWindow;
+using xop::prune_and_rearm;
 
 namespace {
 
@@ -138,6 +139,41 @@ TEST(NheWindow, ARestartReadsTheLastWindowBackFromTheTradeLog)
     std::filesystem::remove(path, ec);
     std::filesystem::remove(path.string() + "-wal", ec);
     std::filesystem::remove(path.string() + "-shm", ec);
+}
+
+TEST(NheWindow, FillsAboveThePruneHeightAreKeptButNotCounted)
+{
+    // [review #251] Read back from trade_log while the node is still behind
+    // the heights it had journalled before the restart.
+    NheWindow window(100);
+    window.add(40, 5.0);
+    window.add(60, 3.0);
+    window.prune(50);
+    EXPECT_EQ(window.fills(), 1U) << "the fill from block 60 is not reached yet";
+    EXPECT_DOUBLE_EQ(window.net(), 5.0);
+    EXPECT_DOUBLE_EQ(window.volume(), 5.0);
+    window.prune(60);
+    EXPECT_EQ(window.fills(), 2U);
+    EXPECT_DOUBLE_EQ(window.net(), 8.0);
+}
+
+TEST(NheAlertLatch, AnOldRunExpiringAsANewOneStartsDoesNotHideIt)
+{
+    // [review #251] Six fills at block 1000 first alert at 1100, after a
+    // restart. At 1577 they expire just as six new ones arrive: pruned before
+    // the new fills go in, the window shows empty and the latch re-arms.
+    NheWindow window;
+    NheAlertLatch latch;
+    for (int i = 0; i < 6; ++i) window.add(1000, 1.0);
+    prune_and_rearm(window, latch, 1100);
+    EXPECT_TRUE(latch.should_alert(window.nhe(), window.fills(), 1100));
+
+    prune_and_rearm(window, latch, 1577);  // before Step 2 adds
+    EXPECT_EQ(window.fills(), 0U);
+    for (int i = 0; i < 6; ++i) window.add(1577, 1.0);
+    prune_and_rearm(window, latch, 1577);  // Step 10
+    EXPECT_TRUE(latch.should_alert(window.nhe(), window.fills(), 1577))
+        << "not held back to 1677 by the old run's reminder";
 }
 
 TEST(NheAlertLatch, RecoveryRearmsEvenWithFewFills)

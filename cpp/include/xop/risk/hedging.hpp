@@ -327,8 +327,13 @@ public:
     /// Forget fills older than the window at block `now`.  [review #251]
     /// Wherever they sit: fills are not recorded in height order (offers
     /// come in map order, and a delayed proof settles an older fill late).
+    /// [review #251] A fill above `now` -- read back from trade_log while
+    /// the node is still catching up after a restart -- is kept but not
+    /// counted until a prune reaches its height.
     void prune(BlockHeight now)
     {
+        now_    = now;
+        pruned_ = true;
         fills_.erase(std::remove_if(fills_.begin(), fills_.end(),
                                     [&](const std::pair<BlockHeight, double>& fill) {
                                         return now > fill.first && now - fill.first > blocks_;
@@ -336,19 +341,30 @@ public:
                      fills_.end());
     }
 
-    [[nodiscard]] std::size_t fills() const noexcept { return fills_.size(); }
+    /// The fills counted: all of them before the first prune, then those at
+    /// or below the height of the last one.
+    [[nodiscard]] std::size_t fills() const noexcept
+    {
+        std::size_t n = 0;
+        for (const auto& fill : fills_) n += counts(fill) ? 1 : 0;
+        return n;
+    }
 
     [[nodiscard]] double net() const noexcept
     {
         double sum = 0.0;
-        for (const auto& fill : fills_) sum += fill.second;
+        for (const auto& fill : fills_) {
+            if (counts(fill)) sum += fill.second;
+        }
         return sum;
     }
 
     [[nodiscard]] double volume() const noexcept
     {
         double sum = 0.0;
-        for (const auto& fill : fills_) sum += fill.second < 0.0 ? -fill.second : fill.second;
+        for (const auto& fill : fills_) {
+            if (counts(fill)) sum += fill.second < 0.0 ? -fill.second : fill.second;
+        }
         return sum;
     }
 
@@ -358,7 +374,14 @@ public:
     }
 
 private:
+    [[nodiscard]] bool counts(const std::pair<BlockHeight, double>& fill) const noexcept
+    {
+        return !pruned_ || fill.first <= now_;
+    }
+
     BlockHeight blocks_;
+    BlockHeight now_{0};
+    bool        pruned_{false};
     std::deque<std::pair<BlockHeight, double>> fills_;
 };
 
@@ -401,6 +424,16 @@ private:
     bool        alerted_{false};
     BlockHeight alerted_at_{0};
 };
+
+/// [review #251] Prunes `window` at `now`, and re-arms `latch` when nothing
+/// counted is left: the run it alerted on is over. Run before Step 2 adds a
+/// heartbeat's fills too, or an old run that expires in the heartbeat a new
+/// one starts would hide the new one behind the old one's latch.
+inline void prune_and_rearm(NheWindow& window, NheAlertLatch& latch, BlockHeight now)
+{
+    window.prune(now);
+    if (window.fills() == 0) latch.reset();
+}
 
 }  // namespace xop
 

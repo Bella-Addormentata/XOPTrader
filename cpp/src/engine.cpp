@@ -6459,8 +6459,9 @@ void Engine::buffer_terminal_offer(const std::string& offer_id,
 asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
 {
     // [review #251] First, before this heartbeat journals any fill: a
-    // restarted engine reads its NHE windows back from trade_log.
-    seed_nhe_windows(block_height);
+    // restarted engine reads its NHE windows back from trade_log, and every
+    // window drops what has expired before this heartbeat's fills go in.
+    refresh_nhe_windows(block_height);
 
     // [T1-03] co_await the fill-detection coroutine directly.
     // [WALLET-LOAD 2026-08-04] Passes the block height for the fill-poll
@@ -20769,6 +20770,14 @@ void Engine::seed_nhe_windows(BlockHeight block_height)
     }
 }
 
+void Engine::refresh_nhe_windows(BlockHeight block_height)
+{
+    seed_nhe_windows(block_height);
+    for (auto& [pair_name, window] : nhe_windows_) {
+        prune_and_rearm(window, nhe_latches_[pair_name], block_height);
+    }
+}
+
 // Step 10: Run hedging layer (compute skew, NHE).
 // [T3-08] Computes NHE from the fills Step 2 records, and alerts when it
 // stays below the 0.70 target.  [ALERT-NOISE] Per pair, over a rolling
@@ -20785,6 +20794,10 @@ void Engine::step_run_hedging(BlockHeight block_height)
     // ISO/IEC 5055: uses the actual fill accumulators from Step 2.
     // [ALERT-NOISE] Per pair, over the window: a block's single fill is
     // one-sided by nature and used to score 0 -- and page -- on its own.
+    // [review #251] Read back here too: the wallet gate can skip Step 2,
+    // and a restart into a wallet outage must still judge the windows the
+    // trade log holds. Once per pair, so nothing counts twice.
+    seed_nhe_windows(block_height);
     // [review #251] A save that switched Telegram on, or to another chat,
     // re-arms every latch: what they passed was never delivered there.
     if (alerts_) {
@@ -20795,12 +20808,9 @@ void Engine::step_run_hedging(BlockHeight block_height)
         }
     }
     for (auto& [pair_name, window] : nhe_windows_) {
-        window.prune(block_height);
-        if (window.fills() == 0) {
-            // [review #251] Quiet: whatever was latched is over.
-            nhe_latches_[pair_name].reset();
-            continue;
-        }
+        // [review #251] Quiet: whatever was latched is over.
+        prune_and_rearm(window, nhe_latches_[pair_name], block_height);
+        if (window.fills() == 0) continue;
         const double nhe = window.nhe();
         spdlog::debug("[Engine] Step 10: NHE {} = {:.3f} over {} fill(s) (net {:.0f}, "
                       "volume {:.0f})",

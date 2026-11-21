@@ -881,6 +881,11 @@ private:
     /// from trade_log, once, before Step 2 feeds that pair anything.
     void seed_nhe_windows(BlockHeight block_height);
 
+    /// [review #251] seed_nhe_windows, then every window pruned at
+    /// `block_height` and the latch of each emptied one re-armed: before
+    /// Step 2 adds this heartbeat's fills.
+    void refresh_nhe_windows(BlockHeight block_height);
+
     /// Step 11: Mark-to-market inventory, attribute spread/inventory/fee
     /// PnL, and persist a snapshot to the Database.
     void step_update_pnl(BlockHeight block_height);
