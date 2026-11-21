@@ -14,18 +14,19 @@ their network fee with XCH from the options address, although the engine
 had told the wallet to leave those coins alone. The Chia wallet picks a CAT
 spend's XCH fee coin itself and ignores the exclusions there. Each time the
 coin went back to the trading funds and the book topped up again. While the
-options fence holds XCH, the engine now sends a cancel of an offer that
-offers no XCH, a bulk cancel and a CAT coin split without a fee, so the
-wallet picks no fee coin; the fee actually sent is what the engine books.
-Cancels of offers of XCH keep their fee, which comes from the offer's own
-coin.
+options fence is up, the engine now sends a cancel of an offer that offers
+no XCH, a bulk cancel and a CAT coin split without a fee, so the wallet
+picks no fee coin; the fee actually sent is what the engine books. Cancels
+of offers of XCH keep their fee, which comes from the offer's own coin.
 
 ### The fence stays up across a restart (#250)
 
 Closing the app with the options book on, or a Settings save that restarts
 it, no longer lowers the engine's fence flag in between. The engine a
 restart brings up is fenced from its first moment: on v0.10.55 it had
-cancelled offers before the new app raised the flag again.
+cancelled offers before the new app raised the flag again. A flag kept up
+for a restart that does not come, or after options are switched off, still
+comes down once the book has nothing open.
 
 ### Calls and puts by default (#250)
 

@@ -255,8 +255,10 @@ TEST(CoinFenceWiring, NoWalletPickedFeeCoinWhileTheFenceHoldsXch)
     for (const char* name : {"cancel_offer", "cancel_offers", "split_coins"}) {
         EXPECT_NE(member(src, name).find("kFeeUsedKey"), std::string::npos) << name;
     }
-    EXPECT_NE(member(src, "cancel_offers").find("fence_holds_xch("), std::string::npos);
-    EXPECT_NE(member(src, "split_coins").find("fence_holds_xch("), std::string::npos);
+    EXPECT_NE(member(src, "cancel_offers").find("fence_up()"), std::string::npos);
+    EXPECT_NE(member(src, "split_coins").find("fence_up()"), std::string::npos);
+    EXPECT_NE(member(src, "fence_safe_cancel_fee").find("fence_up()"), std::string::npos)
+        << "whenever the fence is up: holding XCH can change before the wallet chooses";
     EXPECT_NE(member(src, "fence_safe_cancel_fee").find("trade_record_offers_xch("),
               std::string::npos);
 }

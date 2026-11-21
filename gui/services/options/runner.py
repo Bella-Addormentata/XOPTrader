@@ -138,6 +138,27 @@ class Snapshot:
 # -- config ----------------------------------------------------------------------
 
 
+def _options_as_if_on(config_path: Path) -> config.OptionsConfig | None:
+    """[review] config.yaml's options read as if they were switched on, or None.
+
+    For the fence flag alone: a book switched off since a flag went up still
+    names the record and the fence mode that decide whether it comes down.
+    """
+    from gui.services.config_split import load_merged
+
+    try:
+        root = load_merged(Path(config_path))
+        section = root.get("options") if isinstance(root, dict) else None
+        if not isinstance(section, dict):
+            return None
+        parsed = config.parse({**root, "options": {**section, "enabled": True}})
+        if parsed is None:
+            return None
+        return config.resolve_database_path(parsed, config_path)
+    except Exception:  # noqa: BLE001 - no settings to follow: the flag stays as it is
+        return None
+
+
 def load_options(config_path: Path) -> config.OptionsConfig:
     """The ``options:`` section of config.yaml with secrets.yaml over it, or RunnerError."""
     from gui.services.config_split import load_merged
@@ -678,16 +699,43 @@ class OptionsRunner:
 
         Up while a run is on or the record has a contract open or a transaction
         unsettled; down otherwise. Only with ``engine_fence: auto``. Never
-        raises: options not set up leave the flag as it is.
+        raises: options that cannot be read at all leave the flag as it is.
+
+        [review] With options switched off, or the fence no longer following
+        the book, a flag this app left up (for a restart, say) still follows
+        the book it was raised for: the settings the last run had, or
+        config.yaml's read as if the book were on.
         """
-        try:
-            cfg = load_options(self._config_path)
-        except RunnerError:
-            return
-        if not cfg.wallet.fence_follows_book:
+        cfg = self._fence_settings()
+        if cfg is None:
             return
         with self._fence_lock:
+            self._keep_fence = False
             self._sync_fence_locked(cfg)
+
+    def settle_fence(self) -> None:
+        """[review] A restart that is not to happen: the flag follows the book again.
+
+        ``stop(keep_fence=True)`` left the flag up for a run that does not
+        come (its settings refused, or switched off meanwhile).
+        """
+        self.sync_fence()
+
+    def _fence_settings(self) -> config.OptionsConfig | None:
+        """The settings the flag answers to: config.yaml's, or the book's it was raised for."""
+        try:
+            cfg: config.OptionsConfig | None = load_options(self._config_path)
+        except RunnerError:
+            cfg = None
+        if cfg is not None and cfg.wallet.fence_follows_book:
+            return cfg
+        last = self._last_loaded
+        if last is not None and last.wallet.fence_follows_book:
+            return last
+        lenient = _options_as_if_on(self._config_path)
+        if lenient is not None and lenient.wallet.fence_follows_book:
+            return lenient
+        return None
 
     def _sync_fence_locked(self, cfg: config.OptionsConfig) -> None:
         """Caller holds ``_fence_lock``. An unreadable record keeps the flag up.

@@ -1192,15 +1192,12 @@ ChiaWalletRPC::cancel_offers(std::uint64_t batch_fee, bool secure)
     // was never cancelled), and its paging loop breaks on the first batch
     // that matched nothing (so the scan stopped early).
     // [FEE-COIN] A bulk cancel can hold offers of CATs alone, whose fee coin
-    // the wallet picks itself, past the exclusions: none while the fence
-    // holds XCH.
-    if (secure && batch_fee > 0) {
-        const bool holds = co_await fence_holds_xch();
-        if (holds) {
-            spdlog::info("[OPTIONS-FENCE] bulk cancel without a fee: the wallet would pick the "
-                         "fee coin of an offer of CATs itself, ignoring the fence");
-            batch_fee = 0;
-        }
+    // the wallet picks itself, past the exclusions: none while the fence is
+    // up.
+    if (secure && batch_fee > 0 && fence_up()) {
+        spdlog::info("[OPTIONS-FENCE] bulk cancel without a fee: the wallet would pick the "
+                     "fee coin of an offer of CATs itself, ignoring the fence");
+        batch_fee = 0;
     }
     json payload = make_cancel_offers_request(batch_fee, secure);
     // [OPTIONS-FENCE] Only a fee makes the wallet select a coin.
@@ -1466,16 +1463,13 @@ ChiaWalletRPC::split_coins(
     }
 
     // [FEE-COIN] A CAT split's fee is paid with an XCH coin the wallet picks
-    // itself, past the exclusions below: none while the fence holds XCH.  An
-    // XCH split pays from the coin it splits.
-    if (fee > 0 && wallet_id != 1) {
-        const bool holds = co_await fence_holds_xch();
-        if (holds) {
-            spdlog::info("[OPTIONS-FENCE] splitting a coin of wallet {} without a fee: the wallet "
-                         "would pick its fee coin itself, ignoring the fence",
-                         wallet_id);
-            fee = 0;
-        }
+    // itself, past the exclusions below: none while the fence is up.  An XCH
+    // split pays from the coin it splits.
+    if (fee > 0 && wallet_id != 1 && fence_up()) {
+        spdlog::info("[OPTIONS-FENCE] splitting a coin of wallet {} without a fee: the wallet "
+                     "would pick its fee coin itself, ignoring the fence",
+                     wallet_id);
+        fee = 0;
     }
 
     json payload = {
@@ -1548,21 +1542,10 @@ ChiaFullNodeRPC::get_unspent_coin_records_strict(const std::string& puzzle_hash)
     co_return records;
 }
 
-asio::awaitable<bool>
-ChiaWalletRPC::fence_holds_xch()
-{
-    if (!fence_ || !fence_->enabled()) co_return false;
-    co_await fence_->ensure_fresh();
-    const auto held = fence_->held("xch");
-    co_return !held || held->second > 0U;
-}
-
 asio::awaitable<std::uint64_t>
 ChiaWalletRPC::fence_safe_cancel_fee(const std::string& trade_id, std::uint64_t fee)
 {
-    if (fee == 0U) co_return fee;
-    const bool holds = co_await fence_holds_xch();
-    if (!holds) co_return fee;
+    if (fee == 0U || !fence_up()) co_return fee;
     std::optional<bool> offers_xch;
     try {
         offers_xch = trade_record_offers_xch(co_await get_offer(trade_id, false));

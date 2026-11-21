@@ -437,3 +437,48 @@ def test_a_restart_for_new_settings_keeps_the_flag_up_in_between(tmp_path) -> No
     assert run.stop_for_new_settings() is runner.Mode.REHEARSE
     _wait(lambda: not run.finishing and not run.snapshot().running)
     assert _flag(tmp_path).exists(), "nothing open, but the book is about to start again"
+
+
+def _switch_options_off(path: Path) -> None:
+    yaml = pytest.importorskip("yaml")
+    root = yaml.safe_load(path.read_text(encoding="utf-8"))
+    root["options"]["enabled"] = False
+    path.write_text(yaml.safe_dump(root), encoding="utf-8")
+
+
+def test_a_restart_that_does_not_come_brings_the_flag_down(tmp_path) -> None:
+    """[review] Options switched off by the save: no restart, and nothing open."""
+    made: list[FakeBook] = []
+    path = _config(tmp_path)
+    run = runner.OptionsRunner(
+        path, interval=0.02, build=_builder(made), engine_state=lambda url: DOWN
+    )
+    run.start(runner.Mode.REHEARSE)
+    _wait(lambda: bool(made) and made[0].steps >= 1)
+    _switch_options_off(path)
+
+    assert run.stop_for_new_settings() is runner.Mode.REHEARSE
+    _wait(lambda: not run.finishing and not run.snapshot().running)
+    assert _flag(tmp_path).exists(), "kept up while the restart was due"
+
+    run.settle_fence()
+    assert not _flag(tmp_path).exists(), "the last run's book has nothing open"
+
+
+def test_a_flag_the_last_session_left_comes_down_with_options_switched_off(tmp_path) -> None:
+    """[review] A new app, options off since: the flag still follows the book."""
+    made: list[FakeBook] = []
+    path = _config(tmp_path)
+    first = runner.OptionsRunner(
+        path, interval=0.02, build=_builder(made), engine_state=lambda url: DOWN
+    )
+    first.start(runner.Mode.REHEARSE)
+    _wait(lambda: bool(made) and made[0].steps >= 1)
+    first.stop(keep_fence=True)  # the app closing with the book on
+    _wait(lambda: not first.snapshot().running)
+    assert _flag(tmp_path).exists()
+    _switch_options_off(path)
+
+    runner.OptionsRunner(path, build=_builder([])).sync_fence()  # the next app's page
+
+    assert not _flag(tmp_path).exists()

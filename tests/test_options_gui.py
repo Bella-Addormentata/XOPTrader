@@ -1036,6 +1036,11 @@ class _SavedOver(RunnerDouble):
     def restart_refusal(self) -> str:
         return self.refusal
 
+    settled = 0
+
+    def settle_fence(self) -> None:
+        self.settled += 1
+
     def stop_for_new_settings(self):
         if self.mode is Mode.OFF or not self.changed:
             return None
@@ -1131,6 +1136,7 @@ def test_a_new_wallet_is_the_operator_s_to_switch_on(app, tmp_path, monkeypatch)
 
         assert runner.starts == [Mode.LIVE] and runner.mode is Mode.OFF
         assert "not started again" in page._held.text()
+        assert runner.settled == 1, "the flag kept up for the restart follows the book again"
         assert (
             QSettings("XOP-tests-options", options_page._SETTINGS_APP).value(options_page.KEY_MODE)
             == "off"

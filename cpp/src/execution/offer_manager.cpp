@@ -5314,7 +5314,7 @@ asio::awaitable<json> OfferManager::cancel_offer_charged(
     xch_cycle_ledger_.note_lock(0, to_mojo_saturating(fee));
     json reply = co_await wallet_->cancel_offer(trade_id, fee, secure);
     // [FEE-COIN] The wallet client sends an offer of CATs alone without a fee
-    // while the options fence holds XCH: book what it sent.
+    // while the options fence is up: book what it sent.
     if (reply.is_object() && reply.contains(rpc::ChiaWalletRPC::kFeeUsedKey)
         && reply[rpc::ChiaWalletRPC::kFeeUsedKey].is_number_unsigned()) {
         fee = reply[rpc::ChiaWalletRPC::kFeeUsedKey].get<std::uint64_t>();
