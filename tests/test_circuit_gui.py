@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -25,9 +26,8 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from gui.services.circuit import poll  # noqa: E402
 from gui.services.circuit.api import CircuitApi  # noqa: E402
 
-FIXTURES = (
-    Path(__file__).resolve().parent.parent / "gui" / "services" / "circuit" / "tests" / "fixtures"
-)
+REPO = Path(__file__).resolve().parent.parent
+FIXTURES = REPO / "gui" / "services" / "circuit" / "tests" / "fixtures"
 #: When the fixtures were read (2026-11-21 18:22:40 UTC).
 NOW = 1_795_285_360
 
@@ -397,6 +397,58 @@ def test_closing_the_app_joins_the_round(app) -> None:
     assert not page.fetching()
     assert server.calls == ["/oracle"], "the round ended after the answer it was waiting for"
     _close(page, app)
+
+
+#: A page whose first read never answers in time, closed as the app closes it.
+_STUCK_ROUND = """
+import os, sys, threading
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+import shiboken6
+from PySide6.QtWidgets import QApplication
+from gui.services.circuit.api import CircuitApi
+from gui.widgets.circuit import CircuitWidget
+
+app = QApplication(sys.argv)
+entered = threading.Event()
+
+def transport(method, url, body, headers, timeout_s):
+    entered.set()
+    threading.Event().wait(30)  # far past the page's wait
+    raise TimeoutError("no answer")
+
+page = CircuitWidget(client_factory=lambda stop: CircuitApi(
+    "https://api.example.test", min_interval_s=0, transport=transport))
+page.set_enabled(True)
+page.show()
+if not entered.wait(5):
+    sys.exit("the round never asked")
+page.stop_background_work(timeout_ms=200)
+if page.fetching():
+    sys.exit("the round still counts as running")
+# As the app's exit does when its window goes: the page, and its thread with
+# it, destroyed at once. A thread still running here aborts the process.
+shiboken6.delete(page)
+print("closed", flush=True)
+"""
+
+
+def test_closing_the_app_ends_a_read_stuck_past_the_wait_and_still_exits() -> None:
+    # In a child process: a QThread destroyed while it runs aborts the whole
+    # process (qFatal), which would take this test run with it.
+    started = time.monotonic()
+    ran = subprocess.run(  # noqa: S603 -- this interpreter, our own code, no shell
+        [sys.executable, "-c", _STUCK_ROUND],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    took = time.monotonic() - started
+    assert ran.returncode == 0, ran.stderr
+    assert "closed" in ran.stdout
+    assert "did not stop in 200 ms; ending its thread" in ran.stderr
+    assert took < 20, f"exiting waited on the stuck read ({took:.1f} s)"
 
 
 # -- the switch ----------------------------------------------------------------------
