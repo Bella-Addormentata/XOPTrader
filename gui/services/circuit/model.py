@@ -83,8 +83,14 @@ def fmt_from_now(at: float, now: float) -> str:
 
 
 def fmt_utc(at: float, now: float) -> str:
-    """A time in UTC; the date too unless it is within a day of ``now``."""
-    when = _dt.datetime.fromtimestamp(at, _dt.timezone.utc)  # noqa: UP017 -- 3.10, as api.py
+    """A time in UTC; the date too unless it is within a day of ``now``.
+
+    A time no calendar can hold, from a garbled answer, is shown as its number.
+    """
+    try:
+        when = _dt.datetime.fromtimestamp(at, _dt.timezone.utc)  # noqa: UP017 -- 3.10, as api.py
+    except (OverflowError, OSError, ValueError):
+        return f"unix time {at:.0f}"
     if abs(at - now) < 86_400:
         return when.strftime("%H:%M UTC")
     return when.strftime("%Y-%m-%d %H:%M UTC")
@@ -97,20 +103,35 @@ def short_id(name: str) -> str:
 
 
 def apy_from_df(discount_factor: Any) -> float | None:
-    """The yearly rate of a per-minute discount factor scaled by 10**10."""
+    """The yearly rate of a per-minute discount factor scaled by 10**10.
+
+    None for anything but a positive number, and for a factor whose yearly
+    rate no float can hold (10**12, say, is 100 times a minute).
+    """
     if isinstance(discount_factor, bool) or not isinstance(discount_factor, (int, float)):
         return None
-    per_minute = float(discount_factor) / DF_SCALE
-    if per_minute <= 0:
+    try:
+        per_minute = float(discount_factor) / DF_SCALE
+        if not (per_minute > 0 and math.isfinite(per_minute)):
+            return None
+        return math.exp(MINUTES_PER_YEAR * math.log(per_minute)) - 1
+    except OverflowError:
         return None
-    return math.exp(MINUTES_PER_YEAR * math.log(per_minute)) - 1
 
 
 def _number(value: Any) -> float:
-    """A JSON number; ``TypeError`` for anything else (a bool included)."""
+    """A finite JSON number; ``TypeError`` for anything else (a bool included).
+
+    Python's JSON parser takes ``NaN`` and ``Infinity``, and an integer too big
+    for a float raises ``OverflowError``: both are answers of an unexpected
+    shape, not figures to show.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"expected a number, got {value!r}")
-    return float(value)
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"expected a finite number, got {value!r}")
+    return number
 
 
 def _optional_number(value: Any) -> float | None:
@@ -179,9 +200,14 @@ class Protocol:
     statutes: tuple[tuple[int, str, Any], ...]
 
     @property
-    def emergency(self) -> bool:
-        """BLOCK_ISSUANCE is set: the protocol's core functions are off."""
-        return self.block_issuance not in (None, 0)
+    def emergency(self) -> bool | None:
+        """BLOCK_ISSUANCE is set: the protocol's core functions are off.
+
+        None when the answer has no BLOCK_ISSUANCE: the state is not known.
+        """
+        if self.block_issuance is None:
+            return None
+        return self.block_issuance != 0
 
 
 def protocol_from(answer: Any) -> Protocol:
@@ -592,7 +618,14 @@ def build_view(
                 value = bills_from(answer, now)
             else:
                 value = announcers_from(answer, now)
-        except (AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
+        except (
+            AttributeError,
+            KeyError,
+            IndexError,
+            TypeError,
+            ValueError,
+            ArithmeticError,  # OverflowError, ZeroDivisionError
+        ) as exc:
             problems[read] = f"the answer has an unexpected shape ({type(exc).__name__}: {exc})"
             continue
         built[field] = value

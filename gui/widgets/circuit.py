@@ -14,10 +14,11 @@ section empty with a note rather than breaking the page.
 
 OFF BY DEFAULT (Settings > Advanced > Subsystems). Switched off, the sidebar
 entry is hidden and nothing is asked. Switched on, it reads only while the
-page is open: when it opens (unless the last read was under a minute ago),
-then every three minutes, eight requests a round (:mod:`gui.services.circuit.poll`),
-on a worker thread. Building the page asks nothing, so the switch works both
-ways without a restart.
+page is open: when it opens (unless a whole round started under a minute
+ago), then every three minutes, eight requests a round
+(:mod:`gui.services.circuit.poll`), on a worker thread. Closed, it starts no
+new round. Building the page asks nothing, so the switch works both ways
+without a restart.
 """
 
 from __future__ import annotations
@@ -53,7 +54,8 @@ LOSS_RED: Final[str] = _C.LOSS_RED
 
 #: Between two rounds of reads while the page is open.
 ROUND_EVERY_MS: Final[int] = 180_000
-#: Opening the page reads again unless the last round started this recently.
+#: Opening the page reads again unless the last round started this recently
+#: and was not cut short.
 FRESH_FOR_S: Final[float] = 60.0
 #: Relative times on the page ("in 21 min") are redrawn this often.
 REDRAW_EVERY_MS: Final[int] = 15_000
@@ -154,7 +156,7 @@ class CircuitWidget(QWidget):
     ) -> None:
         super().__init__(parent)
         #: Called once, at the first round: building the page asks nothing.
-        self._client_factory = client_factory or (lambda stop: poll.page_client(stop))
+        self._client_factory = client_factory or poll.page_client
         self._wall = wall
         self._enabled = False
         self._api: Any = None
@@ -319,8 +321,10 @@ class CircuitWidget(QWidget):
         return self._thread is not None
 
     def refresh(self) -> bool:
-        """Start a round of reads now. False when switched off or one is under way."""
-        if not self._enabled:
+        """Start a round of reads now. False when switched off, closed, or one is under way."""
+        if not self._enabled or not self.isVisible():
+            # Closed, no new round starts: not from the timer, nor one that
+            # was due once a round being stopped had ended.
             return False
         if self._thread is not None:
             if self._stop.is_set():
@@ -384,9 +388,17 @@ class CircuitWidget(QWidget):
     def _opened(self) -> None:
         self._round_timer.start()
         self._redraw_timer.start()
+        if not self._fresh():
+            self.refresh()
+
+    def _fresh(self) -> bool:
+        """The last round started under FRESH_FOR_S ago and is not cut short."""
         started = self._round_started_at
         if started is None or self._wall() - started >= FRESH_FOR_S:
-            self.refresh()
+            return False
+        if self._thread is not None:
+            return not self._stop.is_set()  # running on, or being stopped
+        return not self._round_why
 
     @Slot(object)
     def _on_result(self, result: poll.Result) -> None:
@@ -403,6 +415,9 @@ class CircuitWidget(QWidget):
     @Slot(int, str)
     def _on_done(self, answered: int, why: str) -> None:
         self._round_ended_at = self._wall()
+        if not why and self._round_seen < len(poll.PAGE_READS):
+            # poll.fetch() ends a round between two reads once told to stop.
+            why = "stopped"
         self._round_why = why
         self._render()
 
@@ -527,14 +542,16 @@ class CircuitWidget(QWidget):
                 )
             else:
                 self._set("collateral", f"{model.fmt_units(locked)} XCH locked")
-            if protocol.emergency:
+            if protocol.emergency is None:
+                self._set("emergency", "unknown: the statutes answer has no BLOCK_ISSUANCE")
+            elif protocol.emergency:
                 self._set("emergency", f"ON: BLOCK_ISSUANCE is {protocol.block_issuance}")
                 banner = (
                     "Circuit's emergency switch is on (BLOCK_ISSUANCE = "
                     f"{protocol.block_issuance}): the protocol's core functions are switched off."
                 )
             else:
-                self._set("emergency", "off (BLOCK_ISSUANCE is 0)")
+                self._set("emergency", f"off (BLOCK_ISSUANCE is {protocol.block_issuance})")
             if protocol.status and protocol.status != "ok":
                 banner = banner or f"The statutes answer says status {protocol.status!r}."
         if vaults is None:

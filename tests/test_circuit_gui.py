@@ -272,6 +272,22 @@ def test_the_emergency_switch_is_a_banner(app) -> None:
         _close(page, app)
 
 
+def test_an_answer_without_the_emergency_switch_says_unknown_not_off(app) -> None:
+    server = FixtureServer()
+    del server.answers["/statutes"][1]["implemented_statutes"]["BLOCK_ISSUANCE"]
+    page, _factory = _page(server)
+    try:
+        page.set_enabled(True)
+        page.show()
+        _wait_until(app, lambda: not page.fetching() and len(server.calls) == 8)
+        assert page._values["emergency"].text() == (
+            "unknown: the statutes answer has no BLOCK_ISSUANCE"
+        )
+        assert page._banner.isHidden()
+    finally:
+        _close(page, app)
+
+
 def test_switching_off_ends_a_round_at_its_next_wait(app) -> None:
     entered, gate = threading.Event(), threading.Event()
     server = FixtureServer()
@@ -305,6 +321,51 @@ def test_switching_off_ends_a_round_at_its_next_wait(app) -> None:
         # The read under way finished; the next one stopped at its wait, unasked.
         assert server.calls == ["/oracle", "/statutes"]
         assert not page._round_timer.isActive()
+    finally:
+        gate.set()
+        _close(page, app)
+
+
+def test_a_round_due_after_one_cut_short_waits_until_the_page_is_open(app) -> None:
+    entered, gate = threading.Event(), threading.Event()
+    server = FixtureServer()
+
+    def transport(method, url, body, headers, timeout_s):
+        if url.endswith("/statutes") and not gate.is_set():
+            entered.set()
+            gate.wait(5)
+        return server(method, url, body, headers, timeout_s)
+
+    from gui.widgets.circuit import CircuitWidget
+
+    def factory(stop: threading.Event) -> CircuitApi:
+        def sleep(seconds: float) -> None:
+            if stop.wait(seconds):
+                raise poll.Stopped()
+
+        return CircuitApi(
+            "https://api.example.test", min_interval_s=0.2, transport=transport, sleep=sleep
+        )
+
+    page = CircuitWidget(client_factory=factory, wall=Clock())
+    try:
+        page.set_enabled(True)
+        page.show()
+        _wait_until(app, entered.is_set)  # the first round is in its second read
+        page.set_enabled(False)  # it ends at its next wait...
+        page.set_enabled(True)  # ...and on again, a new round is due once it has
+        assert page._round_due
+        page.hide()  # closed before the first round has ended
+        gate.set()
+        _wait_until(app, lambda: not page.fetching())
+        app.processEvents()
+        assert server.calls == ["/oracle", "/statutes"], "closed, no round starts"
+        assert "(stopped before the end)" in page._status.text()
+
+        # Opened again within the minute: a round cut short is not a fresh read.
+        page.show()
+        _wait_until(app, lambda: not page.fetching() and len(server.calls) == 10)
+        assert server.calls[2:] == [read.path for read in poll.PAGE_READS]
     finally:
         gate.set()
         _close(page, app)

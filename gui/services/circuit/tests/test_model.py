@@ -80,6 +80,21 @@ def test_the_emergency_switch_is_seen(answers) -> None:
     assert model.build_view(answers, now=NOW).protocol.emergency
 
 
+def test_an_answer_without_the_emergency_switch_leaves_it_unknown(answers) -> None:
+    del answers["statutes"]["implemented_statutes"]["BLOCK_ISSUANCE"]
+    protocol = model.build_view(answers, now=NOW).protocol
+    assert protocol.block_issuance is None
+    assert protocol.emergency is None, "not known, so neither on nor off"
+
+
+def test_a_fee_too_large_for_a_float_is_no_rate_and_the_rest_still_shows(answers) -> None:
+    answers["statutes"]["implemented_statutes"]["STABILITY_FEE_DF"] = 10**12
+    view = model.build_view(answers, now=NOW)
+    assert view.problems == {}
+    assert view.protocol.stability_fee_apy is None
+    assert view.protocol.savings_apy == pytest.approx(0.0400, abs=5e-5)
+
+
 def test_the_vaults_are_counted_and_sorted(view) -> None:
     vaults = view.vaults
     assert vaults.count == 15
@@ -287,6 +302,11 @@ def test_an_older_answer_stays_with_a_note_when_the_latest_read_failed(answers) 
         ("surplus_auctions", [{"name": "x"}]),
         ("bills", [{"name": "x"}]),
         ("announcers", [{"launcher_id": "x", "price": True}]),
+        # Python's JSON parser reads NaN and Infinity; neither is a figure.
+        ("oracle", {"price_delay": float("nan")}),
+        ("vaults", [{"name": "x", "debt": float("inf"), "collateral": 1}]),
+        # An integer too big for a float.
+        ("treasury", {"treasury_balance": 10**400}),
     ],
 )
 def test_an_answer_of_another_shape_is_a_note_not_a_crash(answers, read, answer) -> None:
@@ -342,6 +362,8 @@ def test_times() -> None:
     assert model.fmt_from_now(NOW - 300, NOW) == "5 min ago"
     assert model.fmt_utc(NOW, NOW) == "18:22 UTC"
     assert model.fmt_utc(NOW - 2 * 86_400, NOW) == "2026-11-19 18:22 UTC"
+    # A time no calendar holds (a garbled answer) is shown, not raised.
+    assert model.fmt_utc(1e20, NOW) == "unix time 100000000000000000000"
 
 
 def test_ids_rates_and_shares() -> None:
@@ -351,6 +373,8 @@ def test_ids_rates_and_shares() -> None:
     assert model.fmt_usd(0.94) == "$0.94"
     assert model.fmt_pct(1.9115) == "191%"
     assert model.fmt_pct(0.04301, 2) == "4.30%"
-    for junk in (None, True, "10000000801", 0, -5):
+    for junk in (None, True, "10000000801", 0, -5, float("nan"), float("inf"), 10**400):
         assert model.apy_from_df(junk) is None
+    # 100 times a minute: a rate no float holds.
+    assert model.apy_from_df(10**12) is None
     assert model.apy_from_df(10**10) == 0
