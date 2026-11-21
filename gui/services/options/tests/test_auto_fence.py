@@ -482,3 +482,48 @@ def test_a_flag_the_last_session_left_comes_down_with_options_switched_off(tmp_p
     runner.OptionsRunner(path, build=_builder([])).sync_fence()  # the next app's page
 
     assert not _flag(tmp_path).exists()
+
+
+def test_a_new_record_does_not_release_a_flag_the_old_book_still_needs(tmp_path) -> None:
+    """[review] A save moves options.database_path: the restart is refused, and the
+    old book's open contract keeps the flag up, whatever the new record says."""
+    yaml = pytest.importorskip("yaml")
+    old = tmp_path / "book.db"
+    _record_open_contract(old)
+    made: list[FakeBook] = []
+    path = _config(tmp_path, db=str(old))
+    run = runner.OptionsRunner(
+        path, interval=0.02, build=_builder(made), engine_state=lambda url: DOWN
+    )
+    run.start(runner.Mode.REHEARSE)
+    _wait(lambda: bool(made) and made[0].steps >= 1)
+    root = yaml.safe_load(path.read_text(encoding="utf-8"))
+    root["options"]["database_path"] = str(tmp_path / "elsewhere.db")  # missing: nothing open
+    path.write_text(yaml.safe_dump(root), encoding="utf-8")
+
+    assert run.stop_for_new_settings() is runner.Mode.REHEARSE
+    _wait(lambda: not run.finishing and not run.snapshot().running)
+    assert run.restart_refusal() == runner.WALLET_CHANGED
+    run.settle_fence()
+
+    assert _flag(tmp_path).exists(), "the old book has a contract open"
+
+
+def test_the_old_record_released_with_the_new_one_lets_the_flag_down(tmp_path) -> None:
+    yaml = pytest.importorskip("yaml")
+    made: list[FakeBook] = []
+    path = _config(tmp_path, db=str(tmp_path / "book.db"))
+    run = runner.OptionsRunner(
+        path, interval=0.02, build=_builder(made), engine_state=lambda url: DOWN
+    )
+    run.start(runner.Mode.REHEARSE)
+    _wait(lambda: bool(made) and made[0].steps >= 1)
+    root = yaml.safe_load(path.read_text(encoding="utf-8"))
+    root["options"]["database_path"] = str(tmp_path / "elsewhere.db")
+    path.write_text(yaml.safe_dump(root), encoding="utf-8")
+
+    assert run.stop_for_new_settings() is runner.Mode.REHEARSE
+    _wait(lambda: not run.finishing and not run.snapshot().running)
+    run.settle_fence()
+
+    assert not _flag(tmp_path).exists(), "neither record has anything open"
