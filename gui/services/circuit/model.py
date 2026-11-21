@@ -212,7 +212,8 @@ class Protocol:
     """Circuit's settings (its statutes) that a market maker cares about."""
 
     status: str
-    block_issuance: Any
+    #: As the answer gave it (0 or 1), so the page shows it as given.
+    block_issuance: int | float
     stability_fee_apy: float | None
     savings_apy: float | None
     liquidation_ratio_pct: float | None
@@ -224,13 +225,8 @@ class Protocol:
     statutes: tuple[tuple[int, str, Any], ...]
 
     @property
-    def emergency(self) -> bool | None:
-        """BLOCK_ISSUANCE is set: the protocol's core functions are off.
-
-        None when the answer has no BLOCK_ISSUANCE: the state is not known.
-        """
-        if self.block_issuance is None:
-            return None
+    def emergency(self) -> bool:
+        """BLOCK_ISSUANCE is set: the protocol's core functions are off."""
         return self.block_issuance != 0
 
 
@@ -246,15 +242,19 @@ def protocol_from(answer: Any) -> Protocol:
         order.sort()
     else:
         order = [(i, str(name), value) for i, (name, value) in enumerate(statutes.items())]
-    block_issuance = statutes.get(BLOCK_ISSUANCE)
+    # The emergency switch and the status must both be there. An answer
+    # without either says nothing of an emergency, and taken as the latest
+    # answer it would hide one that an older answer showed: it is of an
+    # unexpected shape, so the older answer stays beside a note.
+    block_issuance = statutes[BLOCK_ISSUANCE]
     # Checked, but kept as given, so the page shows 0 or 1, not 0.0 or 1.0.
     # A string "0", false, NaN or a number no float holds is no state at all.
-    _optional_number(block_issuance)
+    _number(block_issuance)
     penalty = _optional_number(statutes.get("VAULT_LIQUIDATION_PENALTY_BPS"))
     usage = _optional_number(answer.get("current_collateral_usage"))
     cap = _optional_number(answer.get("max_collateral_cap"))
     counter = answer.get("price_update_counter")
-    status = answer.get("status", "")
+    status = answer["status"]
     if not isinstance(status, str):  # "ok", or what is wrong: always text
         raise TypeError(f"expected the status as text, got {status!r}")
     return Protocol(

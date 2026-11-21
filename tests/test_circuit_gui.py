@@ -272,7 +272,19 @@ def test_the_emergency_switch_is_a_banner(app) -> None:
         _close(page, app)
 
 
-def test_a_garbled_answer_keeps_the_last_good_one_and_its_banner(app) -> None:
+def _garbled_statutes(good: dict, how: str) -> dict:
+    if how == "statutes not an object":
+        return {"status": "ok", "implemented_statutes": []}
+    garbled = json.loads(json.dumps(good))
+    if how == "no emergency switch":
+        del garbled["implemented_statutes"]["BLOCK_ISSUANCE"]
+    else:  # no status
+        del garbled["status"]
+    return garbled
+
+
+@pytest.mark.parametrize("how", ["statutes not an object", "no emergency switch", "no status"])
+def test_a_garbled_answer_keeps_the_last_good_one_and_its_banner(app, how) -> None:
     server = FixtureServer()
     server.answers["/statutes"][1]["implemented_statutes"]["BLOCK_ISSUANCE"] = 1
     page, _factory = _page(server)
@@ -282,7 +294,7 @@ def test_a_garbled_answer_keeps_the_last_good_one_and_its_banner(app) -> None:
         _wait_until(app, lambda: not page.fetching() and len(server.calls) == 8)
         assert not page._banner.isHidden()
 
-        server.answers["/statutes"] = (200, {"status": "ok", "implemented_statutes": []})
+        server.answers["/statutes"] = (200, _garbled_statutes(server.answers["/statutes"][1], how))
         assert page.refresh()
         _wait_until(app, lambda: not page.fetching() and len(server.calls) == 16)
         # Answered, but of another shape: a failed read, not a new answer.
@@ -334,7 +346,7 @@ def test_every_row_of_a_table_shows_above_a_horizontal_scroll_bar(app) -> None:
         _close(page, app)
 
 
-def test_an_answer_without_the_emergency_switch_says_unknown_not_off(app) -> None:
+def test_a_first_answer_without_the_emergency_switch_says_neither_on_nor_off(app) -> None:
     server = FixtureServer()
     del server.answers["/statutes"][1]["implemented_statutes"]["BLOCK_ISSUANCE"]
     page, _factory = _page(server)
@@ -342,10 +354,56 @@ def test_an_answer_without_the_emergency_switch_says_unknown_not_off(app) -> Non
         page.set_enabled(True)
         page.show()
         _wait_until(app, lambda: not page.fetching() and len(server.calls) == 8)
-        assert page._values["emergency"].text() == (
-            "unknown: the statutes answer has no BLOCK_ISSUANCE"
-        )
+        assert page._values["emergency"].text() == "-"
         assert page._banner.isHidden()
+        notes = page._notes["statutes"]
+        assert notes and all(
+            note.text() == "statutes: the answer has an unexpected shape (KeyError: "
+            "'BLOCK_ISSUANCE')"
+            for note in notes
+        )
+    finally:
+        _close(page, app)
+
+
+def test_an_emergency_and_a_status_warning_both_show(app) -> None:
+    server = FixtureServer()
+    server.answers["/statutes"][1]["implemented_statutes"]["BLOCK_ISSUANCE"] = 1
+    server.answers["/statutes"][1]["status"] = "degraded"
+    page, _factory = _page(server)
+    try:
+        page.set_enabled(True)
+        page.show()
+        _wait_until(app, lambda: not page.fetching() and len(server.calls) == 8)
+        lines = page._banner.text().splitlines()
+        assert len(lines) == 2 and not page._banner.isHidden()
+        assert "emergency switch is on (BLOCK_ISSUANCE = 1)" in lines[0]
+        assert lines[1] == "The statutes answer says status 'degraded'."
+    finally:
+        _close(page, app)
+
+
+def test_the_tables_take_keyboard_focus_and_bring_in_columns_out_of_view(app) -> None:
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    page, factory = _page()
+    try:
+        page.set_enabled(True)
+        page.resize(420, 1200)
+        page.show()
+        _wait_until(app, lambda: not page.fetching() and len(factory.server.calls) == 8)
+        app.processEvents()
+        table = page._closest
+        assert table.focusPolicy() & Qt.FocusPolicy.TabFocus, "Tab reaches it"
+        bar = table.horizontalScrollBar()
+        assert bar.isVisible() and bar.value() == 0
+        table.setFocus()
+        table.setCurrentCell(0, 0)
+        QTest.keyClick(table, Qt.Key.Key_End)  # to the row's last column
+        app.processEvents()
+        assert table.currentColumn() == table.columnCount() - 1
+        assert bar.value() > 0, "the column out of view was scrolled in"
     finally:
         _close(page, app)
 

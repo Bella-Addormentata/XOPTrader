@@ -80,11 +80,16 @@ def test_the_emergency_switch_is_seen(answers) -> None:
     assert model.build_view(answers, now=NOW).protocol.emergency
 
 
-def test_an_answer_without_the_emergency_switch_leaves_it_unknown(answers) -> None:
-    del answers["statutes"]["implemented_statutes"]["BLOCK_ISSUANCE"]
-    protocol = model.build_view(answers, now=NOW).protocol
-    assert protocol.block_issuance is None
-    assert protocol.emergency is None, "not known, so neither on nor off"
+@pytest.mark.parametrize("missing", ["BLOCK_ISSUANCE", "status"])
+def test_an_answer_without_the_emergency_switch_or_its_status_is_a_note(answers, missing) -> None:
+    # Neither on nor off: taken as the latest, it would hide an emergency an
+    # older answer showed.
+    statutes = answers["statutes"]
+    del (statutes["implemented_statutes"] if missing == "BLOCK_ISSUANCE" else statutes)[missing]
+    view = model.build_view(answers, now=NOW)
+    assert view.protocol is None
+    problem = view.problems["statutes"]
+    assert problem == f"the answer has an unexpected shape (KeyError: {missing!r})"
 
 
 @pytest.mark.parametrize(

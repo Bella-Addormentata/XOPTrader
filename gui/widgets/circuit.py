@@ -106,7 +106,9 @@ def _table(columns: Sequence[str]) -> QTableWidget:
     table.verticalHeader().setVisible(False)
     table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-    table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    # Reachable from the keyboard: Tab into a table, and the arrow keys move
+    # along its rows and bring in the columns the page has no room for.
+    table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
     table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     header = table.horizontalHeader()
     header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
@@ -546,7 +548,7 @@ class CircuitWidget(QWidget):
 
     def _draw_protocol(self, view: model.CircuitView, now: float) -> None:
         oracle, protocol, vaults = view.oracle, view.protocol, view.vaults
-        banner = ""
+        alerts: list[str] = []
         if oracle is None:
             self._set("price", "-")
             self._set("oracle", "-")
@@ -599,18 +601,16 @@ class CircuitWidget(QWidget):
                 )
             else:
                 self._set("collateral", f"{model.fmt_units(locked)} XCH locked")
-            if protocol.emergency is None:
-                self._set("emergency", "unknown: the statutes answer has no BLOCK_ISSUANCE")
-            elif protocol.emergency:
+            if protocol.emergency:
                 self._set("emergency", f"ON: BLOCK_ISSUANCE is {protocol.block_issuance}")
-                banner = (
+                alerts.append(
                     "Circuit's emergency switch is on (BLOCK_ISSUANCE = "
                     f"{protocol.block_issuance}): the protocol's core functions are switched off."
                 )
             else:
                 self._set("emergency", f"off (BLOCK_ISSUANCE is {protocol.block_issuance})")
-            if protocol.status and protocol.status != "ok":
-                banner = banner or f"The statutes answer says status {protocol.status!r}."
+            if protocol.status != "ok":  # shown beside the emergency, not instead of it
+                alerts.append(f"The statutes answer says status {protocol.status!r}.")
         if vaults is None:
             self._set("borrowed", "-")
         else:
@@ -622,8 +622,8 @@ class CircuitWidget(QWidget):
             if ratio is not None:
                 text += f"; all their collateral is worth {model.fmt_pct(ratio)} of it"
             self._set("borrowed", text)
-        self._banner.setText(banner)
-        self._banner.setVisible(bool(banner))
+        self._banner.setText("\n".join(alerts))
+        self._banner.setVisible(bool(alerts))
 
     @staticmethod
     def _rate(apy: float | None, what: str) -> str:
