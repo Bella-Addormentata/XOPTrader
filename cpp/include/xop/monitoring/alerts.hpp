@@ -191,9 +191,15 @@ const char* to_string(AlertRule rule) noexcept;
 /// of the threshold (5%, 10%, 15%, ...), and again in a new episode once the
 /// drawdown has eased below kResetFraction of the threshold. It used to be
 /// sent on every cycle the drawdown stayed above 5%.
+/// [review #251] A drawdown still past the threshold kRemindAfter after its
+/// last message is sent again, so a message lost on the way (a Telegram
+/// outage) is not lost for the rest of the episode.
 class DrawdownAlertLatch {
 public:
+    using Clock = std::chrono::steady_clock;
+
     static constexpr double kResetFraction = 0.8;
+    static constexpr std::chrono::hours kRemindAfter{6};
     /// [review] Steps are counted with rounding allowed for (0.15 / 0.05
     /// reads 2.9999999999999996) and bounded, so neither an infinite
     /// drawdown nor a tiny threshold overflows the conversion.
@@ -202,7 +208,8 @@ public:
 
     /// True when `drawdown` (a fraction of peak equity) should be alerted.
     /// Not thread-safe: AlertManager holds its lock around it.
-    [[nodiscard]] bool should_alert(double drawdown, double threshold) noexcept
+    [[nodiscard]] bool should_alert(double drawdown, double threshold,
+                                    Clock::time_point now) noexcept
     {
         if (!std::isfinite(drawdown) || !std::isfinite(threshold) || !(threshold > 0.0)) {
             return false;  // nothing honest to say
@@ -218,15 +225,25 @@ public:
         const double steps = ratio + kEpsilon;
         const int step = steps >= static_cast<double>(kMaxStep) ? kMaxStep
                                                                 : static_cast<int>(steps);
-        if (step <= alerted_step_) return false;
+        const bool deeper = step > alerted_step_;
+        const bool remind = alerted_step_ > 0 && now - alerted_at_ >= kRemindAfter;
+        if (!deeper && !remind) return false;
+        // The step of the message sent: after a reminder from an eased
+        // drawdown, getting deeper again is news again.
         alerted_step_ = step;
+        alerted_at_   = now;
         return true;
     }
+
+    /// [review #251] The next drawdown past the threshold is sent whatever
+    /// the last message said (Telegram was just switched on, or moved).
+    void reset() noexcept { alerted_step_ = 0; }
 
     [[nodiscard]] int alerted_step() const noexcept { return alerted_step_; }
 
 private:
     int alerted_step_{0};
+    Clock::time_point alerted_at_{};
 };
 
 /// Map each rule to its severity tier.
@@ -355,6 +372,14 @@ public:
     /// True if Telegram delivery is enabled (both token and chat_id are set).
     bool is_enabled() const noexcept;
 
+    /// [review #251] Counts the saves that switched Telegram on or pointed it
+    /// at another chat. A latch that passed a warning before such a save
+    /// re-arms on a new count, so a warning that still stands is delivered.
+    [[nodiscard]] std::uint64_t delivery_epoch() const noexcept
+    {
+        return delivery_epoch_.load(std::memory_order_acquire);
+    }
+
     // -- Alert Dispatch ------------------------------------------------------
 
     /// Send a single alert message at the given severity tier.
@@ -457,6 +482,7 @@ private:
     std::string bot_token_;
     std::string chat_id_;
     std::atomic<bool> enabled_{false};
+    std::atomic<std::uint64_t> delivery_epoch_{0};
 
     // Per-tier rate-limit cooldowns.
     std::chrono::seconds cooldown_critical_{60};
@@ -475,7 +501,8 @@ private:
     // Defaults are set in the constructor.
     std::unordered_map<std::uint8_t, double> thresholds_;
 
-    // [ALERT-NOISE] Rule 10 fires once per 5% step of an episode.
+    // [ALERT-NOISE] Rule 10 fires once per 5% step of an episode, with a
+    // reminder while it stands.
     DrawdownAlertLatch drawdown_latch_;
 
     // -- Default threshold constants -----------------------------------------

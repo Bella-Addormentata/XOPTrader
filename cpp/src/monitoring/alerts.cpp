@@ -244,6 +244,13 @@ void AlertManager::set_credentials(const std::string& bot_token,
         chat_id_    = chat_id;
         now_enabled = !bot_token_.empty() && !chat_id_.empty();
         enabled_.store(now_enabled, std::memory_order_release);
+        // [review #251] What the latches passed while Telegram was off, or
+        // sent to the old chat, never reached this one: they re-arm, and a
+        // warning that still stands goes out again.
+        if (now_enabled) {
+            drawdown_latch_.reset();
+            delivery_epoch_.fetch_add(1, std::memory_order_acq_rel);
+        }
     }
     spdlog::info("AlertManager: Telegram credentials updated from the saved "
                  "config -- alerts {}", now_enabled ? "enabled" : "disabled "
@@ -381,8 +388,8 @@ void AlertManager::send_alert(AlertRule rule, const std::string& message)
     // WARNING window -- must deliver BOTH outcomes to an operator who is
     // watching for exactly this message.
     // [review #251] PnlDrawdown and HedgeImbalance are paced by their own
-    // latches, once per step or episode: the cooldown would drop the one
-    // message they have already decided is news.
+    // latches (news, or a reminder hours later): the cooldown would drop the
+    // one message they have already decided to send.
     if (!alert_rule_skips_cooldown(rule) && !check_rate_limit(rule)) {
         return;
     }
@@ -615,35 +622,21 @@ void AlertManager::start_worker()
 #endif
 
             // Execute the request.
-            // [review #251] Retried a few times with a growing pause: alerts
-            // paced once per step or episode are not sent again on their own,
-            // so a passing Telegram outage would otherwise hide them. A 4xx
-            // other than 429 is the request's fault, not the network's.
-            constexpr int kTelegramAttempts = 3;
-            for (int attempt = 1; attempt <= kTelegramAttempts; ++attempt) {
-                bool sent      = false;
-                bool permanent = false;
-                CURLcode res = curl_easy_perform(curl);
-                if (res != CURLE_OK) {
-                    // Log error WITHOUT the URL (contains secret bot token).
-                    spdlog::warn("AlertManager: Telegram POST failed (attempt {}/{}): {}",
-                                 attempt, kTelegramAttempts, curl_easy_strerror(res));
-                } else {
-                    long http_code = 0;
-                    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-                    sent = http_code == 200;
-                    permanent = http_code >= 400 && http_code < 500 && http_code != 429;
-                    if (!sent) {
-                        spdlog::warn("AlertManager: Telegram API returned HTTP {} "
-                                     "(attempt {}/{})",
-                                     http_code, attempt, kTelegramAttempts);
-                    }
+            // [review #251] One attempt: a retry here would hold every later
+            // alert behind it, CRITICAL ones included. The self-paced rules
+            // send a standing warning again hours later instead.
+            CURLcode res = curl_easy_perform(curl);
+            if (res != CURLE_OK) {
+                // Log error WITHOUT the URL (contains secret bot token).
+                spdlog::warn("AlertManager: Telegram POST failed: {}",
+                             curl_easy_strerror(res));
+            } else {
+                long http_code = 0;
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+                if (http_code != 200) {
+                    spdlog::warn("AlertManager: Telegram API returned HTTP {}",
+                                 http_code);
                 }
-                if (sent || permanent || attempt == kTelegramAttempts
-                    || send_stop_.load(std::memory_order_acquire)) {
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::seconds(2 * attempt));
             }
 
             curl_easy_cleanup(curl);
@@ -910,13 +903,14 @@ void AlertManager::check_pnl_drawdown(const BotState& state)
     const double drawdown = (state.peak_equity_usd - state.equity_usd)
                           / state.peak_equity_usd;
 
-    // [ALERT-NOISE] Once per 5% step of an episode, not on every cycle.
+    // [ALERT-NOISE] Once per 5% step of an episode, not on every cycle,
+    // and again every DrawdownAlertLatch::kRemindAfter while it stands.
     // [review #251] Under mtx_: check_and_alert may run on any thread. The
     // lock is let go before send_alert, which takes it itself.
     bool news = false;
     {
         std::lock_guard lock(mtx_);
-        news = drawdown_latch_.should_alert(drawdown, threshold);
+        news = drawdown_latch_.should_alert(drawdown, threshold, Clock::now());
     }
     if (news) {
         send_alert(AlertRule::PnlDrawdown,

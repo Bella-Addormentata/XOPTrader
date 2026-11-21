@@ -6458,6 +6458,10 @@ void Engine::buffer_terminal_offer(const std::string& offer_id,
 
 asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
 {
+    // [review #251] First, before this heartbeat journals any fill: a
+    // restarted engine reads its NHE windows back from trade_log.
+    seed_nhe_windows(block_height);
+
     // [T1-03] co_await the fill-detection coroutine directly.
     // [WALLET-LOAD 2026-08-04] Passes the block height for the fill-poll
     // age gate (a just-posted offer cannot have settled).
@@ -7155,9 +7159,12 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         // These accumulators are consumed by step_run_hedging (Step 10).
         // ISO/IEC 5055: double conversion to prevent integer overflow.
         // [ALERT-NOISE] Per pair, so base units never mix.
+        // [review #251] The pair's window now holds a fill trade_log holds
+        // too: it is not read back from there any more.
         const double fill_size_d = static_cast<double>(fill.size);
         nhe_windows_.try_emplace(fill.pair_name).first->second.add(
             fill.block_height, fill.side == Side::Bid ? fill_size_d : -fill_size_d);
+        nhe_seeded_.insert(fill.pair_name);
 
         // [T5-CR3] Notify the strategy that a fill occurred so that the
         // exponential-decay tau resets to tau_max.  Without this call,
@@ -20734,10 +20741,38 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
     co_return;
 }
 
+// [review #251] A restart empties the NHE windows, and Step 2 never feeds a
+// fill trade_log already holds, so the last window's maker fills are read
+// back from it: once per pair, before Step 2 has fed that pair anything, so
+// no fill counts twice.  A pair whose read fails is tried again on the next
+// heartbeat, until Step 2 feeds it (its window is then this run's fills).
+void Engine::seed_nhe_windows(BlockHeight block_height)
+{
+    if (!db_) return;
+    const BlockHeight since = block_height > NheWindow::kDefaultBlocks
+        ? block_height - NheWindow::kDefaultBlocks
+        : BlockHeight{0};
+    for (const auto& pc : config_.pairs) {
+        if (nhe_seeded_.count(pc.name) != 0) continue;
+        try {
+            const auto rows = db_->query_pace_fills(pc.name, since);
+            const std::size_t added = nhe_windows_.try_emplace(pc.name).first->second.seed(rows);
+            nhe_seeded_.insert(pc.name);
+            if (added > 0) {
+                spdlog::info("[Engine] NHE window for {} read back from trade_log: {} fill(s) "
+                             "since block {}", pc.name, added, since);
+            }
+        } catch (const std::exception& e) {
+            spdlog::warn("[Engine] NHE window for {} not read back from trade_log ({}) -- "
+                         "trying again next heartbeat", pc.name, e.what());
+        }
+    }
+}
+
 // Step 10: Run hedging layer (compute skew, NHE).
 // [T3-08] Computes NHE from the fills Step 2 records, and alerts when it
 // stays below the 0.70 target.  [ALERT-NOISE] Per pair, over a rolling
-// window (nhe_windows_), once per episode (nhe_latches_).
+// window (nhe_windows_), once per window while it lasts (nhe_latches_).
 void Engine::step_run_hedging(BlockHeight block_height)
 {
     // Layer 1: inventory-based skew (already applied in step 7 via
@@ -20750,6 +20785,15 @@ void Engine::step_run_hedging(BlockHeight block_height)
     // ISO/IEC 5055: uses the actual fill accumulators from Step 2.
     // [ALERT-NOISE] Per pair, over the window: a block's single fill is
     // one-sided by nature and used to score 0 -- and page -- on its own.
+    // [review #251] A save that switched Telegram on, or to another chat,
+    // re-arms every latch: what they passed was never delivered there.
+    if (alerts_) {
+        const std::uint64_t epoch = alerts_->delivery_epoch();
+        if (epoch != nhe_delivery_epoch_) {
+            nhe_delivery_epoch_ = epoch;
+            for (auto& entry : nhe_latches_) entry.second.reset();
+        }
+    }
     for (auto& [pair_name, window] : nhe_windows_) {
         window.prune(block_height);
         if (window.fills() == 0) {
@@ -20764,7 +20808,7 @@ void Engine::step_run_hedging(BlockHeight block_height)
 
         // [T3-08] Alert when NHE stays below the 0.70 target: the pair keeps
         // filling on one side, which increases adverse selection risk.
-        if (nhe_latches_[pair_name].should_alert(nhe, window.fills())) {
+        if (nhe_latches_[pair_name].should_alert(nhe, window.fills(), block_height)) {
             spdlog::warn("[Engine] Step 10: NHE {} {:.3f} < target {:.2f} over {} fills "
                          "-- one-sided flow",
                          pair_name, nhe, HedgingManager::nhe_target(), window.fills());
