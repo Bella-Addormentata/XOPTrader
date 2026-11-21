@@ -1042,14 +1042,7 @@ asio::awaitable<int> OfferManager::post_quotes(
         }
     }
 
-    // [UNIQUE-REQUEST 2026-11-21] What the live offers ask for, so no tier
-    // posted below asks for the same coin (unique_request.hpp).
-    std::set<RequestedAmount> requested_taken = live_requested_amounts();
-
-    for (const auto& quoted : quotes) {
-        // [UNIQUE-REQUEST] A copy: its request may be moved by a mojo or two
-        // before it is built, and what is posted and tracked is the copy.
-        TierQuote tier = quoted;
+    for (const auto& tier : quotes) {
         // Skip further tiers on the side that already reported
         // insufficient funds; the other side may still succeed.
         if (tier.side == Side::Bid && bid_funds_exhausted) continue;
@@ -1126,24 +1119,6 @@ asio::awaitable<int> OfferManager::post_quotes(
                 ask_funds_exhausted = true;
                 break;
             }
-        }
-
-        // [UNIQUE-REQUEST 2026-11-21] Ask for an amount no live offer asks
-        // for: two that ask for the same coin cannot be taken together.
-        if (!make_request_unique(pair, tier, requested_taken)) {
-            logger_->debug("{} {} tier {}: another live offer asks for the "
-                           "same amount and no nudge within reach clears it "
-                           "-- posted as computed",
-                           pair.name, to_string(tier.side), tier.tier_index);
-        } else if (tier.size != quoted.size || tier.price != quoted.price) {
-            const RequestedAmount was = requested_amount(
-                pair, quoted.side, quoted.price, quoted.size);
-            const RequestedAmount now = requested_amount(
-                pair, tier.side, tier.price, tier.size);
-            logger_->info("{} {} tier {} asks for {} mojos instead of {} -- "
-                          "another live offer asks for that amount",
-                          pair.name, to_string(tier.side), tier.tier_index,
-                          now.second, was.second);
         }
 
         // Step 1: Build the offer_dict for the wallet RPC.
@@ -1370,8 +1345,6 @@ asio::awaitable<int> OfferManager::post_quotes(
         // offer in State, and its flush gives it an offer_log row.
         posting_mark.release();
         ++created_count;
-        // [UNIQUE-REQUEST] Later tiers of this call keep clear of it too.
-        requested_taken.insert(requested_amount(pair, tier.side, tier.price, tier.size));
 
         logger_->info("Posted {} {} tier {} @ {} mojos, size {} mojos [{}]",
                       pair.name, to_string(tier.side), tier.tier_index,
@@ -5263,19 +5236,6 @@ json OfferManager::build_offer_dict(const PairConfig& pair,
     }
 
     return offer_dict;
-}
-
-std::set<RequestedAmount> OfferManager::live_requested_amounts() const
-{
-    std::set<RequestedAmount> taken;
-    for (const auto& po : state_->get_all_offers()) {
-        const auto it = pair_config_map_.find(po.pair_name);
-        if (it == pair_config_map_.end()) {
-            continue;
-        }
-        taken.insert(requested_amount(it->second, po.side, po.price, po.size));
-    }
-    return taken;
 }
 
 // ---------------------------------------------------------------------------

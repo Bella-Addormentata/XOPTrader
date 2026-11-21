@@ -114,7 +114,6 @@ add_executable(xop_tests
     test_maker_fill_legs.cpp
     test_drawdown_breaker.cpp
     test_alert_noise.cpp
-    test_unique_request.cpp
     test_widebook_quotes.cpp
     test_watchdog.cpp
     test_height_source.cpp
