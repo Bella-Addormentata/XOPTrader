@@ -5,6 +5,26 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Two alerts that fired on nearly every cycle
+
+- **Natural Hedge Efficiency** was worked out per heartbeat from that block's
+  fills alone, summed across pairs in different base units. A block with a
+  single fill is one-sided by nature and scored 0, so a CRITICAL
+  "ExposureBreach" went out on almost every fill. It is now worked out per
+  pair, over about three hours of blocks, needs at least six fills, and goes
+  out as a WARNING of its own, `HedgeImbalance`, naming the pair: once when
+  the pair turns one-sided, then at most once per three hours while it stays
+  so. A restarted engine reads the last three hours of fills back from the
+  trade log.
+- **The equity drawdown warning** went out on every cycle while the drawdown
+  stayed above 5%. It now goes out when the drawdown reaches a deeper 5% step
+  (5%, 10%, 15%, ...), again in a new episode once it has eased below 4%, and
+  as a reminder every six hours while it stays above 5%.
+- Switching Telegram on in Settings, or pointing it at another chat, sends
+  either warning again if it still stands.
+
 ## [0.10.56] — 2026-11-20 — the options address's XCH stays put, and calls and puts by default
 
 ### The options address's XCH no longer pays the engine's cancel fees (#250)

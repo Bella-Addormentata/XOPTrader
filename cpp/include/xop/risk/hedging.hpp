@@ -31,9 +31,13 @@
 #include "xop/config.hpp"
 #include "xop/state.hpp"
 
+#include <algorithm>
+#include <cstddef>
+#include <deque>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace xop {
@@ -271,6 +275,165 @@ private:
     static AssetId find_best_buy_candidate(
         const std::unordered_map<AssetId, double>& deviations);
 };
+
+// ---------------------------------------------------------------------------
+// [ALERT-NOISE] NheWindow -- Natural Hedge Efficiency of ONE pair, over a
+// rolling window of blocks.
+//
+// It used to be worked out per heartbeat, from that block's fills alone and
+// summed across pairs in different base units.  A block with a single fill is
+// one-sided by nature, so it scored 0 and a CRITICAL alert went out on almost
+// every fill.  Over a window, with a minimum number of fills, a low score
+// means what it says: the pair keeps filling on one side.
+// ---------------------------------------------------------------------------
+class NheWindow {
+public:
+    /// About three hours of blocks.
+    static constexpr BlockHeight kDefaultBlocks = 576;
+    /// Fewer fills than this say nothing about balance.
+    static constexpr std::size_t kMinFills = 6;
+
+    explicit NheWindow(BlockHeight blocks = kDefaultBlocks) noexcept : blocks_(blocks) {}
+
+    /// One fill: + for a buy of the base asset, - for a sale, in base units.
+    void add(BlockHeight block, double signed_size)
+    {
+        fills_.emplace_back(block, signed_size);
+    }
+
+    /// [review #251] Adds fills read back from trade_log, as
+    /// Database::query_pace_fills returns them: a maker row's "bid" is a
+    /// buy, its "ask" a sale. Taker rows are skipped -- Step 2 feeds the
+    /// window maker fills only. Returns how many fills were added.
+    template <typename Rows>
+    std::size_t seed(const Rows& rows)
+    {
+        std::size_t added = 0;
+        for (const auto& row : rows) {
+            if (row.is_taker) continue;
+            const double size = static_cast<double>(row.size_mojos);
+            if (row.side_lower == "bid") {
+                add(row.block_height, size);
+            } else if (row.side_lower == "ask") {
+                add(row.block_height, -size);
+            } else {
+                continue;
+            }
+            ++added;
+        }
+        return added;
+    }
+
+    /// Forget fills older than the window at block `now`.  [review #251]
+    /// Wherever they sit: fills are not recorded in height order (offers
+    /// come in map order, and a delayed proof settles an older fill late).
+    /// [review #251] A fill above `now` -- read back from trade_log while
+    /// the node is still catching up after a restart -- is kept but not
+    /// counted until a prune reaches its height.
+    void prune(BlockHeight now)
+    {
+        now_    = now;
+        pruned_ = true;
+        fills_.erase(std::remove_if(fills_.begin(), fills_.end(),
+                                    [&](const std::pair<BlockHeight, double>& fill) {
+                                        return now > fill.first && now - fill.first > blocks_;
+                                    }),
+                     fills_.end());
+    }
+
+    /// The fills counted: all of them before the first prune, then those at
+    /// or below the height of the last one.
+    [[nodiscard]] std::size_t fills() const noexcept
+    {
+        std::size_t n = 0;
+        for (const auto& fill : fills_) n += counts(fill) ? 1 : 0;
+        return n;
+    }
+
+    [[nodiscard]] double net() const noexcept
+    {
+        double sum = 0.0;
+        for (const auto& fill : fills_) {
+            if (counts(fill)) sum += fill.second;
+        }
+        return sum;
+    }
+
+    [[nodiscard]] double volume() const noexcept
+    {
+        double sum = 0.0;
+        for (const auto& fill : fills_) {
+            if (counts(fill)) sum += fill.second < 0.0 ? -fill.second : fill.second;
+        }
+        return sum;
+    }
+
+    [[nodiscard]] double nhe() const noexcept
+    {
+        return HedgingManager::compute_nhe(net(), volume());
+    }
+
+private:
+    [[nodiscard]] bool counts(const std::pair<BlockHeight, double>& fill) const noexcept
+    {
+        return !pruned_ || fill.first <= now_;
+    }
+
+    BlockHeight blocks_;
+    BlockHeight now_{0};
+    bool        pruned_{false};
+    std::deque<std::pair<BlockHeight, double>> fills_;
+};
+
+/// [ALERT-NOISE] Says when a pair's low hedge efficiency is news: from the
+/// first window with enough fills below the target, then at most once per
+/// window while it stays below -- [review #251] each alert is about fills the
+/// one before did not include, and one lost on the way is sent again. The
+/// episode ends when the window is back at or above the target.
+class NheAlertLatch {
+public:
+    /// `now` is the height the window was pruned at; `remind_after` its length.
+    [[nodiscard]] bool should_alert(double nhe, std::size_t fills, BlockHeight now,
+                                    double target = HedgingManager::nhe_target(),
+                                    std::size_t min_fills = NheWindow::kMinFills,
+                                    BlockHeight remind_after = NheWindow::kDefaultBlocks) noexcept
+    {
+        // [review #251] Recovery first: the minimum fill count gates only a
+        // new alert, never the end of an episode.
+        if (nhe >= target) {
+            alerted_ = false;
+            return false;
+        }
+        if (fills < min_fills) return false;
+        // [review #251] Once every fill the last alert counted is out of the
+        // window, a run still below the target is news -- also when that
+        // window expired between two heartbeats and Step 2 added the new
+        // fills before the prune, so the window never showed empty.
+        const bool window_passed = now > alerted_at_ && now - alerted_at_ > remind_after;
+        if (alerted_ && !window_passed) return false;
+        alerted_    = true;
+        alerted_at_ = now;
+        return true;
+    }
+
+    /// The pair went quiet (its window emptied), or Telegram was switched on
+    /// or moved: the next run alerts afresh.
+    void reset() noexcept { alerted_ = false; }
+
+private:
+    bool        alerted_{false};
+    BlockHeight alerted_at_{0};
+};
+
+/// [review #251] Prunes `window` at `now`, and re-arms `latch` when nothing
+/// counted is left: the run it alerted on is over. Run before Step 2 adds a
+/// heartbeat's fills too, or an old run that expires in the heartbeat a new
+/// one starts would hide the new one behind the old one's latch.
+inline void prune_and_rearm(NheWindow& window, NheAlertLatch& latch, BlockHeight now)
+{
+    window.prune(now);
+    if (window.fills() == 0) latch.reset();
+}
 
 }  // namespace xop
 
