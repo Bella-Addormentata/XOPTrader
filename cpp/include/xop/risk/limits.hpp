@@ -31,6 +31,7 @@
 #include "xop/types.hpp"
 #include "xop/config.hpp"
 #include "xop/state.hpp"
+#include "xop/strategy/revive.hpp"
 
 #include <cmath>
 #include <cstddef>
@@ -571,6 +572,74 @@ public:
     [[nodiscard]]
     static bool series_crashing_counted(const CrashSeries& s, double threshold,
                                         std::size_t window) noexcept;
+
+    /// [WIDEBOOK-ISOLATE review #252] What the flash-crash check does with
+    /// one pair this heartbeat (a pair that is not an isolated revive pair).
+    template <typename State>
+    struct WideCrashStep {
+        /// The pair's own state from now on: Crash or Recovery while it is
+        /// held back on its own, nullopt when it is not. Never Normal.
+        std::optional<State> held;
+        /// Whether its crash and stability signals go to the global guard
+        /// this heartbeat. False while it is held, and on the heartbeat a
+        /// hold ends by recovery, so one pair's release never moves the
+        /// global state.
+        bool global{true};
+    };
+
+    /// [WIDEBOOK-ISOLATE review #252] The routing behind WideCrashStep.
+    /// `held` is the pair's own state so far (nullopt: not held), `crashing`
+    /// is series_crashing(), `counted_crashing` series_crashing_counted(),
+    /// and the two phases are series_stable()'s.
+    ///
+    ///  - A drop the narrower books confirm is everyone's: a hold, if any,
+    ///    ends and the pair joins the global guard.
+    ///  - A drop only too-wide books show starts or keeps the pair's own
+    ///    Crash, which it leaves through Recovery exactly as the global
+    ///    state machine does (revive::next_crash_state).
+    ///  - A pair neither crashing nor held is the global guard's, as before.
+    template <typename State>
+    [[nodiscard]]
+    static constexpr WideCrashStep<State> wide_crash_step(
+        std::optional<State> held, bool crashing, bool counted_crashing,
+        bool stable_phase1, bool stable_phase2) noexcept
+    {
+        if (crashing && counted_crashing) {
+            return {std::nullopt, true};
+        }
+        if (!crashing && !held.has_value()) {
+            return {std::nullopt, true};
+        }
+        const State next = revive::next_crash_state(
+            held.value_or(State::Normal), crashing, stable_phase1, stable_phase2);
+        if (next == State::Normal) {
+            return {std::nullopt, false};
+        }
+        return {next, false};
+    }
+
+    /// [WIDEBOOK-NOQUOTE review #252] The width book_too_wide_to_quote()
+    /// judges: the wider of the published spread and the width of the book
+    /// this heartbeat's mid came from, which MarketDataFeed records in the
+    /// price history (the newest sample, when it is from `current_block`).
+    /// The published MarketSnapshot::spread_bps alone is 0 after a failed
+    /// offers fetch -- a raw ticker's width is not published (PR #159) --
+    /// while the mid is still served from the cached, possibly wide, book.
+    template <typename Entry>
+    [[nodiscard]]
+    static double quote_gate_spread_bps(double published_spread_bps,
+                                        const std::vector<Entry>& history,
+                                        BlockHeight current_block) noexcept
+    {
+        double width = published_spread_bps;
+        if (!history.empty() && history.back().block_height == current_block) {
+            const double sample = history.back().spread_bps;
+            if (std::isnan(width) || sample > width) {
+                width = sample;
+            }
+        }
+        return width;
+    }
 
     /// [WIDEBOOK-NOQUOTE 2026-11-21] True when a pair is to post nothing this
     /// heartbeat: its two-sided book is wider than `max_spread_bps`

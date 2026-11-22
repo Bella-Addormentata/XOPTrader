@@ -5125,35 +5125,42 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
                            config_.risk.flash_crash_threshold_pct,
                            config_.risk.flash_crash_window_blocks);
                 const auto wide_it = wide_crash_state_.find(pair.name);
-                const bool held = wide_it != wide_crash_state_.end();
-                if (counted_crash) {
-                    if (held) wide_crash_state_.erase(wide_it);
-                } else if (pair_crashing || held) {
-                    const FlashCrashState st =
-                        held ? wide_it->second : FlashCrashState::Normal;
-                    const FlashCrashState next = revive::next_crash_state(
-                        st, pair_crashing, pair_stable_phase1, pair_stable_phase2);
-                    if (next != st) {
-                        if (next == FlashCrashState::Crash) {
-                            spdlog::warn("[Engine] Flash crash seen only through "
-                                         "{}'s too-wide book -- its own quotes "
-                                         "suspended, the other pairs keep "
-                                         "quoting", pair.name);
-                            alerts_->send_alert(AlertRule::FlashCrash,
-                                "Flash crash seen only through " + pair.name
-                                + "'s too-wide book -- its own offer posting "
-                                  "suspended");
-                        } else {
-                            spdlog::info("[Engine] {} wide-book crash state "
-                                         "{} -> {}", pair.name, to_string(st),
-                                         to_string(next));
-                        }
-                    }
-                    if (next == FlashCrashState::Normal) {
-                        wide_crash_state_.erase(pair.name);
+                const std::optional<FlashCrashState> held =
+                    wide_it != wide_crash_state_.end()
+                        ? std::optional<FlashCrashState>{wide_it->second}
+                        : std::nullopt;
+                // [review #252] The routing itself is a pure step, tested on
+                // its own: PreTradeCheck::wide_crash_step.
+                const auto step = PreTradeCheck::wide_crash_step(
+                    held, pair_crashing, counted_crash,
+                    pair_stable_phase1, pair_stable_phase2);
+                if (step.held != held) {
+                    if (step.held == FlashCrashState::Crash) {
+                        spdlog::warn("[Engine] Flash crash seen only through "
+                                     "{}'s too-wide book -- its own quotes "
+                                     "suspended, the other pairs keep "
+                                     "quoting", pair.name);
+                        alerts_->send_alert(AlertRule::FlashCrash,
+                            "Flash crash seen only through " + pair.name
+                            + "'s too-wide book -- its own offer posting "
+                              "suspended");
                     } else {
-                        wide_crash_state_[pair.name] = next;
+                        spdlog::info(
+                            "[Engine] {} wide-book crash state {} -> {}{}",
+                            pair.name,
+                            to_string(held.value_or(FlashCrashState::Normal)),
+                            to_string(step.held.value_or(FlashCrashState::Normal)),
+                            step.global ? " -- the narrower books confirm the "
+                                          "drop, so the global guard judges it"
+                                        : "");
                     }
+                }
+                if (step.held.has_value()) {
+                    wide_crash_state_[pair.name] = *step.held;
+                } else if (held.has_value()) {
+                    wide_crash_state_.erase(pair.name);
+                }
+                if (!step.global) {
                     continue;  // out of the global guard while it is held
                 }
             }
@@ -7724,22 +7731,28 @@ void Engine::step_compute_quotes(BlockHeight block_height)
                     std::chrono::steady_clock::now(),
                     config_.market_data.cex_freshness_threshold_sec));
             const double scale = static_cast<double>(kMojosPerXch);
+            // [review #252] The width of the book the mid came from, not only
+            // the published spread: that one is 0 after a failed offers fetch
+            // while the mid still comes from the cached, possibly wide, book.
+            const double wb_width = PreTradeCheck::quote_gate_spread_bps(
+                wb.spread_bps, market_data_->get_price_history(pair_name),
+                block_height);
             if (PreTradeCheck::book_too_wide_to_quote(
-                    wb.spread_bps, config_.risk.flash_crash_max_spread_bps,
+                    wb_width, config_.risk.flash_crash_max_spread_bps,
                     wb.best_bid > 0 && wb.best_ask > 0, fv_usable)) {
                 if (wide_book_held_.insert(pair_name).second) {
                     spdlog::warn("[Engine] Step 4: {} book is {:.0f} bps wide "
                                  "(bid {:.6f}, ask {:.6f}; max {:.0f}) and it "
                                  "has no usable fair value -- posting nothing "
                                  "on it until one returns",
-                                 pair_name, wb.spread_bps,
+                                 pair_name, wb_width,
                                  static_cast<double>(wb.best_bid) / scale,
                                  static_cast<double>(wb.best_ask) / scale,
                                  config_.risk.flash_crash_max_spread_bps);
                 } else {
                     spdlog::debug("[Engine] Step 4: {} still too wide to price "
                                   "({:.0f} bps, no fair value) -- no quotes",
-                                  pair_name, wb.spread_bps);
+                                  pair_name, wb_width);
                 }
                 pcs.quote_valid = false;
                 continue;
@@ -7747,7 +7760,7 @@ void Engine::step_compute_quotes(BlockHeight block_height)
             if (wide_book_held_.erase(pair_name) > 0) {
                 spdlog::info("[Engine] Step 4: {} can be priced again (book "
                              "{:.0f} bps, fair value {}) -- quoting resumes",
-                             pair_name, wb.spread_bps,
+                             pair_name, wb_width,
                              wb_fv.has_value() ? to_string(wb_fv->tier)
                                                : "none");
             }
