@@ -29,6 +29,14 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   worked out. `config.example.yaml` uses `auto` and leaves
   `hedge_size_xch` out.
 
+### A pair held back on a wide-book drop claims no share of the bid floor
+
+While a pair was held back on its own after a drop only its too-wide book
+showed (0.10.57), it still took its share of the target-gap bid floor, so
+the other pairs buying the same coin ran with smaller bids for as long as
+the hold lasted. It is now left out of that sharing, as a pair that cannot
+quote for any other reason already was.
+
 ## [0.10.57] — 2026-11-21 — no quotes on a book too wide to price, quieter alerts, and a read-only Circuit page
 
 ### Two alerts that fired on nearly every cycle (#251)

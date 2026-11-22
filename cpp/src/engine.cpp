@@ -7691,6 +7691,20 @@ void Engine::step_compute_quotes(BlockHeight block_height)
             }
         }
 
+        // [WIDEBOOK-ISOLATE] A pair held on its own wide-book crash is not
+        // quoted, as a revive pair in its own crash state is not, above. The
+        // state is as the last heartbeat left it; this heartbeat's is applied
+        // before Step 6. Decided here, and not only in that later pass, so
+        // the pair is out of the target-gap sharing at the end of this step:
+        // a pair that cannot quote claims no share of a coin's gap, and the
+        // pairs that can are not left short for as long as the hold lasts.
+        if (wide_crash_state_.count(pair_name) > 0) {
+            spdlog::debug("[Engine] Step 4: {} held on its own wide-book crash "
+                          "-- suppressing quotes", pair_name);
+            pcs.quote_valid = false;
+            continue;
+        }
+
         // -- Staleness gate: suppress quoting when market data is stale ------
         // If the market data feed has not received a fresh update within the
         // staleness threshold (5 minutes), skip quote generation for this
