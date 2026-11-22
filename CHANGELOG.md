@@ -37,6 +37,28 @@ the other pairs buying the same coin ran with smaller bids for as long as
 the hold lasted. It is now left out of that sharing, as a pair that cannot
 quote for any other reason already was.
 
+### Offers no longer ask for identical amounts
+
+When a taker combines several offers in one transaction, the wallet pays
+every request for an asset from one coin, and Chia rejects two identical
+outputs of one spend. The wallet also reuses an offer's payment address. So
+two live offers asking for the same amount of the same asset could not be
+taken together (each still filled on its own). The XCH bids of every XCH
+pair use the same tier sizes, and the BYC/wUSDC.b bids each ask for exactly
+1 BYC, so this was common.
+
+Each new offer now asks for an amount no live offer asks for, moved by a
+mojo or two and never against a limit the engine holds:
+- **An ask** asks for a mojo more of the quote asset, its price raised just
+  enough (at most 25 bps), so it never goes under a price floor.
+- **A bid** asks for a mojo less of the base asset and pays less. A bid at
+  its tier minimum cannot shrink, so it asks for a mojo more instead, and
+  only while what it pays stays the same: true of every XCH bid, where a
+  mojo of XCH is far under a mojo of the quote asset. A pair the pace
+  controller manages never grows a bid.
+- What is posted is what is recorded, so a restart reads the same amounts.
+- With no allowed move, the offer is posted as before.
+
 ## [0.10.57] — 2026-11-21 — no quotes on a book too wide to price, quieter alerts, and a read-only Circuit page
 
 ### Two alerts that fired on nearly every cycle (#251)
