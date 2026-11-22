@@ -5,9 +5,9 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.57] — 2026-11-21 — no quotes on a book too wide to price, quieter alerts, and a read-only Circuit page
 
-### Two alerts that fired on nearly every cycle
+### Two alerts that fired on nearly every cycle (#251)
 
 - **Natural Hedge Efficiency** was worked out per heartbeat from that block's
   fills alone, summed across pairs in different base units. A block with a
@@ -25,7 +25,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Switching Telegram on in Settings, or pointing it at another chat, sends
   either warning again if it still stands.
 
-### Circuit DAO: a read-only server check (#225)
+### Circuit DAO: a read-only server check (#225, #248)
 
 - **`python -m gui.services.circuit probe`** asks Circuit's public API
   (api.circuitdao.com) one read-only question per endpoint, 15 in about a
@@ -35,7 +35,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   requests a minute. `gui/services/circuit/api.py` also runs on its own
   (`python api.py probe`) with any Python 3.10 or later.
 
-### Circuit DAO: a read-only Circuit page (#225)
+### Circuit DAO: a read-only Circuit page (#225, #253)
 
 - **A Circuit page** in the sidebar, before Settings, on by default for
   now. Unticking Settings → Advanced → Subsystems → "Show the Circuit DAO
@@ -63,7 +63,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   name, status, price or ratio that is missing or garbled is a note, never
   taken as "no" or left blank.
 
-### A book too wide to price
+### A book too wide to price (#252)
 
 - **No quotes on it.** On 2026-11-21 XCH/BYC's Dexie book went 158% wide
   (bid 0.10, ask 0.90) while its fair value was unavailable. The engine
