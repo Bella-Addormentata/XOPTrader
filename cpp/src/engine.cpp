@@ -5086,6 +5086,10 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             // (Step 4), and it neither trips nor holds the other pairs.
             if (pair.revive_market
                 && config_.strategy.revive_isolate_flash_crash) {
+                // [review #252] Its revive state owns its crash gate now: a
+                // wide-book hold from before a save that made it a revive
+                // pair would otherwise outlive it.
+                wide_crash_state_.erase(pair.name);
                 auto& st = revive_crash_state_[pair.name];
                 const FlashCrashState next = revive::next_crash_state(
                     st, pair_crashing, pair_stable_phase1, pair_stable_phase2);
@@ -7711,8 +7715,14 @@ void Engine::step_compute_quotes(BlockHeight block_height)
             pcw != nullptr && !pcw->revive_market) {
             const MarketSnapshot wb = state_->get_market(pair_name);
             const auto wb_fv = market_data_->get_fair_value(pair_name);
-            const bool fv_usable = wb_fv.has_value()
-                && wb_fv->tier != FairValueTier::Unavailable;
+            // [review #252] Not a value that may rest on a frozen CoinGecko
+            // price (fair_value_prices_wide_book).
+            const bool fv_usable = fair_value_prices_wide_book(
+                wb_fv,
+                coingecko_feed_fresh_for_revival(
+                    !coingecko_prices_.empty(), coingecko_last_fetch_,
+                    std::chrono::steady_clock::now(),
+                    config_.market_data.cex_freshness_threshold_sec));
             const double scale = static_cast<double>(kMojosPerXch);
             if (PreTradeCheck::book_too_wide_to_quote(
                     wb.spread_bps, config_.risk.flash_crash_max_spread_bps,

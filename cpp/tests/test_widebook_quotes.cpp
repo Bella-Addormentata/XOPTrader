@@ -7,8 +7,10 @@
 #include <gtest/gtest.h>
 
 #include <limits>
+#include <optional>
 #include <vector>
 
+#include "xop/execution/market_data.hpp"
 #include "xop/risk/limits.hpp"
 
 using xop::Mojo;
@@ -75,4 +77,29 @@ TEST(WideBookQuotes, TheCountedCheckKeepsItsWindow)
     EXPECT_TRUE(PreTradeCheck::series_crashing_counted(series, 0.20, 0));
     EXPECT_FALSE(PreTradeCheck::series_crashing_counted(series, 0.20, 5))
         << "the high has left the window";
+}
+
+TEST(WideBookQuotes, AFairValueOnAFrozenCoinGeckoPriceDoesNotPriceIt)
+{
+    // [review #252] During a CoinGecko outage the solve keeps its last
+    // anchors and the result is stamped fresh every heartbeat.
+    using xop::FairValue;
+    using xop::FairValueTier;
+    using xop::fair_value_prices_wide_book;
+    const auto with = [](FairValueTier tier) {
+        FairValue fv{};
+        fv.price = 0.87;
+        fv.tier = tier;
+        return std::optional<FairValue>{fv};
+    };
+    EXPECT_FALSE(fair_value_prices_wide_book(std::nullopt, true));
+    EXPECT_FALSE(fair_value_prices_wide_book(with(FairValueTier::Unavailable), true));
+    for (const auto tier : {FairValueTier::CexDirect, FairValueTier::Inferred,
+                            FairValueTier::Triangulated}) {
+        EXPECT_TRUE(fair_value_prices_wide_book(with(tier), true)) << xop::to_string(tier);
+    }
+    EXPECT_FALSE(fair_value_prices_wide_book(with(FairValueTier::CexDirect), false));
+    EXPECT_FALSE(fair_value_prices_wide_book(with(FairValueTier::Inferred), false));
+    EXPECT_TRUE(fair_value_prices_wide_book(with(FairValueTier::Triangulated), false))
+        << "cross-checked by other paths";
 }

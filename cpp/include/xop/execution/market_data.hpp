@@ -206,6 +206,19 @@ struct FairValue {
     std::size_t   observations{0};
 };
 
+/// [WIDEBOOK-NOQUOTE review #252] Whether a fair value may price a pair whose
+/// own book is too wide to price: any usable tier while the CoinGecko feed is
+/// fresh, and only a cross-checked (Triangulated) one while it is stale. A
+/// CexDirect or Inferred value may rest on a frozen CoinGecko price during an
+/// outage: update_fair_values() keeps the last anchors, and the ingest stamps
+/// the result fresh every heartbeat.
+[[nodiscard]] inline bool fair_value_prices_wide_book(const std::optional<FairValue>& fv,
+                                                      bool cex_feed_fresh) noexcept
+{
+    if (!fv.has_value() || fv->tier == FairValueTier::Unavailable) return false;
+    return cex_feed_fresh || fv->tier == FairValueTier::Triangulated;
+}
+
 // ---------------------------------------------------------------------------
 // FairValueObservation -- the raw, book-derived inputs the fair-value solve
 // needs from one pair, fetched under a single lock.

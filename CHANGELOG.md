@@ -71,7 +71,8 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   0.63 BYC, against a fair price of about 0.87, were taken within minutes:
   about 11 BYC under cost. A pair whose two-sided book is wider than
   `risk.flash_crash_max_spread_bps` (2000 bps) and that has no usable fair
-  value now posts nothing until one of them returns. Resting offers stay as
+  value now posts nothing until one of them returns. While the CoinGecko feed
+  is stale, only a cross-checked fair value counts as usable here. Resting offers stay as
   they are; revive pairs keep their own thin-book rules.
 - **The flash-crash guard holds back only that pair** when the drop shows
   only through books that wide. XCH/BYC's book went that wide about every
