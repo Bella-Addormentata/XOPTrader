@@ -50,6 +50,7 @@
 #include <gtest/gtest.h>
 
 #include "xop/execution/market_data.hpp"
+#include "xop/risk/limits.hpp"
 #include "xop/state.hpp"
 #include "xop/types.hpp"
 
@@ -399,6 +400,37 @@ TEST(RawTickerProvenance, AFailedFetchKeepsTheCachedMidsBookWidthInHistory)
         << "the published spread stays 0 for the raw ticker (PR #159)";
     EXPECT_DOUBLE_EQ(h[1].spread_bps, h[0].spread_bps)
         << "the cached mid keeps the width of the book it came from";
+}
+
+TEST(RawTickerProvenance, AFailedFetchStillHoldsBackAPairTooWideToQuote)
+{
+    // [WIDEBOOK-NOQUOTE review #252] The quote gate (Engine Step 4) must not
+    // read the published spread alone: on the failed-fetch heartbeat above it
+    // is 0, and a book too wide to price would be quoted on for a heartbeat.
+    State state;
+    MarketDataFeed feed(provenance_cfg(), state);
+    feed.ingest_block_height(100);
+    feed.ingest_competing_offers(
+        kPair,
+        {third_party("tp-bid", Side::Bid, kBid),
+         third_party("tp-ask", Side::Ask, 108.0)},
+        {}, xop::kMojosPerXch, 1'000);
+    feed.refresh({kPair});
+    feed.ingest_block_height(101);
+    feed.ingest_dexie(kPair, kBid, 108.0, /*last=*/83.40, /*vol_24h=*/0.21);
+    feed.refresh({kPair});
+
+    const auto snap = state.get_market(kPair);
+    ASSERT_DOUBLE_EQ(snap.spread_bps, 0.0) << "precondition: a raw ticker's spread";
+    ASSERT_TRUE(snap.best_bid > 0 && snap.best_ask > 0);
+    const double width = xop::PreTradeCheck::quote_gate_spread_bps(
+        snap.spread_bps, feed.get_price_history(kPair), 101);
+    EXPECT_GT(width, 2000.0);
+    EXPECT_TRUE(xop::PreTradeCheck::book_too_wide_to_quote(
+        width, 2000.0, snap.best_bid > 0 && snap.best_ask > 0, /*fair_value_usable=*/false));
+    EXPECT_FALSE(xop::PreTradeCheck::book_too_wide_to_quote(
+        snap.spread_bps, 2000.0, true, false))
+        << "the published spread alone lets it through";
 }
 
 TEST(RawTickerProvenance, AFilteredBookRecordsItsSpreadInHistory)

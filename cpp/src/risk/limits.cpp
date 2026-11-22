@@ -809,6 +809,33 @@ bool PreTradeCheck::series_crashing(const CrashSeries& s, double threshold,
     return false;
 }
 
+bool PreTradeCheck::series_crashing_counted(const CrashSeries& s,
+                                            double threshold,
+                                            std::size_t window) noexcept
+{
+    const std::size_t n = std::min(s.prices.size(), s.counted.size());
+    const std::size_t start = (window > 0 && n > window) ? n - window : 0;
+
+    Mojo high = 0;  // running maximum of the counted samples
+    for (std::size_t i = start; i < n; ++i) {
+        if (!s.counted[i]) {
+            continue;  // from too wide a book: neither a high nor a low
+        }
+        if (s.prices[i] > high) {
+            high = s.prices[i];
+        }
+        if (high <= 0) {
+            continue;
+        }
+        const double drawdown = static_cast<double>(high - s.prices[i])
+                              / static_cast<double>(high);
+        if (drawdown >= threshold) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool PreTradeCheck::series_stable(const CrashSeries& s,
                                   std::size_t required_blocks,
                                   double stability_band) noexcept

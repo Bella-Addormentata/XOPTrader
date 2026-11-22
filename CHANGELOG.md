@@ -5,9 +5,9 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.57] — 2026-11-21 — no quotes on a book too wide to price, quieter alerts, and a read-only Circuit page
 
-### Two alerts that fired on nearly every cycle
+### Two alerts that fired on nearly every cycle (#251)
 
 - **Natural Hedge Efficiency** was worked out per heartbeat from that block's
   fills alone, summed across pairs in different base units. A block with a
@@ -25,7 +25,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Switching Telegram on in Settings, or pointing it at another chat, sends
   either warning again if it still stands.
 
-### Circuit DAO: a read-only server check (#225)
+### Circuit DAO: a read-only server check (#225, #248)
 
 - **`python -m gui.services.circuit probe`** asks Circuit's public API
   (api.circuitdao.com) one read-only question per endpoint, 15 in about a
@@ -35,7 +35,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   requests a minute. `gui/services/circuit/api.py` also runs on its own
   (`python api.py probe`) with any Python 3.10 or later.
 
-### Circuit DAO: a read-only Circuit page (#225)
+### Circuit DAO: a read-only Circuit page (#225, #253)
 
 - **A Circuit page** in the sidebar, before Settings, on by default for
   now. Unticking Settings → Advanced → Subsystems → "Show the Circuit DAO
@@ -62,6 +62,22 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   against Circuit's own API description and the live answers, so a yes/no,
   name, status, price or ratio that is missing or garbled is a note, never
   taken as "no" or left blank.
+
+### A book too wide to price (#252)
+
+- **No quotes on it.** On 2026-11-21 XCH/BYC's Dexie book went 158% wide
+  (bid 0.10, ask 0.90) while its fair value was unavailable. The engine
+  centred its quotes near that book's midpoint, and four asks at 0.49 to
+  0.63 BYC, against a fair price of about 0.87, were taken within minutes:
+  about 11 BYC under cost. A pair whose two-sided book is wider than
+  `risk.flash_crash_max_spread_bps` (2000 bps) and that has no usable fair
+  value now posts nothing until one of them returns. While the CoinGecko feed
+  is stale, only a cross-checked fair value counts as usable here. Resting offers stay as
+  they are; revive pairs keep their own thin-book rules.
+- **The flash-crash guard holds back only that pair** when the drop shows
+  only through books that wide. XCH/BYC's book went that wide about every
+  two hours on 2026-11-20 and 21, and each time every XCH pair stopped for
+  an hour or more. A drop the narrower books confirm still stops every pair.
 
 ## [0.10.56] — 2026-11-20 — the options address's XCH stays put, and calls and puts by default
 
