@@ -5,6 +5,30 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Options: the contract size comes from your limits
+
+- **`contract_xch: auto`**, which a size left out now means too, sizes the
+  contracts from the limits: variety first, then size. It is the largest of
+  1, 10, 100, ... XCH at which every call slot (call strikes x expiries,
+  within `max_contracts` and `max_contracts_per_expiry`) still fits inside
+  `max_locked_xch`, and never under 1 XCH. Two call strikes on two Fridays
+  are four slots: `max_locked_xch: 4` gives 1 XCH contracts and `40` gives
+  10 XCH ones. When even 1 XCH a slot does not fit, the nearest expiry and
+  the strikes nearest the money are written first, as before. A number
+  written is used as it is, so no existing book changes.
+- **Why 1 XCH at least.** A contract's premium grows with its size and its
+  fees do not, and 0.001 wUSDC.b is a coarse price step for a contract much
+  under 1 XCH.
+- **Settings > Options** has "Contract size: Automatic, from my limits" or
+  "Fixed", and says what Automatic comes to with the limits and the grid as
+  they are. A new book starts on Automatic.
+- The top-up target's "one contract" of headroom, and the size the Dexie
+  book must fill (`market.hedge_size_xch`, when not written), follow the size
+  worked out. `config.example.yaml` uses `auto` and leaves
+  `hedge_size_xch` out.
+
 ## [0.10.57] — 2026-11-21 — no quotes on a book too wide to price, quieter alerts, and a read-only Circuit page
 
 ### Two alerts that fired on nearly every cycle (#251)

@@ -70,6 +70,11 @@ Under the fence ``fund_from_wallet`` and ``engine_beside_open_contracts`` are
 not used, and are ignored with a warning rather than refused. Without an
 ``options.target`` the fence's target comes from the limits
 (:func:`default_target`); ``target: false`` turns top-ups off.
+
+[AUTO-SIZE] ``contract_xch: auto`` (also when it is not written) sizes the
+contracts from the limits: variety first, then size -- the largest of 1, 10,
+100, ... XCH at which every call slot the grid can hold still fits inside
+``limits.max_locked_xch``, and never under 1 XCH (:func:`auto_contract_xch`).
 """
 
 from __future__ import annotations
@@ -296,6 +301,83 @@ class Limits:
     max_fee_mojos: int
 
 
+#: [AUTO-SIZE] ``options.contract_xch: auto`` never goes under this many XCH...
+AUTO_CONTRACT_MIN_XCH = 1
+#: ...nor over this many, whatever the cap: a bound for the search.
+AUTO_CONTRACT_MAX_XCH = 1_000_000
+
+
+def held_call_slots(limits: Limits, call_strikes: int, expiries: int) -> int:
+    """[AUTO-SIZE] The most calls the grid can hold at once.
+
+    One slot per call strike and expiry, within ``max_contracts_per_expiry``
+    and ``max_contracts`` (a cap that is unset or unlimited does not bound
+    it). Puts share those two caps, so with puts written this is the most the
+    calls could take, and the size worked out from it errs on the small side.
+    """
+    per_expiry = max(0, call_strikes)
+    if limits.max_contracts_per_expiry > 0:
+        per_expiry = min(per_expiry, limits.max_contracts_per_expiry)
+    slots = max(0, expiries) * per_expiry
+    if limits.max_contracts > 0:
+        slots = min(slots, limits.max_contracts)
+    return slots
+
+
+def auto_contract_xch(limits: Limits, call_strikes: int, expiries: int) -> int:
+    """[AUTO-SIZE] What ``options.contract_xch: auto`` stands for, in whole XCH.
+
+    Variety first, then size: the largest of 1, 10, 100, ... XCH at which
+    every call slot the grid can hold at once (:func:`held_call_slots`) still
+    fits inside ``max_locked_xch``. More strikes or dates, or a lower cap,
+    mean smaller contracts, down to 1 XCH and never under it: when even that
+    does not cover every slot, the limits decide which are written -- the
+    nearest expiry first, then the strikes nearest the money
+    (:func:`gui.services.options.quoting.plan`).
+
+    1 XCH too when ``max_locked_xch`` is not a number (unset or unlimited:
+    there is nothing to size from), and when no calls are written: a put
+    locks the quote asset, and how much of it depends on the price.
+
+    Why 1 XCH at least: a contract's premium grows with its size and its fees
+    do not, and the quote asset's smallest unit (0.001 wUSDC.b) is a coarse
+    price step for a contract much under 1 XCH.
+    """
+    slots = held_call_slots(limits, call_strikes, expiries)
+    size = AUTO_CONTRACT_MIN_XCH
+    if slots <= 0 or limits.max_locked_xch <= 0:
+        return size
+    while (
+        size * 10 <= AUTO_CONTRACT_MAX_XCH
+        and size * 10 * XCH_MOJOS * slots <= limits.max_locked_xch
+    ):
+        size *= 10
+    return size
+
+
+def _contract_size(section: dict) -> float | None:
+    """``options.contract_xch`` in XCH; None for ``auto``, which not writing it also means.
+
+    [AUTO-SIZE] Left out or null is ``auto``, as an unwritten ``expiries`` is
+    weekly and an unwritten ``target`` comes from the limits. Anything else
+    must be a positive number.
+    """
+    raw = section.get("contract_xch")
+    if raw is None or (isinstance(raw, str) and raw.strip().lower() == "auto"):
+        return None
+    if isinstance(raw, bool):
+        raise OptionsConfigError("options.contract_xch must be a number of XCH, or auto")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise OptionsConfigError(
+            f"options.contract_xch must be a number of XCH, or auto (got {raw!r})"
+        ) from exc
+    if not math.isfinite(value) or int(round(value * XCH_MOJOS)) <= 0:
+        raise OptionsConfigError("options.contract_xch must be positive")
+    return value
+
+
 @dataclasses.dataclass(frozen=True)
 class MarketConfig:
     max_age_seconds: float
@@ -473,6 +555,9 @@ class OptionsConfig:
     #: [ROLLING] ``options.expiries: weekly`` (or a mapping): the expiries roll
     #: forward on their own and ``expiries`` is empty. None for a list of dates.
     expiry_rule: ExpiryRule | None = None
+    #: [AUTO-SIZE] ``options.contract_xch: auto`` (or not written):
+    #: ``contract_xch_mojos`` was worked out from the limits (auto_contract_xch).
+    contract_auto: bool = False
 
     @property
     def address_prefix(self) -> str:
@@ -680,10 +765,9 @@ def parse(root: Any) -> OptionsConfig | None:
     quote_decimals = int(_number(section, "quote_asset_decimals", 3))
     if not 0 <= quote_decimals <= 12:
         raise OptionsConfigError("options.quote_asset_decimals must be between 0 and 12")
-    contract_xch = _number(section, "contract_xch", None, minimum=0.0)
-    contract_mojos = int(round(contract_xch * XCH_MOJOS))
-    if contract_mojos <= 0:
-        raise OptionsConfigError("options.contract_xch must be positive")
+    # [AUTO-SIZE] None for `auto`: sized below, once the grid and the limits
+    # are read.
+    written_xch = _contract_size(section)
 
     expiries_raw = section.get("expiries")
     expiry_rule = _expiry_rule(expiries_raw)
@@ -775,6 +859,16 @@ def parse(root: Any) -> OptionsConfig | None:
         max_contracts_per_expiry=_cap(limits_raw, "max_contracts_per_expiry", 1),
         max_fee_mojos=int(_number(limits_raw, "max_fee_mojos", 0)),
     )
+    if written_xch is None:
+        # A rule's expiries can coincide (a month-end Friday that is also one
+        # of the weeklies), so this may count one too many: the smaller size.
+        grid_expiries = (
+            expiry_rule.weekly + expiry_rule.monthly if expiry_rule is not None else len(expiries)
+        )
+        contract_xch = float(auto_contract_xch(limits, len(calls), grid_expiries))
+    else:
+        contract_xch = written_xch
+    contract_mojos = int(round(contract_xch * XCH_MOJOS))
     fee_auto = str(section.get("fee_mojos", 0)).strip().lower() == "auto"
     fee = 0 if fee_auto else int(_number(section, "fee_mojos", 0))
     if fee > limits.max_fee_mojos:
@@ -829,6 +923,7 @@ def parse(root: Any) -> OptionsConfig | None:
         splash=splash_config,
         coingecko_api_key=str(coingecko.get("api_key") or "").strip(),
         expiry_rule=expiry_rule,
+        contract_auto=written_xch is None,
         target=_resolve_target(section, quote_unit, wallet, limits, contract_mojos, bool(puts)),
     )
 

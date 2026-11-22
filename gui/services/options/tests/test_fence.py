@@ -115,6 +115,27 @@ def test_the_default_target_comes_from_the_limits() -> None:
     assert written.target is not None and written.target.xch_mojos == 3 * config.XCH_MOJOS
 
 
+def test_the_default_target_follows_an_auto_size() -> None:
+    """[AUTO-SIZE] "One contract" of headroom is one contract of the size worked out."""
+    parsed = _parse(
+        _shared(),
+        contract_xch="auto",
+        expiries="weekly",
+        call_strikes_pct=[110, 120],
+        put_strikes_pct=[],
+        limits={
+            "max_locked_xch": 40,
+            "max_locked_quote": 1,
+            "max_contracts": 4,
+            "max_contracts_per_expiry": 2,
+        },
+    )
+    assert parsed.contract_xch_mojos == 10 * config.XCH_MOJOS
+    assert parsed.target == config.TargetConfig(
+        xch_mojos=50 * config.XCH_MOJOS, quote_mojos=2_000, tolerance=0.2
+    )
+
+
 # -- the app's own spends -------------------------------------------------------
 
 
