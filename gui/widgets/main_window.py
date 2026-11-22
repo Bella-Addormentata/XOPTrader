@@ -122,6 +122,11 @@ try:
 except ImportError:
     OptionsWidget = None  # type: ignore[assignment,misc]
 
+try:
+    from gui.widgets.circuit import CircuitWidget
+except ImportError:
+    CircuitWidget = None  # type: ignore[assignment,misc]
+
 # ---------------------------------------------------------------------------
 # Theme constants -- sourced from the canonical CHIA palette singleton.
 # ---------------------------------------------------------------------------
@@ -182,7 +187,8 @@ _PAGE_WARP: Final[int] = 7
 _PAGE_BASE_WALLET: Final[int] = 8
 _PAGE_PERMUTO: Final[int] = 9
 _PAGE_OPTIONS: Final[int] = 10
-_PAGE_SETTINGS: Final[int] = 11
+_PAGE_CIRCUIT: Final[int] = 11
+_PAGE_SETTINGS: Final[int] = 12
 
 
 def _fmt_usd(value: float) -> str:
@@ -335,9 +341,13 @@ class MainWindow(QMainWindow):
         # Startup requests from the Settings > Startup tab, applied ONCE
         # through the same gates as a click. dexie: adopt|on|off.
         from gui.widgets.settings import (
+            load_circuit_enabled,
             load_permuto_enabled,
             load_startup_states,
         )
+        # [CIRCUIT] The read-only Circuit page: built either way (it asks
+        # nothing until it is on and open), shown in the sidebar only when on.
+        self._circuit_enabled: bool = load_circuit_enabled()
         self._startup_dexie, self._startup_permuto = load_startup_states()
         # [PERMUTO MASTER SWITCH] Read ONCE, before anything Permuto-shaped
         # is built, because what it gates is construction: the toolbar
@@ -2175,6 +2185,7 @@ class MainWindow(QMainWindow):
         self._sidebar.page_changed.connect(self._on_page_changed)
         # Hidden, not removed: _NAV_ITEMS positions ARE the page indices.
         self._sidebar.set_page_visible(_PAGE_PERMUTO, self._permuto_enabled)
+        self._sidebar.set_page_visible(_PAGE_CIRCUIT, self._circuit_enabled)
         outer_layout.addWidget(self._sidebar)
 
         # -- Vertical splitter (top content / bottom tabs) ------------------
@@ -2224,12 +2235,13 @@ class MainWindow(QMainWindow):
         )
         self._stacked.addWidget(self._base_wallet_widget)
         # [PERMUTO MASTER SWITCH] Index 9 is ALWAYS occupied, disabled or
-        # not. The page indices are positional -- _PAGE_SETTINGS is 11
-        # because Permuto is 9 and Options 10 -- and the last time that assumption slipped,
-        # the first-run "you have no config" redirect opened a key-generation
-        # page instead of Settings. A placeholder holds the slot; what it
-        # does not do is construct PermutoWidget, whose __init__ calls
-        # refresh() and reads the identity out of secrets.yaml.
+        # not. The page indices are positional -- _PAGE_SETTINGS is 12
+        # because Permuto is 9, Options 10 and Circuit 11 -- and the last
+        # time that assumption slipped, the first-run "you have no config"
+        # redirect opened a key-generation page instead of Settings. A
+        # placeholder holds the slot; what it does not do is construct
+        # PermutoWidget, whose __init__ calls refresh() and reads the
+        # identity out of secrets.yaml.
         if self._permuto_enabled:
             self._permuto_widget = self._create_page_widget(     # index 9
                 PermutoWidget, "Permuto"
@@ -2259,8 +2271,22 @@ class MainWindow(QMainWindow):
         if landed != _PAGE_OPTIONS:
             _log.error("[Options] page landed at index %d, not _PAGE_OPTIONS (%d)",
                        landed, _PAGE_OPTIONS)
+        # [CIRCUIT] Index 11, before Settings. Built whether or not it is
+        # switched on: construction asks nothing, so the switch can take
+        # effect at once both ways, and the slot is held either way.
+        self._circuit_widget = self._create_page_widget(            # index 11
+            CircuitWidget, "Circuit", scrollable=True
+        )
+        self._stacked.addWidget(self._circuit_widget)
+        circuit_page = self._unwrap(self._circuit_widget)
+        if circuit_page is not None and hasattr(circuit_page, "set_enabled"):
+            circuit_page.set_enabled(self._circuit_enabled)
+        landed = self._stacked.indexOf(self._circuit_widget)
+        if landed != _PAGE_CIRCUIT:
+            _log.error("[Circuit] page landed at index %d, not _PAGE_CIRCUIT (%d)",
+                       landed, _PAGE_CIRCUIT)
         self._settings_widget = self._create_page_widget(SettingsWidget, "Settings")
-        self._stacked.addWidget(self._settings_widget)              # index 11
+        self._stacked.addWidget(self._settings_widget)              # index 12
         settings_page = self._unwrap(self._settings_widget)
         if settings_page is not None and hasattr(
                 settings_page, "permuto_enabled_changed"):
@@ -2270,6 +2296,10 @@ class MainWindow(QMainWindow):
                 settings_page, "options_switch_visible_changed"):
             settings_page.options_switch_visible_changed.connect(
                 self._on_options_switch_visible_changed)
+        if settings_page is not None and hasattr(
+                settings_page, "circuit_enabled_changed"):
+            settings_page.circuit_enabled_changed.connect(
+                self._on_circuit_enabled_changed)
         self._splitter.addWidget(self._stacked)
 
         # Bottom area: tab widget (35 %)
@@ -3500,6 +3530,25 @@ class MainWindow(QMainWindow):
             # last-page persistence to fall back on.
             self._switch_page(_PAGE_DASHBOARD)
 
+    def _on_circuit_enabled_changed(self, enabled: bool) -> None:
+        """Settings > Subsystems: show or hide the read-only Circuit page, at once.
+
+        Off hides the sidebar entry and stops the page asking Circuit's API
+        (a round under way ends at its next wait); on shows the entry, and
+        the page reads when it is opened.
+        """
+        self._circuit_enabled = bool(enabled)
+        page = self._unwrap(self._circuit_widget)
+        if page is not None and hasattr(page, "set_enabled"):
+            page.set_enabled(self._circuit_enabled)
+        self._sidebar.set_page_visible(_PAGE_CIRCUIT, self._circuit_enabled)
+        if not self._circuit_enabled and self._stacked.currentIndex() == _PAGE_CIRCUIT:
+            self._switch_page(_PAGE_DASHBOARD)
+        _log.info("[Circuit] page %s", "shown" if self._circuit_enabled else "hidden")
+        self.statusBar().showMessage(
+            "Circuit page added to the sidebar." if self._circuit_enabled
+            else "Circuit page hidden; it no longer asks Circuit's API.", 6000)
+
     def _revert_permuto_enabled(self, enabled: bool) -> None:
         """Put the Settings checkbox back after a refused change."""
         page = self._unwrap(self._settings_widget)
@@ -4057,7 +4106,8 @@ class MainWindow(QMainWindow):
                 _log.exception("[Permuto] live session did not stop cleanly")
 
         for page in (self._wallet_balances, self._settings_widget,
-                     self._permuto_widget, self._options_widget):
+                     self._permuto_widget, self._options_widget,
+                     self._circuit_widget):
             widget = self._unwrap(page)
             if widget is not None and hasattr(widget, "stop_background_work"):
                 widget.stop_background_work()

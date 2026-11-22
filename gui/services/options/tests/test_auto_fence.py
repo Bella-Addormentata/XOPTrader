@@ -210,8 +210,10 @@ def test_live_beside_a_running_engine_waits_for_its_fence_instead_of_refusing(tm
         _wait(lambda: "waiting for the trading engine to put its fence up" in run.snapshot().held)
         assert made and made[0].steps == 0, "nothing signs before the engine's fence is up"
         seen["fence"] = holds
-        _wait(lambda: made[0].steps >= 1)
-        assert run.snapshot().held == ""
+        # The snapshot, not the fake's counter: the runner clears ``held`` only
+        # after the step, once it has read the book's record, so a check made
+        # as soon as the counter moves can still see the last wait.
+        _wait(lambda: made[0].steps >= 1 and run.snapshot().held == "")
     finally:
         run.stop()
 

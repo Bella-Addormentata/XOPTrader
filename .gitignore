@@ -95,3 +95,6 @@ logs/
 
 # Claude Code agent worktrees (never repository content)
 .claude/worktrees/
+
+# Circuit API probe output (python -m gui.services.circuit probe)
+circuit_probe_*/

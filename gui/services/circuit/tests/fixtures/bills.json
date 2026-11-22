@@ -1,0 +1,13 @@
+[
+ {
+  "name": "ee930ba6fa4eb2e3efeda40a6251fec438dff9546996353478732916d0cf85b8",
+  "amount": 31000000000,
+  "bill": null,
+  "status": null,
+  "exitable_at": 1787349649,
+  "exitable_in": -7935731,
+  "operation": "implement_bill",
+  "timestamp": 1787348749,
+  "spent": false
+ }
+]
