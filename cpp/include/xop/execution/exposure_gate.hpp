@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -280,6 +281,62 @@ static_assert(exposure_cancel_floor(Mojo{100'000'000'000}, 0.25)
         d.verdict = ExposureVerdict::SuppressNew;
     }
     return d;
+}
+
+/// [UNIQUE-REQUEST 2026-11-23] What a side that got Ok could spend on top of
+/// its planned tiers without changing that verdict: what the projection
+/// leaves above the reserve and, under the unified rule, what the free coins
+/// leave above it too (decide_exposure's funding test) -- the less of the
+/// two. 0 for any other verdict.
+///
+/// A bid that has to ask for a few mojos more to differ from the other live
+/// offers pays for them out of this (execution/unique_request.hpp), so it
+/// can neither turn the verdict nor reach into the reserve. The figure is
+/// the WALLET's: within_side_caps() below then holds it to the side's own
+/// allocation.
+[[nodiscard]] constexpr Mojo spare_above_reserve(bool                    unified,
+                                                 const ExposureInputs&   in,
+                                                 const ExposureDecision& decision) noexcept
+{
+    if (decision.verdict != ExposureVerdict::Ok) return 0;
+    const Mojo reserve = in.reserve_mojos < 0 ? Mojo{0} : in.reserve_mojos;
+    Mojo spare = decision.projected_mojos > reserve
+        ? decision.projected_mojos - reserve : Mojo{0};
+    if (unified) {
+        const Mojo free_after = projected_balance_after_fills(
+            in.spendable_mojos, 0, in.planned_spend_mojos);
+        const Mojo free_spare = free_after > reserve ? free_after - reserve : Mojo{0};
+        if (free_spare < spare) spare = free_spare;
+    }
+    return spare;
+}
+
+/// [review #256] `spare` held to the caps Step 7 put on ONE side's own
+/// spending of a coin several sides spend:
+///   - its share of a coin they together want more of than it holds
+///     (PairCycleState::coin_share_*, strategy/coin_budget.hpp);
+///   - the coin it may lock under wait-to-grow (lockable_*).
+/// spare_above_reserve() is wallet-wide: it would let one pair's bids pay for
+/// their extra mojos out of what Step 7 gave another pair. `side_spend` is
+/// what the side's live resting offers and its new tiers spend together, in
+/// the coin's mojos. A cap leaves what it has above that, and nothing once
+/// the side is at or past it; a cap that is not set does not bind.
+[[nodiscard]] constexpr Mojo within_side_caps(Mojo                spare,
+                                              Mojo                side_spend,
+                                              std::optional<Mojo> coin_share,
+                                              std::optional<Mojo> lockable) noexcept
+{
+    Mojo left = spare > 0 ? spare : Mojo{0};
+    if (side_spend < 0) side_spend = 0;
+    if (coin_share.has_value()) {
+        const Mojo under = *coin_share > side_spend ? *coin_share - side_spend : Mojo{0};
+        if (under < left) left = under;
+    }
+    if (lockable.has_value()) {
+        const Mojo under = *lockable > side_spend ? *lockable - side_spend : Mojo{0};
+        if (under < left) left = under;
+    }
+    return left;
 }
 
 /// One resting offer, reduced to what the asset-wide projection needs: the
