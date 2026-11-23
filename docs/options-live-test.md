@@ -16,7 +16,7 @@ The straightforward set-up, with the app alone:
    writes calls at 110% and 120% and puts at 90% and 80% of spot, and the
    top-up target and the contract size come from your limits.
 
-   **Contract size** (0.10.58 and later) is Automatic unless you choose Fixed:
+   **Contract size** (0.10.57 and later) is Automatic unless you choose Fixed:
    the largest of 1, 10, 100, ... XCH at which every call slot (strikes x
    expiries, within Max contracts and Max per expiry) still fits inside Max
    XCH locked, and never under 1 XCH. So variety comes first and size second.
