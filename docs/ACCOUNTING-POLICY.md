@@ -65,7 +65,7 @@ engine runs re-anchors the drawdown peak. The rules and their limits are in
 
 | What happens | What is booked |
 |---|---|
-| The options book tops the sub-account up while the fence is up | `options_withdrawal` of the amount and the send's fee, once the book records the send as confirmed. Event id `options_topup:<transaction>` |
+| The options book tops the sub-account up while the fence is up | `options_withdrawal` of the amount and the send's fee, once the wallet's own record of that transaction says it confirmed. Event id `options_topup:<transaction>` |
 | The fence goes up | `options_withdrawal` of what the address held at the first list after it went up. Event id `options_fence_up:<n>` |
 | The fence goes down | `options_deposit` of what the address held at the last list before it went down. Event id `options_fence_down:<n>` |
 | A mint, a clawback, an expiry | nothing: collateral moves between the options address and a contract, and no balance the engine reads changes |
@@ -73,20 +73,36 @@ engine runs re-anchors the drawdown peak. The rules and their limits are in
 A fence event is written at every transition, also when the address held
 nothing (one zero leg on `xch`), so the newest one says where the books stand
 and a restart reads the same answer. The first, `#1`, only adopts the state
-the fence is found in.
+the fence is found in. The fence logs each change with the list it had then,
+and the books take the log in order: two changes between two heartbeats are
+two events, each with its own list.
 
-Nothing is counted twice: top-ups are booked before a fence event; while the
-books stand fence-down no top-up is booked, because its coins are trading
-funds and the next fence-up event takes them; and a top-up sent before that
-event's list is inside it. A top-up the book has not yet recorded as
-confirmed, whose coin is among those the fence returns as it goes down, did
-arrive while the fence was up and is booked with that event.
+A top-up is confirmed by its own transaction. The options book's database
+says which top-ups there are; whether one has confirmed, the engine asks the
+wallet (`get_transaction`), so it is booked in the heartbeat after it
+confirms. The book's own `topup_confirmed` row, written minutes later, is the
+fallback for a transaction the wallet no longer knows.
+
+Nothing is counted twice: while the books stand fence-down no top-up is
+booked, because its coins are trading funds and the next fence-up event
+takes them; a top-up sent before that event's list is inside it; and when
+the fence goes down, a confirmed top-up the books do not hold yet is booked
+ahead of that event only if the list it returns holds the top-up's own coin,
+by id.
+
+The journal comes first, so a stop can fall between it and the inventory
+tracker holding the flow. A marker per asset (`capital_reconcile_pending`)
+is written before the journal and dropped once the tracker holds the flow
+and is written. A start that finds one treats Step 11's wallet correction of
+that asset as the flow reaching the tracker: it re-anchors the drawdown
+peak, with no second Net Deposits entry.
 
 Still without an event, and so left to the divergence control: a premium
 (paid to an ordinary address of the wallet), a top-up the book never wrote
 down, whatever happened before the first booked event, what the options book
-did across a fence change while the engine was not running, and the fence
-taken away by switching the options book off in `config.yaml`.
+did across a fence change while the engine was not running, fence changes
+the books had not yet heard of when the engine stopped, and the fence taken
+away by switching the options book off in `config.yaml`.
 
 `accounting.options_transfer_ingest_enabled: false` stops all of it.
 
@@ -250,9 +266,8 @@ while 1% of the XCH wallet is 1.2 XCH — enough to swallow an entire missed
 
 Two more terms widen it while they apply: the wallet's `pending_change`
 (coins in flight), and capital the options sub-account has taken or returned
-that is known and not yet booked — a top-up the options book has not recorded
-as confirmed (for at most two hours after it was sent), or a fence event
-waiting for a price.
+that is known and not yet booked — a top-up waiting to book (for at most two
+hours after it was sent), or a fence event that could not be booked yet.
 
 **Persistence requirement**: escalation needs N consecutive **same-signed**
 breaches (alert at 2, pause at 3). The ledger can only ever *lag* the wallet,

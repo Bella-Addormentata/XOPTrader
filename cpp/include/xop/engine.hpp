@@ -1977,13 +1977,15 @@ private:
 
     /// [OPTIONS-CAPITAL 2026-11-23] Book what moved between the trading funds
     /// and the options sub-account as capital: the options book's top-ups
-    /// (read READ-ONLY from options.database_path) and the fence going down
-    /// or up.  Ledger legs under options_withdrawal / options_deposit, Net
-    /// Deposits at the engine's own USD mark, inventory by the flow itself
-    /// or by Step 11's wallet reconcile re-armed, and the flow re-anchor of
-    /// the drawdown peak.  Runs after the bridge scans, before the
-    /// invariant.  What crosses the edge, what is booked and the known
-    /// limits: accounting/options_transfer.hpp.
+    /// (read READ-ONLY from options.database_path, and confirmed by the
+    /// wallet's own record of each one's transaction) and the fence going
+    /// down or up (every change, in order, from the fence's log).  Ledger
+    /// legs under options_withdrawal / options_deposit, Net Deposits at the
+    /// engine's own USD mark, inventory by the flow itself or by Step 11's
+    /// wallet reconcile re-armed, and the flow re-anchor of the drawdown
+    /// peak.  Runs after the bridge scans, before the invariant.  What
+    /// crosses the edge, what is booked and the known limits:
+    /// accounting/options_transfer.hpp.
     asio::awaitable<void> step_ingest_options_transfers(BlockHeight block_height);
     /// What one booking came to.
     enum class OptionsBooking {
@@ -1991,13 +1993,16 @@ private:
         Known,   ///< The ledger already held it.
         Wait,    ///< A price or a wallet snapshot is missing: next heartbeat.
         Never,   ///< It cannot book (no ledger opening before it).
-        Failed,  ///< The ledger write failed: next heartbeat.
+        Failed,  ///< A write failed: next heartbeat.
     };
     /// What one pass booked, for its tail (peak, window, persistence).
     struct OptionsTally {
         bool                  reset_peak{false};
         bool                  inv_changed{false};
         std::set<std::string> rebase_assets;
+        /// Assets whose tracked quantity moved with a flow (relatively): once
+        /// the tracker is written their markers can go.
+        std::set<std::string> settled_assets;
         std::size_t           booked{0};
         double                booked_usd{0.0};
     };
@@ -2007,17 +2012,35 @@ private:
     asio::awaitable<OptionsBooking> book_options_flow(
         const accounting::OptionsFlow& flow, bool fence_event,
         BlockHeight block_height, OptionsTally& tally);
+    /// A fence-down event about to be booked, for the top-ups that go first.
+    struct OptionsLowering {
+        /// The ids of the coins the event returns; std::nullopt when it
+        /// returns the address as it is now (the fence went down unseen),
+        /// and every confirmed top-up then arrived before it.
+        std::optional<std::vector<std::string>> coin_ids;
+        double at_unix{0.0};  ///< When the fence went down.
+    };
     /// One pass over the options book's top-ups, in the order they were
-    /// sent.  `returned_coins`, when the fence is going down: the coins its
-    /// event returns, so that a top-up the book has not recorded as
-    /// confirmed, whose coin is among them, is booked with it (stamped
-    /// `returned_at_iso`).  True when a top-up that must book could not yet:
-    /// no fence event is booked in such a pass.
+    /// sent.  `lowering`: the fence-down event this pass goes before, or
+    /// nullptr.  True when a top-up that must book could not yet: no
+    /// fence-down event is booked in such a pass.
     asio::awaitable<bool> book_options_topups(
         const std::vector<accounting::OptionsTopUpRow>& rows,
-        const std::vector<std::pair<std::string, std::uint64_t>>* returned_coins,
-        const std::string& returned_at_iso,
+        const OptionsLowering* lowering,
         BlockHeight block_height, OptionsTally& tally);
+    /// What the wallet's record of a top-up's transaction says: whether it
+    /// confirmed, and the id of the coin it created at the options address
+    /// when the record shows one.
+    struct OptionsProof {
+        bool                       confirmed{false};
+        std::optional<std::string> coin_id;
+    };
+    /// Asks the wallet (get_transaction) about @p topup, at most once per
+    /// heartbeat; every heartbeat when @p ask_now, else at
+    /// accounting::topup_proof_due's pace.  std::nullopt when it was not
+    /// asked or gave no answer: never read as "unconfirmed".
+    asio::awaitable<std::optional<OptionsProof>> options_topup_proof(
+        const accounting::OptionsFlow& topup, bool ask_now, BlockHeight block_height);
     /// A validated wallet snapshot of @p asset read in this heartbeat, after
     /// the flows this step books; read at most once per heartbeat.
     asio::awaitable<bool> options_wallet_snapshot(const AssetId& asset,
@@ -2032,23 +2055,34 @@ private:
     bool        options_books_loaded_{false};
     std::string options_last_fence_event_id_;
     std::string options_fence_up_stamp_;
+    /// The fence's log of its changes was begun (rpc::CoinFence::
+    /// begin_transitions): from then on every change reaches the books.
+    bool        options_log_begun_{false};
     /// Flows decided in this process (booked or found booked; never
     /// bookable), and what has been warned about once.
     std::set<std::string> options_booked_event_ids_;
     std::set<std::string> options_terminal_skip_ids_;
     std::set<std::string> options_warned_ids_;
-    /// Assets whose Step 11 reconcile an options flow re-armed: the
-    /// correction it makes re-anchors, as a secondary bridge asset's does.
+    /// Assets with a journalled options flow the inventory tracker may not
+    /// hold yet: the correction Step 11's wallet reconcile makes for one
+    /// re-anchors, as a secondary bridge asset's does.  Mirrored durably in
+    /// capital_reconcile_pending, and restored from it at startup.
     std::set<std::string> options_capital_assets_;
     /// Mojos by asset of options flows known and not booked yet (a top-up
-    /// the options book has not recorded as confirmed; an event waiting for
-    /// a price).  Rebuilt by every pass of the step; the invariant, next,
-    /// carries it as tolerance.
+    /// waiting to book; a fence event that could not be booked).  Rebuilt by
+    /// every pass of the step; the invariant, next, carries it as tolerance.
+    /// options_owed_ids_: the flows already counted in this pass.
     std::unordered_map<std::string, Mojo> options_pending_slack_;
+    std::set<std::string>                 options_owed_ids_;
     /// The assets options_wallet_snapshot read in heartbeat
     /// options_snapshot_block_.
     BlockHeight           options_snapshot_block_{0};
     std::set<std::string> options_snapshot_assets_;
+    /// The wallet's answers about top-ups in heartbeat options_proof_block_,
+    /// and the heartbeat each top-up was last asked about.
+    BlockHeight                                                 options_proof_block_{0};
+    std::unordered_map<std::string, std::optional<OptionsProof>> options_proof_cache_;
+    std::unordered_map<std::string, BlockHeight>                 options_proof_asked_;
 
     /// Tie the ledger's implied balances to the wallet's confirmed balances
     /// and escalate on sustained, unexplained divergence.  Alert-only unless

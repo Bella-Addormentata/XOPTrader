@@ -199,6 +199,21 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
 );
 )SQL";
 
+// [OPTIONS-CAPITAL 2026-11-23] One row per asset for which an external
+// capital flow was journalled and the inventory tracker may not hold it yet.
+// Written BEFORE the flow's ledger legs and deleted only once the tracker
+// holds the flow and inventory_state is written, so a process that stops in
+// between leaves the next one a durable note: the correction Step 11's
+// wallet reconcile then makes for that asset is the flow reaching the
+// tracker, a capital event, not a loss (accounting/options_transfer.hpp).
+constexpr const char* kCreateCapitalReconcilePending = R"SQL(
+CREATE TABLE IF NOT EXISTS capital_reconcile_pending (
+    asset_id    TEXT    PRIMARY KEY,
+    reason      TEXT    NOT NULL,
+    created_at  TEXT    DEFAULT CURRENT_TIMESTAMP
+);
+)SQL";
+
 constexpr const char* kCreateArbEdgeLog = R"SQL(
 CREATE TABLE IF NOT EXISTS arb_edge_log (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1749,6 +1764,92 @@ std::optional<Database::LedgerEventStamp> Database::ledger_latest_event(
     return found;
 }
 
+bool Database::mark_capital_reconcile_pending(const std::string& asset_id,
+                                              const std::string& reason) noexcept
+{
+    // Kept as first written: the oldest unsettled flow is the one a restart
+    // needs to know of, and a second flow for the asset changes nothing.
+    static constexpr const char* kInsert = R"SQL(
+        INSERT OR IGNORE INTO capital_reconcile_pending (asset_id, reason)
+        VALUES (?1, ?2);
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    try {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, kInsert, -1, &stmt, nullptr) != SQLITE_OK) {
+            spdlog::error("[Database] mark_capital_reconcile_pending prepare failed: {}",
+                          sqlite3_errmsg(db_));
+            sqlite3_finalize(stmt);
+            return false;
+        }
+        sqlite3_bind_text(stmt, 1, asset_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, reason.c_str(), -1, SQLITE_TRANSIENT);
+        const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+        if (!ok) {
+            spdlog::error("[Database] mark_capital_reconcile_pending failed for {}: {}",
+                          asset_id, sqlite3_errmsg(db_));
+        }
+        sqlite3_finalize(stmt);
+        return ok;
+    } catch (...) {
+        spdlog::error("[Database] mark_capital_reconcile_pending: unexpected exception");
+        return false;
+    }
+}
+
+bool Database::clear_capital_reconcile_pending(const std::string& asset_id) noexcept
+{
+    static constexpr const char* kDelete = R"SQL(
+        DELETE FROM capital_reconcile_pending WHERE asset_id = ?1;
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    try {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, kDelete, -1, &stmt, nullptr) != SQLITE_OK) {
+            spdlog::error("[Database] clear_capital_reconcile_pending prepare failed: {}",
+                          sqlite3_errmsg(db_));
+            sqlite3_finalize(stmt);
+            return false;
+        }
+        sqlite3_bind_text(stmt, 1, asset_id.c_str(), -1, SQLITE_TRANSIENT);
+        const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+        if (!ok) {
+            spdlog::error("[Database] clear_capital_reconcile_pending failed for {}: {}",
+                          asset_id, sqlite3_errmsg(db_));
+        }
+        sqlite3_finalize(stmt);
+        return ok;
+    } catch (...) {
+        spdlog::error("[Database] clear_capital_reconcile_pending: unexpected exception");
+        return false;
+    }
+}
+
+std::optional<std::vector<std::string>> Database::capital_reconcile_pending() const
+{
+    static constexpr const char* kSelect = R"SQL(
+        SELECT asset_id FROM capital_reconcile_pending ORDER BY asset_id;
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, kSelect, -1, &stmt, nullptr) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return std::nullopt;
+    }
+    std::vector<std::string> assets;
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char* id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        if (id != nullptr) assets.emplace_back(id);
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return std::nullopt;
+    return assets;
+}
+
 std::string Database::ledger_opening_time(const AssetId& asset_id) const
 {
     static constexpr const char* kSelect = R"SQL(
@@ -2128,6 +2229,7 @@ void Database::run_migrations()
         kCreateRatioRebalanceModes,
         kCreateLedgerEntries,
         kIndexLedgerAsset,
+        kCreateCapitalReconcilePending,
         kCreateArbEdgeLog,
         kIndexArbEdgeDirTime,
         kCreateTakerFills,

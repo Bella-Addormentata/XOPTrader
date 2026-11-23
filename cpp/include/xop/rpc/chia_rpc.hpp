@@ -1028,6 +1028,21 @@ public:
         std::int64_t start = 0,
         std::int64_t end   = 50);
 
+    /**
+     * @brief The wallet's record of one transaction.
+     *
+     * Wraps the Chia wallet RPC "get_transaction" endpoint.  Read-only: it
+     * selects no coins, so the options fence does not come into it.
+     *
+     * @param transaction_id  The id the wallet gave when it was sent.
+     * @return The `transaction` object of the answer (a TransactionRecord:
+     *         `confirmed`, `confirmed_at_height`, `additions`, ...).
+     * @throws ChiaRPCError on transport or application-level failure (a
+     *         transaction the wallet does not know is one), or when the
+     *         answer carries no transaction object.
+     */
+    asio::awaitable<json> get_transaction(const std::string& transaction_id);
+
     // -- [OPTIONS-FENCE] ------------------------------------------------------
 
     /**

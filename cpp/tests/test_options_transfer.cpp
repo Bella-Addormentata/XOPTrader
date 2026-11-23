@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -358,35 +359,139 @@ TEST(OptionsTransfer, ATopUpIsCapitalThatLeftOnlyIfTheFenceWasUp)
     EXPECT_EQ(judge_topup(OptionsFenceBooked::Unknown, sent, ""), OptionsTopUpVerdict::Deferred);
 }
 
-TEST(OptionsTransfer, ATopUpsCoinAmongThoseTheFenceReturnsHasArrived)
+TEST(OptionsTransfer, ATopUpIsConfirmedByItsOwnTransaction)
 {
-    // The book has not recorded this one as confirmed. The fence goes down
-    // and its last list holds a coin of exactly the amount sent: it arrived
-    // while the fence was up, so it is booked with the event that returns it.
-    OptionsTopUpRow row = xch_top_up();
-    row.confirmed_at = 0;
-    const OptionsFlow pending = classify_options_topup(row, kUsdc);
-    ASSERT_EQ(pending.status, OptionsFlowStatus::Pending);
+    // The wallet's record of the send (get_transaction): this transaction's
+    // confirmation and the coins this transaction created. Another coin of
+    // the same amount at the address proves nothing about it.
+    const OptionsFlow topup = classify_options_topup(xch_top_up(), kUsdc);
+    ASSERT_EQ(topup_amount(topup), std::optional<std::uint64_t>{1'500'000'000'000});
+    const std::string options_ph = "b18cdf6985b3a061e0c89b671d93f334aedf5be86ce1e79e2297d55f2528cc55";
+    const nlohmann::json record = nlohmann::json::parse(R"({
+        "confirmed": true, "confirmed_at_height": 9601234, "amount": 1500000000000,
+        "fee_amount": 10000000, "name": "0x2bbcfcaa7c11b312edf1a37cb95da12ecacfdb313b04fd5adb9a0f90f0898bf6",
+        "additions": [
+            {"parent_coin_info": "0xAAAA", "puzzle_hash": "0xb18cdf6985b3a061e0c89b671d93f334aedf5be86ce1e79e2297d55f2528cc55",
+             "amount": 1500000000000},
+            {"parent_coin_info": "0xAAAA", "puzzle_hash": "0xcccc", "amount": 7399990000000},
+            {"parent_coin_info": "0xAAAA", "puzzle_hash": "0xdddd", "amount": 1500000000000},
+            {"puzzle_hash": "0xeeee", "amount": 1500000000000},
+            {"parent_coin_info": "0xAAAA", "puzzle_hash": "0xffff", "amount": "1500000000000"},
+            "not a coin"
+        ]})");
+    const auto proof = read_topup_transaction(record, topup);
+    ASSERT_TRUE(proof);
+    EXPECT_TRUE(proof->confirmed);
+    // Every coin of exactly the amount sent. Which of them is the top-up's
+    // is the caller's to say: the one at the options address.
+    ASSERT_EQ(proof->outputs.size(), 2u);
+    EXPECT_EQ(proof->outputs[0].parent_coin_info, "0xAAAA");
+    EXPECT_EQ(proof->outputs[0].puzzle_hash, "0x" + options_ph);
+    EXPECT_EQ(proof->outputs[0].amount, 1'500'000'000'000);
+    EXPECT_EQ(proof->outputs[1].puzzle_hash, "0xdddd");
 
-    EXPECT_TRUE(topup_coin_listed(pending, {{"xch", 250}, {"xch", 1'500'000'000'000}}));
-    EXPECT_FALSE(topup_coin_listed(pending, {})) << "nothing there";
-    EXPECT_FALSE(topup_coin_listed(pending, {{"xch", 1'500'000'000'001}, {"xch", 1'499'999'999'999}}))
-        << "exactly its amount";
-    EXPECT_FALSE(topup_coin_listed(pending, {{kUsdc, 1'500'000'000'000}})) << "of its asset";
-    // The fee is not a coin at the address.
-    EXPECT_FALSE(topup_coin_listed(pending, {{"xch", 10'000'000}}));
+    // Not confirmed yet is an answer too.
+    const auto waiting = read_topup_transaction(
+        nlohmann::json::parse(R"({"confirmed": false, "additions": []})"), topup);
+    ASSERT_TRUE(waiting);
+    EXPECT_FALSE(waiting->confirmed);
+    EXPECT_TRUE(waiting->outputs.empty());
+    // A record without its coins still says whether it confirmed.
+    const auto bare = read_topup_transaction(nlohmann::json::parse(R"({"confirmed": true})"), topup);
+    ASSERT_TRUE(bare);
+    EXPECT_TRUE(bare->confirmed);
+    EXPECT_TRUE(bare->outputs.empty());
 
+    // No answer is never read as either.
+    EXPECT_FALSE(read_topup_transaction(nlohmann::json::object(), topup));
+    EXPECT_FALSE(read_topup_transaction(nlohmann::json::parse(R"({"confirmed": "yes"})"), topup));
+    EXPECT_FALSE(read_topup_transaction(nlohmann::json::parse(R"({"confirmed": 1})"), topup));
+    EXPECT_FALSE(read_topup_transaction(nlohmann::json::array(), topup));
+    EXPECT_FALSE(read_topup_transaction(nlohmann::json(), topup));
+
+    // The quote asset's top-up is looked for by its own amount.
     const OptionsFlow quote = classify_options_topup(quote_top_up(), kUsdc);
-    EXPECT_TRUE(topup_coin_listed(quote, {{"xch", 2'000}, {kUsdc, 2'000}}));
-    EXPECT_FALSE(topup_coin_listed(quote, {{"xch", 2'000}}));
-
+    EXPECT_EQ(topup_amount(quote), std::optional<std::uint64_t>{2'000});
+    EXPECT_TRUE(read_topup_transaction(record, quote)->outputs.empty());
     // Only a top-up has a coin to look for.
-    EXPECT_FALSE(topup_coin_listed(OptionsFlow{}, {{"xch", 0}}));
-    EXPECT_FALSE(topup_coin_listed(
-        options_fence_flow(false, 2, {{"xch", 5}}, "2026-11-24T10:00:00.000Z"), {{"xch", 5}}));
-    OptionsFlow odd = pending;
+    const OptionsFlow fence = options_fence_flow(false, 2, {{"xch", 5}}, "2026-11-24T10:00:00.000Z");
+    EXPECT_FALSE(topup_amount(fence));
+    EXPECT_FALSE(topup_amount(OptionsFlow{}));
+    ASSERT_TRUE(read_topup_transaction(record, fence));
+    EXPECT_TRUE(read_topup_transaction(record, fence)->outputs.empty());
+    OptionsFlow odd = topup;
     odd.legs.front().delta_mojos = std::numeric_limits<Mojo>::min();
-    EXPECT_FALSE(topup_coin_listed(odd, {{"xch", 1}}));
+    EXPECT_FALSE(topup_amount(odd));
+}
+
+TEST(OptionsTransfer, AConfirmedTopUpIsPlacedByItsOwnCoinWhenTheFenceGoesDown)
+{
+    const double lowered = 1'795'300'000.5;
+    // The list the fence-down event books holds the top-up's own coin: it
+    // arrived before the fence went down, whatever anyone recorded when.
+    EXPECT_TRUE(topup_arrived_before_lowering(true, 0, lowered));
+    EXPECT_TRUE(topup_arrived_before_lowering(true, 1'795'399'999, lowered));
+    // It does not: the coin arrived with the fence down, and is trading
+    // funds until the fence goes up and takes it.
+    EXPECT_FALSE(topup_arrived_before_lowering(false, 0, lowered));
+    EXPECT_FALSE(topup_arrived_before_lowering(false, 1'795'200'000, lowered))
+        << "the coin decides, not the book's clock";
+
+    // The wallet's record does not show the coin. Only a confirmation the
+    // options book wrote down no later than the fence went down says
+    // "before".
+    EXPECT_TRUE(topup_arrived_before_lowering(std::nullopt, 1'795'299'999, lowered));
+    EXPECT_TRUE(topup_arrived_before_lowering(std::nullopt, 1'795'300'000, lowered));
+    EXPECT_FALSE(topup_arrived_before_lowering(std::nullopt, 1'795'300'001, lowered));
+    EXPECT_FALSE(topup_arrived_before_lowering(std::nullopt, 0, lowered)) << "no record at all";
+}
+
+TEST(OptionsTransfer, TheWalletIsAskedEveryHeartbeatOnlyWhileATopUpMayBeOnItsWay)
+{
+    // Within two hours of the send: every heartbeat.
+    EXPECT_TRUE(topup_proof_due(/*recent=*/true, 9'600'100, 9'600'099));
+    EXPECT_TRUE(topup_proof_due(true, 9'600'100, 0));
+    // After that the options book has forgotten the send, and it can still
+    // confirm: once in this process, then every kOptionsProofEveryBlocks.
+    EXPECT_TRUE(topup_proof_due(false, 9'600'100, 0)) << "never asked in this process";
+    EXPECT_FALSE(topup_proof_due(false, 9'600'100, 9'600'099));
+    EXPECT_FALSE(topup_proof_due(false, 9'600'100 + kOptionsProofEveryBlocks - 1, 9'600'100));
+    EXPECT_TRUE(topup_proof_due(false, 9'600'100 + kOptionsProofEveryBlocks, 9'600'100));
+    EXPECT_TRUE(topup_proof_due(false, 9'600'000, 9'600'100)) << "a height that ran backwards";
+    EXPECT_EQ(kOptionsProofEveryBlocks, 120u);
+}
+
+TEST(OptionsTransfer, TheFenceLogIsTakenInOrderAgainstWhereTheBooksStand)
+{
+    using Books = OptionsFenceBooked;
+    using Step = OptionsLogStep;
+    // No fence event yet: the books begin in the entry's state.
+    EXPECT_EQ(judge_transition(Books::Unknown, true, false, false), Step::Adopt);
+    EXPECT_EQ(judge_transition(Books::Unknown, false, false, true), Step::Adopt);
+    // The books already stand where the entry puts the fence.
+    EXPECT_EQ(judge_transition(Books::Up, true, true, false), Step::Skip);
+    EXPECT_EQ(judge_transition(Books::Up, true, false, false), Step::Skip)
+        << "found up with the books up needs no list";
+    EXPECT_EQ(judge_transition(Books::Down, false, false, true), Step::Skip);
+    // It went down: a deposit of its last list (or of the address as it is).
+    EXPECT_EQ(judge_transition(Books::Up, false, true, false), Step::BookDown);
+    EXPECT_EQ(judge_transition(Books::Up, false, false, false), Step::BookDown);
+    // It went up: a withdrawal of its first list, once there is one...
+    EXPECT_EQ(judge_transition(Books::Down, true, true, false), Step::BookUp);
+    EXPECT_EQ(judge_transition(Books::Down, true, true, true), Step::BookUp);
+    EXPECT_EQ(judge_transition(Books::Down, true, false, false), Step::Wait);
+    // ...and if it went down again before any list was had, no balance was
+    // read behind it: the two entries go together.
+    EXPECT_EQ(judge_transition(Books::Down, true, false, true), Step::DropPair);
+
+    // The case the log exists for: down and up again between two passes.
+    // The books stand up and the fence stands up, and both changes book.
+    Books books = Books::Up;
+    EXPECT_EQ(judge_transition(books, /*entry_up=*/false, true, true), Step::BookDown);
+    books = booked_fence_state("options_fence_down:7");
+    EXPECT_EQ(judge_transition(books, /*entry_up=*/true, true, false), Step::BookUp);
+    books = booked_fence_state("options_fence_up:8");
+    EXPECT_EQ(books, Books::Up);
 }
 
 TEST(OptionsTransfer, AnUnbookedTopUpWidensTheToleranceForTwoHours)
@@ -507,6 +612,8 @@ const char* const kStep =
     "asio::awaitable<void> Engine::step_ingest_options_transfers(BlockHeight block_height)";
 const char* const kBookFlow = "asio::awaitable<Engine::OptionsBooking> Engine::book_options_flow(";
 const char* const kTopUps = "asio::awaitable<bool> Engine::book_options_topups(";
+const char* const kProof =
+    "asio::awaitable<std::optional<Engine::OptionsProof>> Engine::options_topup_proof(";
 
 constexpr std::size_t npos = std::string::npos;
 
@@ -559,53 +666,6 @@ TEST(OptionsTransferWiring, TheStepStandsDownWithTheLedgerAndTheFence)
               npos);
 }
 
-TEST(OptionsTransferWiring, TheStateIsAdoptedThenTopUpsThenTheFence)
-{
-    const std::string step = function_body(read_engine_cpp(), kStep);
-    ASSERT_FALSE(step.empty());
-    const std::size_t adopt = position_of(
-        step, "accounting::options_fence_flow( up_now, "
-              "accounting::next_fence_sequence(options_last_fence_event_id_), {},");
-    const std::size_t rows = position_of(step, "accounting::join_options_topups(*events);");
-    const std::size_t first_pass = position_of(
-        step, "bool waiting = co_await book_options_topups(rows, nullptr, {}, block_height, tally);");
-    const std::size_t lowered = position_of(step, "coin_fence_->lowered();");
-    const std::size_t raised = position_of(step, "coin_fence_->raised();");
-    ASSERT_NE(adopt, npos);
-    ASSERT_NE(rows, npos);
-    ASSERT_NE(first_pass, npos);
-    ASSERT_NE(lowered, npos);
-    ASSERT_NE(raised, npos);
-    EXPECT_LT(rows, adopt) << "nothing is written on a record that could not be read";
-    EXPECT_LT(adopt, first_pass) << "no top-up is judged against an unknown state";
-    EXPECT_LT(first_pass, lowered) << "top-ups first";
-    EXPECT_LT(first_pass, raised);
-
-    // Down: the last list, or the address as it is when found down at start;
-    // a top-up whose coin that list holds books ahead of the event.
-    EXPECT_NE(position_of(step, "if (!back) back = co_await coin_fence_->list_holding();"), npos);
-    const std::size_t with_coins = position_of(
-        step, "waiting = co_await book_options_topups(rows, &back->coins, at_iso, block_height, tally);");
-    const std::size_t down = position_of(
-        step, "accounting::options_fence_flow( /*went_up=*/false, sequence, back->totals, at_iso);");
-    ASSERT_NE(with_coins, npos);
-    ASSERT_NE(down, npos);
-    EXPECT_LT(with_coins, down);
-    // Up: the first list, stamped with its own moment; then the top-ups sent
-    // since can book.
-    EXPECT_NE(position_of(step, "accounting::options_fence_flow( /*went_up=*/true, sequence, "
-                                "gone->totals, stamp_of(gone->at_unix));"),
-              npos);
-    EXPECT_NE(position_of(step, "(void)co_await book_options_topups(rows, nullptr, {}, block_height, tally);"),
-              npos);
-    // No fence event in a pass where a top-up that must book is waiting, and
-    // one that is not booked is owed to the invariant.
-    EXPECT_EQ(count_of(step, "OptionsBooking outcome = OptionsBooking::Wait; if (!waiting) {"), 2u);
-    EXPECT_EQ(count_of(step, "} else { owe_event("), 2u);
-    // The books are read again after every fence event.
-    EXPECT_EQ(count_of(step, "options_books_loaded_ = load_options_books();"), 4u);
-}
-
 TEST(OptionsTransferWiring, ADatabaseThatCannotBeReadIsNotOneWithNoTopUps)
 {
     const std::string raw = read_engine_cpp();
@@ -627,17 +687,105 @@ TEST(OptionsTransferWiring, ADatabaseThatCannotBeReadIsNotOneWithNoTopUps)
     EXPECT_NE(position_of(reader, "WHERE kind IN ('topup_sent', 'topup_confirmed') ORDER BY id;"), npos);
 }
 
-TEST(OptionsTransferWiring, ATopUpIsJudgedBeforeItIsBooked)
+TEST(OptionsTransferWiring, EveryFenceChangeIsBookedInOrderAndAcknowledgedOnlyThen)
 {
-    const std::string pass = function_body(read_engine_cpp(), kTopUps);
+    const std::string step = function_body(read_engine_cpp(), kStep);
+    ASSERT_FALSE(step.empty());
+    // The log is begun once the books and the record can be read, so its
+    // first entry is the state the books compare themselves with.
+    const std::size_t rows = position_of(step, "accounting::join_options_topups(*events);");
+    const std::size_t begun = position_of(
+        step, "if (!options_log_begun_) { coin_fence_->begin_transitions(); options_log_begun_ = true; }");
+    const std::size_t log = position_of(step, "coin_fence_->transitions();");
+    ASSERT_NE(rows, npos);
+    ASSERT_NE(begun, npos);
+    ASSERT_NE(log, npos);
+    EXPECT_LT(rows, begun) << "nothing is written on a record that could not be read";
+    EXPECT_LT(begun, log);
+    EXPECT_EQ(count_of(step, "coin_fence_->begin_transitions();"), 1u);
+
+    // Each entry is judged against where the books stand at that point of
+    // the pass, not where the fence has ended up.
+    EXPECT_NE(position_of(step, "accounting::judge_transition( "
+                                "accounting::booked_fence_state(options_last_fence_event_id_), entry.up, "
+                                "entry.holding.has_value(), i + 1 < log.size());"),
+              npos);
+    // Up books its own first list at that list's moment; down, its own last
+    // list -- or the address as it is when no list says what came back.
+    EXPECT_NE(position_of(step, "accounting::options_fence_flow( /*went_up=*/true, sequence, "
+                                "entry.holding->totals, stamp_of(entry.holding->at_unix));"),
+              npos);
+    EXPECT_NE(position_of(step, "if (back) { lowering.coin_ids = back->coin_ids; } else { "
+                                "back = co_await coin_fence_->list_holding(); }"),
+              npos);
+    EXPECT_NE(position_of(step, "accounting::options_fence_flow( /*went_up=*/false, sequence, "
+                                "back->totals, stamp_of(back->at_unix));"),
+              npos);
+    // Top-ups first: no fence-down event in a pass where one that belongs
+    // before it is waiting.
+    const std::size_t first = position_of(
+        step, "if (co_await book_options_topups(rows, &lowering, block_height, tally)) { "
+              "owe_event(down); stalled = true; continue; }");
+    const std::size_t down = position_of(
+        step, "outcome = co_await book_options_flow(down, /*fence_event=*/true, block_height, tally);");
+    ASSERT_NE(first, npos);
+    ASSERT_NE(down, npos);
+    EXPECT_LT(first, down);
+
+    // An entry leaves the log only once the books hold it and have been
+    // read again; one that could not be booked stops the pass and is met
+    // again, with what it moves owed to the invariant.
+    const std::size_t not_booked = position_of(
+        step, "if (outcome != OptionsBooking::Booked && outcome != OptionsBooking::Known) { "
+              "stalled = true; continue; }");
+    const std::size_t reread = position_of(
+        step, "options_books_loaded_ = load_options_books(); if (!options_books_loaded_) { "
+              "stalled = true; continue; } coin_fence_->acknowledge(entry.serial);");
+    ASSERT_NE(not_booked, npos);
+    ASSERT_NE(reread, npos);
+    EXPECT_LT(not_booked, reread);
+    EXPECT_EQ(count_of(step, "owe_event(up);"), 1u);
+    EXPECT_EQ(count_of(step, "owe_event(down);"), 2u);
+    // Nothing to book: the books already stand there, or it went up and
+    // down again before any list was had.
+    EXPECT_NE(position_of(step, "case accounting::OptionsLogStep::Skip: "
+                                "coin_fence_->acknowledge(entry.serial); continue;"),
+              npos);
+    EXPECT_NE(position_of(step, "case accounting::OptionsLogStep::DropPair: "
+                                "coin_fence_->acknowledge(log[i + 1].serial); ++i; continue;"),
+              npos);
+    // Then the top-ups, with the fence as the books now hold it -- not in a
+    // pass that stopped at an event.
+    const std::size_t last = position_of(
+        step, "if (!stalled) { (void)co_await book_options_topups(rows, nullptr, block_height, tally); }");
+    ASSERT_NE(last, npos);
+    EXPECT_LT(reread, last);
+}
+
+TEST(OptionsTransferWiring, ATopUpIsConfirmedByItsOwnTransactionBeforeItIsBooked)
+{
+    const std::string raw = read_engine_cpp();
+    const std::string pass = function_body(raw, kTopUps);
     ASSERT_FALSE(pass.empty());
     const std::size_t judged = position_of(
         pass, "accounting::judge_topup(books, flow.floor_iso, options_fence_up_stamp_);");
+    const std::size_t asked = position_of(
+        pass, "co_await options_topup_proof(flow, recent || placing, block_height)");
+    const std::size_t unconfirmed = position_of(pass, "if (!confirmed) { owe(); continue; }");
+    const std::size_t placed = position_of(
+        pass, "if (!accounting::topup_arrived_before_lowering(coin_returned, row.confirmed_at, "
+              "lowering->at_unix)) { continue;");
     const std::size_t booked = position_of(
         pass, "co_await book_options_flow(flow, /*fence_event=*/false, block_height, tally);");
     ASSERT_NE(judged, npos);
+    ASSERT_NE(asked, npos);
+    ASSERT_NE(unconfirmed, npos);
+    ASSERT_NE(placed, npos);
     ASSERT_NE(booked, npos);
-    EXPECT_LT(judged, booked);
+    EXPECT_LT(judged, asked);
+    EXPECT_LT(asked, unconfirmed);
+    EXPECT_LT(unconfirmed, placed);
+    EXPECT_LT(placed, booked);
     EXPECT_EQ(count_of(pass, "co_await book_options_flow("), 1u);
     EXPECT_NE(position_of(pass, "if (verdict == accounting::OptionsTopUpVerdict::Deferred) {"), npos);
     // One the ledger holds from an earlier process is not "inside": it booked.
@@ -645,19 +793,47 @@ TEST(OptionsTransferWiring, ATopUpIsJudgedBeforeItIsBooked)
                                 "options_booked_event_ids_.insert(flow.event_id); } else { "
                                 "options_terminal_skip_ids_.insert(flow.event_id);"),
               npos);
-    // Unconfirmed, it books only on the evidence of its coin among those a
-    // fence-down event returns; otherwise it is owed to the invariant.
-    EXPECT_NE(position_of(pass, "if (returned_coins == nullptr || "
-                                "!accounting::topup_coin_listed(flow, *returned_coins)) { owe(); continue; }"),
+    // The wallet is asked when the options book has not recorded the
+    // confirmation, or when the top-up's coin is needed to place it.
+    EXPECT_NE(position_of(pass, "const bool placing = lowering != nullptr && lowering->coin_ids.has_value();"),
               npos);
-    // ...once a heartbeat: the pass with the returned coins follows one that
-    // has owed every top-up it meets.
-    EXPECT_NE(position_of(pass, "const auto owe = [&] { if (returned_coins != nullptr) return; "
-                                "if (!accounting::topup_slack_applies(row.sent_at, now_unix)) return;"),
+    EXPECT_NE(position_of(pass, "if (!confirmed || placing) {"), npos);
+    // Its OWN coin, by id: no amount is compared anywhere in the pass.
+    EXPECT_NE(position_of(pass, "coin_returned = std::find(ids.begin(), ids.end(), *coin_id) != ids.end();"),
+              npos);
+    EXPECT_EQ(position_of(pass, "amount"), npos);
+    // What is owed to the invariant is counted once a heartbeat.
+    EXPECT_NE(position_of(pass, "if (!recent || !options_owed_ids_.insert(flow.event_id).second) return;"),
               npos);
     EXPECT_NE(position_of(pass, "if (outcome == OptionsBooking::Wait || outcome == OptionsBooking::Failed) "
                                 "{ owe(); waiting = true; }"),
               npos);
+
+    const std::string proof = function_body(raw, kProof);
+    ASSERT_FALSE(proof.empty());
+    // One read-only wallet call, behind the wallet circuit, at most once a
+    // heartbeat for a top-up and at topup_proof_due's pace.
+    const std::size_t due = position_of(
+        proof, "if (!accounting::topup_proof_due(ask_now, block_height, last_asked)) co_return std::nullopt;");
+    const std::size_t gate = position_of(
+        proof, "if (!wallet_ || !wallet_->is_open() || !wallet_step_may_run(\"options ingest\")) {");
+    const std::size_t call = position_of(proof, "co_await wallet_->get_transaction(transaction_id);");
+    ASSERT_NE(due, npos);
+    ASSERT_NE(gate, npos);
+    ASSERT_NE(call, npos);
+    EXPECT_LT(due, gate);
+    EXPECT_LT(gate, call);
+    EXPECT_EQ(count_of(proof, "wallet_->"), 2u) << "is_open and get_transaction";
+    EXPECT_NE(position_of(proof, "accounting::read_topup_transaction(record, topup)"), npos);
+    // The top-up's coin is the output at the options address, named as the
+    // fence's refresher names the coins it lists.
+    EXPECT_NE(position_of(proof, "if (fenced.count(puzzle_hash) == 0) continue;"), npos);
+    EXPECT_NE(position_of(proof, "execution::CoinManager::compute_coin_name( "
+                                 "rpc::fence_normalise_hex(out.parent_coin_info), puzzle_hash, "
+                                 "out.amount)"),
+              npos);
+    // No answer is not "unconfirmed": an error leaves it unanswered.
+    EXPECT_NE(position_of(proof, "std::optional<OptionsProof> answer; try {"), npos);
 }
 
 TEST(OptionsTransferWiring, AFlowIsJournalledBeforeAnythingElseMoves)
@@ -666,26 +842,43 @@ TEST(OptionsTransferWiring, AFlowIsJournalledBeforeAnythingElseMoves)
     ASSERT_FALSE(book.empty());
     const std::size_t opening = position_of(book, "!accounting::iso_strictly_after(flow.floor_iso, opening_time)");
     const std::size_t snapshot = position_of(book, "co_await options_wallet_snapshot(asset, block_height)");
+    const std::size_t marker = position_of(book, "db_->mark_capital_reconcile_pending(asset_id, \"options\")");
     const std::size_t journal = position_of(book, "db_->append_ledger_entries(entries);");
     const std::size_t known = position_of(book, "if (*inserted != entries.size()) {");
     const std::size_t deposit = position_of(book, "pnl_->add_net_deposit_usd(p.val.flow_usd);");
     const std::size_t inventory = position_of(book, "inventory_->adjust_quantity(");
     ASSERT_NE(opening, npos);
     ASSERT_NE(snapshot, npos);
+    ASSERT_NE(marker, npos);
     ASSERT_NE(journal, npos);
     ASSERT_NE(known, npos);
     ASSERT_NE(deposit, npos);
     ASSERT_NE(inventory, npos);
+    // One the ledger holds from an earlier process is known before any price
+    // or wallet read it could be made to wait on.
+    const std::size_t held = position_of(book, "if (db_->ledger_has_event(flow.event_id)) { "
+                                               "options_booked_event_ids_.insert(flow.event_id); "
+                                               "co_return OptionsBooking::Known; }");
+    ASSERT_NE(held, npos);
+    EXPECT_LT(held, opening);
+    EXPECT_LT(held, position_of(book, "asset_usd_pseudo_price(asset)"));
+    EXPECT_LT(held, snapshot);
     EXPECT_LT(opening, journal) << "a flow inside the opening balance is not booked again";
     EXPECT_LT(snapshot, journal) << "the invariant ties the books to a snapshot read after the flow";
+    // The durable marker is written before the journal, and a flow whose
+    // marker could not be written is not journalled.
+    EXPECT_LT(marker, journal);
+    EXPECT_NE(position_of(book, "if (!db_->mark_capital_reconcile_pending(asset_id, \"options\")) {"), npos);
     EXPECT_LT(journal, known);
     EXPECT_LT(known, deposit) << "a flow the ledger already held has no second effect";
     EXPECT_LT(known, inventory);
     EXPECT_EQ(count_of(book, "pnl_->add_net_deposit_usd("), 1u);
-    // The bridge asset keeps its single inventory writer.
-    EXPECT_NE(position_of(book, "if (asset_id == acc.bridge_asset_id && bridge_accounting_operational()) {"),
-              npos);
-    // Wallet truth goes through Step 11's reconcile, marked as capital.
+    // The bridge asset keeps its single inventory writer, and needs no marker.
+    EXPECT_EQ(count_of(book, "asset_id == acc.bridge_asset_id && bridge_accounting_operational()"), 2u);
+    // A relative move is settled once the tracker is written; wallet truth
+    // goes through Step 11's reconcile, marked as capital, and its marker
+    // stays until then.
+    EXPECT_NE(position_of(book, "tally.inv_changed = true; tally.settled_assets.insert(asset_id);"), npos);
     EXPECT_NE(position_of(book, "inventory_reconcile_capital_[asset_id] = true; "
                                 "options_capital_assets_.insert(asset_id);"),
               npos);
@@ -693,7 +886,57 @@ TEST(OptionsTransferWiring, AFlowIsJournalledBeforeAnythingElseMoves)
     EXPECT_NE(position_of(book, "const std::string entry_time = fence_event ? flow.at_iso :"), npos);
 }
 
-TEST(OptionsTransferWiring, TheInvariantAndStepElevenKnowAboutOptionsFlows)
+TEST(OptionsTransferWiring, TheMarkerOutlivesAStopAndGoesOnlyOnceTheTrackerIsWritten)
+{
+    const std::string raw = read_engine_cpp();
+    const std::string engine = squeeze(raw);
+    // A start restores the markers with the inventory they qualify, before
+    // any heartbeat can reconcile it.
+    const std::size_t restored = engine.find(squeeze("db_->load_inventory_state();"));
+    const std::size_t markers = engine.find(squeeze(
+        "if (const auto pending = db_->capital_reconcile_pending()) { "
+        "for (const auto& asset_id : *pending) { options_capital_assets_.insert(asset_id); "
+        "inventory_reconcile_capital_[asset_id] = true; }"));
+    ASSERT_NE(restored, npos);
+    ASSERT_NE(markers, npos);
+    EXPECT_LT(restored, markers);
+    EXPECT_EQ(count_of(engine, "db_->capital_reconcile_pending()"), 1u);
+
+    // Step 11's wallet reconcile re-anchors for such an asset, as it does
+    // for a secondary bridge asset...
+    const std::size_t reconcile = engine.find(squeeze("|| options_capital_assets_.count(aid) > 0)) {"));
+    ASSERT_NE(reconcile, npos);
+    EXPECT_LT(reconcile, engine.find(squeeze("pnl_window_rebase_assets_[aid] = block_height;"), reconcile));
+    EXPECT_EQ(count_of(engine, "|| options_capital_assets_.count(aid) > 0)) {"), 1u);
+    // ...and drops the marker only after the tracker is written.
+    const std::size_t settled = engine.find(squeeze(
+        "if (options_capital_assets_.erase(aid) > 0) { options_settled.push_back(aid); }"));
+    const std::size_t written = engine.find(squeeze(
+        "if (mutated || !options_settled.empty()) { persist_inventory_state(); }"));
+    const std::size_t dropped = engine.find(squeeze(
+        "for (const auto& settled : options_settled) { "
+        "if (db_) db_->clear_capital_reconcile_pending(settled); }"));
+    ASSERT_NE(settled, npos);
+    ASSERT_NE(written, npos);
+    ASSERT_NE(dropped, npos);
+    EXPECT_LT(settled, written);
+    EXPECT_LT(written, dropped);
+
+    // A flow that moved the tracker itself: the same order, in the step.
+    const std::string step = function_body(raw, kStep);
+    const std::size_t persisted = position_of(step, "if (tally.inv_changed) { persist_inventory_state(); }");
+    const std::size_t cleared = position_of(
+        step, "for (const auto& asset_id : tally.settled_assets) { "
+              "if (options_capital_assets_.count(asset_id) == 0) { "
+              "db_->clear_capital_reconcile_pending(asset_id); } }");
+    ASSERT_NE(persisted, npos);
+    ASSERT_NE(cleared, npos);
+    EXPECT_LT(persisted, cleared);
+    EXPECT_EQ(count_of(engine, "clear_capital_reconcile_pending("), 2u);
+    EXPECT_EQ(count_of(engine, "mark_capital_reconcile_pending("), 1u);
+}
+
+TEST(OptionsTransferWiring, TheInvariantAndTheRestartReaderKnowAboutOptionsFlows)
 {
     const std::string raw = read_engine_cpp();
     const std::string invariant =
@@ -703,15 +946,6 @@ TEST(OptionsTransferWiring, TheInvariantAndStepElevenKnowAboutOptionsFlows)
                           "const Mojo inflight_slack = accounting::add_slack( std::abs(cached.pending_change), "
                           "options_owed != options_pending_slack_.end() ? options_owed->second : 0);"),
               npos);
-
-    const std::string engine = squeeze(raw);
-    // Step 11's wallet reconcile re-anchors for an asset an options flow
-    // re-armed, as it does for a secondary bridge asset.
-    const std::size_t reconcile = engine.find(squeeze("|| options_capital_assets_.count(aid) > 0)) {"));
-    ASSERT_NE(reconcile, npos);
-    EXPECT_LT(reconcile, engine.find(squeeze("pnl_window_rebase_assets_[aid] = block_height;"), reconcile));
-    EXPECT_EQ(count_of(engine, "|| options_capital_assets_.count(aid) > 0)) {"), 1u);
-    EXPECT_EQ(count_of(engine, "options_capital_assets_.erase(aid);"), 1u);
 
     // Net Deposits is rebuilt from these rows on restart too.
     std::string pnl_path = XOP_TESTS_ENGINE_CPP;

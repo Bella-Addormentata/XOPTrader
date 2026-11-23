@@ -1677,4 +1677,20 @@ ChiaWalletRPC::get_transactions(std::int64_t wallet_id,
     co_return txs;
 }
 
+// ---------------------------------------------------------------------------
+// ChiaWalletRPC::get_transaction
+// ---------------------------------------------------------------------------
+
+asio::awaitable<json>
+ChiaWalletRPC::get_transaction(const std::string& transaction_id)
+{
+    const json resp = co_await rpc_post(
+        "get_transaction", make_get_transaction_request(transaction_id));
+    if (!resp.contains("transaction") || !resp["transaction"].is_object()) {
+        throw ChiaRPCError("get_transaction: response missing "
+                           "'transaction' object");
+    }
+    co_return resp["transaction"];
+}
+
 } // namespace xop::rpc

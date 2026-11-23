@@ -36,8 +36,12 @@
 //   * A top-up.  The book records it in its own database: an `events` row of
 //     kind topup_sent (amount, fee, transaction) written when the send is
 //     accepted, and one of kind topup_confirmed when the book next sees the
-//     wallet report it confirmed -- up to one of its steps later.  The
-//     engine reads that table READ-ONLY, as it reads the GUI's warp jobs.
+//     wallet report it confirmed -- minutes later.  The engine reads that
+//     table READ-ONLY, as it reads the GUI's warp jobs, for WHICH top-ups
+//     there are.  WHETHER one has confirmed it asks the wallet itself, by
+//     the top-up's own transaction (read_topup_transaction), so it is booked
+//     in the heartbeat after it confirms; the book's row is the fallback
+//     for a transaction the wallet no longer knows.
 //   * The fence going down or up (`engine_fence: auto`).  Down, the
 //     sub-account's coins are trading funds again: a deposit of what it
 //     held.  Up, they leave: a withdrawal of what it holds.
@@ -45,11 +49,16 @@
 // between the options address and a contract, and no balance the engine
 // reads changes.
 //
-// HOW MUCH A FENCE EVENT MOVES, AND WHEN.  The fence keeps the list it had
-// at the transition (rpc::CoinFence): the first list after it went up, the
-// last one before it went down.  The event books that list, stamped with
-// that moment, however much later it is written -- so what reached the
-// address afterwards is not in it.
+// HOW MUCH A FENCE EVENT MOVES, AND WHEN.  The fence keeps a log of its
+// changes (rpc::CoinFence::Transition), each with the list it had then: the
+// first list after it went up, the last one before it went down.  The books
+// take the entries in order and acknowledge each only once it is booked, so
+// two changes between two passes are two events, each with its own list --
+// comparing only where the fence ended up would lose whatever the address
+// held differently in between.  An event books its list, stamped with its
+// moment, however much later it is written, so what reached the address
+// afterwards is not in it.  The log begins with the state the fence is found
+// in, which is how a change while the engine was not running shows.
 //
 // WHAT IS BOOKED, and why nothing is counted twice.
 //   * A top-up is capital that left only if the fence was up when it
@@ -61,28 +70,38 @@
 //       - a top-up SENT before the newest fence-up event's list is inside
 //         that event (topup_inside_fence_event): never booked;
 //       - any other confirmed top-up is booked.
-//   * Top-ups go first: a fence event is booked only in a pass where no
-//     confirmed top-up is still waiting (for a price, a wallet snapshot).
-//     Otherwise one sent while the fence was up could be taken for one that
-//     is inside the fence-up event after it.
-//   * The fence going down returns the coins of its list.  A top-up the book
-//     has not yet recorded as confirmed, whose coin that list holds, did
-//     arrive while the fence was up: it is booked with the event
-//     (topup_coin_listed), or the deposit would return capital no
-//     withdrawal took out.
+//   * Top-ups go first: a fence-down event is booked only in a pass where no
+//     confirmed top-up that belongs before it is still waiting (for a price,
+//     a wallet snapshot).
+//   * The fence going down returns the coins of its list.  A confirmed top-up
+//     the books do not hold yet arrived before that if the list holds ITS
+//     coin -- the one its own transaction created, by id, not any coin of
+//     the same amount -- and is then booked ahead of the event; otherwise it
+//     arrived with the fence down (topup_arrived_before_lowering).  A fence
+//     found down at start returns the address as it is, and every confirmed
+//     top-up is before that.
 //   * A fence event is written at EVERY transition, also when the address
 //     held nothing (one zero leg on XCH).  So the direction of the newest
-//     fence event is where the books stand, a restart reads the same answer,
-//     and a transition while the engine was not running shows as the fence
-//     standing the other way from the books.  With no fence event at all the
-//     state the fence is found in is adopted with a zero event (#1), which
-//     takes nothing: no top-up is inside it, and what the address held
-//     before the books began is history (KNOWN LIMITS).
+//     fence event is where the books stand, and a restart reads the same
+//     answer.  With no fence event at all the state the fence is found in is
+//     adopted with a zero event (#1), which takes nothing: no top-up is
+//     inside it, and what the address held before the books began is history
+//     (KNOWN LIMITS).
 //
-// UNTIL THE BOOK HAS RECORDED A CONFIRMATION the wallet may already be
-// short of the top-up.  The engine widens the divergence control's tolerance
-// by the amount for that long (topup_slack_applies), so a top-up is not
-// "reconciled" away as unexplained minutes before it is booked.
+// A FLOW AND THE INVENTORY TRACKER.  The journal comes first, so a stop can
+// fall between it and the tracker holding the flow.  Before the journal a
+// marker is written for each asset (Database::mark_capital_reconcile_pending)
+// and dropped only once the tracker holds the flow and is written.  A start
+// that finds one knows that Step 11's wallet reconcile, when it corrects that
+// asset, is the flow reaching the tracker: it re-anchors the drawdown peak,
+// with no second Net Deposits entry and no second move.
+//
+// UNTIL A TOP-UP IS BOOKED the wallet may already be short of it (a price
+// or a wallet snapshot is missing; the wallet could not be asked).  The
+// engine widens the divergence control's tolerance by the amount for that
+// long (topup_slack_applies), and by a fence event it knows of and could not
+// book yet, so a transfer is not "reconciled" away as unexplained before it
+// is booked.
 //
 // KNOWN LIMITS.  Each leaves a gap the divergence control absorbs.
 //   * A premium is paid to an ordinary address of the wallet, so it reaches
@@ -97,6 +116,9 @@
 //     wrong by its amount when its coin had not arrived yet, or had already
 //     gone into a contract.  And a fence that went down then returns what
 //     the address holds at that start, less whatever was spent from it.
+//   * The fence's log lives in the process.  Changes it had not yet told the
+//     books of at a stop are lost; the next start compares the books with
+//     where it finds the fence.
 //   * Switching the options book off in config.yaml (options.enabled, not
 //     the toolbar) takes the fence away with no event.
 //
@@ -449,22 +471,116 @@ enum class OptionsTopUpVerdict {
     return OptionsTopUpVerdict::Book;
 }
 
-/// Whether `coins` (one entry for each coin at the options address) holds a
-/// top-up's coin: one of its asset and exactly its amount.  A send creates
-/// one coin of the amount sent, so this is the top-up having arrived,
-/// whatever the book has recorded.
-[[nodiscard]] inline bool topup_coin_listed(const OptionsFlow& topup, const OptionsHeld& coins) noexcept
+/// What to do with one entry of the fence's log (rpc::CoinFence::Transition),
+/// oldest first, given where the books stand.
+enum class OptionsLogStep {
+    Adopt,     ///< No fence event yet: the books begin in this entry's state.
+    Skip,      ///< The books already stand there: nothing to book.
+    BookUp,    ///< The fence went up: a withdrawal of its first list.
+    BookDown,  ///< The fence went down: a deposit of its last list.
+    /// It went up and down again before any list was had.  No balance was
+    /// read behind it and nothing reached or left the address for it: the
+    /// two entries are dropped together.
+    DropPair,
+    Wait,      ///< It went up and its coins are not listed yet.
+};
+
+[[nodiscard]] constexpr OptionsLogStep judge_transition(OptionsFenceBooked books, bool entry_up,
+                                                        bool has_list, bool has_next) noexcept
 {
-    if (topup.legs.empty() || topup.legs.front().leg != kOptionsLeg) return false;
-    const OptionsLeg& capital = topup.legs.front();
-    if (capital.delta_mojos >= 0 || capital.delta_mojos == std::numeric_limits<Mojo>::min()) {
-        return false;
+    if (books == OptionsFenceBooked::Unknown) return OptionsLogStep::Adopt;
+    if ((books == OptionsFenceBooked::Up) == entry_up) return OptionsLogStep::Skip;
+    if (!entry_up) return OptionsLogStep::BookDown;
+    if (has_list) return OptionsLogStep::BookUp;
+    return has_next ? OptionsLogStep::DropPair : OptionsLogStep::Wait;
+}
+
+/// The amount a top-up sent: its capital leg, as a coin's amount.  nullopt
+/// for a flow that is not a top-up.
+[[nodiscard]] inline std::optional<std::uint64_t> topup_amount(const OptionsFlow& topup) noexcept
+{
+    if (topup.legs.empty() || topup.legs.front().leg != kOptionsLeg) return std::nullopt;
+    const Mojo delta = topup.legs.front().delta_mojos;
+    if (delta >= 0 || delta == std::numeric_limits<Mojo>::min()) return std::nullopt;
+    return static_cast<std::uint64_t>(-delta);
+}
+
+/// One coin a transaction created, as the wallet's record of it lists it.
+struct OptionsCoinRef {
+    std::string parent_coin_info;
+    std::string puzzle_hash;
+    Mojo        amount{0};
+};
+
+/// What the wallet's own record of a top-up's transaction says (the
+/// `transaction` object of its get_transaction answer).  It is this
+/// transaction's confirmation and this transaction's coin: another coin of
+/// the same amount at the address proves nothing about it.
+struct OptionsTopUpProof {
+    bool confirmed{false};
+    /// The coins it created with exactly the amount sent.  The top-up's own
+    /// coin is the one of them at the options address; the caller knows that
+    /// address's puzzle hashes and how a coin's id is computed.
+    std::vector<OptionsCoinRef> outputs;
+};
+
+/// Reads that record for `topup`.  nullopt when it does not say whether the
+/// transaction confirmed: no answer is never read as either.
+[[nodiscard]] inline std::optional<OptionsTopUpProof> read_topup_transaction(
+    const nlohmann::json& transaction, const OptionsFlow& topup)
+{
+    if (!transaction.is_object()) return std::nullopt;
+    const auto confirmed = transaction.find("confirmed");
+    if (confirmed == transaction.end() || !confirmed->is_boolean()) return std::nullopt;
+    OptionsTopUpProof proof;
+    proof.confirmed = confirmed->get<bool>();
+    const auto amount = topup_amount(topup);
+    const auto additions = transaction.find("additions");
+    if (!amount || additions == transaction.end() || !additions->is_array()) return proof;
+    for (const auto& coin : *additions) {
+        if (!coin.is_object()) continue;
+        const auto parent = coin.find("parent_coin_info");
+        const auto puzzle = coin.find("puzzle_hash");
+        const auto value  = coin.find("amount");
+        if (parent == coin.end() || !parent->is_string()) continue;
+        if (puzzle == coin.end() || !puzzle->is_string()) continue;
+        if (value == coin.end() || !value->is_number_unsigned()) continue;
+        if (value->get<std::uint64_t>() != *amount) continue;
+        proof.outputs.push_back({parent->get<std::string>(), puzzle->get<std::string>(),
+                                 to_mojo_saturating(*amount)});
     }
-    const auto amount = static_cast<std::uint64_t>(-capital.delta_mojos);
-    for (const auto& [asset_id, coin_amount] : coins) {
-        if (asset_id == capital.asset_id && coin_amount == amount) return true;
-    }
-    return false;
+    return proof;
+}
+
+/// Whether a confirmed top-up the books do not hold yet arrived BEFORE the
+/// fence went down.  Then the event that returns the address's coins returns
+/// its coin too, and its withdrawal is booked ahead of that event; otherwise
+/// it arrived with the fence down, and its coin is trading funds until the
+/// fence goes up and takes it.  `coin_returned`: whether the list that event
+/// books holds the top-up's OWN coin, when the wallet's record shows which
+/// coin that is.  Without it, only a confirmation the options book recorded
+/// (`book_confirmed_at`, 0 = none) no later than the fence went down
+/// (`lowered_at_unix`) says "before".
+[[nodiscard]] constexpr bool topup_arrived_before_lowering(std::optional<bool> coin_returned,
+                                                           std::int64_t book_confirmed_at,
+                                                           double lowered_at_unix) noexcept
+{
+    if (coin_returned.has_value()) return *coin_returned;
+    return book_confirmed_at > 0 && static_cast<double>(book_confirmed_at) <= lowered_at_unix;
+}
+
+/// How often the wallet is asked about a top-up the options book has not
+/// recorded as confirmed, once it is no longer `recent` (still within
+/// topup_slack_applies): the book has forgotten the send by then, and it
+/// can still confirm.
+inline constexpr BlockHeight kOptionsProofEveryBlocks = 120;
+
+/// Whether to ask now.  `last_asked_block` 0 = never asked in this process.
+[[nodiscard]] constexpr bool topup_proof_due(bool recent, BlockHeight block,
+                                             BlockHeight last_asked_block) noexcept
+{
+    if (recent || last_asked_block == 0) return true;
+    return block < last_asked_block || block - last_asked_block >= kOptionsProofEveryBlocks;
 }
 
 /// Whether a top-up sent at `sent_at` and not booked yet still widens the

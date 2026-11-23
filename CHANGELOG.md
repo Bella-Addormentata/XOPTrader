@@ -109,20 +109,27 @@ waiting like that: 1.5 XCH and 2 wUSDC.b on 2026-11-20, 0.5 XCH on
 2026-11-21.
 
 - **A top-up is booked as capital that left.** The engine reads the options
-  book's record (read-only) and enters each confirmed top-up and its fee in
-  the ledger as an `options_withdrawal`. Its value goes to Net Deposits, not
-  to P&L. The three waiting ones are booked the first time this engine runs
-  with the fence up.
+  book's record (read-only) for which top-ups there are, and enters each one
+  and its fee in the ledger as an `options_withdrawal` once it has
+  confirmed. Its value goes to Net Deposits, not to P&L. The three waiting
+  ones are booked the first time this engine runs with the fence up.
+- **Confirmed by its own transaction.** The options book writes a
+  confirmation down minutes after the coins moved (five, for the three
+  above). The engine asks the wallet about that one transaction instead, so
+  a top-up is booked in the heartbeat after it confirms.
 - **So is the fence going down or up** (`engine_fence: auto`). Down, the
   sub-account's coins are trading funds again: a deposit of what it held.
-  Up, they leave again: a withdrawal of what it holds.
+  Up, they leave again: a withdrawal of what it holds. Every change is
+  booked, in order, each with the coins the address held at that moment.
 - **Nothing is counted twice.** A top-up counts only if the fence was up
-  when it went out. One sent while it was down is part of what the fence
-  takes when it goes up.
-- **No alert while a top-up is on its way.** The options book records a
-  confirmation minutes after the coins moved (five, for the three above).
-  The divergence check allows for a sent top-up until it is booked, for at
-  most two hours, instead of "reconciling" it away as unexplained and then
+  when it arrived. One that arrives while it is down is part of what the
+  fence takes when it goes up.
+- **A restart in the middle is safe.** If the engine stops between entering
+  a transfer and updating its tracked balance, the next start knows, and
+  the correction it makes then is not read as a loss.
+- **No alert while a transfer waits to be booked.** If a price or a wallet
+  reading is missing for a heartbeat, the divergence check allows for the
+  known transfer instead of "reconciling" it away as unexplained and then
   meeting it again.
 - The Net Deposits card counts these beside the bridge flows.
 - Not covered, and still left to the divergence check: a premium (it arrives

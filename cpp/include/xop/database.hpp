@@ -692,6 +692,30 @@ public:
     [[nodiscard]] std::optional<LedgerEventStamp> ledger_latest_event(
         const std::string& prefix) const;
 
+    // -- Capital flows the inventory tracker may not hold yet ----------------
+
+    /// [OPTIONS-CAPITAL] Note, durably, that an external capital flow is
+    /// being journalled for `asset_id` and the inventory tracker does not
+    /// hold it yet.  Written BEFORE the flow's ledger legs, so a process
+    /// that stops between the journal and the tracker's write leaves the
+    /// next one this note (see capital_reconcile_pending()).  An asset
+    /// already noted stays as first written.  Never throws.
+    /// @return false when the note could not be written: the caller then
+    ///         must not journal the flow.
+    [[nodiscard]] bool mark_capital_reconcile_pending(const std::string& asset_id,
+                                                      const std::string& reason) noexcept;
+
+    /// [OPTIONS-CAPITAL] The tracker holds the flow and inventory_state is
+    /// written: the note is dropped.  Never throws.
+    bool clear_capital_reconcile_pending(const std::string& asset_id) noexcept;
+
+    /// [OPTIONS-CAPITAL] The assets noted, or std::nullopt when the table
+    /// could not be read.  A start restores them: the correction Step 11's
+    /// wallet reconcile makes for such an asset is a flow the ledger already
+    /// holds reaching the tracker -- a capital event (it re-anchors the
+    /// drawdown peak), with no second Net Deposits entry.
+    [[nodiscard]] std::optional<std::vector<std::string>> capital_reconcile_pending() const;
+
     /// The entry_time of this asset's 'opening' leg (ISO-8601 UTC), or ""
     /// when none exists / the query fails.  [S19] The bridge ingester
     /// skips jobs completed at or before this instant: their flow is

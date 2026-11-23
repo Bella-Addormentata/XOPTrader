@@ -782,6 +782,46 @@ TEST(DatabaseTest, LedgerLatestEventIsTheNewestWithThatPrefix) {
               -1'500'000'000'000LL - 10'000'000LL - 1LL + 500'000'000'000LL - 1LL);
 }
 
+// [OPTIONS-CAPITAL] A capital flow is journalled before the inventory tracker
+// holds it.  The note written first is what a process that starts after a
+// stop in between reads: the correction it makes for that asset is the flow
+// reaching the tracker, not a loss.
+TEST(DatabaseTest, ACapitalFlowTheTrackerMayNotHoldYetIsNotedAcrossARestart) {
+    TempDbPath temp("capital_reconcile_pending");
+    const std::string usdc = "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d";
+    {
+        xop::Database db(temp.path().string());
+        const auto none = db.capital_reconcile_pending();
+        ASSERT_TRUE(none.has_value()) << "an empty table is an answer";
+        EXPECT_TRUE(none->empty());
+
+        EXPECT_TRUE(db.mark_capital_reconcile_pending("xch", "options"));
+        EXPECT_TRUE(db.mark_capital_reconcile_pending(usdc, "options"));
+        // A second flow for an asset changes nothing: one note an asset.
+        EXPECT_TRUE(db.mark_capital_reconcile_pending("xch", "options"));
+        const auto both = db.capital_reconcile_pending();
+        ASSERT_TRUE(both.has_value());
+        EXPECT_EQ(*both, (std::vector<std::string>{usdc, "xch"}));
+    }
+    // The stop: nothing but the database carries it over.
+    xop::Database db(temp.path().string());
+    const auto restored = db.capital_reconcile_pending();
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(*restored, (std::vector<std::string>{usdc, "xch"}));
+
+    // The tracker holds the XCH flow and is written: that note goes, the
+    // other stays.
+    EXPECT_TRUE(db.clear_capital_reconcile_pending("xch"));
+    EXPECT_EQ(db.capital_reconcile_pending().value_or(std::vector<std::string>{"?"}),
+              (std::vector<std::string>{usdc}));
+    // Clearing what is not there is not an error.
+    EXPECT_TRUE(db.clear_capital_reconcile_pending("xch"));
+    EXPECT_TRUE(db.clear_capital_reconcile_pending(usdc));
+    EXPECT_TRUE(db.capital_reconcile_pending().value_or(std::vector<std::string>{"?"}).empty());
+    // It never touched a balance.
+    EXPECT_TRUE(db.ledger_balances().empty());
+}
+
 TEST(DatabaseTest, LedgerSurvivesReopen) {
     TempDbPath temp("ledger_reopen");
     {
