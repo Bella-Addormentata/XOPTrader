@@ -135,6 +135,19 @@ def _number(section: dict, key: str, default: float | None, *, minimum: float = 
     return value
 
 
+def _mojos(units: float, scale: int, what: str) -> int:
+    """``units`` in mojos, rounded to the nearest.
+
+    [review #254] A finite number can still be too large to count in mojos
+    (1e300): that is a config error here, not ``round``'s OverflowError,
+    which no caller expects from a parser.
+    """
+    amount = units * scale
+    if not math.isfinite(amount):
+        raise OptionsConfigError(f"{what} is too large")
+    return int(round(amount))
+
+
 def _path(section: dict, key: str) -> str:
     """A file path, with ``~`` expanded as the chia section's paths are. "" if unset.
 
@@ -389,7 +402,11 @@ def _contract_size(section: dict) -> float | None:
         raise OptionsConfigError(
             f"options.contract_xch must be a number of XCH, or auto (got {raw!r})"
         ) from exc
-    if not math.isfinite(value) or int(round(value * XCH_MOJOS)) <= 0:
+    # [review #254] Positive before it is scaled: -1e300 times a mojo count is
+    # -inf, which round() answers with OverflowError.
+    if not math.isfinite(value) or value <= 0:
+        raise OptionsConfigError("options.contract_xch must be positive")
+    if _mojos(value, XCH_MOJOS, "options.contract_xch") <= 0:  # under half a mojo
         raise OptionsConfigError("options.contract_xch must be positive")
     return value
 
@@ -884,7 +901,7 @@ def parse(root: Any) -> OptionsConfig | None:
         contract_xch = float(auto_contract_xch(limits, len(calls), grid_expiries))
     else:
         contract_xch = written_xch
-    contract_mojos = int(round(contract_xch * XCH_MOJOS))
+    contract_mojos = _mojos(contract_xch, XCH_MOJOS, "options.contract_xch")
     fee_auto = str(section.get("fee_mojos", 0)).strip().lower() == "auto"
     fee = 0 if fee_auto else int(_number(section, "fee_mojos", 0))
     if fee > limits.max_fee_mojos:
@@ -997,8 +1014,8 @@ def _target(section: dict, quote_unit: int) -> TargetConfig | None:
     if tolerance >= 100.0:
         raise OptionsConfigError("options.target.tolerance_pct must be below 100")
     return TargetConfig(
-        xch_mojos=int(round(xch * XCH_MOJOS)),
-        quote_mojos=int(round(quote * quote_unit)),
+        xch_mojos=_mojos(xch, XCH_MOJOS, "options.target.xch"),
+        quote_mojos=_mojos(quote, quote_unit, "options.target.quote"),
         tolerance=tolerance / 100.0,
     )
 

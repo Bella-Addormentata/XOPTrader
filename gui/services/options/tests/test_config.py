@@ -133,6 +133,11 @@ def test_expiries_accept_iso_and_unix_and_need_a_zone() -> None:
         {"contract_xch": ""},
         {"contract_xch": True},
         {"contract_xch": float("inf")},
+        {"contract_xch": 1e300},
+        {"contract_xch": -1e300},
+        {"contract_xch": 1e-13},
+        {"target": {"xch": 1e300}},
+        {"target": {"xch": 1, "quote": 1e306}},
         {
             "limits": {
                 "max_locked_xch": 1e300,
@@ -594,3 +599,18 @@ def test_a_cap_too_large_to_count_is_refused_as_a_cap() -> None:
     limits = {**_section()["limits"], "max_locked_quote": "1e306"}
     with pytest.raises(config.OptionsConfigError, match="max_locked_quote is too large"):
         _parse(limits=limits)
+
+
+def test_a_number_too_large_to_count_in_mojos_is_a_config_error() -> None:
+    """[review #254] Never an OverflowError: the command line prints config errors,
+    and a traceback is not one."""
+    with pytest.raises(config.OptionsConfigError, match="contract_xch is too large"):
+        _parse(contract_xch=1e300)
+    with pytest.raises(config.OptionsConfigError, match="contract_xch must be positive"):
+        _parse(contract_xch=-1e300)
+    with pytest.raises(config.OptionsConfigError, match="target.xch is too large"):
+        _parse(target={"xch": 1e300})
+    with pytest.raises(config.OptionsConfigError, match="target.quote is too large"):
+        _parse(target={"xch": 1, "quote": 1e306})
+    # The largest sizes that do count still parse.
+    assert _parse(contract_xch=1e6).contract_xch_mojos == 10**18
