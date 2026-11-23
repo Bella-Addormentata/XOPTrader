@@ -2903,6 +2903,8 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         rec.status        = db_status_for(po);
                         rec.created_block = po.created_at_block;
                         rec.fee_mojos     = po.fee_mojos;
+                        rec.requested_asset = po.requested_asset;  // [UNIQUE-REQUEST]
+                        rec.requested_mojos = po.requested_mojos;
                         db_->insert_offer(rec);
                         if (po.cancel_pending) {
                             // The row's cause and an event.
@@ -17928,10 +17930,16 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     execution::RequestBounds bounds;
                     bounds.bid_may_grow = bids_may_grow;
                     // [TIERMIN] A resting offer under its tier's minimum is
-                    // retired ("tier_min_undersized").
-                    const auto min_it = pcs.tier_min_mojos.find({tq.side, tq.tier_index});
-                    if (tq.side == Side::Bid && min_it != pcs.tier_min_mojos.end()) {
-                        bounds.min_bid_size = min_it->second;
+                    // retired ("tier_min_undersized"). [review #255] With no
+                    // tier minimum the pair's own minimum size holds, the
+                    // one Step 7's dust filter enforces.
+                    if (tq.side == Side::Bid) {
+                        const auto min_it = pcs.tier_min_mojos.find({tq.side, tq.tier_index});
+                        bounds.min_bid_size = execution::min_bid_size_mojos(
+                            *pair_cfg, config_.strategy.min_offer_size_units,
+                            min_it != pcs.tier_min_mojos.end()
+                                ? std::optional<Mojo>{min_it->second}
+                                : std::nullopt);
                     }
                     return bounds;
                 },
@@ -17999,6 +18007,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 orec.status        = "pending";
                 orec.created_block = block_height;
                 orec.fee_mojos     = recommended_fee;
+                // [UNIQUE-REQUEST] What the offer asks for, kept with its row.
+                const auto asked = execution::requested_amount(
+                    *pair_cfg, etq.side, etq.price, etq.size);
+                orec.requested_asset = asked.first;
+                orec.requested_mojos = asked.second;
 
                 // Capture order-book context for outcome analysis.
                 {
@@ -18168,6 +18181,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         rec.status        = db_status_for(po);
                         rec.created_block = po.created_at_block;
                         rec.fee_mojos     = po.fee_mojos;
+                        rec.requested_asset = po.requested_asset;  // [UNIQUE-REQUEST]
+                        rec.requested_mojos = po.requested_mojos;
                         db_->insert_offer(rec);
                     } catch (...) {
                         // Already exists or DB constraint - fine.

@@ -31,36 +31,43 @@
 // --------------------------------------------
 // Before Step 8 posts a tier, what it asks for is moved by the fewest mojos
 // that make it differ from what every resting offer asks for. Step 8 then
-// posts and records the moved tier, so State and offer_log hold what the
-// offer really asks for, also after a restart.
+// posts and records the moved tier, and the request itself is kept with the
+// offer in State and in offer_log (PendingOffer::requested_*), so it is known
+// to the mojo also after a restart and for an offer read back from the
+// wallet, whose price is not one this formula can be run backwards from.
 //
 // The engine compares a resting offer with its plan exactly in two places,
 // and a move must trip neither, or the offer is cancelled and reposted every
 // cycle (review of the first version, #252):
 //   - [TIERMIN] a resting offer under its tier's minimum is retired
-//     ("tier_min_undersized"), so a bid never goes under min_bid_size;
+//     ("tier_min_undersized"), and Step 7's dust filter drops a tier under
+//     the pair's own minimum size: a bid never goes under min_bid_size;
 //   - [PACE] the resting bids of a pace-managed pair are held to its pool to
 //     the mojo (pace::select_resting_to_cancel), so such a bid never grows.
 // And no move may spend more or sell for less than Step 7 allowed:
 //   - an ASK asks for more of the quote asset, its price raised just enough
 //     (within max_ask_move_bps): never under a no-loss or peg floor;
 //   - a BID first asks for less of the base asset (and pays less): never
-//     over a budget. Only where its tier minimum forbids that does it ask
-//     for more, and then only while what it PAYS stays the same to the mojo
-//     -- true of every XCH-base bid, where one base mojo is far under one
-//     mojo of the quote asset.
+//     over a budget. Only where its minimum forbids that does it ask for
+//     more, and then only while what it PAYS stays the same to the mojo --
+//     true of every XCH-base bid, where one base mojo is far under one mojo
+//     of the quote asset.
 // A tier no allowed move clears is posted as computed: two offers sharing a
 // request only stops a taker combining them.
 // ---------------------------------------------------------------------------
 
 #include "xop/config.hpp"
+#include "xop/peg_registry.hpp"
 #include "xop/types.hpp"
 
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -78,10 +85,25 @@ using RequestedAmount = std::pair<std::string, Mojo>;
                            static_cast<double>(pair.quote_mojos_per_unit));
 }
 
+/// [review #255] A rounded quote leg as a Mojo. build_offer_dict casts it
+/// directly, which is undefined for a leg no Mojo holds. Step 7 plans no such
+/// tier, but these helpers are also run on the records of resting offers, and
+/// one adopted from the wallet before requests were recorded has a price
+/// worked out from raw mojos (1e9 times too large on wmilliETH.b/XCH). So
+/// here it is defined: nothing for a leg that is not positive, the largest
+/// Mojo for one past it.
+[[nodiscard]] inline Mojo leg_as_mojo(double rounded_leg) noexcept
+{
+    if (!(rounded_leg > 0.0)) {
+        return 0;  // also NaN
+    }
+    return to_mojo_checked(rounded_leg).value_or(std::numeric_limits<Mojo>::max());
+}
+
 /// What a bid pays, in quote mojos: build_offer_dict rounds it up.
 [[nodiscard]] inline Mojo bid_offered_quote(const PairConfig& pair, Mojo price, Mojo size) noexcept
 {
-    return static_cast<Mojo>(std::ceil(quote_leg_mojos(pair, price, size)));
+    return leg_as_mojo(std::ceil(quote_leg_mojos(pair, price, size)));
 }
 
 /// The requested side of a tier exactly as build_offer_dict asks for it: a
@@ -93,12 +115,80 @@ using RequestedAmount = std::pair<std::string, Mojo>;
     if (side == Side::Bid) {
         return {pair.base_asset_id, size};
     }
-    return {pair.quote_asset_id, static_cast<Mojo>(std::floor(quote_leg_mojos(pair, price, size)))};
+    return {pair.quote_asset_id, leg_as_mojo(std::floor(quote_leg_mojos(pair, price, size)))};
+}
+
+/// [review #255] The request of an offer read back from the wallet: the
+/// asset on the requested side of `pair`, with the mojos the wallet's own
+/// summary gives for it (`requested`: asset id -> mojos). nullopt when the
+/// summary does not name that asset with a positive amount.
+///
+/// An adopted offer's PendingOffer::price is worked out from the summary's
+/// raw mojos, without the two assets' decimals, so requested_amount() cannot
+/// be run on it: an ask of 1 XCH for 997 quote mojos is adopted at price 997
+/// and would read as asking for nothing.
+[[nodiscard]] inline std::optional<RequestedAmount> request_from_summary(
+    const PairConfig& pair, Side side, const std::unordered_map<std::string, Mojo>& requested)
+{
+    const std::string& asset = (side == Side::Bid) ? pair.base_asset_id : pair.quote_asset_id;
+    const auto it = requested.find(asset);
+    if (it == requested.end() || it->second <= 0) {
+        return std::nullopt;
+    }
+    return RequestedAmount{asset, it->second};
+}
+
+/// Writes `request` onto `offer` (PendingOffer::requested_*); nothing when
+/// there is none to write.
+inline void note_request(PendingOffer& offer, const std::optional<RequestedAmount>& request)
+{
+    if (request.has_value()) {
+        offer.requested_asset = request->first;
+        offer.requested_mojos = request->second;
+    }
+}
+
+/// [review #255] What a resting offer asks for: the amount recorded with it,
+/// when there is one; else its price and size run through
+/// requested_amount(), which is exact for an offer this engine built.
+/// nullopt when neither is possible (`pair` is null: its pair is no longer
+/// configured).
+[[nodiscard]] inline std::optional<RequestedAmount> request_of(const PendingOffer& offer,
+                                                              const PairConfig* pair)
+{
+    if (!offer.requested_asset.empty() && offer.requested_mojos > 0) {
+        return RequestedAmount{offer.requested_asset, offer.requested_mojos};
+    }
+    if (pair == nullptr) {
+        return std::nullopt;
+    }
+    const RequestedAmount worked_out =
+        requested_amount(*pair, offer.side, offer.price, offer.size);
+    if (worked_out.second <= 0) {
+        return std::nullopt;  // nothing a new offer could ask for too
+    }
+    return worked_out;
+}
+
+/// [review #255] The smallest size a bid may be moved down to: its tier's
+/// minimum this cycle when its side posts tier minimums (`tier_min`), else
+/// the pair's own minimum offer size (config.hpp effective_min_offer_units,
+/// which Step 7's dust filter enforces). Never under one mojo.
+[[nodiscard]] inline Mojo min_bid_size_mojos(const PairConfig& pair, double global_min_units,
+                                             std::optional<Mojo> tier_min) noexcept
+{
+    if (tier_min.has_value()) {
+        return *tier_min > 1 ? *tier_min : Mojo{1};
+    }
+    const double units = effective_min_offer_units(pair, global_min_units);
+    const std::optional<Mojo> mojos = ceil_mojo_checked(
+        units * static_cast<double>(pair.base_mojos_per_unit));
+    return mojos.has_value() && *mojos > 1 ? *mojos : Mojo{1};
 }
 
 /// How far one tier's request may move (see the header comment).
 struct RequestBounds {
-    /// A bid's size never goes under this: its tier minimum this cycle, or 1.
+    /// A bid's size never goes under this (min_bid_size_mojos).
     Mojo   min_bid_size{1};
     /// False on a pace-managed pair, whose resting bids are held to a pool.
     bool   bid_may_grow{true};
@@ -120,12 +210,13 @@ enum class RequestMove {
                                                      const std::set<RequestedAmount>& taken,
                                                      const RequestBounds& bounds = {})
 {
+    constexpr Mojo kMax = std::numeric_limits<Mojo>::max();
     const RequestedAmount want = requested_amount(pair, tier.side, tier.price, tier.size);
     if (taken.count(want) == 0) {
         return RequestMove::None;
     }
     if (tier.side == Side::Bid) {
-        // Less of the base asset, down to the tier's minimum.
+        // Less of the base asset, down to its minimum.
         for (int k = 1; k <= bounds.max_steps; ++k) {
             const Mojo size = tier.size - k;
             if (size < bounds.min_bid_size || size <= 0) {
@@ -136,10 +227,11 @@ enum class RequestMove {
                 return RequestMove::Moved;
             }
         }
-        // More of it, while what the bid pays does not change.
-        if (bounds.bid_may_grow) {
-            const Mojo pays = bid_offered_quote(pair, tier.price, tier.size);
-            for (int k = 1; k <= bounds.max_steps; ++k) {
+        // More of it, while what the bid pays does not change -- which
+        // cannot be told of a payment no Mojo holds (leg_as_mojo).
+        const Mojo pays = bid_offered_quote(pair, tier.price, tier.size);
+        if (bounds.bid_may_grow && pays < kMax) {
+            for (int k = 1; k <= bounds.max_steps && tier.size <= kMax - k; ++k) {
                 const Mojo size = tier.size + k;
                 if (bid_offered_quote(pair, tier.price, size) != pays) {
                     break;
@@ -161,12 +253,19 @@ enum class RequestMove {
     }
     const double max_price =
         static_cast<double>(tier.price) * (1.0 + bounds.max_ask_move_bps / 10'000.0);
-    for (int k = 1; k <= bounds.max_steps; ++k) {
+    for (int k = 1; k <= bounds.max_steps && want.second <= kMax - k; ++k) {
         const Mojo target = want.second + k;
         if (taken.count({want.first, target}) != 0) {
             continue;
         }
-        Mojo price = static_cast<Mojo>(std::ceil(static_cast<double>(target) / per_price_unit));
+        // [review #255] Checked: a price this dear may not fit a Mojo at
+        // all, and then no dearer one does either.
+        const std::optional<Mojo> first =
+            ceil_mojo_checked(static_cast<double>(target) / per_price_unit);
+        if (!first.has_value()) {
+            break;
+        }
+        Mojo price = *first;
         bool found = false;
         for (int fix = 0; fix < 4 && price > tier.price; ++fix) {
             const Mojo got = requested_amount(pair, Side::Ask, price, tier.size).second;
@@ -179,7 +278,7 @@ enum class RequestMove {
                 found = true;
                 break;
             }
-            if (got > target) {
+            if (got > target || price == kMax) {
                 break;  // one price unit moves the request past it
             }
             ++price;
@@ -196,18 +295,16 @@ enum class RequestMove {
     return RequestMove::Shared;
 }
 
-/// What every resting offer asks for. `pair_of(pair_name)` gives the pair's
-/// config, or nullptr for an offer whose pair is no longer configured, which
-/// is left out.
+/// What every resting offer asks for (request_of). `pair_of(pair_name)`
+/// gives the pair's config, or nullptr when it is no longer configured.
 template <typename PairLookup>
 [[nodiscard]] std::set<RequestedAmount> requested_by(const std::vector<PendingOffer>& resting,
                                                      PairLookup&& pair_of)
 {
     std::set<RequestedAmount> taken;
     for (const PendingOffer& offer : resting) {
-        const PairConfig* pair = pair_of(offer.pair_name);
-        if (pair != nullptr) {
-            taken.insert(requested_amount(*pair, offer.side, offer.price, offer.size));
+        if (const auto request = request_of(offer, pair_of(offer.pair_name))) {
+            taken.insert(*request);
         }
     }
     return taken;

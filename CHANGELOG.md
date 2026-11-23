@@ -63,12 +63,14 @@ Each new offer now asks for an amount no live offer asks for, moved by a
 mojo or two and never against a limit the engine holds:
 - **An ask** asks for a mojo more of the quote asset, its price raised just
   enough (at most 25 bps), so it never goes under a price floor.
-- **A bid** asks for a mojo less of the base asset and pays less. A bid at
-  its tier minimum cannot shrink, so it asks for a mojo more instead, and
-  only while what it pays stays the same: true of every XCH bid, where a
-  mojo of XCH is far under a mojo of the quote asset. A pair the pace
-  controller manages never grows a bid.
-- What is posted is what is recorded, so a restart reads the same amounts.
+- **A bid** asks for a mojo less of the base asset and pays less, down to
+  its minimum size (its tier's, or the pair's). At its minimum it asks for a
+  mojo more instead, and only while what it pays stays the same: true of
+  every XCH bid, where a mojo of XCH is far under a mojo of the quote asset.
+  A pair the pace controller manages never grows a bid.
+- What each offer asks for is recorded with it (two new `offer_log`
+  columns), so a restart reads the same amounts, also for an offer read back
+  from the wallet.
 - With no allowed move, the offer is posted as before.
 
 ### Two alerts that fired on nearly every cycle (#251)

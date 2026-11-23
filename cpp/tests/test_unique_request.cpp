@@ -10,10 +10,15 @@
 
 #include <cmath>
 #include <cstdint>
+#include <fstream>
+#include <limits>
+#include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
+#include "engine_source_scan.hpp"
 #include "xop/execution/unique_request.hpp"
 
 using xop::kMojosPerXch;
@@ -25,6 +30,9 @@ using xop::TierQuote;
 using xop::execution::bid_offered_quote;
 using xop::execution::make_request_unique;
 using xop::execution::make_requests_unique;
+using xop::execution::min_bid_size_mojos;
+using xop::execution::note_request;
+using xop::execution::request_from_summary;
 using xop::execution::requested_amount;
 using xop::execution::requested_by;
 using xop::execution::RequestBounds;
@@ -303,7 +311,7 @@ TEST(UniqueRequest, RestingOffersAreReadWithWhatTheyReallyAskFor)
     });
 
     EXPECT_EQ(taken, (std::set<RequestedAmount>{{"xch", 10 * kXch + 1}, {"usdc", 997}}))
-        << "an offer of a pair no longer configured is left out";
+        << "an offer of a pair no longer configured, with no request recorded, is left out";
 
     TierQuote fresh = tier_of(Side::Bid, 88.520541355931, 10 * kXch);
     EXPECT_EQ(make_request_unique(kXchDbx, fresh, taken, at_minimum(10 * kXch)),
@@ -313,4 +321,230 @@ TEST(UniqueRequest, RestingOffersAreReadWithWhatTheyReallyAskFor)
     EXPECT_EQ(make_request_unique(kXchDbx, clash, taken, at_minimum(10 * kXch)),
               RequestMove::Moved);
     EXPECT_EQ(clash.size, 10 * kXch) << "a mojo less, down to its minimum";
+}
+
+// ---------------------------------------------------------------------------
+// [review #255]
+// ---------------------------------------------------------------------------
+
+TEST(UniqueRequest, AnAskWhosePriceCannotBeWrittenIsLeftShared)
+{
+    // 10 XCH at nearly the largest price a Mojo holds: asking for one more
+    // quote mojo would need a price past it. The conversion is checked, and
+    // the tier is as computed.
+    TierQuote t{};
+    t.side = Side::Ask;
+    t.size = 10 * kXch;
+    t.price = 9'223'372'036'854'774'784;
+    const RequestedAmount want = requested_amount(kXchUsdc, t.side, t.price, t.size);
+    const TierQuote before = t;
+    EXPECT_EQ(make_request_unique(kXchUsdc, t, {want}), RequestMove::Shared);
+    EXPECT_EQ(t.price, before.price);
+    EXPECT_EQ(t.size, before.size);
+}
+
+TEST(UniqueRequest, AnOfferReadBackFromTheWalletKeepsItsExactRequest)
+{
+    // OfferManager::try_parse_wallet_offer adopts an ask of 1 XCH for 997
+    // quote mojos at price 997: quote mojos per base mojo x 1e12, without the
+    // two assets' decimals. Run through the formula that price asks for
+    // nothing, so the request is taken from the wallet's summary and kept.
+    PendingOffer adopted{};
+    adopted.offer_id = "0xadopted";
+    adopted.pair_name = kXchUsdc.name;
+    adopted.side = Side::Ask;
+    adopted.size = kXch;
+    adopted.price = 997;
+    const auto config_of = [](const std::string& name) -> const PairConfig* {
+        return name == kXchUsdc.name ? &kXchUsdc : nullptr;
+    };
+    EXPECT_TRUE(requested_by({adopted}, config_of).empty())
+        << "precondition: its price and size alone say nothing";
+
+    note_request(adopted, request_from_summary(kXchUsdc, Side::Ask, {{"usdc", 997}, {"xch", 5}}));
+    EXPECT_EQ(adopted.requested_asset, "usdc");
+    EXPECT_EQ(adopted.requested_mojos, 997);
+    const auto taken = requested_by({adopted}, config_of);
+    EXPECT_EQ(taken, (std::set<RequestedAmount>{{"usdc", 997}}));
+
+    // A new ask that would ask for the same 997 mojos is moved off it.
+    TierQuote fresh = tier_of(Side::Ask, 0.9976, kXch);
+    EXPECT_EQ(make_request_unique(kXchUsdc, fresh, taken), RequestMove::Moved);
+    EXPECT_EQ(requested_amount(kXchUsdc, fresh.side, fresh.price, fresh.size).second, 998);
+
+    // The recorded request counts even once its pair is no longer configured.
+    adopted.pair_name = "XCH/GONE";
+    EXPECT_EQ(requested_by({adopted}, config_of).count({"usdc", 997}), 1u);
+}
+
+TEST(UniqueRequest, ALegNoMojoHoldsIsStillDefined)
+{
+    // An offer adopted before requests were recorded has a price worked out
+    // from raw mojos: on wmilliETH.b/XCH that is 1e9 times too large, or
+    // whatever rounding a number that size left behind. Its request is then
+    // worked out by the formula, which says "the largest Mojo" for a leg past
+    // it and "nothing" for one that is not positive.
+    constexpr Mojo kTop = std::numeric_limits<Mojo>::max();
+    constexpr Mojo kBottom = std::numeric_limits<Mojo>::min();
+    EXPECT_EQ(requested_amount(kEthXch, Side::Ask, kTop, 5'000).second, kTop);
+    EXPECT_EQ(bid_offered_quote(kEthXch, kTop, 5'000), kTop);
+    EXPECT_EQ(requested_amount(kEthXch, Side::Ask, kBottom, 5'000).second, 0);
+    EXPECT_EQ(bid_offered_quote(kEthXch, kBottom, 5'000), 0);
+
+    // A record that works out to nothing reserves nothing.
+    PendingOffer old{};
+    old.pair_name = kEthXch.name;
+    old.side = Side::Ask;
+    old.size = 5'000;
+    old.price = kBottom;
+    EXPECT_TRUE(requested_by({old}, [](const std::string&) { return &kEthXch; }).empty());
+
+    // And a bid whose payment no Mojo holds does not grow: "pays the same"
+    // cannot be told of it.
+    TierQuote t{};
+    t.side = Side::Bid;
+    t.size = 5'000;
+    t.price = kTop;
+    const TierQuote before = t;
+    EXPECT_EQ(make_request_unique(kEthXch, t, {{"eth", 5'000}}, at_minimum(5'000)),
+              RequestMove::Shared);
+    EXPECT_EQ(t.size, before.size);
+}
+
+TEST(UniqueRequest, TheSummaryNamesTheAssetOnTheRequestedSide)
+{
+    const auto bid = request_from_summary(kXchUsdc, Side::Bid, {{"xch", 10 * kXch}, {"usdc", 9}});
+    ASSERT_TRUE(bid.has_value());
+    EXPECT_EQ(*bid, (RequestedAmount{"xch", 10 * kXch}));
+    EXPECT_FALSE(request_from_summary(kXchUsdc, Side::Ask, {{"xch", 5}}).has_value())
+        << "the quote asset is not in it";
+    EXPECT_FALSE(request_from_summary(kXchUsdc, Side::Ask, {{"usdc", 0}}).has_value());
+
+    PendingOffer untouched{};
+    note_request(untouched, std::nullopt);
+    EXPECT_TRUE(untouched.requested_asset.empty());
+    EXPECT_EQ(untouched.requested_mojos, 0);
+}
+
+TEST(UniqueRequest, ABidNeverGoesUnderThePairsMinimumSize)
+{
+    // BYC/wUSDC.b sets min_offer_size_units_override: 1, and Step 7's dust
+    // filter drops a tier under it: a 1 BYC bid cannot become 0.999 BYC.
+    PairConfig byc = kBycUsdc;
+    byc.min_offer_size_units_override = 1.0;
+    EXPECT_EQ(min_bid_size_mojos(byc, /*global_min_units=*/5.0, std::nullopt), kCat);
+    EXPECT_EQ(min_bid_size_mojos(kBycUsdc, 5.0, std::nullopt), 5 * kCat)
+        << "no override: the global minimum";
+    EXPECT_EQ(min_bid_size_mojos(kXchByc, 5.0, std::nullopt), kXch) << "an XCH-base pair: 1 XCH";
+    EXPECT_EQ(min_bid_size_mojos(byc, 5.0, Mojo{2'000}), 2'000)
+        << "its tier's minimum, on a side posting tier minimums";
+    EXPECT_EQ(min_bid_size_mojos(byc, 5.0, Mojo{0}), 1);
+
+    // Four 1 BYC bids at that minimum. None shrinks; one grows, the one that
+    // can ask for a mojo more and pay the same; the others are as computed.
+    std::vector<TierQuote> tiers{tier_of(Side::Bid, 0.5801, kCat, 0), tier_of(Side::Bid, 0.5809, kCat, 1),
+                                 tier_of(Side::Bid, 0.5802, kCat, 2), tier_of(Side::Bid, 0.5803, kCat, 3)};
+    const std::vector<TierQuote> before = tiers;
+    std::set<RequestedAmount> taken;
+    std::size_t shared = 0;
+    const Mojo min_size = min_bid_size_mojos(byc, 5.0, std::nullopt);
+    const auto moved = make_requests_unique(
+        byc, tiers, taken, [min_size](const TierQuote&) { return at_minimum(min_size); }, &shared);
+
+    ASSERT_EQ(moved.size(), 1u);
+    EXPECT_EQ(moved[0].tier_index, 2);
+    EXPECT_EQ(moved[0].asked_now, kCat + 1);
+    EXPECT_EQ(shared, 2u);
+    for (std::size_t i = 0; i < tiers.size(); ++i) {
+        EXPECT_GE(tiers[i].size, min_size) << "tier " << i;
+        EXPECT_EQ(bid_offered_quote(byc, tiers[i].price, tiers[i].size),
+                  bid_offered_quote(byc, before[i].price, before[i].size))
+            << "tier " << i << " pays what it did";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The wiring, by source scan: no unit test can construct Engine or
+// OfferManager (engine_source_scan.hpp).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using xop_tests::engine_scan::count_of;
+using xop_tests::engine_scan::position_of;
+using xop_tests::engine_scan::read_engine_cpp;
+using xop_tests::engine_scan::squeeze;
+
+std::string read_offer_manager_cpp()
+{
+    std::ifstream in(XOP_TESTS_OFFER_MANAGER_CPP, std::ios::binary);
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    return buffer.str();
+}
+
+}  // namespace
+
+TEST(UniqueRequestWiring, Step8MovesTheTiersItThenPostsAndRecords)
+{
+    const std::string engine = squeeze(read_engine_cpp());
+    ASSERT_FALSE(engine.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t taken_at = position_of(
+        engine, "auto requested = execution::requested_by( state_->get_all_offers(), "
+                "[&](const std::string& name) { return find_pair_config(name); });");
+    const std::size_t pass_at = position_of(
+        engine, "const auto moved = execution::make_requests_unique( "
+                "*pair_cfg, fee_filtered_tiers, requested,");
+    const std::size_t post_at = position_of(
+        engine, "int posted = co_await offer_mgr_->post_quotes( "
+                "*pair_cfg, fee_filtered_tiers, block_height, fee_override);");
+    const std::size_t record_at = position_of(
+        engine, "const auto asked = execution::requested_amount( *pair_cfg, etq.side, etq.price, etq.size); "
+                "orec.requested_asset = asked.first; orec.requested_mojos = asked.second;");
+    ASSERT_NE(taken_at, std::string::npos);
+    ASSERT_NE(pass_at, std::string::npos);
+    ASSERT_NE(post_at, std::string::npos);
+    ASSERT_NE(record_at, std::string::npos);
+    // Every resting offer's request is read, the tiers are moved, and the
+    // same list is posted and then recorded with what each tier asks for.
+    EXPECT_LT(taken_at, pass_at);
+    EXPECT_LT(pass_at, post_at);
+    EXPECT_LT(post_at, record_at);
+    EXPECT_EQ(count_of(engine, "execution::make_requests_unique("), 1u);
+
+    // The bounds: a pace-managed pair's bids never grow, and a bid's floor is
+    // its tier's minimum or, without one, the pair's own minimum size.
+    EXPECT_NE(position_of(engine, "const bool bids_may_grow = !pcs.pace.managed;"), std::string::npos);
+    EXPECT_NE(position_of(engine,
+                          "bounds.min_bid_size = execution::min_bid_size_mojos( "
+                          "*pair_cfg, config_.strategy.min_offer_size_units, "
+                          "min_it != pcs.tier_min_mojos.end() ? std::optional<Mojo>{min_it->second} "
+                          ": std::nullopt);"),
+              std::string::npos);
+
+    // An offer adopted at boot or mirrored from State is persisted with the
+    // request State holds for it.
+    EXPECT_EQ(count_of(engine, "rec.requested_asset = po.requested_asset;"), 2u);
+    EXPECT_EQ(count_of(engine, "rec.requested_mojos = po.requested_mojos;"), 2u);
+}
+
+TEST(UniqueRequestWiring, OffersReadBackFromTheWalletKeepWhatTheyAskFor)
+{
+    const std::string manager = squeeze(read_offer_manager_cpp());
+    ASSERT_FALSE(manager.empty()) << XOP_TESTS_OFFER_MANAGER_CPP;
+    // try_parse_wallet_offer, from the summary's requested amounts.
+    EXPECT_EQ(count_of(manager,
+                       "note_request(po, request_from_summary(pc_it->second, po.side, requested));"),
+              1u);
+    // evaluate_orphan, and the orphan adopted from its verdict.
+    EXPECT_EQ(count_of(manager,
+                       "if (const auto asked = request_from_summary(pc_it->second, eval.side, requested)) { "
+                       "eval.requested_asset = asked->first; eval.requested_mojos = asked->second; }"),
+              1u);
+    EXPECT_EQ(count_of(manager, "po.requested_asset = eval.requested_asset;"), 1u);
+    EXPECT_EQ(count_of(manager, "po.requested_mojos = eval.requested_mojos;"), 1u);
+    // A new offer, from the tier it was built from.
+    EXPECT_EQ(count_of(manager,
+                       "note_request(pending, requested_amount(pair, tier.side, tier.price, tier.size));"),
+              1u);
 }

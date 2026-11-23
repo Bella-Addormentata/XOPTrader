@@ -1429,3 +1429,49 @@ TEST(OfferStatusMapping, PersistedStatusFollowsTheStateFlag)
     po.cancel_pending = true;
     EXPECT_STREQ(xop::db_status_for(po), "cancel_pending");
 }
+
+TEST(DatabaseTest, AnOffersRequestedAmountIsKeptWithItsRow)
+{
+    // [UNIQUE-REQUEST review #255] What an offer asks to be paid, to the mojo,
+    // comes back with the row -- also for an offer adopted from the wallet at
+    // a price the amount cannot be worked out from (1 XCH for 997 quote
+    // mojos, adopted at price 997).
+    TempDbPath temp_db{"xop_offer_requested"};
+    {
+        xop::Database db(temp_db.path().string());
+        xop::DbOfferRecord asked;
+        asked.offer_id = "0xasked";
+        asked.pair_name = "XCH/wUSDC.b";
+        asked.side = "ask";
+        asked.price_mojos = 997;
+        asked.size_mojos = 1'000'000'000'000;
+        asked.created_block = 100;
+        asked.requested_asset = "usdc";
+        asked.requested_mojos = 997;
+        db.insert_offer(asked);
+        xop::DbOfferRecord plain = asked;  // a row written with nothing recorded
+        plain.offer_id = "0xplain";
+        plain.created_block = 101;
+        plain.requested_asset.clear();
+        plain.requested_mojos = 0;
+        db.insert_offer(plain);
+    }
+
+    // Reopened: the columns are added once, and the rows are as written.
+    xop::Database db(temp_db.path().string());
+    const auto pending = db.query_pending_offers();
+    ASSERT_EQ(pending.size(), 2u);
+    ASSERT_EQ(pending[0].offer_id, "0xasked");
+    EXPECT_EQ(pending[0].requested_asset, "usdc");
+    EXPECT_EQ(pending[0].requested_mojos, 997);
+    EXPECT_EQ(pending[1].requested_asset, "");
+    EXPECT_EQ(pending[1].requested_mojos, 0);
+
+    // State gets it from the row, and a row made from State carries it back.
+    const xop::PendingOffer restored = xop::pending_offer_from_db(pending[0]);
+    EXPECT_EQ(restored.requested_asset, "usdc");
+    EXPECT_EQ(restored.requested_mojos, 997);
+    const xop::DbOfferRecord again = xop::offer_log_row_for(restored);
+    EXPECT_EQ(again.requested_asset, "usdc");
+    EXPECT_EQ(again.requested_mojos, 997);
+}

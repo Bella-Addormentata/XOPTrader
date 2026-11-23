@@ -21,6 +21,7 @@
  */
 
 #include <xop/execution/offer_manager.hpp>
+#include <xop/execution/unique_request.hpp>
 
 #include <xop/execution/asset_reserve.hpp>
 
@@ -1339,6 +1340,8 @@ asio::awaitable<int> OfferManager::post_quotes(
         // [S70] Reached only past expiry_echo_ok above, so a non-zero value
         // here IS the wallet's echo, not merely what we asked for.
         pending.expiry_max_time  = expiry_max_time.value_or(0);
+        // [UNIQUE-REQUEST] What it asks for, kept with it.
+        note_request(pending, requested_amount(pair, tier.side, tier.price, tier.size));
 
         state_->upsert_offer(pending);
         // [S74] Recorded: a keep stop that stops the io_context now finds this
@@ -4433,6 +4436,19 @@ OrphanEvaluation OfferManager::evaluate_orphan(
         }
     }
 
+    // [UNIQUE-REQUEST review #255] What it asks for, to the mojo, as the
+    // summary gives it: the price above is from raw mojos and cannot be run
+    // back into the amount (unique_request.hpp).
+    if (matched) {
+        if (const auto pc_it = pair_config_map_.find(eval.pair_name);
+            pc_it != pair_config_map_.end()) {
+            if (const auto asked = request_from_summary(pc_it->second, eval.side, requested)) {
+                eval.requested_asset = asked->first;
+                eval.requested_mojos = asked->second;
+            }
+        }
+    }
+
     if (!matched || eval.price <= 0) {
         eval.disposition = OrphanDisposition::Unknown;
         eval.reason = matched ? "could not compute price"
@@ -4889,6 +4905,8 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 po.side            = eval.side;
                 po.price           = eval.price;
                 po.size            = eval.size;
+                po.requested_asset = eval.requested_asset;  // [UNIQUE-REQUEST]
+                po.requested_mojos = eval.requested_mojos;
                 po.tier            = 0;  // Unknown original tier -- assign 0.
                 po.fee_mojos       = current_fee_mojos_;
                 // Approximate creation block from age.
@@ -6242,6 +6260,14 @@ std::optional<PendingOffer> OfferManager::try_parse_wallet_offer(
     }
 
     if (!matched) return std::nullopt;
+
+    // [UNIQUE-REQUEST review #255] What it asks for, to the mojo, as the
+    // summary gives it: the price above is from raw mojos and cannot be run
+    // back into the amount (unique_request.hpp).
+    if (const auto pc_it = pair_config_map_.find(po.pair_name);
+        pc_it != pair_config_map_.end()) {
+        note_request(po, request_from_summary(pc_it->second, po.side, requested));
+    }
 
     // Extract fee.
     if (summary.contains("fees") && summary["fees"].is_number()) {

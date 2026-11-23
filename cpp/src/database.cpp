@@ -344,13 +344,13 @@ INSERT INTO offer_log
     (offer_id, pair_name, side, price_mojos, size_mojos, tier,
     competitiveness_score, queue_ahead_mojos, queue_ahead_score,
     execution_quality_score, status, created_block, fee_mojos,
-    book_best_bid, book_best_ask)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    book_best_bid, book_best_ask, requested_asset, requested_mojos)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 )SQL";
 
 constexpr const char* kQueryPendingOffers = R"SQL(
 SELECT offer_id, pair_name, side, price_mojos, size_mojos, tier,
-       status, created_block, fee_mojos
+       status, created_block, fee_mojos, requested_asset, requested_mojos
 FROM offer_log
 WHERE status IN ('pending', 'cancel_pending')
 ORDER BY created_block ASC;
@@ -685,6 +685,9 @@ void Database::insert_offer(const DbOfferRecord& r)
     bind_int64 (stmt_insert_offer_, 13, to_mojo_saturating(r.fee_mojos));
     bind_int64 (stmt_insert_offer_, 14, static_cast<std::int64_t>(r.book_best_bid));
     bind_int64 (stmt_insert_offer_, 15, static_cast<std::int64_t>(r.book_best_ask));
+    // [UNIQUE-REQUEST] What the offer asks to be paid, to the mojo.
+    bind_text  (stmt_insert_offer_, 16, r.requested_asset);
+    bind_int64 (stmt_insert_offer_, 17, static_cast<std::int64_t>(r.requested_mojos));
 
     step_and_reset(stmt_insert_offer_);
 
@@ -724,6 +727,10 @@ std::vector<DbOfferRecord> Database::query_pending_offers() const
         rec.status        = p6 ? p6 : kOfferStatusPending;
         rec.created_block = static_cast<BlockHeight>(sqlite3_column_int64(stmt_query_pending_, 7));
         rec.fee_mojos     = static_cast<std::uint64_t>(sqlite3_column_int64(stmt_query_pending_, 8));
+        // [UNIQUE-REQUEST] NULL / 0 on a row from before these columns.
+        const char* p9 = reinterpret_cast<const char*>(sqlite3_column_text(stmt_query_pending_, 9));
+        rec.requested_asset = p9 ? p9 : "";
+        rec.requested_mojos = sqlite3_column_int64(stmt_query_pending_, 10);
         results.push_back(std::move(rec));
     }
 
@@ -2136,6 +2143,13 @@ void Database::run_migrations()
     sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN book_best_bid INTEGER DEFAULT 0;",
                  nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN book_best_ask INTEGER DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    // [UNIQUE-REQUEST 2026-11-22] What each offer asks to be paid, to the
+    // mojo.  Added only here, not in kCreateOfferLog, so a fresh database
+    // takes the same path an existing one does.
+    sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN requested_asset TEXT;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN requested_mojos INTEGER DEFAULT 0;",
                  nullptr, nullptr, nullptr);
 
     // [S14] The fee a cancel escalation recorded before paying it
