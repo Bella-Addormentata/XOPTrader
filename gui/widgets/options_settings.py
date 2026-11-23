@@ -13,7 +13,8 @@ would then refuse.
 
 Defaults, as the book reads them (0.10.53): sharing the trading wallet takes
 its host, port, certificates and key from the Connection tab, the fence
-follows the book, and the target comes from the limits.
+follows the book, and the target comes from the limits. [AUTO-SIZE] So does
+the contract size, unless a number is written (``contract_xch: auto``).
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ from PySide6.QtWidgets import (
 
 from gui.theme import COLORS as _C
 
-__all__ = ["FENCE_MODES", "TARGET_MODES", "OptionsSettingsSection"]
+__all__ = ["FENCE_MODES", "SIZE_MODES", "TARGET_MODES", "OptionsSettingsSection"]
 
 #: (label, the value written as options.wallet.engine_fence)
 FENCE_MODES: tuple[tuple[str, Any], ...] = (
@@ -58,6 +59,10 @@ EXPIRY_MODES: tuple[str, ...] = (
     "None: no new contracts",
 )
 _EXPIRY_ROLLING, _EXPIRY_FIXED, _EXPIRY_NONE = range(3)
+#: [AUTO-SIZE] Labels for options.contract_xch: ``auto`` (worked out from the
+#: limits), or a number.
+SIZE_MODES: tuple[str, ...] = ("Automatic, from my limits", "Fixed")
+_SIZE_AUTO, _SIZE_FIXED = range(2)
 
 #: The dedicated wallet's own connection. Its secrets (dotted under options)
 #: are the ones a save must take from this tab rather than from the files.
@@ -96,7 +101,9 @@ def _limit_value(text: str) -> Any:
     value = float(text)
     if not math.isfinite(value):
         raise ValueError(text)
-    return int(value) if value == int(value) else value
+    # [review #254] A whole number is written as one, while it is one a float
+    # holds exactly: 1e300 as an int is 301 digits no signal or spin box takes.
+    return int(value) if value == int(value) and abs(value) < 2**53 else value
 
 
 def _expiry_text(value: Any) -> str:
@@ -309,6 +316,19 @@ class OptionsSettingsSection:
         # -- the grid --
         grid = QGroupBox("Grid")
         grid_form = QFormLayout(grid)
+        self.size_mode = QComboBox()
+        self.size_mode.addItems(list(SIZE_MODES))
+        self.size_mode.setToolTip(
+            "options.contract_xch. Automatic (auto): the largest of 1, 10, 100, ... XCH at "
+            "which every call slot (strikes x expiries, within Max contracts and Max per "
+            "expiry) still fits inside Max XCH locked, and never under 1 XCH. More strikes or "
+            "dates, or a lower cap, mean smaller contracts. Fixed: the size you write."
+        )
+        grid_form.addRow("Contract size:", self.size_mode)
+        self.size_hint = QLabel("")
+        self.size_hint.setWordWrap(True)
+        self.size_hint.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        grid_form.addRow("", self.size_hint)
         self.contract_xch = QDoubleSpinBox()
         self.contract_xch.setRange(0.0, 1_000_000.0)
         self.contract_xch.setDecimals(4)
@@ -317,7 +337,8 @@ class OptionsSettingsSection:
         self.contract_xch.setSpecialValueText("not set")
         self.contract_xch.setValue(1.0)
         self.contract_xch.setSuffix(" XCH")
-        grid_form.addRow("Contract size:", self.contract_xch)
+        self._size_label = QLabel("XCH per contract:")
+        grid_form.addRow(self._size_label, self.contract_xch)
         self.expiry_mode = QComboBox()
         self.expiry_mode.addItems(list(EXPIRY_MODES))
         self.expiry_mode.setToolTip(
@@ -389,7 +410,13 @@ class OptionsSettingsSection:
 
         for box in (self.enabled, self.share):
             box.toggled.connect(self._changed)
-        for combo in (self.network, self.fence, self.target_mode, self.expiry_mode):
+        for combo in (
+            self.network,
+            self.fence,
+            self.target_mode,
+            self.size_mode,
+            self.expiry_mode,
+        ):
             combo.currentIndexChanged.connect(self._changed)
         for edit in (
             self.address,
@@ -444,6 +471,7 @@ class OptionsSettingsSection:
             self.target_xch,
             self.target_quote,
             self.target_tolerance,
+            self.size_mode,
             self.contract_xch,
             self.expiry_mode,
             self.expiry_weeks,
@@ -479,8 +507,102 @@ class OptionsSettingsSection:
         for label, field in self._fixed_rows:
             label.setVisible(not rolling)
             field.setVisible(not rolling)
+        fixed_size = self.size_mode.currentIndex() == _SIZE_FIXED
+        self._size_label.setVisible(fixed_size)
+        self.contract_xch.setVisible(fixed_size)
+        self.size_hint.setVisible(not fixed_size)
+        self.size_hint.setText(self._size_hint())
         self.target_hint.setText(self._target_hint())
         self.limits_hint.setText(self._limits_hint())
+
+    def _auto_size(self) -> tuple[int, int, float | None]:
+        """[AUTO-SIZE] What Automatic comes to with the fields as they are.
+
+        (XCH a contract, the call slots the grid can hold, Max XCH locked or
+        None when it is not a number) -- by the book's own rule
+        (:func:`gui.services.options.config.auto_contract_xch`), so the tab
+        shows the size the book would mint with. A field the book would
+        refuse counts as unset here; Save says what is wrong with it.
+        """
+        from gui.services.options import config as options_config
+
+        def cap(key: str) -> float | None:
+            try:
+                value = _limit_value(self.limit_fields[key].text())
+            except ValueError:
+                return None
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                return None
+            return float(value)
+
+        def count(key: str) -> int:
+            try:
+                value = _limit_value(self.limit_fields[key].text())
+            except ValueError:
+                return options_config.UNSET
+            if value == "unlimited":
+                return options_config.UNLIMITED
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 1:
+                return options_config.UNSET
+            return int(value)
+
+        xch_cap = cap("max_locked_xch")
+        cap_mojos = None if xch_cap is None else xch_cap * options_config.XCH_MOJOS
+        if cap_mojos is not None and not math.isfinite(cap_mojos):
+            # [review #254] Too large to count in mojos (1e300): the book
+            # refuses it, so it is no number to size from. Save says so.
+            xch_cap = cap_mojos = None
+        limits = options_config.Limits(
+            max_locked_xch=(
+                options_config.UNSET if cap_mojos is None else int(math.floor(cap_mojos))
+            ),
+            max_locked_quote=options_config.UNSET,
+            max_contracts=count("max_contracts"),
+            max_contracts_per_expiry=count("max_contracts_per_expiry"),
+            max_fee_mojos=0,
+        )
+        try:
+            calls = len(_number_list(self.call_strikes.text()))
+        except ValueError:
+            calls = 0
+        mode = self.expiry_mode.currentIndex()
+        if mode == _EXPIRY_ROLLING:
+            expiries = self.expiry_weeks.value() + self.expiry_months.value()
+        elif mode == _EXPIRY_FIXED:
+            dates = _text_list(self.expiries.text())
+            try:
+                # [review #254] As the book counts them: the same moment
+                # written twice, or in two UTC offsets, is one expiry.
+                expiries = options_config.distinct_expiries(dates)
+            except options_config.OptionsConfigError:
+                expiries = len(set(dates))  # Save says what is wrong with it
+        else:
+            expiries = 0
+        size = options_config.auto_contract_xch(limits, calls, expiries)
+        return size, options_config.held_call_slots(limits, calls, expiries), xch_cap
+
+    def _contract_size(self) -> float:
+        """The contract size the book would use: the box's, or what Automatic comes to."""
+        if self.size_mode.currentIndex() == _SIZE_FIXED:
+            return self.contract_xch.value()
+        return float(self._auto_size()[0])
+
+    def _size_hint(self) -> str:
+        """[AUTO-SIZE] What Automatic comes to, and why."""
+        if self.size_mode.currentIndex() == _SIZE_FIXED:
+            return ""
+        size, slots, cap = self._auto_size()
+        if cap is None:
+            return f"{size} XCH a contract: Max XCH locked below has no number to size it from."
+        if slots <= 0:
+            return f"{size} XCH a contract: there are no call slots to size it from."
+        covered = min(slots, int(cap // size))
+        if covered < slots:
+            return (
+                f"{size} XCH a contract, the smallest it goes: Max XCH locked covers "
+                f"{covered} of the {slots} call slots, nearest expiry first."
+            )
+        return f"{size} XCH a contract: all {slots} call slots fit inside Max XCH locked."
 
     def _limits_hint(self) -> str:
         """[review] Why nothing would be minted with these limits, or ""."""
@@ -493,7 +615,7 @@ class OptionsSettingsSection:
         if any(value is None for value in values.values()):
             return "Nothing is minted until all four limits are set: a number each, or unlimited."
         cap = values["max_locked_xch"]
-        if isinstance(cap, (int, float)) and cap < self.contract_xch.value():
+        if isinstance(cap, (int, float)) and cap < self._contract_size():
             return "Max XCH locked is less than one contract: nothing is minted."
         return ""
 
@@ -517,7 +639,7 @@ class OptionsSettingsSection:
             puts, quote_cap = [], None
         if puts and isinstance(quote_cap, (int, float)):
             quote += float(quote_cap)
-        xch = float(cap) + self.contract_xch.value()
+        xch = float(cap) + self._contract_size()
         return f"From your limits: {xch:g} XCH and {quote:g} of the quote asset."
 
     # -- config <-> widgets --------------------------------------------------------
@@ -567,12 +689,20 @@ class OptionsSettingsSection:
             self.target_mode.setCurrentIndex(_TARGET_LIMITS)
 
         size = section.get("contract_xch")
-        # None: a new book's size, written once the tab is saved. Malformed,
-        # or not above 0: "not set" (0), and written back as it is for the
-        # book's parser to refuse on Save, with its reason.
-        shown = 1.0 if size is None else max(_number(size, 0.0), 0.0)
-        _show_number(self.contract_xch, shown)
-        self._loaded_numbers["contract_xch"] = size
+        if size is None or (isinstance(size, str) and size.strip().lower() == "auto"):
+            # [AUTO-SIZE] `auto`, or not written (the book reads that as auto
+            # too): Automatic. The box holds what Fixed would start from, and
+            # nothing loaded, so switching to Fixed writes the box's number.
+            self.size_mode.setCurrentIndex(_SIZE_AUTO)
+            _show_number(self.contract_xch, 1.0)
+            self._loaded_numbers["contract_xch"] = None
+        else:
+            # A number. Malformed, or not above 0: "not set" (0), and
+            # written back as it is for the book's parser to refuse on Save,
+            # with its reason.
+            self.size_mode.setCurrentIndex(_SIZE_FIXED)
+            _show_number(self.contract_xch, max(_number(size, 0.0), 0.0))
+            self._loaded_numbers["contract_xch"] = size
         expiries = section.get("expiries")
         rule = _rule_counts(expiries)
         listed = expiries if isinstance(expiries, (list, tuple)) else []
@@ -690,7 +820,11 @@ class OptionsSettingsSection:
             "enabled": self.enabled.isChecked(),
             "network": self.network.currentText(),
             "wallet": wallet,
-            "contract_xch": self._number_out("contract_xch", self.contract_xch, 4),
+            "contract_xch": (
+                "auto"
+                if self.size_mode.currentIndex() == _SIZE_AUTO
+                else self._number_out("contract_xch", self.contract_xch, 4)
+            ),
             "expiries": self._collect_expiries(),
             "call_strikes_pct": _number_list(self.call_strikes.text()),
             "put_strikes_pct": _number_list(self.put_strikes.text()),

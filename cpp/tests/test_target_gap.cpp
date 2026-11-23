@@ -333,3 +333,33 @@ TEST(TargetGapUnits, UnusableRatesAndFloorsGiveZero) {
         EXPECT_EQ(floor_units(bad_floor, 1.0, 1e12), 0.0);
     }
 }
+
+TEST(TargetGapShared, APairLeftOutLeavesItsShareToTheOthers) {
+    // [WIDEBOOK-ISOLATE] A pair that cannot quote is not in `pairs`: Step 4
+    // drops one held on its own wide-book crash before the floors are shared
+    // (SizingWiring.APairHeldOnItsOwnWideBookCrashTakesNoShareOfAGap).  With
+    // XCH/BYC out, the two XCH-buying pairs left want 91.19 + 0.815 = 92.005
+    // XCH of the 91.19 deficit, so each is scaled by 91.19/92.005 and not by
+    // 91.19/107.41: XCH/wUSDC.b's floor is 90.38 XCH where it was 77.42.
+    const Valuation v = value_targeted(live_book(), kMaxAge);
+    const double want_wusdc = 91.19;
+    const double want_byc = 15.405;
+    const double want_dbx = 38.6 - 0.15 * 251.9;
+
+    const std::vector<double> held_out = shared_bid_floors_xch(
+        v, {{"XCH", "WUSDC.B"}, {"XCH", "DBX"}, {"BYC", "WUSDC.B"}, {"WMILLIETH.B", "XCH"}});
+    ASSERT_EQ(held_out.size(), 4u);
+    const double scale_out = 91.19 / (want_wusdc + want_dbx);
+    EXPECT_NEAR(held_out[0], want_wusdc * scale_out, 1e-9);
+    EXPECT_NEAR(held_out[1], want_dbx * scale_out, 1e-9);
+    EXPECT_NEAR(held_out[0] + held_out[1], deficit_xch(v, "XCH"), 1e-9)
+        << "the pairs that can quote still take XCH to its target";
+
+    // The hold over, the pair is quoted again and shares again.
+    const std::vector<double> back = shared_bid_floors_xch(v, live_pairs());
+    const double scale_in = 91.19 / (want_wusdc + want_byc + want_dbx);
+    EXPECT_NEAR(back[0], want_wusdc * scale_in, 1e-9);
+    EXPECT_NEAR(back[1], want_byc * scale_in, 1e-9);
+    EXPECT_GT(held_out[0], back[0]) << "left out, it had been holding the others' bids down";
+    EXPECT_GT(held_out[1], back[2]);
+}

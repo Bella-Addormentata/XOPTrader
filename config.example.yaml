@@ -1708,7 +1708,16 @@ options:
   quote_asset_decimals: 3
 
   # The grid. One slot per expiry and strike; a slot is refilled when it sells.
-  contract_xch: 20                       # [REQUIRED] XCH per contract
+  # contract_xch is the XCH per contract. `auto` (also when left out) sizes it
+  # from limits below, variety first and then size: the largest of 1, 10, 100,
+  # ... XCH at which every call slot (call strikes x expiries, within
+  # max_contracts and max_contracts_per_expiry) still fits inside
+  # max_locked_xch, and never under 1 XCH. With the grid below (two call
+  # strikes on two Fridays) max_locked_xch: 4 gives 1 XCH contracts and 40
+  # gives 10 XCH ones. When even 1 XCH a slot does not fit, the nearest expiry
+  # and the strikes nearest the money are written first. Or write a number,
+  # e.g. 0.5.
+  contract_xch: auto
   # weekly: the next two Fridays at 08:00 UTC, rolling forward on their own
   # (the crypto options market's time; xchoptions.com has no standard dates).
   # monthly: the last Friday of the next two months. Or counts of each, e.g.
@@ -1815,7 +1824,9 @@ options:
     max_age_seconds: 600
     max_spread_pct: 10
     require_book: true
-    hedge_size_xch: 20
+    # [OPTIONAL] The size the Dexie book must be able to fill. Left out, one
+    # contract (contract_xch, also when that is auto).
+    # hedge_size_xch: 20
 
   # Reading the chain. The wallet does not track option coins, so the book
   # reads them from a full node. It asks as little as it can: what is settled

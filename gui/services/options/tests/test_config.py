@@ -128,7 +128,24 @@ def test_expiries_accept_iso_and_unix_and_need_a_zone() -> None:
         {"quote_asset_id": "abc"},
         {"quote_asset_id": None},
         {"contract_xch": 0},
-        {"contract_xch": None},
+        {"contract_xch": -1},
+        {"contract_xch": "big"},
+        {"contract_xch": ""},
+        {"contract_xch": True},
+        {"contract_xch": float("inf")},
+        {"contract_xch": 1e300},
+        {"contract_xch": -1e300},
+        {"contract_xch": 1e-13},
+        {"target": {"xch": 1e300}},
+        {"target": {"xch": 1, "quote": 1e306}},
+        {
+            "limits": {
+                "max_locked_xch": 1e300,
+                "max_locked_quote": 1,
+                "max_contracts": 1,
+                "max_contracts_per_expiry": 1,
+            }
+        },
         {"network": "devnet"},
         {"call_strikes_pct": [110, 110]},
         {"call_strikes_pct": [0]},
@@ -425,3 +442,175 @@ def test_the_example_config_writes_both_sides() -> None:
     section = yaml.safe_load(example.read_text(encoding="utf-8"))["options"]
     assert section["call_strikes_pct"] == list(config.DEFAULT_CALL_STRIKES_PCT)
     assert section["put_strikes_pct"] == list(config.DEFAULT_PUT_STRIKES_PCT)
+
+
+# -- [AUTO-SIZE] options.contract_xch: auto ---------------------------------------
+
+
+def _caps(xch, contracts=config.UNLIMITED, per_expiry=config.UNLIMITED) -> config.Limits:
+    """Limits with ``xch`` XCH lockable (or UNSET / UNLIMITED) and the two counts."""
+    locked = xch if xch in (config.UNSET, config.UNLIMITED) else int(xch * config.XCH_MOJOS)
+    return config.Limits(
+        max_locked_xch=locked,
+        max_locked_quote=config.UNSET,
+        max_contracts=contracts,
+        max_contracts_per_expiry=per_expiry,
+        max_fee_mojos=0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("limits", "calls", "expiries", "size"),
+    [
+        # Two strikes on two Fridays: four call slots.
+        (_caps(4, 4, 2), 2, 2, 1),
+        (_caps(39.99, 4, 2), 2, 2, 1),
+        (_caps(40, 4, 2), 2, 2, 10),
+        (_caps(400, 4, 2), 2, 2, 100),
+        (_caps(4000, 4, 2), 2, 2, 1000),
+        # The trading PC's limits on 2026-11-22: one 1 XCH contract fits.
+        (_caps(1.0, 2, 2), 2, 2, 1),
+        # The counts hold the grid to two contracts, so two 10 XCH ones fit in 20.
+        (_caps(20, 2, 2), 2, 2, 10),
+        (_caps(20, config.UNLIMITED, 1), 2, 2, 10),
+        # No count caps: all four slots, and 10 XCH each would be 40.
+        (_caps(20), 2, 2, 1),
+        (_caps(20, config.UNSET, config.UNSET), 2, 2, 1),
+        # More variety, smaller contracts.
+        (_caps(100), 2, 2, 10),
+        (_caps(100), 3, 4, 1),
+        # Nothing to size from: the smallest.
+        (_caps(config.UNSET), 2, 2, 1),
+        (_caps(config.UNLIMITED), 2, 2, 1),
+        (_caps(1000), 0, 2, 1),
+        (_caps(1000), 2, 0, 1),
+        # Under one contract: still 1 XCH, and the cap then lets none be written.
+        (_caps(0.5, 4, 2), 2, 2, 1),
+        # Bounded, whatever the cap.
+        (_caps(10**12), 1, 1, config.AUTO_CONTRACT_MAX_XCH),
+    ],
+)
+def test_auto_is_the_largest_power_of_ten_that_covers_every_call_slot(
+    limits, calls, expiries, size
+) -> None:
+    """[AUTO-SIZE] Variety first, then size; never under 1 XCH."""
+    assert config.auto_contract_xch(limits, calls, expiries) == size
+
+
+def test_the_call_slots_the_grid_can_hold() -> None:
+    assert config.held_call_slots(_caps(1), 2, 2) == 4
+    assert config.held_call_slots(_caps(1, contracts=3), 2, 2) == 3
+    assert config.held_call_slots(_caps(1, per_expiry=1), 2, 2) == 2
+    assert config.held_call_slots(_caps(1, contracts=1, per_expiry=1), 2, 2) == 1
+    assert config.held_call_slots(_caps(1, config.UNSET, config.UNSET), 2, 3) == 6
+    assert config.held_call_slots(_caps(1), 0, 3) == 0
+
+
+@pytest.mark.parametrize("written", ["auto", " AUTO ", "Auto", None])
+def test_a_size_written_auto_or_null_is_worked_out(written) -> None:
+    # Two call strikes on one date, at most 5 an expiry and 10 in all: two
+    # slots, and 100 XCH lockable covers them at 10 XCH each, not at 100.
+    parsed = _parse(contract_xch=written)
+    assert parsed.contract_auto is True
+    assert parsed.contract_xch_mojos == 10 * config.XCH_MOJOS
+    assert parsed.market.hedge_size_xch == 10.0, "the price is read at the size written"
+
+
+def test_a_size_left_out_is_auto_too() -> None:
+    """[AUTO-SIZE] As an unwritten expiries is weekly: nothing more to set."""
+    section = _section()
+    del section["contract_xch"]
+    parsed = config.parse({"options": section})
+    assert parsed is not None and parsed.contract_auto is True
+    assert parsed.contract_xch_mojos == 10 * config.XCH_MOJOS
+
+
+def test_a_written_size_is_kept_as_written() -> None:
+    parsed = _parse(contract_xch=0.5)
+    assert parsed.contract_auto is False
+    assert parsed.contract_xch_mojos == config.XCH_MOJOS // 2
+    assert _parse(contract_xch="20").contract_xch_mojos == 20 * config.XCH_MOJOS
+
+
+def test_auto_counts_the_expiries_of_a_rule() -> None:
+    limits = {
+        "max_locked_xch": 40,
+        "max_locked_quote": 1,
+        "max_contracts": 4,
+        "max_contracts_per_expiry": 2,
+    }
+    weekly = _parse(
+        contract_xch="auto", expiries="weekly", call_strikes_pct=[110, 120], limits=limits
+    )
+    assert weekly.contract_xch_mojos == 10 * config.XCH_MOJOS, "four slots of 10 XCH in 40"
+    # Three weeklies and a month-end, two strikes each, eight contracts allowed.
+    more = _parse(
+        contract_xch="auto",
+        expiries={"weekly": 3, "monthly": 1},
+        call_strikes_pct=[110, 120],
+        limits={**limits, "max_contracts": 8},
+    )
+    assert more.contract_xch_mojos == config.XCH_MOJOS, "eight slots: 10 XCH each would be 80"
+    none = _parse(contract_xch="auto", expiries="none", limits=limits)
+    assert none.contract_xch_mojos == config.XCH_MOJOS, "no new contracts: nothing to size"
+
+
+def test_a_malformed_size_says_auto_is_a_choice() -> None:
+    with pytest.raises(config.OptionsConfigError, match="a number of XCH, or auto"):
+        _parse(contract_xch="big")
+    with pytest.raises(config.OptionsConfigError, match="must be positive"):
+        _parse(contract_xch=0)
+
+
+def test_the_example_config_sizes_its_contracts_from_the_limits() -> None:
+    from pathlib import Path
+
+    yaml = pytest.importorskip("yaml")
+    example = Path(__file__).resolve().parents[4] / "config.example.yaml"
+    section = yaml.safe_load(example.read_text(encoding="utf-8"))["options"]
+    assert section["contract_xch"] == "auto"
+
+
+def test_the_same_expiry_written_twice_is_one_expiry() -> None:
+    """[review #254] What auto sizes from, and what the Settings preview must match."""
+    same = ["2026-12-01T13:00:00Z", "2026-12-01T14:00:00+01:00", 1796130000]
+    assert config.distinct_expiries(same) == 1
+    assert config.distinct_expiries([*same, "2026-12-08T13:00:00Z"]) == 2
+    assert config.distinct_expiries([]) == 0
+    with pytest.raises(config.OptionsConfigError):
+        config.distinct_expiries(["next friday"])
+
+    # Two call strikes on that one expiry, 20 XCH lockable: two slots of 10 XCH.
+    parsed = _parse(
+        contract_xch="auto",
+        expiries=same,
+        call_strikes_pct=[110, 120],
+        limits={**_section()["limits"], "max_locked_xch": 20},
+    )
+    assert parsed.expiries == (1796130000,)
+    assert parsed.contract_xch_mojos == 10 * config.XCH_MOJOS
+
+
+def test_a_cap_too_large_to_count_is_refused_as_a_cap() -> None:
+    """[review #254] 1e300 XCH is finite, but not in mojos: the book's own error."""
+    limits = {**_section()["limits"], "max_locked_xch": 1e300}
+    with pytest.raises(config.OptionsConfigError, match="max_locked_xch is too large"):
+        _parse(limits=limits)
+    limits = {**_section()["limits"], "max_locked_quote": "1e306"}
+    with pytest.raises(config.OptionsConfigError, match="max_locked_quote is too large"):
+        _parse(limits=limits)
+
+
+def test_a_number_too_large_to_count_in_mojos_is_a_config_error() -> None:
+    """[review #254] Never an OverflowError: the command line prints config errors,
+    and a traceback is not one."""
+    with pytest.raises(config.OptionsConfigError, match="contract_xch is too large"):
+        _parse(contract_xch=1e300)
+    with pytest.raises(config.OptionsConfigError, match="contract_xch must be positive"):
+        _parse(contract_xch=-1e300)
+    with pytest.raises(config.OptionsConfigError, match="target.xch is too large"):
+        _parse(target={"xch": 1e300})
+    with pytest.raises(config.OptionsConfigError, match="target.quote is too large"):
+        _parse(target={"xch": 1, "quote": 1e306})
+    # The largest sizes that do count still parse.
+    assert _parse(contract_xch=1e6).contract_xch_mojos == 10**18

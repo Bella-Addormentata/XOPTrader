@@ -8,6 +8,7 @@ simulator standing in for the chain.
 
 from __future__ import annotations
 
+import dataclasses
 import http.server
 import json
 import math
@@ -853,6 +854,11 @@ def test_status_prints_the_book(tmp_path, monkeypatch, capsys) -> None:
     assert "3 XCH" in out and "C110@5" in out and "minting" in out and "waiting: mint" in out
     assert "chain is read from coinset" in out
     assert "fees: 0 mojos a transaction" in out
+    assert cli.contract_size_line(cfg) == "contract size: 20 XCH"
+    assert cli.contract_size_line(cfg) in out.splitlines()
+    assert cli.contract_size_line(dataclasses.replace(cfg, contract_auto=True)) == (
+        "contract size: 20 XCH (auto, from the limits)"
+    )
     assert "wallet: synced (no fingerprint set, so whichever key it has open)" in out
     assert "splash: off" in out
 

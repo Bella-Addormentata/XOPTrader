@@ -301,6 +301,13 @@ def _learned_rate(book_store: store.OptionStore) -> float:
         return 0.0
 
 
+def contract_size_line(cfg: config.OptionsConfig) -> str:
+    """[AUTO-SIZE] The contract size as `status` says it, so ``auto`` is never a guess."""
+    size = cfg.contract_xch_mojos / config.XCH_MOJOS
+    auto = " (auto, from the limits)" if cfg.contract_auto else ""
+    return f"contract size: {size:g} XCH{auto}"
+
+
 def _status(cfg: config.OptionsConfig) -> int:
     book, book_store, coins = build(cfg)
     print(f"network {cfg.network}   dry_run {cfg.dry_run}")
@@ -320,6 +327,7 @@ def _status(cfg: config.OptionsConfig) -> int:
         )
     else:
         print(f"fees: {cfg.fee_mojos} mojos a transaction")
+    print(contract_size_line(cfg))
     if cfg.splash.enabled:
         live = book_store.offers(status="live")
         taken = sum(offer.splash_at is not None for offer in live)

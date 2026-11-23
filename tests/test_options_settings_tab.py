@@ -25,7 +25,12 @@ pytest.importorskip("ruamel.yaml")
 
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
-from gui.widgets.options_settings import _TARGET_CUSTOM, TARGET_MODES  # noqa: E402
+from gui.widgets.options_settings import (  # noqa: E402
+    _SIZE_AUTO,
+    _SIZE_FIXED,
+    _TARGET_CUSTOM,
+    TARGET_MODES,
+)
 from gui.widgets.settings import SettingsWidget  # noqa: E402
 
 ADDRESS = "xch1kxxd76v9kwsxrcxgndn3mylnxjhd7klgdns7083zjl247ffge32sr5rsy2"
@@ -125,6 +130,7 @@ def test_the_tab_shows_the_options_section(panel, tmp_path):
     assert tab.enabled.isChecked() and tab.share.isChecked()
     assert tab.address.text() == ADDRESS
     assert tab.fence.currentIndex() == 0, "auto, the default"
+    assert tab.size_mode.currentIndex() == _SIZE_FIXED and not tab.contract_xch.isHidden()
     assert tab.contract_xch.value() == 0.5
     assert tab.expiries.text() == "2026-12-04T14:00:00Z"
     assert tab.call_strikes.text() == "110, 120" and tab.put_strikes.text() == ""
@@ -544,3 +550,156 @@ def test_strike_lists_written_null_stay_blank_and_save_empty(panel, tmp_path):
     assert panel.save_config(str(cfg_path)) is True, _SAID
     saved = _saved_options(cfg_path)
     assert saved["call_strikes_pct"] == [] and saved["put_strikes_pct"] == []
+
+
+# -- [AUTO-SIZE] options.contract_xch: auto ---------------------------------------
+
+_FOUR_SLOTS = {
+    "max_locked_xch": 4,
+    "max_locked_quote": 1,
+    "max_contracts": 4,
+    "max_contracts_per_expiry": 2,
+}
+
+
+def _auto_book(tmp_path: Path, **extra) -> Path:
+    """Two call strikes on the next two Fridays, sized by the book: four slots."""
+    return _shared_book(
+        tmp_path, **{"contract_xch": "auto", "expiries": "weekly", "limits": _FOUR_SLOTS, **extra}
+    )
+
+
+def test_an_auto_size_shows_as_automatic_and_is_saved_as_auto(panel, tmp_path):
+    cfg_path = _auto_book(tmp_path)
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+
+    assert tab.size_mode.currentIndex() == _SIZE_AUTO
+    assert tab.contract_xch.isHidden() and tab._size_label.isHidden()
+    assert not tab.size_hint.isHidden()
+    assert tab.size_hint.text() == "1 XCH a contract: all 4 call slots fit inside Max XCH locked."
+    assert "5 XCH and 2 of the quote asset" in tab.target_hint.text(), "4 XCH plus one contract"
+    assert tab.limits_hint.text() == ""
+    assert not panel._dirty, "showing it is not an edit"
+
+    tab.limit_fields["max_locked_quote"].setText("2")  # an edit elsewhere
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["contract_xch"] == "auto"
+
+
+@pytest.mark.parametrize("written", [None, "AUTO"])
+def test_a_size_not_written_shows_as_automatic(panel, tmp_path, written):
+    """[AUTO-SIZE] The book reads no size as auto, so the tab shows that."""
+    cfg_path = _auto_book(tmp_path, contract_xch=written)
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.size_mode.currentIndex() == _SIZE_AUTO
+
+    tab.limit_fields["max_locked_quote"].setText("2")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["contract_xch"] == "auto", "written out once saved"
+
+
+def test_the_auto_hint_follows_the_limits_and_the_grid(panel, tmp_path):
+    panel.load_config(str(_auto_book(tmp_path)))
+    tab = panel._options_section
+    cap = tab.limit_fields["max_locked_xch"]
+
+    cap.setText("40")
+    assert tab.size_hint.text().startswith("10 XCH a contract: all 4 call slots fit")
+    assert "50 XCH" in tab.target_hint.text()
+
+    tab.call_strikes.setText("110, 120, 130")  # more variety: six slots wanted, four allowed
+    assert tab.size_hint.text().startswith("10 XCH a contract: all 4 call slots fit")
+    tab.limit_fields["max_contracts"].setText("6")
+    tab.limit_fields["max_contracts_per_expiry"].setText("3")
+    assert tab.size_hint.text().startswith("1 XCH a contract: all 6 call slots fit")
+
+    cap.setText("2")
+    assert tab.size_hint.text() == (
+        "1 XCH a contract, the smallest it goes: Max XCH locked covers 2 of the 6 call "
+        "slots, nearest expiry first."
+    )
+
+    cap.setText("0.5")
+    assert "less than one contract" in tab.limits_hint.text()
+
+    for no_number in ("", "unlimited"):
+        cap.setText(no_number)
+        assert "has no number to size it from" in tab.size_hint.text()
+
+    cap.setText("40")
+    tab.call_strikes.setText("")
+    assert "no call slots to size it from" in tab.size_hint.text()
+
+
+def test_switching_to_fixed_writes_the_number_in_the_box(panel, tmp_path):
+    cfg_path = _auto_book(tmp_path)
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+
+    tab.size_mode.setCurrentIndex(_SIZE_FIXED)
+    assert not tab.contract_xch.isHidden() and tab.size_hint.isHidden()
+    assert tab.contract_xch.value() == 1.0, "what Fixed starts from"
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["contract_xch"] == 1.0
+
+    tab.contract_xch.setValue(2.0)
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["contract_xch"] == 2.0
+
+
+def test_switching_a_written_size_to_automatic_writes_auto(panel, tmp_path):
+    cfg_path = _shared_book(tmp_path, limits=_FOUR_SLOTS)  # contract_xch: 0.5
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.size_mode.currentIndex() == _SIZE_FIXED
+
+    tab.size_mode.setCurrentIndex(_SIZE_AUTO)
+    assert panel._dirty
+    assert "1 XCH a contract" in tab.size_hint.text()
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["contract_xch"] == "auto"
+
+    # And back, untouched: the number it had, exactly.
+    tab.size_mode.setCurrentIndex(_SIZE_FIXED)
+    assert tab.contract_xch.value() == 1.0, "a save rebased the tab on auto"
+
+
+def test_the_auto_hint_counts_fixed_dates_as_the_book_does(panel, tmp_path):
+    """[review #254] The same expiry listed twice, or in two UTC offsets, is one expiry:
+    two call strikes and 20 XCH lockable are two slots of 10 XCH, not four of 1 XCH."""
+    limits = {**_FOUR_SLOTS, "max_locked_xch": 20}
+    cfg_path = _auto_book(
+        tmp_path,
+        expiries=["2026-12-04T14:00:00Z", "2026-12-04T15:00:00+01:00"],
+        limits=limits,
+    )
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+
+    assert tab.size_hint.text() == (
+        "10 XCH a contract: all 2 call slots fit inside Max XCH locked."
+    )
+    assert "30 XCH" in tab.target_hint.text(), "20 XCH plus one 10 XCH contract"
+
+    tab.expiries.setText("2026-12-04T14:00:00Z, 2026-12-11T14:00:00Z")  # two expiries
+    assert tab.size_hint.text().startswith("1 XCH a contract: all 4 call slots fit")
+
+    tab.expiries.setText("next friday, next friday")  # the book refuses it on Save
+    assert "XCH a contract" in tab.size_hint.text(), "the preview still shows a size"
+
+
+def test_a_cap_too_large_to_count_does_not_break_the_preview(panel, tmp_path):
+    """[review #254] 1e300 in Max XCH locked is finite but not in mojos: the preview
+    treats it as no number, and the book refuses it on Save with its reason."""
+    cfg_path = _auto_book(tmp_path)
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+
+    tab.limit_fields["max_locked_xch"].setText("1e300")
+
+    assert "has no number to size it from" in tab.size_hint.text()
+    assert tab.size_mode.currentIndex() == _SIZE_AUTO
+    assert panel.save_config(str(cfg_path)) is False
+    assert any("too large" in said for said in _SAID), _SAID

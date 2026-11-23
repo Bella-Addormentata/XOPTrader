@@ -14,7 +14,16 @@ The straightforward set-up, with the app alone:
    says so. Leave the rest as it is: the engine fence follows the book,
    expiries roll on their own (the next two Fridays at 08:00 UTC), the grid
    writes calls at 110% and 120% and puts at 90% and 80% of spot, and the
-   top-up target comes from your limits.
+   top-up target and the contract size come from your limits.
+
+   **Contract size** (0.10.58 and later) is Automatic unless you choose Fixed:
+   the largest of 1, 10, 100, ... XCH at which every call slot (strikes x
+   expiries, within Max contracts and Max per expiry) still fits inside Max
+   XCH locked, and never under 1 XCH. So variety comes first and size second.
+   Two call strikes on two Fridays are four slots: Max XCH locked 4 gives
+   1 XCH contracts, 40 gives 10 XCH ones. With less than 1 XCH a slot, the
+   nearest expiry and the strikes nearest the money are written first. The
+   tab shows what it comes to. In config.yaml this is `contract_xch: auto`.
 3. **The Options page** (or the OPTIONS switch in the toolbar): Rehearse first,
    to see what the book would mint and list, then Live. With the fence the
    engine keeps trading beside it, so the book can simply be left on: it tops

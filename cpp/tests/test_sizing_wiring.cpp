@@ -1583,3 +1583,51 @@ TEST(SizingWiring, StartupBalancesValueTheFirstHeartbeatsTargetsOnly) {
     EXPECT_EQ(position_of(flat, "cached_wallet_balances_.insert(startup_wallet_balances_"),
               std::string::npos);
 }
+
+TEST(SizingWiring, APairHeldOnItsOwnWideBookCrashTakesNoShareOfAGap) {
+    // [WIDEBOOK-ISOLATE] A pair held on a drop only its too-wide book showed
+    // cannot quote, in Crash or in Recovery: wide_crash_state_ has an entry
+    // for it in both, and none once it is released
+    // (WideBookRouting.AHeldStateIsNeverNormal).  Step 4 drops it before any
+    // quote is computed, so it is not in the list the target-gap floors are
+    // shared across, and the pairs that can quote are not left short while
+    // the hold lasts (TargetGapShared.APairLeftOutLeavesItsShareToTheOthers).
+    const std::string engine = read_engine_cpp();
+    const std::string step4 = function_body(engine, kComputeQuotesSignature);
+    ASSERT_FALSE(step4.empty()) << XOP_TESTS_ENGINE_CPP;
+    const std::size_t gate_at = position_of(
+        step4,
+        "if (wide_crash_state_.count(pair_name) > 0) { "
+        "spdlog::debug(\"[Engine] Step 4: {} held on its own wide-book crash \" "
+        "\"-- suppressing quotes\", pair_name); "
+        "pcs.quote_valid = false; continue; }");
+    ASSERT_NE(gate_at, std::string::npos);
+    EXPECT_EQ(count_of(step4, "wide_crash_state_.count(pair_name) > 0"), 1u);
+
+    // Before the pair's quote is computed, and so before the gap is shared
+    // among the pairs that were quoted.
+    const std::size_t quote_at = position_of(step4, "pcs.raw_quote = strategy.compute_quotes(");
+    const std::size_t skip_at = position_of(
+        step4,
+        "if (!pcs.quote_valid || !std::isfinite(pcs.raw_quote.spread_bps) "
+        "|| !(pcs.raw_quote.spread_bps > 0.0)) { continue; }");
+    const std::size_t share_at = position_of(step4, kSharedCall);
+    ASSERT_NE(quote_at, std::string::npos);
+    ASSERT_NE(skip_at, std::string::npos);
+    ASSERT_NE(share_at, std::string::npos);
+    EXPECT_LT(gate_at, quote_at);
+    EXPECT_LT(quote_at, skip_at);
+    EXPECT_LT(skip_at, share_at);
+
+    // Eligibility comes back with the hold's end, which is the flash-crash
+    // check's alone to decide: it writes and erases the state, Step 4 only
+    // reads it.
+    const std::string heartbeat = function_body(engine, kHeartbeatSignature);
+    ASSERT_FALSE(heartbeat.empty()) << XOP_TESTS_ENGINE_CPP;
+    EXPECT_NE(position_of(heartbeat,
+                          "if (step.held.has_value()) { wide_crash_state_[pair.name] = *step.held; } "
+                          "else if (held.has_value()) { wide_crash_state_.erase(pair.name); }"),
+              std::string::npos);
+    EXPECT_EQ(position_of(step4, "wide_crash_state_.erase("), std::string::npos);
+    EXPECT_EQ(position_of(step4, "wide_crash_state_["), std::string::npos);
+}
