@@ -101,7 +101,9 @@ def _limit_value(text: str) -> Any:
     value = float(text)
     if not math.isfinite(value):
         raise ValueError(text)
-    return int(value) if value == int(value) else value
+    # [review #254] A whole number is written as one, while it is one a float
+    # holds exactly: 1e300 as an int is 301 digits no signal or spin box takes.
+    return int(value) if value == int(value) and abs(value) < 2**53 else value
 
 
 def _expiry_text(value: Any) -> str:
@@ -545,11 +547,14 @@ class OptionsSettingsSection:
             return int(value)
 
         xch_cap = cap("max_locked_xch")
+        cap_mojos = None if xch_cap is None else xch_cap * options_config.XCH_MOJOS
+        if cap_mojos is not None and not math.isfinite(cap_mojos):
+            # [review #254] Too large to count in mojos (1e300): the book
+            # refuses it, so it is no number to size from. Save says so.
+            xch_cap = cap_mojos = None
         limits = options_config.Limits(
             max_locked_xch=(
-                options_config.UNSET
-                if xch_cap is None
-                else int(math.floor(xch_cap * options_config.XCH_MOJOS))
+                options_config.UNSET if cap_mojos is None else int(math.floor(cap_mojos))
             ),
             max_locked_quote=options_config.UNSET,
             max_contracts=count("max_contracts"),

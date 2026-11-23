@@ -688,3 +688,18 @@ def test_the_auto_hint_counts_fixed_dates_as_the_book_does(panel, tmp_path):
 
     tab.expiries.setText("next friday, next friday")  # the book refuses it on Save
     assert "XCH a contract" in tab.size_hint.text(), "the preview still shows a size"
+
+
+def test_a_cap_too_large_to_count_does_not_break_the_preview(panel, tmp_path):
+    """[review #254] 1e300 in Max XCH locked is finite but not in mojos: the preview
+    treats it as no number, and the book refuses it on Save with its reason."""
+    cfg_path = _auto_book(tmp_path)
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+
+    tab.limit_fields["max_locked_xch"].setText("1e300")
+
+    assert "has no number to size it from" in tab.size_hint.text()
+    assert tab.size_mode.currentIndex() == _SIZE_AUTO
+    assert panel.save_config(str(cfg_path)) is False
+    assert any("too large" in said for said in _SAID), _SAID

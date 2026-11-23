@@ -177,8 +177,15 @@ def _cap(section: dict, key: str, scale: int) -> int:
         raise OptionsConfigError(
             f"options.limits.{key} must be positive; use 'unlimited' if no cap is intended"
         )
+    # [review #254] A finite number can still be too large to count in mojos
+    # (1e300 XCH): refused here, not left to math.floor's OverflowError.
+    amount = value * scale
+    if not math.isfinite(amount):
+        raise OptionsConfigError(
+            f"options.limits.{key} is too large; use 'unlimited' if no cap is intended"
+        )
     # Floored: a cap must never round up past what the operator wrote.
-    scaled = math.floor(value * scale)
+    scaled = math.floor(amount)
     if scaled <= 0:
         raise OptionsConfigError(f"options.limits.{key} is below one unit")
     return scaled

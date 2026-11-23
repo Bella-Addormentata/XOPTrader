@@ -133,6 +133,14 @@ def test_expiries_accept_iso_and_unix_and_need_a_zone() -> None:
         {"contract_xch": ""},
         {"contract_xch": True},
         {"contract_xch": float("inf")},
+        {
+            "limits": {
+                "max_locked_xch": 1e300,
+                "max_locked_quote": 1,
+                "max_contracts": 1,
+                "max_contracts_per_expiry": 1,
+            }
+        },
         {"network": "devnet"},
         {"call_strikes_pct": [110, 110]},
         {"call_strikes_pct": [0]},
@@ -576,3 +584,13 @@ def test_the_same_expiry_written_twice_is_one_expiry() -> None:
     )
     assert parsed.expiries == (1796130000,)
     assert parsed.contract_xch_mojos == 10 * config.XCH_MOJOS
+
+
+def test_a_cap_too_large_to_count_is_refused_as_a_cap() -> None:
+    """[review #254] 1e300 XCH is finite, but not in mojos: the book's own error."""
+    limits = {**_section()["limits"], "max_locked_xch": 1e300}
+    with pytest.raises(config.OptionsConfigError, match="max_locked_xch is too large"):
+        _parse(limits=limits)
+    limits = {**_section()["limits"], "max_locked_quote": "1e306"}
+    with pytest.raises(config.OptionsConfigError, match="max_locked_quote is too large"):
+        _parse(limits=limits)
