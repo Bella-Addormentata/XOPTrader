@@ -282,6 +282,33 @@ static_assert(exposure_cancel_floor(Mojo{100'000'000'000}, 0.25)
     return d;
 }
 
+/// [UNIQUE-REQUEST 2026-11-23] What a side that got Ok could spend on top of
+/// its planned tiers without changing that verdict: what the projection
+/// leaves above the reserve and, under the unified rule, what the free coins
+/// leave above it too (decide_exposure's funding test) -- the less of the
+/// two. 0 for any other verdict.
+///
+/// A bid that has to ask for a few mojos more to differ from the other live
+/// offers pays for them out of this and nothing else
+/// (execution/unique_request.hpp), so it can neither turn the verdict nor
+/// reach into the reserve.
+[[nodiscard]] constexpr Mojo spare_above_reserve(bool                    unified,
+                                                 const ExposureInputs&   in,
+                                                 const ExposureDecision& decision) noexcept
+{
+    if (decision.verdict != ExposureVerdict::Ok) return 0;
+    const Mojo reserve = in.reserve_mojos < 0 ? Mojo{0} : in.reserve_mojos;
+    Mojo spare = decision.projected_mojos > reserve
+        ? decision.projected_mojos - reserve : Mojo{0};
+    if (unified) {
+        const Mojo free_after = projected_balance_after_fills(
+            in.spendable_mojos, 0, in.planned_spend_mojos);
+        const Mojo free_spare = free_after > reserve ? free_after - reserve : Mojo{0};
+        if (free_spare < spare) spare = free_spare;
+    }
+    return spare;
+}
+
 /// One resting offer, reduced to what the asset-wide projection needs: the
 /// asset it SPENDS (base for an ask, quote for a bid) and how much of it.
 struct RestingSpend {

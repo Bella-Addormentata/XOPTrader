@@ -510,6 +510,137 @@ TEST(UniqueRequest, ABidNeverGoesUnderThePairsMinimumSize)
 }
 
 // ---------------------------------------------------------------------------
+// [2026-11-23] Offers at their minimum follow the rule too.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The four BYC/wUSDC.b bids as they rest near the peg, each exactly 1 BYC,
+// on a pair whose minimum offer is 1 BYC.
+std::vector<TierQuote> byc_bids_at_the_minimum()
+{
+    return {tier_of(Side::Bid, 0.9997, kCat, 0), tier_of(Side::Bid, 0.9992, kCat, 1),
+            tier_of(Side::Bid, 0.9983, kCat, 2), tier_of(Side::Bid, 0.9961, kCat, 3)};
+}
+
+}  // namespace
+
+TEST(UniqueRequest, ABidAtItsMinimumPaysForExtraMojosOutOfWhatItsSideHasSpare)
+{
+    // None can shrink, and near the peg each BYC mojo costs about a mojo of
+    // wUSDC.b, so none can grow for free either. With 100 mojos spare above
+    // the reserve they ask for 1.000, 1.001, 1.002 and 1.003 BYC, each paying
+    // for its extra mojos at its own price, which does not move.
+    std::vector<TierQuote> tiers = byc_bids_at_the_minimum();
+    const std::vector<TierQuote> before = tiers;
+    std::set<RequestedAmount> taken;
+    std::size_t shared = 0;
+    Mojo spare = 100;
+    const auto moved = make_requests_unique(
+        kBycUsdc, tiers, taken, [](const TierQuote&) { return at_minimum(kCat); }, &shared, &spare);
+
+    EXPECT_EQ(shared, 0u);
+    ASSERT_EQ(moved.size(), 3u);
+    EXPECT_EQ(taken, (std::set<RequestedAmount>{{"byc", 1'000}, {"byc", 1'001}, {"byc", 1'002},
+                                                 {"byc", 1'003}}));
+    Mojo paid_more = 0;
+    for (std::size_t i = 0; i < tiers.size(); ++i) {
+        EXPECT_EQ(tiers[i].price, before[i].price) << "a bid's price is never moved";
+        EXPECT_EQ(tiers[i].size, kCat + static_cast<Mojo>(i));
+        paid_more += bid_offered_quote(kBycUsdc, tiers[i].price, tiers[i].size)
+                     - bid_offered_quote(kBycUsdc, before[i].price, before[i].size);
+    }
+    // 1001 x 0.9992 = 1000.2 -> 1001 (was 1000); 1002 x 0.9983 = 1000.3 ->
+    // 1001 (was 999); 1003 x 0.9961 = 999.1 -> 1000 (was 997).
+    EXPECT_EQ(moved[0].paid_more, 1);
+    EXPECT_EQ(moved[1].paid_more, 2);
+    EXPECT_EQ(moved[2].paid_more, 3);
+    EXPECT_EQ(paid_more, 6);
+    EXPECT_EQ(spare, 94) << "counted down by exactly what the bids pay more";
+}
+
+TEST(UniqueRequest, ABidPaysNoMoreThanItsSideHasSpare)
+{
+    // One mojo spare: the second bid takes it, and the rest are as computed.
+    std::vector<TierQuote> tiers = byc_bids_at_the_minimum();
+    const std::vector<TierQuote> before = tiers;
+    std::set<RequestedAmount> taken;
+    std::size_t shared = 0;
+    Mojo spare = 1;
+    const auto moved = make_requests_unique(
+        kBycUsdc, tiers, taken, [](const TierQuote&) { return at_minimum(kCat); }, &shared, &spare);
+    ASSERT_EQ(moved.size(), 1u);
+    EXPECT_EQ(moved[0].tier_index, 1);
+    EXPECT_EQ(moved[0].paid_more, 1);
+    EXPECT_EQ(shared, 2u);
+    EXPECT_EQ(spare, 0);
+    EXPECT_EQ(tiers[2].size, before[2].size);
+    EXPECT_EQ(tiers[3].size, before[3].size);
+
+    // Nothing spare (the side was not judged, or sits at its reserve), or a
+    // figure below zero: as before this rule, nothing is paid.
+    for (const Mojo none : {Mojo{0}, Mojo{-5}}) {
+        std::vector<TierQuote> again = byc_bids_at_the_minimum();
+        std::set<RequestedAmount> seen;
+        Mojo left = none;
+        EXPECT_TRUE(make_requests_unique(
+                        kBycUsdc, again, seen, [](const TierQuote&) { return at_minimum(kCat); },
+                        nullptr, &left)
+                        .empty());
+        EXPECT_EQ(left, none);
+        for (const TierQuote& t : again) EXPECT_EQ(t.size, kCat);
+    }
+}
+
+TEST(UniqueRequest, AFreeMoveLeavesTheSpareAlone)
+{
+    // An XCH bid at its tier minimum asks for a mojo more and pays the same,
+    // and a bid above its minimum asks for a mojo less: neither draws on it.
+    Mojo spare = 100;
+    std::set<RequestedAmount> taken{{"xch", 10 * kXch}};
+    std::vector<TierQuote> xch{tier_of(Side::Bid, 88.520541355931, 10 * kXch)};
+    const auto grown = make_requests_unique(
+        kXchDbx, xch, taken, [](const TierQuote&) { return at_minimum(10 * kXch); }, nullptr, &spare);
+    ASSERT_EQ(grown.size(), 1u);
+    EXPECT_EQ(xch[0].size, 10 * kXch + 1);
+    EXPECT_EQ(grown[0].paid_more, 0);
+
+    std::set<RequestedAmount> byc_taken{{"byc", kCat}};
+    std::vector<TierQuote> byc{tier_of(Side::Bid, 0.9992, kCat)};
+    const auto shrunk = make_requests_unique(
+        kBycUsdc, byc, byc_taken, [](const TierQuote&) { return RequestBounds{}; }, nullptr, &spare);
+    ASSERT_EQ(shrunk.size(), 1u);
+    EXPECT_EQ(byc[0].size, kCat - 1) << "less is tried first";
+    EXPECT_EQ(shrunk[0].paid_more, 0);
+    EXPECT_EQ(spare, 100);
+}
+
+TEST(UniqueRequest, PaidGrowthKeepsToOnePercentAndToThePacePool)
+{
+    // 0.5 BYC: 1% of it is five mojos, so with 500 to 505 taken it is as
+    // computed, however much is spare.
+    TierQuote half = tier_of(Side::Bid, 0.9992, 500);
+    const TierQuote before = half;
+    std::set<RequestedAmount> taken;
+    for (Mojo m = 500; m <= 505; ++m) taken.insert({"byc", m});
+    RequestBounds rich = at_minimum(500);
+    rich.bid_extra_pay = 1'000'000;
+    EXPECT_EQ(make_request_unique(kBycUsdc, half, taken, rich), RequestMove::Shared);
+    EXPECT_EQ(half.size, before.size);
+    taken.erase({"byc", 505});
+    EXPECT_EQ(make_request_unique(kBycUsdc, half, taken, rich), RequestMove::Moved);
+    EXPECT_EQ(half.size, 505);
+
+    // [PACE] A managed pair's bids are held to its pool to the mojo: they do
+    // not grow, spare or not.
+    TierQuote managed = tier_of(Side::Bid, 0.9992, kCat);
+    RequestBounds pool = at_minimum(kCat, /*may_grow=*/false);
+    pool.bid_extra_pay = 1'000'000;
+    EXPECT_EQ(make_request_unique(kBycUsdc, managed, {{"byc", kCat}}, pool), RequestMove::Shared);
+    EXPECT_EQ(managed.size, kCat);
+}
+
+// ---------------------------------------------------------------------------
 // The wiring, by source scan: no unit test can construct Engine or
 // OfferManager (engine_source_scan.hpp).
 // ---------------------------------------------------------------------------
@@ -563,6 +694,19 @@ TEST(UniqueRequestWiring, Step8MovesTheTiersItThenPostsAndRecords)
                                   "orec.status = db_status_for(in_state);"),
               std::string::npos);
     EXPECT_EQ(count_of(engine, "orec.requested_mojos ="), 1u) << "never recomputed from the tier";
+
+    // What a bid may pay for extra mojos is what the exposure check found
+    // spare for this pair's bid side, read before the pass and handed to it.
+    const std::size_t spare_declared_at = position_of(engine, "Mojo bid_spare_quote_mojos = 0;");
+    const std::size_t spare_set_at = position_of(
+        engine, "bid_spare_quote_mojos = execution::spare_above_reserve( "
+                "exposure_unified, bid_in, bid_dec);");
+    ASSERT_NE(spare_declared_at, std::string::npos);
+    ASSERT_NE(spare_set_at, std::string::npos);
+    EXPECT_LT(spare_declared_at, spare_set_at);
+    EXPECT_LT(spare_set_at, pass_at);
+    EXPECT_EQ(count_of(engine, "bid_spare_quote_mojos ="), 2u) << "declared at 0, set by the check";
+    EXPECT_NE(position_of(engine, "&still_shared, &bid_spare_quote_mojos);"), std::string::npos);
 
     // The bounds: a pace-managed pair's bids never grow, and a bid's floor is
     // its tier's minimum or, without one, the pair's own minimum size.

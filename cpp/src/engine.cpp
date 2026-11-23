@@ -17503,6 +17503,15 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             fee_filtered_tiers = std::move(postable);
         }
 
+        // [UNIQUE-REQUEST 2026-11-23] What this pair's bid side could still
+        // pay beyond its new tiers without changing the answer of the
+        // exposure check below: what the quote asset's projection and its
+        // free coins leave above the reserve. 0 until that check has run and
+        // approved the side, so a side it did not judge pays nothing extra.
+        // Spent further down, by a bid that has to ask for more to differ
+        // from the other live offers (unique_request.hpp).
+        Mojo bid_spare_quote_mojos = 0;
+
         // Pending exposure guard (pre-post projection): include currently
         // pending offers plus candidate new tiers and suppress any side that
         // would breach reserve if all accepted.
@@ -17722,6 +17731,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             if (can_bid && pair_quote_balance_known && pair_quote_reserve_mojos > 0
                 && (!exposure_unified || pair_quote_owned_known)) {
                 const auto [bid_in, bid_dec] = projection_for(/*is_ask=*/false);
+                // [UNIQUE-REQUEST] 0 unless the verdict is Ok.
+                bid_spare_quote_mojos = execution::spare_above_reserve(
+                    exposure_unified, bid_in, bid_dec);
                 if (bid_dec.verdict != execution::ExposureVerdict::Ok) {
                     suppress_bid_projection = true;
                     can_bid = false;
@@ -17923,6 +17935,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // [PACE] A managed pair's resting bids are held to its pool to
             // the mojo, so its bids do not grow.
             const bool bids_may_grow = !pcs.pace.managed;
+            // [2026-11-23] Operator-approved (Dorkmo): a bid already at its
+            // minimum follows the rule too. Where asking for more is not
+            // free it pays for the extra mojos at its own price, out of
+            // bid_spare_quote_mojos and no further.
             std::size_t still_shared = 0;
             const auto moved = execution::make_requests_unique(
                 *pair_cfg, fee_filtered_tiers, requested,
@@ -17943,13 +17959,17 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     }
                     return bounds;
                 },
-                &still_shared);
+                &still_shared, &bid_spare_quote_mojos);
             for (const auto& change : moved) {
                 spdlog::info("[Engine] Step 8: {} {} tier {} asks for {} mojos "
                              "instead of {} -- another live offer asks for "
-                             "that amount",
+                             "that amount{}",
                              pair_name, (change.side == Side::Bid) ? "BID" : "ASK",
-                             change.tier_index, change.asked_now, change.asked_before);
+                             change.tier_index, change.asked_now, change.asked_before,
+                             change.paid_more > 0
+                                 ? fmt::format(" (it pays {} quote mojos more for them)",
+                                               change.paid_more)
+                                 : std::string{});
             }
             if (still_shared > 0) {
                 spdlog::debug("[Engine] Step 8: {} posts {} tier(s) asking for an "

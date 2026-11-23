@@ -49,9 +49,17 @@
 //     (within max_ask_move_bps): never under a no-loss or peg floor;
 //   - a BID first asks for less of the base asset (and pays less): never
 //     over a budget. Only where its minimum forbids that does it ask for
-//     more, and then only while what it PAYS stays the same to the mojo --
+//     more. That is free while what it PAYS stays the same to the mojo --
 //     true of every XCH-base bid, where one base mojo is far under one mojo
 //     of the quote asset.
+//     [2026-11-23] Operator-approved (Dorkmo): offers at their minimum
+//     follow the rule too. Where more is not free -- a 1 BYC bid of
+//     BYC/wUSDC.b, where each BYC mojo costs about a mojo of the quote asset
+//     -- the bid pays for the extra mojos at its own price. Only out of what
+//     Step 8's exposure check found spare above the quote asset's reserve
+//     (bid_extra_pay; execution::spare_above_reserve), so no budget is
+//     passed and the reserve is not touched, and by at most
+//     max_bid_growth_bps of its size.
 // A tier no allowed move clears is posted as computed: two offers sharing a
 // request only stops a taker combining them.
 // ---------------------------------------------------------------------------
@@ -209,6 +217,12 @@ struct RequestBounds {
     Mojo   min_bid_size{1};
     /// False on a pace-managed pair, whose resting bids are held to a pool.
     bool   bid_may_grow{true};
+    /// The most quote mojos a bid may pay beyond what it was sized to pay, to
+    /// ask for more of the base asset: what its side has spare above the
+    /// reserve. 0 = it grows only while it pays the same.
+    Mojo   bid_extra_pay{0};
+    /// The most a bid's size may grow where it pays for the growth.
+    double max_bid_growth_bps{100.0};
     /// The most an ask's price may rise.
     double max_ask_move_bps{25.0};
     /// The most mojos a request moves either way.
@@ -244,14 +258,24 @@ enum class RequestMove {
                 return RequestMove::Moved;
             }
         }
-        // More of it, while what the bid pays does not change -- which
-        // cannot be told of a payment no Mojo holds (leg_as_mojo).
+        // More of it: free while what the bid pays does not change, and past
+        // that paid for at its own price, within what its side has spare
+        // (bid_extra_pay) and max_bid_growth_bps of its size. Neither can be
+        // told of a payment no Mojo holds (leg_as_mojo).
         const Mojo pays = bid_offered_quote(pair, tier.price, tier.size);
         if (bounds.bid_may_grow && pays < kMax) {
+            const Mojo may_pay_more = bounds.bid_extra_pay > 0 ? bounds.bid_extra_pay : Mojo{0};
             for (int k = 1; k <= bounds.max_steps && tier.size <= kMax - k; ++k) {
                 const Mojo size = tier.size + k;
-                if (bid_offered_quote(pair, tier.price, size) != pays) {
+                const Mojo pays_now = bid_offered_quote(pair, tier.price, size);
+                if (pays_now < pays || pays_now >= kMax) {
                     break;
+                }
+                if (pays_now != pays
+                    && (pays_now - pays > may_pay_more
+                        || static_cast<double>(k) * 10'000.0
+                               > static_cast<double>(tier.size) * bounds.max_bid_growth_bps)) {
+                    break;  // every larger size costs at least as much
                 }
                 if (taken.count({want.first, size}) == 0) {
                     tier.size = size;
@@ -333,27 +357,50 @@ struct RequestChange {
     Side         side{Side::Bid};
     Mojo         asked_before{0};
     Mojo         asked_now{0};
+    /// Quote mojos a bid pays beyond what it was sized to pay; 0 for an ask
+    /// and for a bid that moved for free.
+    Mojo         paid_more{0};
 };
 
 /// Makes every tier of `tiers` ask for an amount neither `taken` nor an
 /// earlier tier of the same call asks for, and adds each tier's request to
 /// `taken`. `bounds_of(tier)` gives that tier's bounds. Returns the tiers
 /// that moved; `shared`, when given, counts those no allowed move cleared.
+///
+/// `bid_spare`, when given, is what the pair's bid side may pay beyond its
+/// sizing, in quote mojos (execution::spare_above_reserve). It replaces each
+/// bid's bid_extra_pay and is counted down by what each bid pays more, so
+/// the bids of one call never pay more than it between them.
 template <typename BoundsOf>
 std::vector<RequestChange> make_requests_unique(const PairConfig& pair,
                                                 std::vector<TierQuote>& tiers,
                                                 std::set<RequestedAmount>& taken,
                                                 BoundsOf&& bounds_of,
-                                                std::size_t* shared = nullptr)
+                                                std::size_t* shared = nullptr,
+                                                Mojo* bid_spare = nullptr)
 {
     std::vector<RequestChange> changes;
     if (shared != nullptr) *shared = 0;
     for (TierQuote& tier : tiers) {
         const Mojo before = requested_amount(pair, tier.side, tier.price, tier.size).second;
-        const RequestMove move = make_request_unique(pair, tier, taken, bounds_of(tier));
+        const bool is_bid = (tier.side == Side::Bid);
+        RequestBounds bounds = bounds_of(tier);
+        if (bid_spare != nullptr) {
+            bounds.bid_extra_pay = *bid_spare > 0 ? *bid_spare : Mojo{0};
+        }
+        const Mojo paid_before = is_bid ? bid_offered_quote(pair, tier.price, tier.size) : Mojo{0};
+        const RequestMove move = make_request_unique(pair, tier, taken, bounds);
         const RequestedAmount now = requested_amount(pair, tier.side, tier.price, tier.size);
         if (move == RequestMove::Moved) {
-            changes.push_back({tier.tier_index, tier.side, before, now.second});
+            Mojo paid_more = 0;
+            if (is_bid) {
+                const Mojo paid_now = bid_offered_quote(pair, tier.price, tier.size);
+                paid_more = paid_now > paid_before ? paid_now - paid_before : Mojo{0};
+                if (bid_spare != nullptr) {
+                    *bid_spare -= paid_more;  // never past it: bid_extra_pay bounds the move
+                }
+            }
+            changes.push_back({tier.tier_index, tier.side, before, now.second, paid_more});
         } else if (move == RequestMove::Shared && shared != nullptr) {
             ++*shared;
         }

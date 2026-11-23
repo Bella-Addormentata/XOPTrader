@@ -65,9 +65,12 @@ mojo or two and never against a limit the engine holds:
   enough (at most 25 bps), so it never goes under a price floor.
 - **A bid** asks for a mojo less of the base asset and pays less, down to
   its minimum size (its tier's, or the pair's). At its minimum it asks for a
-  mojo more instead, and only while what it pays stays the same: true of
-  every XCH bid, where a mojo of XCH is far under a mojo of the quote asset.
-  A pair the pace controller manages never grows a bid.
+  mojo more instead. That is free for every XCH bid, where a mojo of XCH is
+  far under a mojo of the quote asset. Where it is not, as for the 1 BYC
+  bids of BYC/wUSDC.b, the bid pays for the extra mojos at its own price
+  (about 0.001 wUSDC.b each): by at most 1% of its size, and only out of
+  what the wallet has spare above that asset's reserve (#256). A pair the
+  pace controller manages never grows a bid.
 - What each offer asks for is recorded with it (two new `offer_log`
   columns), so a restart reads the same amounts, also for an offer read back
   from the wallet and for a batched one, which asks for the total of its

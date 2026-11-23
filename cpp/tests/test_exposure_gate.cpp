@@ -31,6 +31,7 @@ using xop::execution::ExposureVerdict;
 using xop::execution::has_unmapped_live_claim;
 using xop::execution::resting_spend_on_asset;
 using xop::execution::RestingSpend;
+using xop::execution::spare_above_reserve;
 using xop::execution::projected_balance_after_fills;
 
 constexpr Mojo kMojo(long long v) { return static_cast<Mojo>(v); }
@@ -474,6 +475,61 @@ TEST(ExposureRule, TheIncompleteFlagIsNotAnInputToLegacy) {
     EXPECT_EQ(flagged.verdict, plain.verdict);
     EXPECT_EQ(flagged.projected_mojos, plain.projected_mojos);
 }
+
+// -- what an approved side has spare (unique_request.hpp) ----------------------
+
+TEST(ExposureRule, AnApprovedSideHasSpareWhatBothTestsLeaveAboveTheReserve) {
+    // Unified: owned 24.5697 - resting 5 - new 1 leaves 18.5697, and the free
+    // coins 7.2477 - new 1 leave 6.2477. The reserve is 0.1 of either, and
+    // the less of the two is what the side could still spend.
+    const auto in = unified_inputs(kOwned, kSpendableBefore, kRestingBefore, kNewAsk);
+    const auto ok = decide_exposure(/*unified=*/true, in, 0.25);
+    ASSERT_EQ(ok.verdict, ExposureVerdict::Ok);
+    EXPECT_EQ(spare_above_reserve(true, in, ok), kSpendableBefore - kNewAsk - kReserve);
+
+    // Spending exactly that much more keeps the verdict; one mojo more turns it.
+    auto more = in;
+    more.planned_spend_mojos += spare_above_reserve(true, in, ok);
+    EXPECT_EQ(decide_exposure(true, more, 0.25).verdict, ExposureVerdict::Ok);
+    EXPECT_EQ(spare_above_reserve(true, more, decide_exposure(true, more, 0.25)), 0);
+    more.planned_spend_mojos += 1;
+    EXPECT_EQ(decide_exposure(true, more, 0.25).verdict, ExposureVerdict::SuppressNew);
+
+    // The projection is the tighter one when most of what is owned rests.
+    const auto tight = unified_inputs(/*owned=*/6 * kXch + kReserve + 7, kSpendableBefore,
+                                      kRestingBefore, kNewAsk);
+    const auto tight_ok = decide_exposure(true, tight, 0.25);
+    ASSERT_EQ(tight_ok.verdict, ExposureVerdict::Ok);
+    EXPECT_EQ(spare_above_reserve(true, tight, tight_ok), 7);
+}
+
+TEST(ExposureRule, ASideThatIsNotApprovedHasNothingSpare) {
+    // Suppressed: the new tier would leave the projection under the reserve.
+    const auto in = unified_inputs(/*owned=*/6 * kXch, kSpendableBefore, kRestingBefore, kNewAsk);
+    const auto no = decide_exposure(true, in, 0.25);
+    ASSERT_EQ(no.verdict, ExposureVerdict::SuppressNew);
+    EXPECT_EQ(spare_above_reserve(true, in, no), 0);
+
+    // At the reserve exactly the side is approved, with nothing to spare.
+    const auto edge = unified_inputs(/*owned=*/6 * kXch + kReserve, kSpendableBefore,
+                                     kRestingBefore, kNewAsk);
+    const auto at = decide_exposure(true, edge, 0.25);
+    ASSERT_EQ(at.verdict, ExposureVerdict::Ok);
+    EXPECT_EQ(spare_above_reserve(true, edge, at), 0);
+}
+
+TEST(ExposureRule, LegacySpareIsWhatItsOneProjectionLeaves) {
+    // Legacy has one test: spendable - (pending + new) against the reserve.
+    const auto in = legacy_inputs(kSpendableBefore, kRestingBefore, kNewAsk);
+    const auto ok = decide_exposure(/*unified=*/false, in, 0.25);
+    ASSERT_EQ(ok.verdict, ExposureVerdict::Ok);
+    EXPECT_EQ(spare_above_reserve(false, in, ok),
+              kSpendableBefore - kRestingBefore - kNewAsk - kReserve);
+}
+
+// Evaluated by the compiler too: it is the engine's bound on a spend.
+static_assert(spare_above_reserve(true, ExposureInputs{}, xop::execution::ExposureDecision{}) == 0,
+              "nothing owned, nothing spare");
 
 // -- unified: the minimum-age gate on candidates -------------------------------
 
