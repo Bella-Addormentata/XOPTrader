@@ -138,6 +138,22 @@ using RequestedAmount = std::pair<std::string, Mojo>;
     return RequestedAmount{asset, it->second};
 }
 
+/// [review #255] The request of ONE wallet offer made of several tiers of
+/// one side (OfferManager::post_merged_side, batch mode): the asset on the
+/// requested side of `pair`, with `payload_total`, the amount the merged
+/// payload asks for. That is the total of its tiers' requests, which none of
+/// them asks for alone, so requested_amount() gives it for no record of that
+/// trade. nullopt when the payload asks for no positive amount.
+[[nodiscard]] inline std::optional<RequestedAmount> merged_request(const PairConfig& pair,
+                                                                  Side side, Mojo payload_total)
+{
+    if (payload_total <= 0) {
+        return std::nullopt;
+    }
+    return RequestedAmount{(side == Side::Bid) ? pair.base_asset_id : pair.quote_asset_id,
+                           payload_total};
+}
+
 /// Writes `request` onto `offer` (PendingOffer::requested_*); nothing when
 /// there is none to write.
 inline void note_request(PendingOffer& offer, const std::optional<RequestedAmount>& request)
@@ -150,7 +166,8 @@ inline void note_request(PendingOffer& offer, const std::optional<RequestedAmoun
 
 /// [review #255] What a resting offer asks for: the amount recorded with it,
 /// when there is one; else its price and size run through
-/// requested_amount(), which is exact for an offer this engine built.
+/// requested_amount(), which is exact for a single-tier offer this engine
+/// built (a record from before requests were kept).
 /// nullopt when neither is possible (`pair` is null: its pair is no longer
 /// configured).
 [[nodiscard]] inline std::optional<RequestedAmount> request_of(const PendingOffer& offer,

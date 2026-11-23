@@ -18007,11 +18007,6 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 orec.status        = "pending";
                 orec.created_block = block_height;
                 orec.fee_mojos     = recommended_fee;
-                // [UNIQUE-REQUEST] What the offer asks for, kept with its row.
-                const auto asked = execution::requested_amount(
-                    *pair_cfg, etq.side, etq.price, etq.size);
-                orec.requested_asset = asked.first;
-                orec.requested_mojos = asked.second;
 
                 // Capture order-book context for outcome analysis.
                 {
@@ -18045,7 +18040,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     // [S14] post_quotes may already have cancelled this offer
                     // (asymmetric ladder, late create, failed expiry) and
                     // flagged it cancel_pending: persist what State says.
-                    orec.status = db_status_for(state_->get_offer(orec.offer_id));
+                    const PendingOffer in_state = state_->get_offer(orec.offer_id);
+                    orec.status = db_status_for(in_state);
+                    // [UNIQUE-REQUEST review #255] ...and what State says it
+                    // asks for. The offer manager wrote that from the payload
+                    // it sent: this tier's own amount, or for a merged offer
+                    // the total of its tiers, which no tier asks for alone.
+                    orec.requested_asset = in_state.requested_asset;
+                    orec.requested_mojos = in_state.requested_mojos;
                 } else {
                     // post_quotes may have skipped this tier due to a wallet
                     // RPC error (for example insufficient funds).  Do not

@@ -30,6 +30,7 @@ using xop::TierQuote;
 using xop::execution::bid_offered_quote;
 using xop::execution::make_request_unique;
 using xop::execution::make_requests_unique;
+using xop::execution::merged_request;
 using xop::execution::min_bid_size_mojos;
 using xop::execution::note_request;
 using xop::execution::request_from_summary;
@@ -377,6 +378,51 @@ TEST(UniqueRequest, AnOfferReadBackFromTheWalletKeepsItsExactRequest)
     EXPECT_EQ(requested_by({adopted}, config_of).count({"usdc", 997}), 1u);
 }
 
+TEST(UniqueRequest, AMergedOfferAsksForTheTotalOfItsTiers)
+{
+    // Batch mode posts one wallet offer for a whole side
+    // (OfferManager::post_merged_side). Two 1 BYC bids then ask for 2 BYC
+    // together and for 1 BYC not at all, and every record of that trade
+    // carries the total, read from the payload the wallet was sent.
+    const TierQuote first = tier_of(Side::Bid, 0.5801, kCat, 0);
+    const TierQuote second = tier_of(Side::Bid, 0.5772, kCat, 1);
+    const auto total = merged_request(kBycUsdc, Side::Bid, first.size + second.size);
+    ASSERT_TRUE(total.has_value());
+    EXPECT_EQ(*total, (RequestedAmount{"byc", 2 * kCat}));
+
+    PendingOffer a = resting(kBycUsdc, first);
+    PendingOffer b = resting(kBycUsdc, second);
+    const auto config_of = [](const std::string&) { return &kBycUsdc; };
+    EXPECT_EQ(requested_by({a, b}, config_of), (std::set<RequestedAmount>{{"byc", kCat}}))
+        << "precondition: a tier's own price and size give its share, 1 BYC";
+    note_request(a, total);
+    note_request(b, total);
+    const auto taken = requested_by({a, b}, config_of);
+    EXPECT_EQ(taken, (std::set<RequestedAmount>{{"byc", 2 * kCat}}));
+
+    // Batching is switched off and the engine restarted: a new 2 BYC bid is
+    // moved off the merged offer's request, and a 1 BYC bid is free to post.
+    TierQuote two = tier_of(Side::Bid, 0.58, 2 * kCat);
+    EXPECT_EQ(make_request_unique(kBycUsdc, two, taken), RequestMove::Moved);
+    EXPECT_EQ(two.size, 2 * kCat - 1);
+    TierQuote one = tier_of(Side::Bid, 0.58, kCat);
+    EXPECT_EQ(make_request_unique(kBycUsdc, one, taken), RequestMove::None);
+
+    // An ask side: each tier's leg is rounded down on its own, so the total
+    // is not what one record of total size at the worst price would give.
+    const TierQuote low = tier_of(Side::Ask, 1.3019, 100);   // 130.19 -> 130
+    const TierQuote high = tier_of(Side::Ask, 1.3199, 100);  // 131.99 -> 131
+    const Mojo payload = requested_amount(kBycUsdc, low.side, low.price, low.size).second
+                         + requested_amount(kBycUsdc, high.side, high.price, high.size).second;
+    EXPECT_EQ(payload, 261);
+    EXPECT_EQ(requested_amount(kBycUsdc, Side::Ask, low.price, low.size + high.size).second, 260);
+    const auto ask_total = merged_request(kBycUsdc, Side::Ask, payload);
+    ASSERT_TRUE(ask_total.has_value());
+    EXPECT_EQ(*ask_total, (RequestedAmount{"usdc", 261}));
+
+    EXPECT_FALSE(merged_request(kBycUsdc, Side::Ask, 0).has_value()) << "nothing asked for";
+}
+
 TEST(UniqueRequest, ALegNoMojoHoldsIsStillDefined)
 {
     // An offer adopted before requests were recorded has a price worked out
@@ -499,18 +545,24 @@ TEST(UniqueRequestWiring, Step8MovesTheTiersItThenPostsAndRecords)
         engine, "int posted = co_await offer_mgr_->post_quotes( "
                 "*pair_cfg, fee_filtered_tiers, block_height, fee_override);");
     const std::size_t record_at = position_of(
-        engine, "const auto asked = execution::requested_amount( *pair_cfg, etq.side, etq.price, etq.size); "
-                "orec.requested_asset = asked.first; orec.requested_mojos = asked.second;");
+        engine, "orec.requested_asset = in_state.requested_asset; "
+                "orec.requested_mojos = in_state.requested_mojos;");
     ASSERT_NE(taken_at, std::string::npos);
     ASSERT_NE(pass_at, std::string::npos);
     ASSERT_NE(post_at, std::string::npos);
     ASSERT_NE(record_at, std::string::npos);
-    // Every resting offer's request is read, the tiers are moved, and the
-    // same list is posted and then recorded with what each tier asks for.
+    // Every resting offer's request is read, the tiers are moved, the same
+    // list is posted, and each row is then written with the request State
+    // holds for its offer -- the one the offer manager took from the payload
+    // it sent, which for a merged offer is not the tier's own amount.
     EXPECT_LT(taken_at, pass_at);
     EXPECT_LT(pass_at, post_at);
     EXPECT_LT(post_at, record_at);
     EXPECT_EQ(count_of(engine, "execution::make_requests_unique("), 1u);
+    EXPECT_NE(position_of(engine, "const PendingOffer in_state = state_->get_offer(orec.offer_id); "
+                                  "orec.status = db_status_for(in_state);"),
+              std::string::npos);
+    EXPECT_EQ(count_of(engine, "orec.requested_mojos ="), 1u) << "never recomputed from the tier";
 
     // The bounds: a pace-managed pair's bids never grow, and a bid's floor is
     // its tier's minimum or, without one, the pair's own minimum size.
@@ -543,8 +595,32 @@ TEST(UniqueRequestWiring, OffersReadBackFromTheWalletKeepWhatTheyAskFor)
               1u);
     EXPECT_EQ(count_of(manager, "po.requested_asset = eval.requested_asset;"), 1u);
     EXPECT_EQ(count_of(manager, "po.requested_mojos = eval.requested_mojos;"), 1u);
-    // A new offer, from the tier it was built from.
+}
+
+TEST(UniqueRequestWiring, EveryOfferTheManagerCreatesRecordsItsRequest)
+{
+    const std::string manager = squeeze(read_offer_manager_cpp());
+    ASSERT_FALSE(manager.empty()) << XOP_TESTS_OFFER_MANAGER_CPP;
+    const std::string of_its_tier = "requested_amount(pair, tier.side, tier.price, tier.size));";
+    // One wallet offer per tier: post_quotes, a create that landed after the
+    // stop, and the batch fallback's tiers, each also when its expiry did
+    // not take and it is adopted only to be retired.
+    EXPECT_EQ(count_of(manager, "note_request(pending, " + of_its_tier), 3u);
+    EXPECT_EQ(count_of(manager, "note_request(adopt, " + of_its_tier), 2u);
+    EXPECT_EQ(count_of(manager, "note_request(po, " + of_its_tier), 1u);
+
+    // One wallet offer for a whole side: the total the merged payload asks
+    // for, on every record of that trade.
     EXPECT_EQ(count_of(manager,
-                       "note_request(pending, requested_amount(pair, tier.side, tier.price, tier.size));"),
+                       "const std::optional<RequestedAmount> merged_asks_for = merged_request( "
+                       "pair, tiers.front().side, "
+                       "merged_dict.contains(asked_key) ? merged_dict[asked_key].get<std::int64_t>() : 0);"),
               1u);
+    EXPECT_EQ(count_of(manager, "note_request(pending, merged_asks_for);"), 2u);
+    EXPECT_EQ(count_of(manager, "note_request(adopt, merged_asks_for);"), 1u);
+
+    // As many requests noted as records built: a new posting path that
+    // builds a `pending` or an `adopt` and forgets its request fails here.
+    EXPECT_EQ(count_of(manager, "note_request(pending, "), count_of(manager, "PendingOffer pending;"));
+    EXPECT_EQ(count_of(manager, "note_request(adopt, "), count_of(manager, "PendingOffer adopt;"));
 }

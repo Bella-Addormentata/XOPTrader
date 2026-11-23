@@ -70,7 +70,8 @@ mojo or two and never against a limit the engine holds:
   A pair the pace controller manages never grows a bid.
 - What each offer asks for is recorded with it (two new `offer_log`
   columns), so a restart reads the same amounts, also for an offer read back
-  from the wallet.
+  from the wallet and for a batched one, which asks for the total of its
+  tiers.
 - With no allowed move, the offer is posted as before.
 
 ### Two alerts that fired on nearly every cycle (#251)
