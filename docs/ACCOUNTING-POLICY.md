@@ -35,6 +35,8 @@ of legs**. Summing `delta_mojos` per asset gives the ledger's implied balance.
 | `opening` | one leg per asset = wallet confirmed balance at genesis |
 | `fill` (bid) | base `+size`, quote `−quote_mojos`, `xch −fee` |
 | `fill` (ask) | base `−size`, quote `+quote_mojos`, `xch −fee` |
+| `options_withdrawal` | capital that left for the options sub-account: a top-up (`options −amount`, `fee −fee` on `xch`), or the fence going up (`options −held`, one leg per asset) |
+| `options_deposit` | the fence going down: `options +held`, one leg per asset |
 | `adjust` | single leg, explicitly labelled, for movements with no internal event; also the correction of an earlier auto-adjust (below) |
 | `reversal` | one leg per leg of the booking it reverses: same `leg`, `asset_id`, `pair_name` and `block_height`, `delta_mojos` negated |
 
@@ -49,6 +51,44 @@ wrong, an `adjust` for a movement with no internal event. Both historical
 backfill scripts violated this on `trade_log` and left a column that is a
 palimpsest of three incompatible formula generations; they are now retired and
 refuse to run.
+
+### Capital moved to or from the options sub-account (2026-11-23)
+
+The options book keeps its working funds at one address of the trading
+wallet, and while the engine's fence is up every balance the engine reads
+leaves that address out (`rpc/coin_fence.hpp`). So the edge of the trading
+book runs between the wallet's other addresses and that one, and what crosses
+it is **external capital, not performance**: it is journalled, its USD value
+at the engine's own mark goes to Net Deposits, and a flow booked while the
+engine runs re-anchors the drawdown peak. The rules and their limits are in
+`cpp/include/xop/accounting/options_transfer.hpp`; in short:
+
+| What happens | What is booked |
+|---|---|
+| The options book tops the sub-account up while the fence is up | `options_withdrawal` of the amount and the send's fee, once the book records the send as confirmed. Event id `options_topup:<transaction>` |
+| The fence goes up | `options_withdrawal` of what the address held at the first list after it went up. Event id `options_fence_up:<n>` |
+| The fence goes down | `options_deposit` of what the address held at the last list before it went down. Event id `options_fence_down:<n>` |
+| A mint, a clawback, an expiry | nothing: collateral moves between the options address and a contract, and no balance the engine reads changes |
+
+A fence event is written at every transition, also when the address held
+nothing (one zero leg on `xch`), so the newest one says where the books stand
+and a restart reads the same answer. The first, `#1`, only adopts the state
+the fence is found in.
+
+Nothing is counted twice: top-ups are booked before a fence event; while the
+books stand fence-down no top-up is booked, because its coins are trading
+funds and the next fence-up event takes them; and a top-up sent before that
+event's list is inside it. A top-up the book has not yet recorded as
+confirmed, whose coin is among those the fence returns as it goes down, did
+arrive while the fence was up and is booked with that event.
+
+Still without an event, and so left to the divergence control: a premium
+(paid to an ordinary address of the wallet), a top-up the book never wrote
+down, whatever happened before the first booked event, what the options book
+did across a fence change while the engine was not running, and the fence
+taken away by switching the options book off in `config.yaml`.
+
+`accounting.options_transfer_ingest_enabled: false` stops all of it.
 
 ### Reversal: a booking proven wrong (2026-09-26)
 
@@ -207,6 +247,12 @@ while 1% of the XCH wallet is 1.2 XCH — enough to swallow an entire missed
 | `floor_xch_mojos` | 1e9 (0.001 XCH) | covers fee dust |
 | `floor_cat_mojos` | 100 (0.1 unit) | 100× the 1-mojo per-leg `llround` error |
 | `fee_slack_mojos` | 200,000 | ~40 offer events at 5,000 mojos each |
+
+Two more terms widen it while they apply: the wallet's `pending_change`
+(coins in flight), and capital the options sub-account has taken or returned
+that is known and not yet booked — a top-up the options book has not recorded
+as confirmed (for at most two hours after it was sent), or a fence event
+waiting for a price.
 
 **Persistence requirement**: escalation needs N consecutive **same-signed**
 breaches (alert at 2, pause at 3). The ledger can only ever *lag* the wallet,

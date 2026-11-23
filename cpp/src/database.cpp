@@ -1718,6 +1718,37 @@ bool Database::ledger_has_event(const std::string& event_id) const
     return found;
 }
 
+std::optional<Database::LedgerEventStamp> Database::ledger_latest_event(
+    const std::string& prefix) const
+{
+    static constexpr const char* kSelect = R"SQL(
+        SELECT event_id, COALESCE(entry_time, '') FROM ledger_entries
+        WHERE substr(event_id, 1, length(?1)) = ?1
+        ORDER BY id DESC LIMIT 1;
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, kSelect, -1, &stmt, nullptr) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return std::nullopt;
+    }
+    sqlite3_bind_text(stmt, 1, prefix.c_str(), -1, SQLITE_TRANSIENT);
+    LedgerEventStamp found;
+    const int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        const char* id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        const char* at = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        if (id != nullptr) found.event_id = id;
+        if (at != nullptr) found.entry_time = at;
+    }
+    sqlite3_finalize(stmt);
+    // "No such event" and "could not ask" are different answers: the caller
+    // adopts a state on the first and must not on the second.
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE) return std::nullopt;
+    return found;
+}
+
 std::string Database::ledger_opening_time(const AssetId& asset_id) const
 {
     static constexpr const char* kSelect = R"SQL(

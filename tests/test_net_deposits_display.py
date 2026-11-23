@@ -77,7 +77,69 @@ def test_a_wmillieth_unwrap_counts_at_its_usd_value(app, tmp_path):
         ("fill", "trade:1", "base", WUSDC, 100, ""),     # not a bridge row
     ])
     assert out["bridge_flows"] == 2
+    assert out["options_flows"] == 0
     assert out["net_deposits_usd"] == pytest.approx(4.985 - 2.16065)
+
+
+def _options_note(flow_usd: float, px: float, ref: str) -> str:
+    # accounting::options_note's format.
+    kind = "deposit" if flow_usd >= 0 else "withdrawal"
+    return (f"options sub-account {kind}; flow_usd={flow_usd:.10f}; "
+            f"px_usd_per_unit={px:.10f}; ref={ref}")
+
+
+def test_options_sub_account_flows_are_external_capital_too(app, tmp_path):
+    """[OPTIONS-CAPITAL 2026-11-23] A top-up of the options sub-account, and
+    the fence going down or up, move capital across the edge of the trading
+    book: the card counts them with the bridge flows, at the USD in each
+    row's note, and counts the events, not their legs."""
+    tx = "2bbcfcaa7c11b312edf1a37cb95da12ecacfdb313b04fd5adb9a0f90f0898bf6"
+    out = _display(tmp_path, [
+        ("bridge_deposit", "bridge:job:2:a", "bridge", WUSDC, 4_985,
+         _note(4.985, 1.0, 2)),
+        # 1.5 XCH topped up at $5.20, and the send's fee: one flow, two legs.
+        ("options_withdrawal", f"options_topup:{tx}", "options", "xch",
+         -1_500_000_000_000, _options_note(-7.8, 5.2, "top-up 2bbcfcaa7c11b312")),
+        ("options_withdrawal", f"options_topup:{tx}", "fee", "xch",
+         -10_000_000, _options_note(-0.000052, 5.2, "top-up 2bbcfcaa7c11b312")),
+        # The books began with the fence up: an event with nothing behind it.
+        ("options_withdrawal", "options_fence_up:1", "options", "xch", 0,
+         "options sub-account: fence up #1, nothing moved (where the books stand)"),
+        # The fence went down holding 0.4 XCH and 2 wUSDC.b: one flow.
+        ("options_deposit", "options_fence_down:2", "options", "xch",
+         400_000_000_000, _options_note(2.08, 5.2, "fence down #2")),
+        ("options_deposit", "options_fence_down:2", "options", WUSDC,
+         2_000, _options_note(2.0, 1.0, "fence down #2")),
+        ("fill", "trade:1", "base", WUSDC, 100, ""),
+    ])
+    assert out["bridge_flows"] == 1
+    assert out["options_flows"] == 2
+    assert out["net_deposits_usd"] == pytest.approx(
+        4.985 - 7.8 - 0.000052 + 2.08 + 2.0)
+
+
+def test_the_card_names_both_kinds_of_flow():
+    from gui.widgets.main_window import MainWindow
+
+    class _Card:
+        _pnl_display: dict = {}
+        _net_deposits_payload = MainWindow._net_deposits_payload
+
+    card = _Card()
+    assert card._net_deposits_payload()["secondary_text"] == "loading from ledger…"
+    card._pnl_display = {"net_deposits_usd": 0.0, "bridge_flows": 0, "options_flows": 0}
+    assert card._net_deposits_payload()["secondary_text"] == "no external flows yet"
+    card._pnl_display = {"net_deposits_usd": 415.0, "bridge_flows": 3}
+    assert (card._net_deposits_payload()["secondary_text"]
+            == "external capital · 3 bridge flow(s)")
+    card._pnl_display = {"net_deposits_usd": -5.72, "bridge_flows": 1, "options_flows": 2}
+    payload = card._net_deposits_payload()
+    assert payload["secondary_text"] == (
+        "external capital · 1 bridge flow(s), 2 options flow(s)")
+    assert payload["display_text"] == "-$5.72"
+    card._pnl_display = {"net_deposits_usd": -7.8, "options_flows": 1}
+    assert (card._net_deposits_payload()["secondary_text"]
+            == "external capital · 1 options flow(s)")
 
 
 def test_no_ledger_table_is_no_flows(app, tmp_path):
@@ -96,12 +158,18 @@ def test_no_ledger_table_is_no_flows(app, tmp_path):
     worker.pnl_display_ready.connect(lambda d: captured.update(d))
     worker.fetch_pnl_display("")
     assert captured["bridge_flows"] == 0
+    assert captured["options_flows"] == 0
     assert captured["net_deposits_usd"] == 0.0
 
 
 @pytest.mark.parametrize("note,expected", [
     (_note(-2.16065, 3.95, 9), -2.16065),
     (_note(4.985, 1.0, 2), 4.985),
+    # [OPTIONS-CAPITAL] An options leg carries the same field.
+    ("options sub-account withdrawal; flow_usd=-7.8000000000; "
+     "px_usd_per_unit=5.2000000000; ref=top-up 2bbcfcaa7c11b312", -7.8),
+    ("options sub-account: fence up #1, nothing moved (where the books stand)",
+     0.0),
     ("", 0.0),
     ("hand edit", 0.0),
     ("flow_usd=", 0.0),

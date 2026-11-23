@@ -729,6 +729,59 @@ TEST(DatabaseTest, LedgerHasEventAnswersBeforeAndAfterTheWrite) {
     EXPECT_TRUE(db.ledger_has_event("reward:abc123"));
 }
 
+// [OPTIONS-CAPITAL] The options ingest asks the ledger where the books stand:
+// the newest event whose id starts with a prefix.
+TEST(DatabaseTest, LedgerLatestEventIsTheNewestWithThatPrefix) {
+    TempDbPath temp("ledger_latest_event");
+    xop::Database db(temp.path().string());
+    // The ledger answers every time here: "none" is an empty stamp, and
+    // only a ledger that could not be asked is nullopt.
+    const auto latest = [&db](const char* prefix) {
+        const auto stamp = db.ledger_latest_event(prefix);
+        EXPECT_TRUE(stamp.has_value()) << prefix;
+        return stamp.value_or(xop::Database::LedgerEventStamp{});
+    };
+    EXPECT_EQ(latest("options_").event_id, "") << "nothing is journalled yet";
+    EXPECT_EQ(latest("options_").entry_time, "");
+
+    ASSERT_TRUE(db.append_ledger_entries({
+        leg("reward:abc123", "reward", "dbx", 618LL, "reward"),
+        leg("options_topup:aa11", "options", "xch", -1'500'000'000'000LL, "options_withdrawal"),
+        leg("options_topup:aa11", "fee", "xch", -10'000'000LL, "options_withdrawal"),
+        leg("optionsXtopup:zz", "options", "xch", -1LL, "options_withdrawal"),
+    }).has_value());
+    EXPECT_EQ(latest("options_").event_id, "options_topup:aa11")
+        << "the underscore is a character, not a wildcard";
+    EXPECT_EQ(latest("options_fence_").event_id, "") << "no fence event yet";
+
+    // A fence event with nothing behind it is still an event: its zero leg
+    // is how the books know which way the fence went.
+    auto up = leg("options_fence_up:1", "options", "xch", 0LL, "options_withdrawal");
+    up.entry_time = "2026-11-24T10:00:00.000Z";
+    auto down_xch = leg("options_fence_down:2", "options", "xch", 500'000'000'000LL, "options_deposit");
+    auto down_usdc = leg("options_fence_down:2", "options", "usdc", 2'000LL, "options_deposit");
+    down_xch.entry_time = down_usdc.entry_time = "2026-11-24T11:30:00.000Z";
+    ASSERT_EQ(db.append_ledger_entries({up}).value_or(999), 1u);
+    ASSERT_EQ(db.append_ledger_entries({down_xch, down_usdc}).value_or(999), 2u);
+    ASSERT_TRUE(db.append_ledger_entries({
+        leg("trade-z", "base", "xch", -1LL),
+    }).has_value());
+
+    const auto newest = latest("options_");
+    EXPECT_EQ(newest.event_id, "options_fence_down:2");
+    EXPECT_EQ(newest.entry_time, "2026-11-24T11:30:00.000Z");
+    EXPECT_EQ(latest("options_fence_").event_id, "options_fence_down:2");
+    const auto last_up = latest("options_fence_up:");
+    EXPECT_EQ(last_up.event_id, "options_fence_up:1");
+    EXPECT_EQ(last_up.entry_time, "2026-11-24T10:00:00.000Z");
+    EXPECT_EQ(latest("options_topup:").event_id, "options_topup:aa11");
+    EXPECT_EQ(latest("nothing_like_it").event_id, "");
+    EXPECT_EQ(latest("").event_id, "trade-z") << "every id starts with nothing";
+    // The zero leg moved no balance.
+    EXPECT_EQ(db.ledger_balances().at(xop::AssetId{"xch"}),
+              -1'500'000'000'000LL - 10'000'000LL - 1LL + 500'000'000'000LL - 1LL);
+}
+
 TEST(DatabaseTest, LedgerSurvivesReopen) {
     TempDbPath temp("ledger_reopen");
     {

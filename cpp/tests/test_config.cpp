@@ -5567,3 +5567,66 @@ TEST(ConfigParserTest, OptionsEngineFenceDefaultsToAutoOnASharedWallet) {
         EXPECT_FALSE(xop::load_config(tmp.path()).options_fence.enabled) << "options off";
     }
 }
+
+// [OPTIONS-CAPITAL 2026-11-23] The engine reads the options book's top-ups
+// from the book's own database, the file the GUI opens: options.database_path
+// read beside config.yaml when it is relative, and the GUI's default when it
+// is not set.
+TEST(ConfigParserTest, OptionsDatabasePathIsReadBesideTheConfigFile) {
+    const auto options = [](const std::string& database_line) {
+        return std::string(kMinimalValidYaml) + R"(
+options:
+  enabled: true
+  quote_asset_id: "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"
+  wallet:
+    share_trading_wallet: true
+    address: "xch1kxxd76v9kwsxrcxgndn3mylnxjhd7klgdns7083zjl247ffge32sr5rsy2"
+)" + database_line;
+    };
+    {
+        TempYaml tmp(options(""));
+        const auto cfg = xop::load_config(tmp.path());
+        ASSERT_TRUE(cfg.options_fence.enabled);
+        EXPECT_EQ(cfg.options_fence.database_path, anchored(tmp.path(), "data/options_jobs.db"))
+            << "the GUI's default";
+        EXPECT_TRUE(cfg.accounting.options_transfer_ingest_enabled) << "on unless switched off";
+    }
+    {
+        TempYaml tmp(options("  database_path: \"  books/options.db \"\n"));
+        EXPECT_EQ(xop::load_config(tmp.path()).options_fence.database_path,
+                  anchored(tmp.path(), "books/options.db"));
+    }
+    {
+        const std::string absolute =
+            (std::filesystem::temp_directory_path() / "xop_options_elsewhere.db").string();
+        std::string as_yaml = absolute;
+        for (char& c : as_yaml) if (c == '\\') c = '/';
+        TempYaml tmp(options("  database_path: \"" + as_yaml + "\"\n"));
+        EXPECT_EQ(std::filesystem::path(xop::load_config(tmp.path()).options_fence.database_path),
+                  std::filesystem::path(as_yaml))
+            << "an absolute path is used as written";
+    }
+    {
+        TempYaml tmp(options("  database_path: \":memory:\"\n"));
+        EXPECT_EQ(xop::load_config(tmp.path()).options_fence.database_path, ":memory:");
+    }
+    {
+        // Beside config.yaml, whatever the engine's working directory.
+        namespace fs = std::filesystem;
+        const fs::path dir = fs::temp_directory_path() / "xop_options_db_anchor";
+        fs::create_directories(dir);
+        const fs::path file = dir / "config.yaml";
+        {
+            std::ofstream out(file);
+            out << options("  database_path: books/options.db\n");
+        }
+        EXPECT_EQ(xop::load_config(file.string()).options_fence.database_path,
+                  (dir / "books/options.db").lexically_normal().string());
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
+    {
+        TempYaml tmp(options("") + "accounting:\n  options_transfer_ingest_enabled: false\n");
+        EXPECT_FALSE(xop::load_config(tmp.path()).accounting.options_transfer_ingest_enabled);
+    }
+}

@@ -308,7 +308,7 @@ TEST(SizingWiring, EveryBalanceCacheWriterReadsFromASyncedWallet) {
     const std::string fetch = function_body(raw, "asio::awaitable<bool> Engine::fetch_bridge_balance(");
     ASSERT_FALSE(fetch.empty());
     EXPECT_EQ(count_of(fetch, "cached_wallet_balances_["), 1u);
-    EXPECT_EQ(count_of(engine, "co_await fetch_bridge_balance("), 3u) << "the three callers below";
+    EXPECT_EQ(count_of(engine, "co_await fetch_bridge_balance("), 4u) << "the four callers below";
     const std::string primary = function_body(raw, "asio::awaitable<void> Engine::step_ingest_bridge_flows(");
     ASSERT_FALSE(primary.empty());
     EXPECT_NE(position_of(primary, "snapshot_current = co_await secondary_wallet_synced(block_height) "
@@ -332,6 +332,19 @@ TEST(SizingWiring, EveryBalanceCacheWriterReadsFromASyncedWallet) {
     ASSERT_NE(takes_fetch_at, std::string::npos);
     EXPECT_LT(takes_synced_at, takes_fetch_at);
     EXPECT_EQ(count_of(takes, "fetch_bridge_balance("), 1u);
+    // [OPTIONS-CAPITAL] The options ingest reads its snapshots through one
+    // helper, which asks first too.
+    const std::string options =
+        function_body(raw, "asio::awaitable<bool> Engine::options_wallet_snapshot(");
+    ASSERT_FALSE(options.empty());
+    const std::size_t options_synced_at =
+        position_of(options, "if (!co_await secondary_wallet_synced(block_height)) co_return false;");
+    const std::size_t options_fetch_at =
+        position_of(options, "co_await fetch_bridge_balance(asset, block_height, &validated);");
+    ASSERT_NE(options_synced_at, std::string::npos);
+    ASSERT_NE(options_fetch_at, std::string::npos);
+    EXPECT_LT(options_synced_at, options_fetch_at);
+    EXPECT_EQ(count_of(options, "fetch_bridge_balance("), 1u);
 
     // Synced means Step 8 passed its gate this heartbeat, or an on-demand
     // reading the way that gate reads it.

@@ -160,8 +160,11 @@ def test_step11s_restart_reconcile_re_anchors_a_secondary_asset():
     corrected; for a secondary bridge asset that is a capital event."""
     step11 = _body(_engine(), STEP11)
     write = step11.index("note_inventory_absolute_write(aid);")
-    tail = step11[write:write + 1500]
+    # [OPTIONS-CAPITAL] 1700, from 1500: the condition gained a clause (an
+    # asset an options flow re-armed re-anchors the same way).
+    tail = step11[write:write + 1700]
     assert "is_secondary_bridge_asset(" in tail
+    assert "options_capital_assets_.count(aid) > 0" in tail
     assert "peak_equity_hwm_usd_ = 0.0;" in tail
     assert "pnl_window_rebase_assets_[aid] = block_height;" in tail
 

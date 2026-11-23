@@ -50,6 +50,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -274,6 +275,9 @@ public:
         for (const auto& ph : puzzle_hashes) puzzle_hashes_.insert(fence_normalise_hex(ph));
         refreshed_at_.reset();
         coins_.clear();
+        listed_ = false;
+        raised_.reset();
+        lowered_.reset();
     }
 
     /// Which asset each fenced puzzle hash holds ("xch", or a CAT's asset id),
@@ -310,12 +314,24 @@ public:
     /// whether this changed it.  Either way the list is forgotten: going up,
     /// it is unknown until the next refresh -- never an old list from before
     /// the fence went down -- and going down there is nothing to hold.
+    ///
+    /// [OPTIONS-CAPITAL] Going down, the coins of the last list become
+    /// trading funds, and the books record how much: that list is kept
+    /// (lowered) before it is forgotten.  Going up, what the first list
+    /// holds leaves the trading funds (raised), so the old one is dropped.
     bool set_active(bool active)
     {
         std::lock_guard lock(mtx_);
         if (active_ == active) return false;
+        if (!active) {
+            lowered_ = listed_
+                ? std::optional<Holding>{holding_of(coins_, unix_now())}
+                : std::nullopt;
+        }
+        raised_.reset();
         active_ = active;
         coins_.clear();
+        listed_ = false;
         refreshed_at_.reset();
         last_error_.clear();
         return true;
@@ -337,10 +353,13 @@ public:
     {
         std::lock_guard lock(mtx_);
         coins_ = std::move(coins);
+        listed_ = true;
         refreshed_at_ = now;
-        refreshed_unix_ = std::chrono::duration<double>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        refreshed_unix_ = unix_now();
         last_error_.clear();
+        // [OPTIONS-CAPITAL] The first list since the fence went up is what
+        // left the trading funds with it.
+        if (on() && !raised_) raised_ = holding_of(coins_, refreshed_unix_);
     }
 
     /// The list could not be refreshed: until the next successful update the
@@ -398,6 +417,67 @@ public:
             }
         }
         return std::pair<std::uint64_t, std::size_t>{amount, count};
+    }
+
+    /// [OPTIONS-CAPITAL] Mojos by fenced asset ("xch" or an asset id).
+    using Totals = std::vector<std::pair<std::string, std::uint64_t>>;
+
+    /// [OPTIONS-CAPITAL] What the sub-account held at one moment
+    /// (accounting/options_transfer.hpp books it when the fence moves).
+    struct Holding {
+        /// Every fenced asset in the order the assets were set, also one
+        /// that holds nothing.
+        Totals totals;
+        /// Each coin's amount under its asset: a top-up's coin can be found
+        /// among them.
+        Totals coins;
+        /// When (Unix seconds): the list's own time for raised() and
+        /// list_holding(), the moment the fence went down for lowered().
+        double at_unix{0.0};
+    };
+
+    /// [OPTIONS-CAPITAL] The first list had since the fence last went up (or
+    /// was configured): what left the trading funds with it.  Kept as it was
+    /// then, whatever the address holds by now.  std::nullopt until that
+    /// list is had, and while the fence is down.
+    [[nodiscard]] std::optional<Holding> raised() const
+    {
+        std::lock_guard lock(mtx_);
+        return raised_;
+    }
+
+    /// [OPTIONS-CAPITAL] The last list had before the fence last went down,
+    /// stamped with when it went down: those coins became trading funds
+    /// then.  The list may have been old, or its last refresh failed; it is
+    /// still the best count of what came back.  std::nullopt when the fence
+    /// never went down, or went down with no list had since it went up --
+    /// the amount is then unknown, never zero.
+    [[nodiscard]] std::optional<Holding> lowered() const
+    {
+        std::lock_guard lock(mtx_);
+        return lowered_;
+    }
+
+    /// [OPTIONS-CAPITAL] Lists the address afresh, whatever the fence's
+    /// state and without changing it: for a fence found down at start that
+    /// the books hold as up.  std::nullopt when it cannot be listed.  Never
+    /// throws.
+    boost::asio::awaitable<std::optional<Holding>> list_holding()
+    {
+        Refresher refresher;
+        {
+            std::lock_guard lock(mtx_);
+            if (!enabled_) co_return std::nullopt;
+            refresher = refresher_;
+        }
+        if (!refresher) co_return std::nullopt;
+        try {
+            const std::vector<FencedCoin> coins = co_await refresher();
+            std::lock_guard lock(mtx_);
+            co_return holding_of(coins, unix_now());
+        } catch (const std::exception&) {
+            co_return std::nullopt;
+        }
     }
 
     /// Refresh through the refresher when the list is missing or older than
@@ -458,6 +538,34 @@ private:
         return on() && !puzzle_hashes_.empty() && refreshed_at_ && now - *refreshed_at_ <= max_age_;
     }
 
+    [[nodiscard]] static double unix_now()
+    {
+        return std::chrono::duration<double>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    /// Caller holds mtx_.  `coins` by asset, as Holding describes.  A coin
+    /// at a puzzle hash with no asset counts toward none.
+    [[nodiscard]] Holding holding_of(const std::vector<FencedCoin>& coins, double at_unix) const
+    {
+        Holding holding;
+        holding.at_unix = at_unix;
+        for (const auto& [ph, asset] : asset_of_) {
+            auto slot = std::find_if(holding.totals.begin(), holding.totals.end(),
+                                     [&](const auto& t) { return t.first == asset; });
+            if (slot == holding.totals.end()) {
+                holding.totals.emplace_back(asset, std::uint64_t{0});
+                slot = std::prev(holding.totals.end());
+            }
+            for (const auto& c : coins) {
+                if (fence_normalise_hex(c.puzzle_hash) != ph) continue;
+                slot->second += c.amount;
+                holding.coins.emplace_back(asset, c.amount);
+            }
+        }
+        return holding;
+    }
+
     mutable std::mutex                 mtx_;
     bool                               enabled_{false};
     bool                               active_{true};
@@ -465,6 +573,10 @@ private:
     std::set<std::string>              puzzle_hashes_;
     std::vector<std::pair<std::string, std::string>> asset_of_;
     std::vector<FencedCoin>            coins_;
+    /// A list was had since the fence last went up (or was configured).
+    bool                               listed_{false};
+    std::optional<Holding>             raised_;
+    std::optional<Holding>             lowered_;
     std::optional<Clock::time_point>   refreshed_at_;
     double                             refreshed_unix_{0.0};
     std::string                        last_error_;

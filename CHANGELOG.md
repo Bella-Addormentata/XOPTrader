@@ -98,6 +98,38 @@ out a billion times off.
 - Fills were never affected: they are priced from the settled amounts by a
   formula that had the decimals. The readers now share that one formula.
 
+### An options top-up is a transfer, not a loss (#258)
+
+When the options book tops up its sub-account, those coins leave the funds
+the engine trades with. The engine's books had no entry for that. The ledger
+sat above the wallet by the amount, which the divergence check lets pass only
+while enough offers rest. And the equity that left read as a trading loss:
+at once for wUSDC.b, at the next engine start for XCH. Three top-ups were
+waiting like that: 1.5 XCH and 2 wUSDC.b on 2026-11-20, 0.5 XCH on
+2026-11-21.
+
+- **A top-up is booked as capital that left.** The engine reads the options
+  book's record (read-only) and enters each confirmed top-up and its fee in
+  the ledger as an `options_withdrawal`. Its value goes to Net Deposits, not
+  to P&L. The three waiting ones are booked the first time this engine runs
+  with the fence up.
+- **So is the fence going down or up** (`engine_fence: auto`). Down, the
+  sub-account's coins are trading funds again: a deposit of what it held.
+  Up, they leave again: a withdrawal of what it holds.
+- **Nothing is counted twice.** A top-up counts only if the fence was up
+  when it went out. One sent while it was down is part of what the fence
+  takes when it goes up.
+- **No alert while a top-up is on its way.** The options book records a
+  confirmation minutes after the coins moved (five, for the three above).
+  The divergence check allows for a sent top-up until it is booked, for at
+  most two hours, instead of "reconciling" it away as unexplained and then
+  meeting it again.
+- The Net Deposits card counts these beside the bridge flows.
+- Not covered, and still left to the divergence check: a premium (it arrives
+  at an ordinary address of the wallet), and what the options book did
+  across a fence change while the engine was not running.
+- `accounting.options_transfer_ingest_enabled: false` turns it off.
+
 ### Two alerts that fired on nearly every cycle (#251)
 
 - **Natural Hedge Efficiency** was worked out per heartbeat from that block's

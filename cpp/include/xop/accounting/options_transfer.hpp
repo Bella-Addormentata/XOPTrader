@@ -1,0 +1,527 @@
+// options_transfer.hpp -- Capital moved between the trading funds and the
+// options sub-account, booked as EXTERNAL CAPITAL
+// ([OPTIONS-CAPITAL 2026-11-23], operator-approved: Dorkmo).
+//
+// WHY THIS EXISTS.  The options book (gui/services/options) keeps its working
+// funds at one address of the trading wallet, the options sub-account, and
+// the engine fences that address off (rpc/coin_fence.hpp).  While the fence
+// is up, ChiaWalletRPC::get_wallet_balance takes the sub-account's coins out
+// of every balance the engine reads: the engine's balances are the TRADING
+// funds.  So when the book tops the sub-account up -- a plain wallet send
+// from the trading funds to the options address -- the engine's balance
+// drops by the amount (and the fee, in XCH), and nothing said why:
+//
+//   * the ledger had no entry for it, so the books sat above the wallet by
+//     the top-up.  The invariant control tolerates that while the resting
+//     offers are large, and once they are not it raises LedgerDivergence and
+//     posts an "unexplained" adjust;
+//   * Net Deposits did not move, so the equity that left read as
+//     performance.  For wUSDC.b the bridge scan reconciles the tracked
+//     quantity to the wallet at once; for XCH the tracker kept the old
+//     quantity until the next restart's one-shot reconcile.
+//
+// The live record on 2026-11-23: three top-ups in the options database
+// (1.5 XCH and 2 wUSDC.b on 2026-11-20, 0.5 XCH on 2026-11-21, a fee of
+// 10,000,000 mojos each) and no ledger entry for any of them.
+//
+// ACCOUNTING TREATMENT.  The same as a warp bridge flow
+// (accounting/bridge_ingest.hpp): capital that crosses the edge of the
+// trading book is NOT performance.  It books as a first-class ledger event
+// (options_withdrawal out of the trading funds, options_deposit back into
+// them) BEFORE the divergence control runs, its USD value goes to NET
+// DEPOSITS, and a flow booked in this process re-anchors the drawdown peak
+// (restart semantics).
+//
+// WHAT CROSSES THE EDGE.
+//   * A top-up.  The book records it in its own database: an `events` row of
+//     kind topup_sent (amount, fee, transaction) written when the send is
+//     accepted, and one of kind topup_confirmed when the book next sees the
+//     wallet report it confirmed -- up to one of its steps later.  The
+//     engine reads that table READ-ONLY, as it reads the GUI's warp jobs.
+//   * The fence going down or up (`engine_fence: auto`).  Down, the
+//     sub-account's coins are trading funds again: a deposit of what it
+//     held.  Up, they leave: a withdrawal of what it holds.
+// What does NOT cross it: a mint, a clawback, an expiry.  Collateral moves
+// between the options address and a contract, and no balance the engine
+// reads changes.
+//
+// HOW MUCH A FENCE EVENT MOVES, AND WHEN.  The fence keeps the list it had
+// at the transition (rpc::CoinFence): the first list after it went up, the
+// last one before it went down.  The event books that list, stamped with
+// that moment, however much later it is written -- so what reached the
+// address afterwards is not in it.
+//
+// WHAT IS BOOKED, and why nothing is counted twice.
+//   * A top-up is capital that left only if the fence was up when it
+//     arrived.  With the engine running the book sends one only beside a
+//     fence that is up and listed, so:
+//       - while the books stand with the fence DOWN, no top-up is booked
+//         (judge_topup: Deferred).  Its coins are trading funds, and the
+//         next fence-up event takes them with everything else there;
+//       - a top-up SENT before the newest fence-up event's list is inside
+//         that event (topup_inside_fence_event): never booked;
+//       - any other confirmed top-up is booked.
+//   * Top-ups go first: a fence event is booked only in a pass where no
+//     confirmed top-up is still waiting (for a price, a wallet snapshot).
+//     Otherwise one sent while the fence was up could be taken for one that
+//     is inside the fence-up event after it.
+//   * The fence going down returns the coins of its list.  A top-up the book
+//     has not yet recorded as confirmed, whose coin that list holds, did
+//     arrive while the fence was up: it is booked with the event
+//     (topup_coin_listed), or the deposit would return capital no
+//     withdrawal took out.
+//   * A fence event is written at EVERY transition, also when the address
+//     held nothing (one zero leg on XCH).  So the direction of the newest
+//     fence event is where the books stand, a restart reads the same answer,
+//     and a transition while the engine was not running shows as the fence
+//     standing the other way from the books.  With no fence event at all the
+//     state the fence is found in is adopted with a zero event (#1), which
+//     takes nothing: no top-up is inside it, and what the address held
+//     before the books began is history (KNOWN LIMITS).
+//
+// UNTIL THE BOOK HAS RECORDED A CONFIRMATION the wallet may already be
+// short of the top-up.  The engine widens the divergence control's tolerance
+// by the amount for that long (topup_slack_applies), so a top-up is not
+// "reconciled" away as unexplained minutes before it is booked.
+//
+// KNOWN LIMITS.  Each leaves a gap the divergence control absorbs.
+//   * A premium is paid to an ordinary address of the wallet, so it reaches
+//     the trading funds with no event.
+//   * A top-up whose topup_sent row was never written (the app stopped
+//     between the send and the write) is not booked.
+//   * What happened before the first booked event: the sub-account's first
+//     coins, and the fee coins the wallet took from it on 2026-11-20.
+//   * With the engine not running while the book acts, the engine sees only
+//     what the address holds at its next start.  A top-up sent then, with
+//     the books standing fence-down, counts as inside the fence-up event:
+//     wrong by its amount when its coin had not arrived yet, or had already
+//     gone into a contract.  And a fence that went down then returns what
+//     the address holds at that start, less whatever was spent from it.
+//   * Switching the options book off in config.yaml (options.enabled, not
+//     the toolbar) takes the fence away with no event.
+//
+// Everything that decides is pure and in this header, unit-tested in
+// tests/test_options_transfer.cpp.
+
+#ifndef XOP_ACCOUNTING_OPTIONS_TRANSFER_HPP
+#define XOP_ACCOUNTING_OPTIONS_TRANSFER_HPP
+
+#include "xop/types.hpp"
+
+#include <cctype>
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
+namespace xop::accounting {
+
+inline constexpr const char* kOptionsWithdrawal      = "options_withdrawal";
+inline constexpr const char* kOptionsDeposit         = "options_deposit";
+/// The leg that carries the capital, and the one that carries a send's fee.
+inline constexpr const char* kOptionsLeg             = "options";
+inline constexpr const char* kOptionsFeeLeg          = "fee";
+inline constexpr const char* kOptionsEventPrefix     = "options_";
+inline constexpr const char* kOptionsTopUpPrefix     = "options_topup:";
+inline constexpr const char* kOptionsFencePrefix     = "options_fence_";
+inline constexpr const char* kOptionsFenceUpPrefix   = "options_fence_up:";
+inline constexpr const char* kOptionsFenceDownPrefix = "options_fence_down:";
+
+/// How long after its send a top-up that is not booked yet still widens the
+/// divergence control's tolerance.  The book gives a send an hour to
+/// confirm before it forgets it (OptionsBook._TOP_UP_FORGET_SECONDS); twice
+/// that, and a send that never confirmed stops loosening the control.
+inline constexpr std::int64_t kOptionsPendingSlackSeconds = 7'200;
+
+/// "YYYY-MM-DDTHH:MM:SSZ" for a Unix time, in UTC.  "" for a time outside
+/// 2000-01-01 .. 2200-01-01: the book writes `int(time.time())`, and
+/// anything else is not a time this ledger can order.  Pure arithmetic (the
+/// civil-from-days algorithm), so no C library time zone state is touched.
+[[nodiscard]] inline std::string iso_from_unix(std::int64_t unix_seconds)
+{
+    constexpr std::int64_t kMin = 946'684'800;    // 2000-01-01T00:00:00Z
+    constexpr std::int64_t kMax = 7'258'118'400;  // 2200-01-01T00:00:00Z
+    if (unix_seconds < kMin || unix_seconds >= kMax) return {};
+    const std::int64_t days = unix_seconds / 86'400;
+    const std::int64_t secs = unix_seconds % 86'400;
+    // Days since 1970-01-01 to a civil date (H. Hinnant, public domain).
+    const std::int64_t z   = days + 719'468;
+    const std::int64_t era = z / 146'097;
+    const std::int64_t doe = z - era * 146'097;
+    const std::int64_t yoe = (doe - doe / 1'460 + doe / 36'524 - doe / 146'096) / 365;
+    const std::int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const std::int64_t mp  = (5 * doy + 2) / 153;
+    const std::int64_t day = doy - (153 * mp + 2) / 5 + 1;
+    const std::int64_t month = mp < 10 ? mp + 3 : mp - 9;
+    const std::int64_t year  = yoe + era * 400 + (month <= 2 ? 1 : 0);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04lld-%02lld-%02lldT%02lld:%02lld:%02lldZ",
+                  static_cast<long long>(year), static_cast<long long>(month),
+                  static_cast<long long>(day), static_cast<long long>(secs / 3'600),
+                  static_cast<long long>((secs / 60) % 60), static_cast<long long>(secs % 60));
+    return std::string(buf);
+}
+
+/// One row of the options book's `events` table, as the engine reads it.
+struct OptionsEventRow {
+    std::int64_t id{0};       ///< events.id (AUTOINCREMENT).
+    std::int64_t at{0};       ///< events.at (Unix seconds).
+    std::string  kind;        ///< topup_sent | topup_confirmed
+    std::string  detail_json;
+};
+
+/// One top-up: the topup_sent row, with the time of the topup_confirmed row
+/// for the same transaction when there is one.
+struct OptionsTopUpRow {
+    std::int64_t sent_event_id{0};  ///< events.id of topup_sent.
+    std::int64_t sent_at{0};        ///< events.at of topup_sent (Unix seconds).
+    std::int64_t confirmed_at{0};   ///< events.at of topup_confirmed; 0 = not yet.
+    std::string  detail_json;       ///< topup_sent's detail.
+};
+
+/// One leg of a flow: signed mojos of one asset, + into the trading funds.
+struct OptionsLeg {
+    std::string leg;
+    std::string asset_id;
+    Mojo        delta_mojos{0};
+};
+
+enum class OptionsFlowStatus {
+    Invalid,  ///< Can never book: left to the divergence control.
+    Pending,  ///< A top-up the book has not recorded as confirmed yet.
+    Ready,
+};
+
+/// A movement of capital across the edge of the trading book.
+struct OptionsFlow {
+    OptionsFlowStatus       status{OptionsFlowStatus::Invalid};
+    std::string             event_type;  ///< options_withdrawal | options_deposit
+    std::string             event_id;    ///< The ledger's idempotency key.
+    std::string             reference;   ///< For the note and the log.
+    std::vector<OptionsLeg> legs;
+    /// A LOWER bound of when the wallet changed (the send; the transition).
+    /// It is what the ledger opening and the inventory tracker's last
+    /// absolute write are compared with: a later stamp could put a flow
+    /// they already hold after them, and book or move it twice.
+    std::string             floor_iso;
+    /// When the flow is known to have happened (the confirmation).
+    std::string             at_iso;
+};
+
+/// Mojos by asset ("xch" or an asset id), as the coin fence counts them
+/// (rpc::CoinFence::Totals): an asset's total, or one entry for each coin.
+using OptionsHeld = std::vector<std::pair<std::string, std::uint64_t>>;
+
+namespace detail {
+
+/// 64 lowercase hex digits, a 0x prefix dropped; nullopt for anything else.
+[[nodiscard]] inline std::optional<std::string> hex64(const std::string& text)
+{
+    std::string out = text;
+    if (out.size() >= 2 && out[0] == '0' && (out[1] == 'x' || out[1] == 'X')) {
+        out.erase(0, 2);
+    }
+    if (out.size() != 64) return std::nullopt;
+    for (char& c : out) {
+        const auto uc = static_cast<unsigned char>(c);
+        if (std::isxdigit(uc) == 0) return std::nullopt;
+        c = static_cast<char>(std::tolower(uc));
+    }
+    return out;
+}
+
+/// A JSON integer as a Mojo; nullopt for anything else, or one no Mojo holds.
+[[nodiscard]] inline std::optional<Mojo> json_mojos(const nlohmann::json& value)
+{
+    if (value.is_number_unsigned()) {
+        const auto v = value.get<std::uint64_t>();
+        if (v > static_cast<std::uint64_t>(std::numeric_limits<Mojo>::max())) return std::nullopt;
+        return static_cast<Mojo>(v);
+    }
+    if (value.is_number_integer()) return value.get<Mojo>();
+    return std::nullopt;
+}
+
+/// "strictly before" by the 19-character "YYYY-MM-DDTHH:MM:SS" prefix, as
+/// iso_strictly_after (bridge_ingest.hpp) compares; kept local so this
+/// header stands alone.  nullopt when either stamp is too short to compare.
+[[nodiscard]] inline std::optional<bool> iso_before(const std::string& a,
+                                                    const std::string& b) noexcept
+{
+    constexpr std::size_t kPrefix = 19;
+    if (a.size() < kPrefix || b.size() < kPrefix) return std::nullopt;
+    return a.compare(0, kPrefix, b, 0, kPrefix) < 0;
+}
+
+}  // namespace detail
+
+/// Pairs each topup_sent row with the first topup_confirmed row after it
+/// that names the same transaction.  Done here, not in SQL, so the engine's
+/// SQLite needs no JSON functions.  Rows of any other kind are ignored; a
+/// sent row whose transaction cannot be read is kept, unconfirmed, for
+/// classify_options_topup to refuse.
+[[nodiscard]] inline std::vector<OptionsTopUpRow> join_options_topups(
+    const std::vector<OptionsEventRow>& events)
+{
+    const auto transaction_of = [](const std::string& detail_json) -> std::optional<std::string> {
+        const nlohmann::json detail = nlohmann::json::parse(detail_json, nullptr, false);
+        if (!detail.is_object()) return std::nullopt;
+        const auto it = detail.find("transaction");
+        if (it == detail.end() || !it->is_string()) return std::nullopt;
+        return detail::hex64(it->get<std::string>());
+    };
+    std::vector<OptionsTopUpRow> rows;
+    for (const OptionsEventRow& sent : events) {
+        if (sent.kind != "topup_sent") continue;
+        OptionsTopUpRow row;
+        row.sent_event_id = sent.id;
+        row.sent_at       = sent.at;
+        row.detail_json   = sent.detail_json;
+        if (const auto transaction = transaction_of(sent.detail_json)) {
+            for (const OptionsEventRow& confirmed : events) {
+                if (confirmed.kind != "topup_confirmed" || confirmed.id <= sent.id) continue;
+                if (transaction_of(confirmed.detail_json) != transaction) continue;
+                if (row.confirmed_at == 0 || confirmed.at < row.confirmed_at) {
+                    row.confirmed_at = confirmed.at;
+                }
+            }
+        }
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
+
+/// Reads one top-up.  `quote_asset_id` is options.quote_asset_id, the asset
+/// the book calls "quote asset".  The capital leg, always the first, is the
+/// amount sent; the fee leg, when the send paid one, is XCH whatever was
+/// sent.
+[[nodiscard]] inline OptionsFlow classify_options_topup(const OptionsTopUpRow& row,
+                                                        const std::string& quote_asset_id)
+{
+    OptionsFlow flow;
+    const nlohmann::json detail = nlohmann::json::parse(row.detail_json, nullptr, false);
+    if (!detail.is_object()) return flow;
+
+    const auto transaction_it = detail.find("transaction");
+    if (transaction_it == detail.end() || !transaction_it->is_string()) return flow;
+    const auto transaction = detail::hex64(transaction_it->get<std::string>());
+    if (!transaction) return flow;  // no idempotency key: never book on a guess
+
+    const auto asset_it = detail.find("asset");
+    if (asset_it == detail.end() || !asset_it->is_string()) return flow;
+    const std::string what = asset_it->get<std::string>();
+    std::string asset_id;
+    if (what == "XCH") {
+        asset_id = "xch";
+    } else if (what == "quote asset") {
+        const auto quote = detail::hex64(quote_asset_id);
+        if (!quote) return flow;
+        asset_id = *quote;
+    } else {
+        return flow;
+    }
+
+    const auto amount_it = detail.find("amount");
+    if (amount_it == detail.end()) return flow;
+    const auto amount = detail::json_mojos(*amount_it);
+    if (!amount || *amount <= 0) return flow;
+
+    Mojo fee = 0;
+    if (const auto fee_it = detail.find("fee"); fee_it != detail.end() && !fee_it->is_null()) {
+        const auto parsed = detail::json_mojos(*fee_it);
+        if (!parsed || *parsed < 0) return flow;
+        fee = *parsed;
+    }
+
+    flow.floor_iso = iso_from_unix(row.sent_at);
+    if (flow.floor_iso.empty()) return flow;  // chronology unknowable
+
+    flow.event_type = kOptionsWithdrawal;
+    flow.event_id   = std::string{kOptionsTopUpPrefix} + *transaction;
+    flow.reference  = "top-up " + transaction->substr(0, 16);
+    flow.legs.push_back({kOptionsLeg, asset_id, -*amount});
+    if (fee > 0) flow.legs.push_back({kOptionsFeeLeg, "xch", -fee});
+
+    flow.at_iso = iso_from_unix(row.confirmed_at);
+    // A confirmation stamped before its own send is not one to trust.
+    flow.status = (!flow.at_iso.empty() && row.confirmed_at >= row.sent_at)
+        ? OptionsFlowStatus::Ready
+        : OptionsFlowStatus::Pending;
+    return flow;
+}
+
+/// The fence going up (`went_up`) or down, holding `held` (the total of
+/// each asset at the options address, at the transition).  Up, that capital
+/// leaves the trading funds; down, it returns.  An asset with nothing held
+/// has no leg -- except that the event always has one: with nothing held at
+/// all it carries a single zero leg on XCH, because the event itself is the
+/// record of which way the fence went.  The same shape adopts the state the
+/// fence is found in when the books hold no fence event yet: pass nothing
+/// held.  `sequence` numbers the fence events (next_fence_sequence), so the
+/// same transition gets the same event id however often it is tried.
+/// `at_iso` is the moment of the transition's list.
+[[nodiscard]] inline OptionsFlow options_fence_flow(bool went_up, std::int64_t sequence,
+                                                    const OptionsHeld& held,
+                                                    const std::string& at_iso)
+{
+    OptionsFlow flow;
+    if (sequence <= 0 || at_iso.empty()) return flow;
+    for (const auto& [asset_id, amount] : held) {
+        const Mojo mojos = to_mojo_saturating(amount);
+        if (asset_id.empty() || mojos <= 0) continue;
+        flow.legs.push_back({kOptionsLeg, asset_id, went_up ? -mojos : mojos});
+    }
+    if (flow.legs.empty()) flow.legs.push_back({kOptionsLeg, "xch", 0});
+    flow.event_type = went_up ? kOptionsWithdrawal : kOptionsDeposit;
+    flow.event_id   = std::string{went_up ? kOptionsFenceUpPrefix : kOptionsFenceDownPrefix}
+                      + std::to_string(sequence);
+    flow.reference  = std::string{went_up ? "fence up #" : "fence down #"} + std::to_string(sequence);
+    flow.floor_iso  = at_iso;
+    flow.at_iso     = at_iso;
+    flow.status     = OptionsFlowStatus::Ready;
+    return flow;
+}
+
+/// Where the books stand on the fence: the direction of the newest fence
+/// event they hold ("" when they hold none).  Unknown is "no fence event
+/// yet": the state the fence is found in is then adopted, with a zero event.
+enum class OptionsFenceBooked { Unknown, Up, Down };
+
+[[nodiscard]] inline OptionsFenceBooked booked_fence_state(
+    const std::string& latest_fence_event_id) noexcept
+{
+    const auto starts_with = [&](const char* prefix) {
+        return latest_fence_event_id.rfind(prefix, 0) == 0;
+    };
+    if (starts_with(kOptionsFenceDownPrefix)) return OptionsFenceBooked::Down;
+    if (starts_with(kOptionsFenceUpPrefix)) return OptionsFenceBooked::Up;
+    return OptionsFenceBooked::Unknown;
+}
+
+/// The stamp top-ups are compared with: the time of the newest fence-up
+/// event that took what the address held (its entry_time, the moment of its
+/// list).  "" when the books hold none -- and for event #1, which only
+/// adopted the state the fence was found in and took nothing.
+[[nodiscard]] inline std::string fence_up_stamp(const std::string& latest_fence_up_event_id,
+                                                const std::string& entry_time)
+{
+    if (latest_fence_up_event_id.rfind(kOptionsFenceUpPrefix, 0) != 0) return {};
+    if (latest_fence_up_event_id == std::string{kOptionsFenceUpPrefix} + "1") return {};
+    return entry_time;
+}
+
+/// Whether a top-up is inside what a fence-up event booked: it was sent
+/// before that event's list (`up_stamp`, from fence_up_stamp; "" when there
+/// is none), so the engine was not fencing the address when it went out and
+/// its coins are in what the event took.  Strictly before: beside a running
+/// engine the book sends only once the list is published, in the same
+/// second at the earliest.  Fails toward "inside": a stamp that cannot be
+/// read is not booked on a guess.
+[[nodiscard]] inline bool topup_inside_fence_event(const std::string& topup_floor_iso,
+                                                   const std::string& up_stamp) noexcept
+{
+    if (up_stamp.empty()) return false;
+    return detail::iso_before(topup_floor_iso, up_stamp).value_or(true);
+}
+
+/// What becomes of a confirmed top-up the ledger does not hold yet.
+enum class OptionsTopUpVerdict {
+    Book,      ///< The fence was up when it went out: capital that left.
+    Deferred,  ///< The books stand fence-down: the next fence-up event takes its coins.
+    Inside,    ///< Sent before the newest fence-up event's list: never booked.
+};
+
+/// See WHAT IS BOOKED.  `books` is where the books stand now; Unknown (the
+/// state is adopted before any top-up is judged) reads as Deferred.
+[[nodiscard]] inline OptionsTopUpVerdict judge_topup(OptionsFenceBooked books,
+                                                     const std::string& topup_floor_iso,
+                                                     const std::string& up_stamp) noexcept
+{
+    if (books != OptionsFenceBooked::Up) return OptionsTopUpVerdict::Deferred;
+    if (topup_inside_fence_event(topup_floor_iso, up_stamp)) {
+        return OptionsTopUpVerdict::Inside;
+    }
+    return OptionsTopUpVerdict::Book;
+}
+
+/// Whether `coins` (one entry for each coin at the options address) holds a
+/// top-up's coin: one of its asset and exactly its amount.  A send creates
+/// one coin of the amount sent, so this is the top-up having arrived,
+/// whatever the book has recorded.
+[[nodiscard]] inline bool topup_coin_listed(const OptionsFlow& topup, const OptionsHeld& coins) noexcept
+{
+    if (topup.legs.empty() || topup.legs.front().leg != kOptionsLeg) return false;
+    const OptionsLeg& capital = topup.legs.front();
+    if (capital.delta_mojos >= 0 || capital.delta_mojos == std::numeric_limits<Mojo>::min()) {
+        return false;
+    }
+    const auto amount = static_cast<std::uint64_t>(-capital.delta_mojos);
+    for (const auto& [asset_id, coin_amount] : coins) {
+        if (asset_id == capital.asset_id && coin_amount == amount) return true;
+    }
+    return false;
+}
+
+/// Whether a top-up sent at `sent_at` and not booked yet still widens the
+/// divergence control's tolerance at `now_unix` (see UNTIL THE BOOK HAS
+/// RECORDED A CONFIRMATION).
+[[nodiscard]] constexpr bool topup_slack_applies(std::int64_t sent_at, std::int64_t now_unix) noexcept
+{
+    return sent_at > 0 && now_unix >= sent_at && now_unix - sent_at <= kOptionsPendingSlackSeconds;
+}
+
+/// `a + b` for two tolerances, a negative one counting as none, held well
+/// inside Mojo's range: the divergence control adds its other terms to the
+/// sum.
+[[nodiscard]] constexpr Mojo add_slack(Mojo a, Mojo b) noexcept
+{
+    constexpr Mojo kCeiling = std::numeric_limits<Mojo>::max() / 4;
+    if (a < 0) a = 0;
+    if (b < 0) b = 0;
+    if (a > kCeiling) a = kCeiling;
+    if (b > kCeiling) b = kCeiling;
+    return a > kCeiling - b ? kCeiling : a + b;
+}
+
+/// The number of the next fence event, from the newest one the ledger holds
+/// ("" when it holds none): one more than its own, or 1.
+[[nodiscard]] inline std::int64_t next_fence_sequence(
+    const std::string& latest_fence_event_id) noexcept
+{
+    const auto colon = latest_fence_event_id.rfind(':');
+    if (latest_fence_event_id.rfind(kOptionsFencePrefix, 0) != 0 || colon == std::string::npos) {
+        return 1;
+    }
+    std::int64_t n = 0;
+    bool any = false;
+    for (std::size_t i = colon + 1; i < latest_fence_event_id.size(); ++i) {
+        const char c = latest_fence_event_id[i];
+        if (c < '0' || c > '9' || n > 100'000'000'000'000LL) return 1;
+        n = n * 10 + (c - '0');
+        any = true;
+    }
+    return any ? n + 1 : 1;
+}
+
+/// The ledger note of an options leg.  The signed USD rides in the same
+/// `flow_usd=` field a bridge note uses, so parse_bridge_flow_usd rebuilds
+/// Net Deposits from these rows too (PnLTracker::rehydrate_from_db).
+[[nodiscard]] inline std::string options_note(double flow_usd, double usd_per_unit,
+                                              const std::string& reference)
+{
+    char buf[224];
+    std::snprintf(buf, sizeof(buf),
+                  "options sub-account %s; flow_usd=%.10f; px_usd_per_unit=%.10f; ref=%.60s",
+                  flow_usd >= 0.0 ? "deposit" : "withdrawal", flow_usd, usd_per_unit,
+                  reference.c_str());
+    return std::string(buf);
+}
+
+}  // namespace xop::accounting
+
+#endif  // XOP_ACCOUNTING_OPTIONS_TRANSFER_HPP

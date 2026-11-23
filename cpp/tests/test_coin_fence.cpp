@@ -458,3 +458,160 @@ TEST(CoinFenceWiring, TheEngineFollowsTheOptionsFenceFlag)
     EXPECT_NE(sync.substr(0, sync.find("\n}")).find("want = ec ? true : there;"), std::string::npos)
         << "a flag that cannot be read counts as there: the fence fails up";
 }
+
+
+// -- [OPTIONS-CAPITAL] what the fence tells the books ------------------------------
+
+namespace {
+
+double unix_now()
+{
+    return std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+using Totals = rpc::CoinFence::Totals;
+
+}  // namespace
+
+TEST(CoinFenceCapital, TheFirstListAfterGoingUpIsWhatLeftTheTradingFunds)
+{
+    const std::string usd_ph = ex::CoinManager::cat_puzzle_hash(kUsdc, kPuzzle).value();
+    rpc::CoinFence fence;
+    fence.configure({kPuzzle, usd_ph}, std::chrono::seconds(30));
+    fence.set_assets({{kPuzzle, "xch"}, {usd_ph, std::string{"0x"} + kUsdc}});
+    EXPECT_FALSE(fence.raised()) << "up, and not listed yet";
+
+    const double before = unix_now();
+    fence.update({{"aa", kPuzzle, 500}, {"bb", kPuzzle, 250}, {"cc", usd_ph, 1000}});
+    const auto raised = fence.raised();
+    ASSERT_TRUE(raised);
+    EXPECT_EQ(raised->totals, (Totals{{"xch", 750}, {kUsdc, 1000}}));
+    EXPECT_EQ(raised->coins, (Totals{{"xch", 500}, {"xch", 250}, {kUsdc, 1000}}))
+        << "each coin under its asset: a top-up's coin can be found among them";
+    EXPECT_GE(raised->at_unix, before);
+    EXPECT_LE(raised->at_unix, unix_now());
+
+    // It stays as it was then: a top-up that arrives later is not in it, so
+    // the event books what left with the fence however late it is written.
+    fence.update({{"aa", kPuzzle, 500}, {"bb", kPuzzle, 250}, {"cc", usd_ph, 1000},
+                  {"dd", kPuzzle, 2000}});
+    ASSERT_TRUE(fence.raised());
+    EXPECT_EQ(fence.raised()->totals, raised->totals);
+    EXPECT_EQ(fence.raised()->at_unix, raised->at_unix);
+    // A failed refresh does not unsay it either.
+    fence.mark_failed("node away");
+    ASSERT_TRUE(fence.raised());
+    EXPECT_EQ(fence.raised()->totals, raised->totals);
+
+    // Down, nothing is behind the fence; up again, the next first list counts.
+    ASSERT_TRUE(fence.set_active(false));
+    EXPECT_FALSE(fence.raised());
+    ASSERT_TRUE(fence.set_active(true));
+    EXPECT_FALSE(fence.raised()) << "unknown until listed, never the old count";
+    fence.update({{"dd", kPuzzle, 2000}});
+    ASSERT_TRUE(fence.raised());
+    EXPECT_EQ(fence.raised()->totals, (Totals{{"xch", 2000}, {kUsdc, 0}}))
+        << "an asset that is fenced and holds nothing is there, at nothing";
+    EXPECT_EQ(fence.raised()->coins, (Totals{{"xch", 2000}}));
+
+    // A list had while the fence is down is not one behind a fence.
+    ASSERT_TRUE(fence.set_active(false));
+    fence.update({{"ee", kPuzzle, 7}});
+    EXPECT_FALSE(fence.raised());
+
+    // Configured anew, it has no past.
+    fence.configure({kPuzzle}, std::chrono::seconds(30));
+    EXPECT_FALSE(fence.raised());
+    EXPECT_FALSE(fence.lowered());
+}
+
+TEST(CoinFenceCapital, GoingDownKeepsWhatTheLastListHeld)
+{
+    const std::string usd_ph = ex::CoinManager::cat_puzzle_hash(kUsdc, kPuzzle).value();
+    rpc::CoinFence fence;
+    fence.configure({kPuzzle, usd_ph}, std::chrono::seconds(30));
+    fence.set_assets({{kPuzzle, "xch"}, {usd_ph, kUsdc}});
+    EXPECT_FALSE(fence.lowered()) << "it never went down";
+
+    // Those coins become trading funds: the books need how much, and when.
+    fence.update({{"aa", kPuzzle, 500}, {"bb", kPuzzle, 250}, {"cc", usd_ph, 1000}});
+    fence.update({{"aa", kPuzzle, 500}, {"cc", usd_ph, 1000}});
+    const double before = unix_now();
+    ASSERT_TRUE(fence.set_active(false));
+    const auto lowered = fence.lowered();
+    ASSERT_TRUE(lowered);
+    EXPECT_EQ(lowered->totals, (Totals{{"xch", 500}, {kUsdc, 1000}})) << "the last list";
+    EXPECT_EQ(lowered->coins, (Totals{{"xch", 500}, {kUsdc, 1000}}));
+    EXPECT_GE(lowered->at_unix, before) << "stamped when it went down, not when it was listed";
+    EXPECT_LE(lowered->at_unix, unix_now());
+    EXPECT_FALSE(fence.is_fenced_coin("aa")) << "the list itself is forgotten, as before";
+    EXPECT_FALSE(fence.set_active(false)) << "already down";
+    ASSERT_TRUE(fence.lowered());
+    EXPECT_EQ(fence.lowered()->at_unix, lowered->at_unix);
+
+    // Up again and down before any list: unknown, never the old count and
+    // never zero.
+    ASSERT_TRUE(fence.set_active(true));
+    EXPECT_TRUE(fence.lowered()) << "the last lowering still stands";
+    ASSERT_TRUE(fence.set_active(false));
+    EXPECT_FALSE(fence.lowered());
+
+    // A list whose last refresh failed, or that has gone stale, is still the
+    // best count of what came back.
+    ASSERT_TRUE(fence.set_active(true));
+    fence.update({{"dd", kPuzzle, 40}});
+    fence.mark_failed("node away");
+    ASSERT_TRUE(fence.set_active(false));
+    ASSERT_TRUE(fence.lowered());
+    EXPECT_EQ(fence.lowered()->totals, (Totals{{"xch", 40}, {kUsdc, 0}}));
+}
+
+TEST(CoinFenceCapital, ListHoldingReadsTheAddressWhateverTheFenceIsDoing)
+{
+    const std::string usd_ph = ex::CoinManager::cat_puzzle_hash(kUsdc, kPuzzle).value();
+    const auto run = [](rpc::CoinFence& fence) {
+        boost::asio::io_context ioc;
+        auto done = boost::asio::co_spawn(ioc, fence.list_holding(), boost::asio::use_future);
+        ioc.run();
+        return done.get();
+    };
+    rpc::CoinFence off;
+    EXPECT_FALSE(run(off)) << "not configured: no address to list";
+
+    rpc::CoinFence fence;
+    fence.configure({kPuzzle, usd_ph}, std::chrono::seconds(30));
+    fence.set_assets({{kPuzzle, "xch"}, {usd_ph, kUsdc}});
+    EXPECT_FALSE(run(fence)) << "no refresher installed";
+
+    int calls = 0;
+    fence.set_refresher([&]() -> boost::asio::awaitable<std::vector<rpc::FencedCoin>> {
+        ++calls;
+        co_return std::vector<rpc::FencedCoin>{{"aa", kPuzzle, 500}, {"cc", usd_ph, 1000}};
+    });
+    fence.set_active(false);
+    const double before = unix_now();
+    const auto holding = run(fence);
+    ASSERT_TRUE(holding) << "a fence that is down can still be asked what is at the address";
+    EXPECT_EQ(holding->totals, (Totals{{"xch", 500}, {kUsdc, 1000}}));
+    EXPECT_EQ(holding->coins, (Totals{{"xch", 500}, {kUsdc, 1000}}));
+    EXPECT_GE(holding->at_unix, before);
+    EXPECT_EQ(calls, 1);
+    // It changed nothing: still down, still fencing nothing.
+    EXPECT_FALSE(fence.enabled());
+    ASSERT_TRUE(fence.exclusions());
+    EXPECT_TRUE(fence.exclusions()->empty());
+    EXPECT_FALSE(fence.lowered()) << "it went down with no list had";
+
+    // Nor is asking a list behind the fence: up, the first refresh still is.
+    fence.set_active(true);
+    ASSERT_TRUE(run(fence));
+    EXPECT_FALSE(fence.raised());
+    EXPECT_FALSE(fence.exclusions()) << "still unknown to the spending calls";
+
+    fence.set_refresher([]() -> boost::asio::awaitable<std::vector<rpc::FencedCoin>> {
+        throw std::runtime_error("node away");
+        co_return std::vector<rpc::FencedCoin>{};
+    });
+    EXPECT_FALSE(run(fence)) << "unreadable is unknown, not empty";
+}
