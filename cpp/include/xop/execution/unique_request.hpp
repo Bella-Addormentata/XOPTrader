@@ -66,9 +66,11 @@
 // ---------------------------------------------------------------------------
 
 #include "xop/config.hpp"
+#include "xop/execution/take_sizing.hpp"
 #include "xop/peg_registry.hpp"
 #include "xop/types.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -113,6 +115,39 @@ using RequestedAmount = std::pair<std::string, Mojo>;
 [[nodiscard]] inline Mojo bid_offered_quote(const PairConfig& pair, Mojo price, Mojo size) noexcept
 {
     return leg_as_mojo(std::ceil(quote_leg_mojos(pair, price, size)));
+}
+
+/// [review #256] What a bid costs as the engine's own books count it: the
+/// exact integer ceiling that Step 7's funding fit, Step 8's exposure check
+/// and every per-side cap are reckoned with (execution::quote_cost_for_ask).
+/// bid_offered_quote() above is what the wallet is asked to pay, rounded
+/// from a double as build_offer_dict rounds it, and on a product that is a
+/// whole number of mojos the two can differ by one. 0 when it cannot be
+/// reckoned (a size or price that is not positive).
+[[nodiscard]] inline Mojo bid_planned_cost(const PairConfig& pair, Mojo price, Mojo size) noexcept
+{
+    return quote_cost_for_ask(BaseMojos{size}, price, BaseMpu{pair.base_mojos_per_unit},
+                              QuoteMpu{pair.quote_mojos_per_unit})
+        .v;
+}
+
+/// [review #256] What moving a bid from `size` to `moved_size` costs beyond
+/// what was planned for it. Nothing when neither reckoning goes up: not what
+/// the wallet is asked to pay, and not the engine's exact count. Else the
+/// dearer of the two after the move, less the exact count before it -- the
+/// figure the budgets and caps were set with, so a move charged this way
+/// stays inside them by either rounding.
+[[nodiscard]] inline Mojo bid_extra_cost(const PairConfig& pair, Mojo price, Mojo size,
+                                         Mojo moved_size) noexcept
+{
+    const Mojo planned = bid_planned_cost(pair, price, size);
+    const Mojo planned_moved = bid_planned_cost(pair, price, moved_size);
+    const Mojo pays_moved = bid_offered_quote(pair, price, moved_size);
+    if (planned_moved <= planned && pays_moved <= bid_offered_quote(pair, price, size)) {
+        return 0;
+    }
+    const Mojo dearer = std::max(planned_moved, pays_moved);
+    return dearer > planned ? dearer - planned : Mojo{0};
 }
 
 /// The requested side of a tier exactly as build_offer_dict asks for it: a
@@ -259,21 +294,21 @@ enum class RequestMove {
                 return RequestMove::Moved;
             }
         }
-        // More of it: free while what the bid pays does not change, and past
+        // More of it: free while what the bid costs does not change, and past
         // that paid for at its own price, within what its side has spare
-        // (bid_extra_pay) and max_bid_growth_bps of its size. Neither can be
-        // told of a payment no Mojo holds (leg_as_mojo).
-        const Mojo pays = bid_offered_quote(pair, tier.price, tier.size);
-        if (bounds.bid_may_grow && pays < kMax) {
+        // (bid_extra_pay) and max_bid_growth_bps of its size. The cost is
+        // reckoned as the budgets and caps reckon it (bid_extra_cost), and
+        // cannot be told of a payment no Mojo holds (leg_as_mojo).
+        if (bounds.bid_may_grow && bid_offered_quote(pair, tier.price, tier.size) < kMax) {
             const Mojo may_pay_more = bounds.bid_extra_pay > 0 ? bounds.bid_extra_pay : Mojo{0};
             for (int k = 1; k <= bounds.max_steps && tier.size <= kMax - k; ++k) {
                 const Mojo size = tier.size + k;
-                const Mojo pays_now = bid_offered_quote(pair, tier.price, size);
-                if (pays_now < pays || pays_now >= kMax) {
+                if (bid_offered_quote(pair, tier.price, size) >= kMax) {
                     break;
                 }
-                if (pays_now != pays
-                    && (pays_now - pays > may_pay_more
+                const Mojo extra = bid_extra_cost(pair, tier.price, tier.size, size);
+                if (extra > 0
+                    && (extra > may_pay_more
                         || static_cast<double>(k) * 10'000.0
                                > static_cast<double>(tier.size) * bounds.max_bid_growth_bps)) {
                     break;  // every larger size costs at least as much
@@ -358,8 +393,8 @@ struct RequestChange {
     Side         side{Side::Bid};
     Mojo         asked_before{0};
     Mojo         asked_now{0};
-    /// Quote mojos a bid pays beyond what it was sized to pay; 0 for an ask
-    /// and for a bid that moved for free.
+    /// Quote mojos a bid costs beyond what was planned for it
+    /// (bid_extra_cost); 0 for an ask and for a bid that moved for free.
     Mojo         paid_more{0};
 };
 
@@ -390,14 +425,14 @@ std::vector<RequestChange> make_requests_unique(const PairConfig& pair,
         if (bid_spare != nullptr) {
             bounds.bid_extra_pay = *bid_spare > 0 ? *bid_spare : Mojo{0};
         }
-        const Mojo paid_before = is_bid ? bid_offered_quote(pair, tier.price, tier.size) : Mojo{0};
+        const Mojo size_before = tier.size;
         const RequestMove move = make_request_unique(pair, tier, taken, bounds);
         const RequestedAmount now = requested_amount(pair, tier.side, tier.price, tier.size);
         if (move == RequestMove::Moved) {
             Mojo paid_more = 0;
             if (is_bid) {
-                const Mojo paid_now = bid_offered_quote(pair, tier.price, tier.size);
-                paid_more = paid_now > paid_before ? paid_now - paid_before : Mojo{0};
+                // The same reckoning the move was allowed on.
+                paid_more = bid_extra_cost(pair, tier.price, size_before, tier.size);
                 if (bid_spare != nullptr) {
                     *bid_spare -= paid_more;  // never past it: bid_extra_pay bounds the move
                 }

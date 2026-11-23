@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -28,7 +29,9 @@ using xop::PairConfig;
 using xop::PendingOffer;
 using xop::Side;
 using xop::TierQuote;
+using xop::execution::bid_extra_cost;
 using xop::execution::bid_offered_quote;
+using xop::execution::bid_planned_cost;
 using xop::execution::make_request_unique;
 using xop::execution::make_requests_unique;
 using xop::execution::merged_request;
@@ -621,6 +624,69 @@ TEST(UniqueRequest, BidsStayWithinTheirPairsShareOfAQuoteAssetTwoPairsSpend)
     EXPECT_EQ(moved.size(), 2u) << "1.001 and 1.002 BYC: one and two mojos more";
     EXPECT_EQ(shared, 1u) << "the fourth would need three, and one is left";
     EXPECT_EQ(spare, 1);
+}
+
+TEST(UniqueRequest, GrowthIsChargedAgainstTheExactCountTheCapsWereSetWith)
+{
+    // [review #256] Step 7 and Step 8 count a bid's cost as an exact integer
+    // ceiling; the wallet is asked to pay what build_offer_dict rounds from a
+    // double. On a product that is a whole number of mojos the double can
+    // land one over: 1 wmilliETH.b at 0.001015 XCH counts as 1,015,000,000
+    // mojos and may pay 1,015,000,001.
+    constexpr Mojo kPrice = 1'015'000'000;
+    const Mojo planned = bid_planned_cost(kEthXch, kPrice, 1'000);
+    ASSERT_EQ(planned, 1'015'000'000);
+    const Mojo pays = bid_offered_quote(kEthXch, kPrice, 1'000);
+    EXPECT_GE(pays, planned);
+    EXPECT_LE(pays, planned + 1) << "the two roundings differ by a mojo at most";
+    ASSERT_EQ(bid_planned_cost(kEthXch, kPrice, 1'001), 1'016'015'000);
+
+    // Growing it by a mojo costs at least 1,015,000 more than was planned
+    // for it, whichever way the unmoved bid was rounded: the dearer reckoning
+    // after, less the exact count before. Reckoned from the rounded payment
+    // before, it could come to 1,014,999 and pass a cap it breaks by one.
+    const Mojo extra = bid_extra_cost(kEthXch, kPrice, 1'000, 1'001);
+    EXPECT_EQ(extra, std::max(bid_planned_cost(kEthXch, kPrice, 1'001),
+                              bid_offered_quote(kEthXch, kPrice, 1'001))
+                         - planned);
+    EXPECT_GE(extra, 1'015'000) << "never under the exact difference";
+    EXPECT_LE(extra, 1'015'001);
+
+    // With 1,014,999 left, or anything under what it costs, the bid is as
+    // computed...
+    TierQuote t{};
+    t.side = Side::Bid;
+    t.size = 1'000;
+    t.price = kPrice;
+    for (const Mojo too_little : {Mojo{1'014'999}, extra - 1}) {
+        RequestBounds bounds = at_minimum(1'000);
+        bounds.bid_extra_pay = too_little;
+        EXPECT_EQ(make_request_unique(kEthXch, t, {{"eth", 1'000}}, bounds), RequestMove::Shared);
+        EXPECT_EQ(t.size, 1'000);
+    }
+
+    // ...and with exactly that much it grows, inside the cap by both
+    // reckonings, and the pass counts down exactly what it was allowed on.
+    std::vector<TierQuote> tiers{t};
+    std::set<RequestedAmount> taken{{"eth", 1'000}};
+    Mojo spare = extra;
+    const auto moved = make_requests_unique(
+        kEthXch, tiers, taken, [](const TierQuote&) { return at_minimum(1'000); }, nullptr, &spare);
+    ASSERT_EQ(moved.size(), 1u);
+    EXPECT_EQ(tiers[0].size, 1'001);
+    EXPECT_EQ(moved[0].paid_more, extra);
+    EXPECT_EQ(spare, 0);
+    EXPECT_LE(bid_planned_cost(kEthXch, kPrice, tiers[0].size), planned + extra);
+    EXPECT_LE(bid_offered_quote(kEthXch, kPrice, tiers[0].size), planned + extra);
+
+    // A move that raises neither reckoning is free, also where the unmoved
+    // bid's payment already sits a mojo over its exact count; and asking for
+    // less is never charged.
+    EXPECT_EQ(bid_extra_cost(kEthXch, kPrice, 1'000, 1'000), 0);
+    EXPECT_EQ(bid_extra_cost(kEthXch, kPrice, 1'001, 1'000), 0);
+    EXPECT_EQ(bid_extra_cost(kXchDbx, tier_of(Side::Bid, 88.520541355931, kXch).price, 10 * kXch,
+                             10 * kXch + 1),
+              0);
 }
 
 TEST(UniqueRequest, AFreeMoveLeavesTheSpareAlone)
