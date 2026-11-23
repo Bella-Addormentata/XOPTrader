@@ -78,6 +78,26 @@ mojo or two and never against a limit the engine holds:
   tiers.
 - With no allowed move, the offer is posted as before.
 
+### Offers read back from the wallet are priced right (#257)
+
+When the engine has no record of a wallet offer (after a restart, or an offer
+it had counted as gone), it reads the offer back from the wallet. It priced
+those offers without the two assets' decimals, which is right only where
+both assets have the same number of them. On every XCH pair the price came
+out a billion times off.
+
+- **What it cost.** The engine judged the offer against the market at that
+  price and cancelled it. At its start on 2026-11-20 it read a 22.8 XCH ask
+  at 1.011 wUSDC.b back as priced at "1011", and twelve minutes later
+  cancelled it for crossing the mid by 97,112%. The live history holds 38
+  such offers since April.
+- **Now** they are priced like any other offer, so one that is priced well
+  is kept. That saves its cancel fee and the gap on the book while it is
+  replaced. An adopted bid also counted for a billionth of what it would
+  spend until it was cancelled, and that is right now too.
+- Fills were never affected: they are priced from the settled amounts by a
+  formula that had the decimals. The readers now share that one formula.
+
 ### Two alerts that fired on nearly every cycle (#251)
 
 - **Natural Hedge Efficiency** was worked out per heartbeat from that block's

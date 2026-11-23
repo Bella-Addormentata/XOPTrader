@@ -350,10 +350,12 @@ TEST(UniqueRequest, AnAskWhosePriceCannotBeWrittenIsLeftShared)
 
 TEST(UniqueRequest, AnOfferReadBackFromTheWalletKeepsItsExactRequest)
 {
-    // OfferManager::try_parse_wallet_offer adopts an ask of 1 XCH for 997
-    // quote mojos at price 997: quote mojos per base mojo x 1e12, without the
-    // two assets' decimals. Run through the formula that price asks for
-    // nothing, so the request is taken from the wallet's summary and kept.
+    // Before v0.10.57 OfferManager::try_parse_wallet_offer adopted an ask of
+    // 1 XCH for 997 quote mojos at price 997: quote mojos per base mojo x
+    // 1e12, without the two assets' decimals (summary_offer.hpp has the
+    // price right now). Run through the formula that price asks for nothing,
+    // and such a row may still rest: the request is taken from the wallet's
+    // summary and kept.
     PendingOffer adopted{};
     adopted.offer_id = "0xadopted";
     adopted.pair_name = kXchUsdc.name;
@@ -837,14 +839,19 @@ TEST(UniqueRequestWiring, OffersReadBackFromTheWalletKeepWhatTheyAskFor)
 {
     const std::string manager = squeeze(read_offer_manager_cpp());
     ASSERT_FALSE(manager.empty()) << XOP_TESTS_OFFER_MANAGER_CPP;
-    // try_parse_wallet_offer, from the summary's requested amounts.
+    // Both readers take the offer's shape, its request included, from the
+    // summary (offer_from_summary, summary_offer.hpp).
     EXPECT_EQ(count_of(manager,
-                       "note_request(po, request_from_summary(pc_it->second, po.side, requested));"),
-              1u);
+                       "const std::optional<SummaryOffer> shape = "
+                       "offer_from_summary(offered, requested, pair_config_map_);"),
+              2u);
+    // try_parse_wallet_offer.
+    EXPECT_EQ(count_of(manager, "note_request(po, shape->request);"), 1u);
     // evaluate_orphan, and the orphan adopted from its verdict.
     EXPECT_EQ(count_of(manager,
-                       "if (const auto asked = request_from_summary(pc_it->second, eval.side, requested)) { "
-                       "eval.requested_asset = asked->first; eval.requested_mojos = asked->second; }"),
+                       "if (shape->request.has_value()) { "
+                       "eval.requested_asset = shape->request->first; "
+                       "eval.requested_mojos = shape->request->second; }"),
               1u);
     EXPECT_EQ(count_of(manager, "po.requested_asset = eval.requested_asset;"), 1u);
     EXPECT_EQ(count_of(manager, "po.requested_mojos = eval.requested_mojos;"), 1u);

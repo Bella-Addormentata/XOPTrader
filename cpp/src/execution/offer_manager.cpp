@@ -32,6 +32,7 @@
 #include <xop/execution/fee_feedback.hpp>
 #include <xop/execution/fill_proof.hpp>
 #include <xop/execution/stuck_tx_verdict.hpp>
+#include <xop/execution/summary_offer.hpp>
 #include <xop/execution/wallet_circuit.hpp>
 #include <xop/execution/wallet_poll_throttle.hpp>
 #include <xop/risk/watchdog.hpp>
@@ -4394,62 +4395,24 @@ OrphanEvaluation OfferManager::evaluate_orphan(
     }
 
     // ---- Match against our configured pairs --------------------------------
-    // For each pair, check if the offered/requested asset IDs match.
-    // An offer where we GIVE base and GET quote = ask (we sell).
-    // An offer where we GIVE quote and GET base = bid (we buy).
-    bool matched = false;
-    for (const auto& [pname, pcfg] : pair_config_map_) {
-        const std::string& base  = pcfg.base_asset_id;
-        const std::string& quote = pcfg.quote_asset_id;
-
-        bool offered_base  = offered.count(base)  > 0;
-        bool offered_quote = offered.count(quote)  > 0;
-        bool requested_base  = requested.count(base) > 0;
-        bool requested_quote = requested.count(quote) > 0;
-
-        if (offered_base && requested_quote) {
-            // We gave base, got quote -> ASK (we sold base).
-            eval.pair_name = pname;
-            eval.side      = Side::Ask;
-            eval.size      = offered.at(base);
-            // Price = quote_amount / base_amount (quote mojos per base mojo).
-            // But our pricing is in "quote per unit base", scaled to mojos.
-            // For XCH-denominated pairs, both sides are in mojos already.
-            const double base_d  = static_cast<double>(offered.at(base));
-            const double quote_d = static_cast<double>(requested.at(quote));
-            eval.price = (base_d > 0.0)
-                ? static_cast<Mojo>(std::llround(quote_d / base_d
-                    * static_cast<double>(kMojosPerXch)))
-                : 0;
-            matched = true;
-            break;
-        }
-        if (offered_quote && requested_base) {
-            // We gave quote, got base -> BID (we bought base).
-            eval.pair_name = pname;
-            eval.side      = Side::Bid;
-            eval.size      = requested.at(base);
-            const double base_d  = static_cast<double>(requested.at(base));
-            const double quote_d = static_cast<double>(offered.at(quote));
-            eval.price = (base_d > 0.0)
-                ? static_cast<Mojo>(std::llround(quote_d / base_d
-                    * static_cast<double>(kMojosPerXch)))
-                : 0;
-            matched = true;
-            break;
-        }
-    }
-
-    // [UNIQUE-REQUEST review #255] What it asks for, to the mojo, as the
-    // summary gives it: the price above is from raw mojos and cannot be run
-    // back into the amount (unique_request.hpp).
+    // An offer where we GIVE base and GET quote is an ask (we sell); one
+    // where we GIVE quote and GET base is a bid (we buy).
+    // [ADOPT-PRICE 2026-11-23] The price is the engine's, with both assets'
+    // denominations (summary_offer.hpp).  The raw-mojo ratio this used was
+    // 1e9 off on every XCH pair, so the orphan was judged against the mid
+    // below at a price that meant nothing.  What it asks for is kept to the
+    // mojo, as the summary gives it [UNIQUE-REQUEST].
+    const std::optional<SummaryOffer> shape =
+        offer_from_summary(offered, requested, pair_config_map_);
+    const bool matched = shape.has_value();
     if (matched) {
-        if (const auto pc_it = pair_config_map_.find(eval.pair_name);
-            pc_it != pair_config_map_.end()) {
-            if (const auto asked = request_from_summary(pc_it->second, eval.side, requested)) {
-                eval.requested_asset = asked->first;
-                eval.requested_mojos = asked->second;
-            }
+        eval.pair_name = shape->pair_name;
+        eval.side      = shape->side;
+        eval.size      = shape->size;
+        eval.price     = shape->price;
+        if (shape->request.has_value()) {
+            eval.requested_asset = shape->request->first;
+            eval.requested_mojos = shape->request->second;
         }
     }
 
@@ -4503,20 +4466,12 @@ OrphanEvaluation OfferManager::evaluate_orphan(
         return eval;
     }
 
-    const Mojo mid = mid_it->second;
-    const double mid_d   = static_cast<double>(mid);
-    const double price_d = static_cast<double>(eval.price);
-
-    // Signed deviation: positive means our price is ABOVE mid.
-    const double signed_dev = (mid_d > 0.0) ? (price_d - mid_d) / mid_d : 0.0;
-    eval.price_deviation = std::abs(signed_dev);
-
-    // Adverse direction:
-    //   BID too high (signed_dev > 0) -> overpaying, adverse.
-    //   ASK too low  (signed_dev < 0) -> underselling, adverse.
-    eval.adverse = (eval.side == Side::Bid)
-        ? (signed_dev > 0.0)
-        : (signed_dev < 0.0);
+    // How far the price is from the mid, and whether on the side that hurts
+    // us: a BID above it overpays, an ASK below it undersells
+    // (price_standing, summary_offer.hpp).
+    const PriceStanding standing = price_standing(eval.side, eval.price, mid_it->second);
+    eval.price_deviation = standing.deviation;
+    eval.adverse         = standing.adverse;
 
     // ---- Inventory helper bonus -------------------------------------------
     // Check if this orphan would help reduce inventory imbalance.
@@ -6242,54 +6197,22 @@ std::optional<PendingOffer> OfferManager::try_parse_wallet_offer(
 
     if (offered.empty() || requested.empty()) return std::nullopt;
 
-    // Match against configured pairs.
+    // Match against configured pairs.  [ADOPT-PRICE 2026-11-23] Priced with
+    // both assets' denominations (summary_offer.hpp); what it asks for is
+    // kept to the mojo, as the summary gives it [UNIQUE-REQUEST].
+    const std::optional<SummaryOffer> shape =
+        offer_from_summary(offered, requested, pair_config_map_);
+    if (!shape.has_value()) return std::nullopt;
+
     PendingOffer po;
-    po.offer_id = trade_id;
-    po.tier = 0;
+    po.offer_id  = trade_id;
+    po.tier      = 0;
     po.fee_mojos = 0;
-    bool matched = false;
-
-    for (const auto& [pname, pcfg] : pair_config_map_) {
-        const std::string& base  = pcfg.base_asset_id;
-        const std::string& quote = pcfg.quote_asset_id;
-
-        if (offered.count(base) && requested.count(quote)) {
-            po.pair_name = pname;
-            po.side      = Side::Ask;
-            po.size      = offered.at(base);
-            const double base_d  = static_cast<double>(offered.at(base));
-            const double quote_d = static_cast<double>(requested.at(quote));
-            po.price = (base_d > 0.0)
-                ? static_cast<Mojo>(std::llround(
-                    quote_d / base_d * static_cast<double>(kMojosPerXch)))
-                : 0;
-            matched = true;
-            break;
-        }
-        if (offered.count(quote) && requested.count(base)) {
-            po.pair_name = pname;
-            po.side      = Side::Bid;
-            po.size      = requested.at(base);
-            const double base_d  = static_cast<double>(requested.at(base));
-            const double quote_d = static_cast<double>(offered.at(quote));
-            po.price = (base_d > 0.0)
-                ? static_cast<Mojo>(std::llround(
-                    quote_d / base_d * static_cast<double>(kMojosPerXch)))
-                : 0;
-            matched = true;
-            break;
-        }
-    }
-
-    if (!matched) return std::nullopt;
-
-    // [UNIQUE-REQUEST review #255] What it asks for, to the mojo, as the
-    // summary gives it: the price above is from raw mojos and cannot be run
-    // back into the amount (unique_request.hpp).
-    if (const auto pc_it = pair_config_map_.find(po.pair_name);
-        pc_it != pair_config_map_.end()) {
-        note_request(po, request_from_summary(pc_it->second, po.side, requested));
-    }
+    po.pair_name = shape->pair_name;
+    po.side      = shape->side;
+    po.size      = shape->size;
+    po.price     = shape->price;
+    note_request(po, shape->request);
 
     // Extract fee.
     if (summary.contains("fees") && summary["fees"].is_number()) {
@@ -6424,19 +6347,17 @@ std::optional<SettledFill> OfferManager::parse_settled_fill(
         return std::nullopt;
     }
 
-    // Formula (*) from the dimensional analysis above.
-    const double price_d =
-        static_cast<double>(quote_mojos)
-        * static_cast<double>(pair.base_mojos_per_unit)
-        * static_cast<double>(kMojosPerXch)
-        / (static_cast<double>(base_mojos)
-           * static_cast<double>(pair.quote_mojos_per_unit));
-
-    if (!std::isfinite(price_d) || price_d <= 0.0) return std::nullopt;
+    // Formula (*) from the dimensional analysis above, in its one copy
+    // (price_from_legs, summary_offer.hpp): the same arithmetic in the same
+    // order, and checked, so a price no Mojo holds is "unparseable" and not
+    // whatever the cast leaves.
+    const std::optional<Mojo> price = price_from_legs(
+        base_mojos, quote_mojos, pair.base_mojos_per_unit, pair.quote_mojos_per_unit);
+    if (!price.has_value()) return std::nullopt;
 
     SettledFill sf;
     sf.size  = base_mojos;
-    sf.price = static_cast<Mojo>(std::llround(price_d));
+    sf.price = *price;
     return sf;
 }
 
