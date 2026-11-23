@@ -556,3 +556,23 @@ def test_the_example_config_sizes_its_contracts_from_the_limits() -> None:
     example = Path(__file__).resolve().parents[4] / "config.example.yaml"
     section = yaml.safe_load(example.read_text(encoding="utf-8"))["options"]
     assert section["contract_xch"] == "auto"
+
+
+def test_the_same_expiry_written_twice_is_one_expiry() -> None:
+    """[review #254] What auto sizes from, and what the Settings preview must match."""
+    same = ["2026-12-01T13:00:00Z", "2026-12-01T14:00:00+01:00", 1796130000]
+    assert config.distinct_expiries(same) == 1
+    assert config.distinct_expiries([*same, "2026-12-08T13:00:00Z"]) == 2
+    assert config.distinct_expiries([]) == 0
+    with pytest.raises(config.OptionsConfigError):
+        config.distinct_expiries(["next friday"])
+
+    # Two call strikes on that one expiry, 20 XCH lockable: two slots of 10 XCH.
+    parsed = _parse(
+        contract_xch="auto",
+        expiries=same,
+        call_strikes_pct=[110, 120],
+        limits={**_section()["limits"], "max_locked_xch": 20},
+    )
+    assert parsed.expiries == (1796130000,)
+    assert parsed.contract_xch_mojos == 10 * config.XCH_MOJOS

@@ -216,6 +216,15 @@ def _expiry(raw: Any) -> int:
     return int(moment.timestamp())
 
 
+def distinct_expiries(dates: Any) -> int:
+    """[AUTO-SIZE] How many expiries a written list of dates comes to, as :func:`parse` counts.
+
+    The same moment written twice, or in two UTC offsets, is one expiry. Raises
+    OptionsConfigError for an entry :func:`parse` would refuse.
+    """
+    return len({_expiry(item) for item in dates})
+
+
 #: [DEFAULTS] With neither strike list written, the book writes both sides,
 #: out of the money: calls above spot and puts below it. ``[]`` turns a side off.
 DEFAULT_CALL_STRIKES_PCT: tuple[int, ...] = (110, 120)

@@ -564,7 +564,13 @@ class OptionsSettingsSection:
         if mode == _EXPIRY_ROLLING:
             expiries = self.expiry_weeks.value() + self.expiry_months.value()
         elif mode == _EXPIRY_FIXED:
-            expiries = len(_text_list(self.expiries.text()))
+            dates = _text_list(self.expiries.text())
+            try:
+                # [review #254] As the book counts them: the same moment
+                # written twice, or in two UTC offsets, is one expiry.
+                expiries = options_config.distinct_expiries(dates)
+            except options_config.OptionsConfigError:
+                expiries = len(set(dates))  # Save says what is wrong with it
         else:
             expiries = 0
         size = options_config.auto_contract_xch(limits, calls, expiries)

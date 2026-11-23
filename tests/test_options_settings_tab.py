@@ -664,3 +664,27 @@ def test_switching_a_written_size_to_automatic_writes_auto(panel, tmp_path):
     # And back, untouched: the number it had, exactly.
     tab.size_mode.setCurrentIndex(_SIZE_FIXED)
     assert tab.contract_xch.value() == 1.0, "a save rebased the tab on auto"
+
+
+def test_the_auto_hint_counts_fixed_dates_as_the_book_does(panel, tmp_path):
+    """[review #254] The same expiry listed twice, or in two UTC offsets, is one expiry:
+    two call strikes and 20 XCH lockable are two slots of 10 XCH, not four of 1 XCH."""
+    limits = {**_FOUR_SLOTS, "max_locked_xch": 20}
+    cfg_path = _auto_book(
+        tmp_path,
+        expiries=["2026-12-04T14:00:00Z", "2026-12-04T15:00:00+01:00"],
+        limits=limits,
+    )
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+
+    assert tab.size_hint.text() == (
+        "10 XCH a contract: all 2 call slots fit inside Max XCH locked."
+    )
+    assert "30 XCH" in tab.target_hint.text(), "20 XCH plus one 10 XCH contract"
+
+    tab.expiries.setText("2026-12-04T14:00:00Z, 2026-12-11T14:00:00Z")  # two expiries
+    assert tab.size_hint.text().startswith("1 XCH a contract: all 4 call slots fit")
+
+    tab.expiries.setText("next friday, next friday")  # the book refuses it on Save
+    assert "XCH a contract" in tab.size_hint.text(), "the preview still shows a size"
