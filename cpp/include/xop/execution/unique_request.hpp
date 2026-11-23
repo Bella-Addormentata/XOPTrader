@@ -34,7 +34,8 @@
 // posts and records the moved tier, and the request itself is kept with the
 // offer in State and in offer_log (PendingOffer::requested_*), so it is known
 // to the mojo also after a restart and for an offer read back from the
-// wallet, whose price is not one this formula can be run backwards from.
+// wallet, whose price is rounded from its two legs and need not run back
+// into the exact amount.
 //
 // The engine compares a resting offer with its plan exactly in two places,
 // and a move must trip neither, or the offer is cancelled and reposted every
@@ -99,10 +100,9 @@ using RequestedAmount = std::pair<std::string, Mojo>;
 /// [review #255] A rounded quote leg as a Mojo. build_offer_dict casts it
 /// directly, which is undefined for a leg no Mojo holds. Step 7 plans no such
 /// tier, but these helpers are also run on the records of resting offers, and
-/// one adopted from the wallet before requests were recorded has a price
-/// worked out from raw mojos (1e9 times too large on wmilliETH.b/XCH). So
-/// here it is defined: nothing for a leg that is not positive, the largest
-/// Mojo for one past it.
+/// one adopted from the wallet before v0.10.57 has a price worked out from
+/// raw mojos (1e9 times too large on wmilliETH.b/XCH). So here it is defined:
+/// nothing for a leg that is not positive, the largest Mojo for one past it.
 [[nodiscard]] inline Mojo leg_as_mojo(double rounded_leg) noexcept
 {
     if (!(rounded_leg > 0.0)) {
@@ -167,10 +167,11 @@ using RequestedAmount = std::pair<std::string, Mojo>;
 /// summary gives for it (`requested`: asset id -> mojos). nullopt when the
 /// summary does not name that asset with a positive amount.
 ///
-/// An adopted offer's PendingOffer::price is worked out from the summary's
-/// raw mojos, without the two assets' decimals, so requested_amount() cannot
-/// be run on it: an ask of 1 XCH for 997 quote mojos is adopted at price 997
-/// and would read as asking for nothing.
+/// An adopted offer's PendingOffer::price is rounded from the summary's two
+/// legs (summary_offer.hpp), so requested_amount() run on it can land a mojo
+/// off.  Before v0.10.57 it was far worse: the price left out the two
+/// assets' denominations, so an ask of 1 XCH for 997 quote mojos was adopted
+/// at price 997 and read as asking for nothing.
 [[nodiscard]] inline std::optional<RequestedAmount> request_from_summary(
     const PairConfig& pair, Side side, const std::unordered_map<std::string, Mojo>& requested)
 {

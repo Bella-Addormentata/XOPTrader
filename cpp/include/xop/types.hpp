@@ -455,8 +455,10 @@ struct PendingOffer {
     // read back from the wallet, as the wallet's summary gives it.  Empty and
     // 0 when the record does not say (an offer_log row from before these
     // fields): execution/unique_request.hpp then works it out from price and
-    // size, which is exact for an offer this engine built and not for an
-    // adopted one, whose price comes from the summary's raw mojos.
+    // size, which is exact for an offer this engine built.  For one adopted
+    // from the wallet before v0.10.57 it is not: its price was the raw-mojo
+    // ratio of the summary, without the assets' denominations
+    // (execution/summary_offer.hpp).
     std::string  requested_asset{};
     Mojo         requested_mojos{0};
 

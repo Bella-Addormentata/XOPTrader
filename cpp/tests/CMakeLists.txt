@@ -128,6 +128,7 @@ add_executable(xop_tests
     test_activity_interpolation.cpp
     test_xch_mark_price.cpp
     test_settled_fill.cpp
+    test_summary_offer.cpp
     test_wallet_poll_throttle.cpp
     test_client_logger.cpp
     test_pid_reachability.cpp
