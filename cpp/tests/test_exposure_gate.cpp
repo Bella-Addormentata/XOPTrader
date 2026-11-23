@@ -32,6 +32,7 @@ using xop::execution::has_unmapped_live_claim;
 using xop::execution::resting_spend_on_asset;
 using xop::execution::RestingSpend;
 using xop::execution::spare_above_reserve;
+using xop::execution::within_side_caps;
 using xop::execution::projected_balance_after_fills;
 
 constexpr Mojo kMojo(long long v) { return static_cast<Mojo>(v); }
@@ -526,6 +527,33 @@ TEST(ExposureRule, LegacySpareIsWhatItsOneProjectionLeaves) {
     EXPECT_EQ(spare_above_reserve(false, in, ok),
               kSpendableBefore - kRestingBefore - kNewAsk - kReserve);
 }
+
+TEST(ExposureRule, TheSpareIsHeldToTheSidesOwnAllocation) {
+    // [review #256] wUSDC.b funds the XCH/wUSDC.b bids and the BYC/wUSDC.b
+    // bids. While it is short, Step 7 gives the BYC bids a share of 4,000
+    // mojos; four minimum bids cost 3,996 of it. The wallet has 100 spare
+    // above its reserve, but only 4 of them are this side's to spend.
+    EXPECT_EQ(within_side_caps(/*spare=*/100, /*side_spend=*/3'996, /*coin_share=*/Mojo{4'000},
+                               /*lockable=*/std::nullopt),
+              4);
+    // The same from the coin it may lock under wait-to-grow, and the tighter
+    // of the two when both are set.
+    EXPECT_EQ(within_side_caps(100, 3'996, std::nullopt, Mojo{3'998}), 2);
+    EXPECT_EQ(within_side_caps(100, 3'996, Mojo{4'000}, Mojo{3'998}), 2);
+    EXPECT_EQ(within_side_caps(100, 3'996, Mojo{3'997}, Mojo{4'500}), 1);
+    // A side at or past a cap has nothing: its resting offers hold it all.
+    EXPECT_EQ(within_side_caps(100, 4'000, Mojo{4'000}, std::nullopt), 0);
+    EXPECT_EQ(within_side_caps(100, 4'600, std::nullopt, Mojo{4'000}), 0);
+    // No cap set (the coin's claims fit and wait-to-grow is off): the
+    // wallet's figure stands. Never more than it, and never below zero.
+    EXPECT_EQ(within_side_caps(100, 3'996, std::nullopt, std::nullopt), 100);
+    EXPECT_EQ(within_side_caps(3, 3'996, Mojo{9'000}, Mojo{9'000}), 3);
+    EXPECT_EQ(within_side_caps(-7, 3'996, Mojo{9'000}, std::nullopt), 0);
+    EXPECT_EQ(within_side_caps(100, -50, Mojo{60}, std::nullopt), 60);
+}
+
+static_assert(within_side_caps(100, 3'996, Mojo{4'000}, std::nullopt) == 4,
+              "a side spends no more than its share of a short coin leaves");
 
 // Evaluated by the compiler too: it is the engine's bound on a spend.
 static_assert(spare_above_reserve(true, ExposureInputs{}, xop::execution::ExposureDecision{}) == 0,

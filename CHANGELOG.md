@@ -69,8 +69,9 @@ mojo or two and never against a limit the engine holds:
   far under a mojo of the quote asset. Where it is not, as for the 1 BYC
   bids of BYC/wUSDC.b, the bid pays for the extra mojos at its own price
   (about 0.001 wUSDC.b each): by at most 1% of its size, and only out of
-  what the wallet has spare above that asset's reserve (#256). A pair the
-  pace controller manages never grows a bid.
+  what the wallet has spare above that asset's reserve and within the pair's
+  own share of it (#256). A pair the pace controller manages never grows a
+  bid.
 - What each offer asks for is recorded with it (two new `offer_log`
   columns), so a restart reads the same amounts, also for an offer read back
   from the wallet and for a batched one, which asks for the total of its

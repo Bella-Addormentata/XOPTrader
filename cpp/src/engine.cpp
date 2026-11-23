@@ -17506,10 +17506,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // [UNIQUE-REQUEST 2026-11-23] What this pair's bid side could still
         // pay beyond its new tiers without changing the answer of the
         // exposure check below: what the quote asset's projection and its
-        // free coins leave above the reserve. 0 until that check has run and
-        // approved the side, so a side it did not judge pays nothing extra.
-        // Spent further down, by a bid that has to ask for more to differ
-        // from the other live offers (unique_request.hpp).
+        // free coins leave above the reserve, and [review #256] no more than
+        // Step 7's own caps on this side leave (its share of a short coin,
+        // its lockable coin), so it never pays out of another pair's
+        // allocation. 0 until that check has run and approved the side, so a
+        // side it did not judge pays nothing extra. Spent further down, by a
+        // bid that has to ask for more to differ from the other live offers
+        // (unique_request.hpp).
         Mojo bid_spare_quote_mojos = 0;
 
         // Pending exposure guard (pre-post projection): include currently
@@ -17731,9 +17734,23 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             if (can_bid && pair_quote_balance_known && pair_quote_reserve_mojos > 0
                 && (!exposure_unified || pair_quote_owned_known)) {
                 const auto [bid_in, bid_dec] = projection_for(/*is_ask=*/false);
-                // [UNIQUE-REQUEST] 0 unless the verdict is Ok.
-                bid_spare_quote_mojos = execution::spare_above_reserve(
-                    exposure_unified, bid_in, bid_dec);
+                // [UNIQUE-REQUEST] 0 unless the verdict is Ok. This side's
+                // spend is counted as Step 7 counts it: its live resting
+                // bids (a cancel in flight is the coin's pending change, not
+                // an offer) and the tiers it posts now.
+                Mojo side_bid_spend = planned_bid;
+                for (const auto& own_bid : state_->get_all_offers()) {
+                    if (own_bid.pair_name == pair_name && own_bid.side == Side::Bid
+                        && !own_bid.cancel_pending) {
+                        side_bid_spend = saturating_add_mojo(
+                            side_bid_spend,
+                            wait_grow_lock(own_bid.side, own_bid.size, own_bid.price,
+                                           *pair_cfg));
+                    }
+                }
+                bid_spare_quote_mojos = execution::within_side_caps(
+                    execution::spare_above_reserve(exposure_unified, bid_in, bid_dec),
+                    side_bid_spend, pcs.coin_share_bid, pcs.lockable_bid);
                 if (bid_dec.verdict != execution::ExposureVerdict::Ok) {
                     suppress_bid_projection = true;
                     can_bid = false;

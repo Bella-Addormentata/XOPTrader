@@ -56,10 +56,11 @@
 //     follow the rule too. Where more is not free -- a 1 BYC bid of
 //     BYC/wUSDC.b, where each BYC mojo costs about a mojo of the quote asset
 //     -- the bid pays for the extra mojos at its own price. Only out of what
-//     Step 8's exposure check found spare above the quote asset's reserve
-//     (bid_extra_pay; execution::spare_above_reserve), so no budget is
-//     passed and the reserve is not touched, and by at most
-//     max_bid_growth_bps of its size.
+//     Step 8's exposure check found spare above the quote asset's reserve,
+//     held to the side's own share of that asset and to the coin it may lock
+//     (bid_extra_pay; execution::spare_above_reserve and within_side_caps),
+//     so no budget is passed, no other pair's allocation is spent and the
+//     reserve is not touched; and by at most max_bid_growth_bps of its size.
 // A tier no allowed move clears is posted as computed: two offers sharing a
 // request only stops a taker combining them.
 // ---------------------------------------------------------------------------
@@ -368,9 +369,10 @@ struct RequestChange {
 /// that moved; `shared`, when given, counts those no allowed move cleared.
 ///
 /// `bid_spare`, when given, is what the pair's bid side may pay beyond its
-/// sizing, in quote mojos (execution::spare_above_reserve). It replaces each
-/// bid's bid_extra_pay and is counted down by what each bid pays more, so
-/// the bids of one call never pay more than it between them.
+/// sizing, in quote mojos (execution::within_side_caps of
+/// spare_above_reserve). It replaces each bid's bid_extra_pay and is counted
+/// down by what each bid pays more, so the bids of one call never pay more
+/// than it between them.
 template <typename BoundsOf>
 std::vector<RequestChange> make_requests_unique(const PairConfig& pair,
                                                 std::vector<TierQuote>& tiers,

@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "engine_source_scan.hpp"
+#include "xop/execution/exposure_gate.hpp"
 #include "xop/execution/unique_request.hpp"
 
 using xop::kMojosPerXch;
@@ -592,6 +593,36 @@ TEST(UniqueRequest, ABidPaysNoMoreThanItsSideHasSpare)
     }
 }
 
+TEST(UniqueRequest, BidsStayWithinTheirPairsShareOfAQuoteAssetTwoPairsSpend)
+{
+    // [review #256] wUSDC.b funds the XCH/wUSDC.b bids too. While it is
+    // short Step 7 holds the BYC/wUSDC.b bids to a share of 4,000 mojos, and
+    // the four minimum bids cost 1000 + 1000 + 999 + 997 = 3,996 of it. The
+    // wallet as a whole has 100 mojos spare above its reserve, which belong
+    // to the other pair: these bids may pay 4 more, not 6.
+    std::vector<TierQuote> tiers = byc_bids_at_the_minimum();
+    Mojo planned = 0;
+    for (const TierQuote& t : tiers) planned += bid_offered_quote(kBycUsdc, t.price, t.size);
+    ASSERT_EQ(planned, 3'996);
+    Mojo spare = xop::execution::within_side_caps(/*spare=*/100, /*side_spend=*/planned,
+                                                  /*coin_share=*/Mojo{4'000},
+                                                  /*lockable=*/std::nullopt);
+    ASSERT_EQ(spare, 4);
+
+    std::set<RequestedAmount> taken;
+    std::size_t shared = 0;
+    const auto moved = make_requests_unique(
+        kBycUsdc, tiers, taken, [](const TierQuote&) { return at_minimum(kCat); }, &shared, &spare);
+
+    Mojo spent = 0;
+    for (const TierQuote& t : tiers) spent += bid_offered_quote(kBycUsdc, t.price, t.size);
+    EXPECT_LE(spent, 4'000) << "never past the share";
+    EXPECT_EQ(spent, 3'999);
+    EXPECT_EQ(moved.size(), 2u) << "1.001 and 1.002 BYC: one and two mojos more";
+    EXPECT_EQ(shared, 1u) << "the fourth would need three, and one is left";
+    EXPECT_EQ(spare, 1);
+}
+
 TEST(UniqueRequest, AFreeMoveLeavesTheSpareAlone)
 {
     // An XCH bid at its tier minimum asks for a mojo more and pays the same,
@@ -696,11 +727,23 @@ TEST(UniqueRequestWiring, Step8MovesTheTiersItThenPostsAndRecords)
     EXPECT_EQ(count_of(engine, "orec.requested_mojos ="), 1u) << "never recomputed from the tier";
 
     // What a bid may pay for extra mojos is what the exposure check found
-    // spare for this pair's bid side, read before the pass and handed to it.
+    // spare for this pair's bid side, held to the side's own share of the
+    // coin and to the coin it may lock [review #256], read before the pass
+    // and handed to it.
     const std::size_t spare_declared_at = position_of(engine, "Mojo bid_spare_quote_mojos = 0;");
     const std::size_t spare_set_at = position_of(
-        engine, "bid_spare_quote_mojos = execution::spare_above_reserve( "
-                "exposure_unified, bid_in, bid_dec);");
+        engine, "bid_spare_quote_mojos = execution::within_side_caps( "
+                "execution::spare_above_reserve(exposure_unified, bid_in, bid_dec), "
+                "side_bid_spend, pcs.coin_share_bid, pcs.lockable_bid);");
+    // The side's spend: the tiers it posts now and its live resting bids.
+    EXPECT_NE(position_of(engine,
+                          "Mojo side_bid_spend = planned_bid; "
+                          "for (const auto& own_bid : state_->get_all_offers()) { "
+                          "if (own_bid.pair_name == pair_name && own_bid.side == Side::Bid "
+                          "&& !own_bid.cancel_pending) { "
+                          "side_bid_spend = saturating_add_mojo( side_bid_spend, "
+                          "wait_grow_lock(own_bid.side, own_bid.size, own_bid.price, *pair_cfg)); } }"),
+              std::string::npos);
     ASSERT_NE(spare_declared_at, std::string::npos);
     ASSERT_NE(spare_set_at, std::string::npos);
     EXPECT_LT(spare_declared_at, spare_set_at);
