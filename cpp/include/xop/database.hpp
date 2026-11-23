@@ -103,6 +103,10 @@ struct DbOfferRecord {
     std::uint64_t fee_mojos{0};      ///< Fee attached to this offer (mojos).
     Mojo        book_best_bid{0};   ///< Best competing bid at offer creation.
     Mojo        book_best_ask{0};   ///< Best competing ask at offer creation.
+    /// [UNIQUE-REQUEST] What the offer asks to be paid: the asset id and its
+    /// mojos (PendingOffer::requested_*).  "" and 0 when not recorded.
+    std::string requested_asset;
+    Mojo        requested_mojos{0};
 };
 
 /// [S14 2026-09-13] offer_log status values for a live offer and for an
@@ -134,6 +138,8 @@ inline constexpr const char* kOfferStatusCancelPending = "cancel_pending";
     po.created_at_block = rec.created_block;
     po.fee_mojos        = rec.fee_mojos;
     po.cancel_pending   = (rec.status == kOfferStatusCancelPending);
+    po.requested_asset  = rec.requested_asset;
+    po.requested_mojos  = rec.requested_mojos;
     return po;
 }
 
@@ -156,6 +162,8 @@ inline constexpr const char* kOfferStatusCancelPending = "cancel_pending";
     rec.status        = db_status_for(offer);
     rec.created_block = offer.created_at_block;
     rec.fee_mojos     = offer.fee_mojos;
+    rec.requested_asset = offer.requested_asset;
+    rec.requested_mojos = offer.requested_mojos;
     return rec;
 }
 

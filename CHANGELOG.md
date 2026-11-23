@@ -5,9 +5,29 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.57] — 2026-11-22 — wide-book protection, option contracts sized from your limits, distinct offer amounts, quieter alerts, and a read-only Circuit page
 
-### Options: the contract size comes from your limits
+### A book too wide to price (#252, #254)
+
+- **No quotes on it.** On 2026-11-21 XCH/BYC's Dexie book went 158% wide
+  (bid 0.10, ask 0.90) while its fair value was unavailable. The engine
+  centred its quotes near that book's midpoint, and four asks at 0.49 to
+  0.63 BYC, against a fair price of about 0.87, were taken within minutes:
+  about 11 BYC under cost. A pair whose two-sided book is wider than
+  `risk.flash_crash_max_spread_bps` (2000 bps) and that has no usable fair
+  value now posts nothing until one of them returns. While the CoinGecko feed
+  is stale, only a cross-checked fair value counts as usable here. Resting offers stay as
+  they are; revive pairs keep their own thin-book rules.
+- **The flash-crash guard holds back only that pair** when the drop shows
+  only through books that wide. XCH/BYC's book went that wide about every
+  two hours on 2026-11-20 and 21, and each time every XCH pair stopped for
+  an hour or more. A drop the narrower books confirm still stops every pair.
+- **A pair held back this way claims no share of the bid floor.** It is left
+  out of the target-gap sharing, as a pair that cannot quote for any other
+  reason already was, so the other pairs buying the same coin keep their
+  full bids while the hold lasts.
+
+### Options: the contract size comes from your limits (#254)
 
 - **`contract_xch: auto`**, which a size left out now means too, sizes the
   contracts from the limits: variety first, then size. It is the largest of
@@ -29,15 +49,30 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   worked out. `config.example.yaml` uses `auto` and leaves
   `hedge_size_xch` out.
 
-### A pair held back on a wide-book drop claims no share of the bid floor
+### Offers no longer ask for identical amounts (#255)
 
-While a pair was held back on its own after a drop only its too-wide book
-showed (0.10.57), it still took its share of the target-gap bid floor, so
-the other pairs buying the same coin ran with smaller bids for as long as
-the hold lasted. It is now left out of that sharing, as a pair that cannot
-quote for any other reason already was.
+When a taker combines several offers in one transaction, the wallet pays
+every request for an asset from one coin, and Chia rejects two identical
+outputs of one spend. The wallet also reuses an offer's payment address. So
+two live offers asking for the same amount of the same asset could not be
+taken together (each still filled on its own). The XCH bids of every XCH
+pair use the same tier sizes, and the BYC/wUSDC.b bids each ask for exactly
+1 BYC, so this was common.
 
-## [0.10.57] — 2026-11-21 — no quotes on a book too wide to price, quieter alerts, and a read-only Circuit page
+Each new offer now asks for an amount no live offer asks for, moved by a
+mojo or two and never against a limit the engine holds:
+- **An ask** asks for a mojo more of the quote asset, its price raised just
+  enough (at most 25 bps), so it never goes under a price floor.
+- **A bid** asks for a mojo less of the base asset and pays less, down to
+  its minimum size (its tier's, or the pair's). At its minimum it asks for a
+  mojo more instead, and only while what it pays stays the same: true of
+  every XCH bid, where a mojo of XCH is far under a mojo of the quote asset.
+  A pair the pace controller manages never grows a bid.
+- What each offer asks for is recorded with it (two new `offer_log`
+  columns), so a restart reads the same amounts, also for an offer read back
+  from the wallet and for a batched one, which asks for the total of its
+  tiers.
+- With no allowed move, the offer is posted as before.
 
 ### Two alerts that fired on nearly every cycle (#251)
 
@@ -94,22 +129,6 @@ quote for any other reason already was.
   against Circuit's own API description and the live answers, so a yes/no,
   name, status, price or ratio that is missing or garbled is a note, never
   taken as "no" or left blank.
-
-### A book too wide to price (#252)
-
-- **No quotes on it.** On 2026-11-21 XCH/BYC's Dexie book went 158% wide
-  (bid 0.10, ask 0.90) while its fair value was unavailable. The engine
-  centred its quotes near that book's midpoint, and four asks at 0.49 to
-  0.63 BYC, against a fair price of about 0.87, were taken within minutes:
-  about 11 BYC under cost. A pair whose two-sided book is wider than
-  `risk.flash_crash_max_spread_bps` (2000 bps) and that has no usable fair
-  value now posts nothing until one of them returns. While the CoinGecko feed
-  is stale, only a cross-checked fair value counts as usable here. Resting offers stay as
-  they are; revive pairs keep their own thin-book rules.
-- **The flash-crash guard holds back only that pair** when the drop shows
-  only through books that wide. XCH/BYC's book went that wide about every
-  two hours on 2026-11-20 and 21, and each time every XCH pair stopped for
-  an hour or more. A drop the narrower books confirm still stops every pair.
 
 ## [0.10.56] — 2026-11-20 — the options address's XCH stays put, and calls and puts by default
 

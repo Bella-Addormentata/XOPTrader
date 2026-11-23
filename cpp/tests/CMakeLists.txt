@@ -114,6 +114,7 @@ add_executable(xop_tests
     test_maker_fill_legs.cpp
     test_drawdown_breaker.cpp
     test_alert_noise.cpp
+    test_unique_request.cpp
     test_widebook_quotes.cpp
     test_watchdog.cpp
     test_height_source.cpp
@@ -169,6 +170,7 @@ target_compile_definitions(xop_tests
     PRIVATE
         XOP_TESTS_ENGINE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/../src/engine.cpp"
         XOP_TESTS_CHIA_RPC_CPP="${CMAKE_CURRENT_SOURCE_DIR}/../src/rpc/chia_rpc.cpp"
+        XOP_TESTS_OFFER_MANAGER_CPP="${CMAKE_CURRENT_SOURCE_DIR}/../src/execution/offer_manager.cpp"
 )
 
 # Register with CTest so that `ctest` discovers and runs the tests.

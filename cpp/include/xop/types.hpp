@@ -450,6 +450,16 @@ struct PendingOffer {
     std::uint64_t fee_mojos{0};    // fee attached to this offer (mojos)
     bool         cancel_pending{false}; // cancel RPC sent; awaiting on-chain confirmation
 
+    // [UNIQUE-REQUEST 2026-11-22] What the offer asks to be paid, to the mojo:
+    // the asset id and its mojos, as this engine built it or, for an offer
+    // read back from the wallet, as the wallet's summary gives it.  Empty and
+    // 0 when the record does not say (an offer_log row from before these
+    // fields): execution/unique_request.hpp then works it out from price and
+    // size, which is exact for an offer this engine built and not for an
+    // adopted one, whose price comes from the summary's raw mojos.
+    std::string  requested_asset{};
+    Mojo         requested_mojos{0};
+
     // [WALLET-LOAD 2026-08-04] Distance-from-mid at POST time in bps
     // (TierQuote::spread_bps of the tier this offer was created from).
     // Feeds the detect_fills poll backoff's striking-distance reset:

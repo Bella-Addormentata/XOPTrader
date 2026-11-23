@@ -21,6 +21,7 @@
  */
 
 #include <xop/execution/offer_manager.hpp>
+#include <xop/execution/unique_request.hpp>
 
 #include <xop/execution/asset_reserve.hpp>
 
@@ -1243,6 +1244,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                     pending.created_at_ts    = std::chrono::system_clock::now();
                     pending.fee_mojos        = current_fee_mojos_;
                     pending.post_spread_bps  = tier.spread_bps;
+                    note_request(pending, requested_amount(pair, tier.side, tier.price, tier.size));
                     state_->upsert_offer(pending);
                 }
                 try {
@@ -1301,6 +1303,7 @@ asio::awaitable<int> OfferManager::post_quotes(
             adopt.created_at_ts    = std::chrono::system_clock::now();
             adopt.fee_mojos        = current_fee_mojos_;
             adopt.post_spread_bps  = tier.spread_bps;
+            note_request(adopt, requested_amount(pair, tier.side, tier.price, tier.size));
             co_await retire_offer_failed_expiry(adopt, *expiry_max_time,
                                                 "tier");
             continue;
@@ -1339,6 +1342,10 @@ asio::awaitable<int> OfferManager::post_quotes(
         // [S70] Reached only past expiry_echo_ok above, so a non-zero value
         // here IS the wallet's echo, not merely what we asked for.
         pending.expiry_max_time  = expiry_max_time.value_or(0);
+        // [UNIQUE-REQUEST] What it asks for, kept with it. Every record
+        // this manager creates carries its request (review #255): Step 8
+        // persists what State holds.
+        note_request(pending, requested_amount(pair, tier.side, tier.price, tier.size));
 
         state_->upsert_offer(pending);
         // [S74] Recorded: a keep stop that stops the io_context now finds this
@@ -4433,6 +4440,19 @@ OrphanEvaluation OfferManager::evaluate_orphan(
         }
     }
 
+    // [UNIQUE-REQUEST review #255] What it asks for, to the mojo, as the
+    // summary gives it: the price above is from raw mojos and cannot be run
+    // back into the amount (unique_request.hpp).
+    if (matched) {
+        if (const auto pc_it = pair_config_map_.find(eval.pair_name);
+            pc_it != pair_config_map_.end()) {
+            if (const auto asked = request_from_summary(pc_it->second, eval.side, requested)) {
+                eval.requested_asset = asked->first;
+                eval.requested_mojos = asked->second;
+            }
+        }
+    }
+
     if (!matched || eval.price <= 0) {
         eval.disposition = OrphanDisposition::Unknown;
         eval.reason = matched ? "could not compute price"
@@ -4889,6 +4909,8 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 po.side            = eval.side;
                 po.price           = eval.price;
                 po.size            = eval.size;
+                po.requested_asset = eval.requested_asset;  // [UNIQUE-REQUEST]
+                po.requested_mojos = eval.requested_mojos;
                 po.tier            = 0;  // Unknown original tier -- assign 0.
                 po.fee_mojos       = current_fee_mojos_;
                 // Approximate creation block from age.
@@ -5563,6 +5585,17 @@ asio::awaitable<int> OfferManager::post_merged_side(
 
     if (merged_dict.empty()) co_return 0;
 
+    // [UNIQUE-REQUEST review #255] One merged offer asks for ONE amount: the
+    // total of its tiers' requests, which none of them asks for alone. Read
+    // from the payload the wallet is sent, and kept with every record of
+    // this trade, so a restart with batching off still knows what the live
+    // offer asks for (unique_request.hpp).
+    const std::string asked_key = std::to_string(resolve_wallet_id(
+        tiers.front().side == Side::Bid ? pair.base_asset_id : pair.quote_asset_id));
+    const std::optional<RequestedAmount> merged_asks_for = merged_request(
+        pair, tiers.front().side,
+        merged_dict.contains(asked_key) ? merged_dict[asked_key].get<std::int64_t>() : 0);
+
     // [S31] Same check on the batch path. One merged offer is still an offer,
     // and this function is reached after several awaits.
     if (abort_predicate_ && abort_predicate_()) {
@@ -5733,6 +5766,7 @@ asio::awaitable<int> OfferManager::post_merged_side(
                         pending.created_at_ts    = std::chrono::system_clock::now();
                         pending.fee_mojos        = current_fee_mojos_;
                         pending.post_spread_bps  = tier.spread_bps;
+                        note_request(pending, requested_amount(pair, tier.side, tier.price, tier.size));
                         state_->upsert_offer(pending);
                     }
                     try {
@@ -5779,6 +5813,7 @@ asio::awaitable<int> OfferManager::post_merged_side(
                     adopt.created_at_ts    = std::chrono::system_clock::now();
                     adopt.fee_mojos        = current_fee_mojos_;
                     adopt.post_spread_bps  = tier.spread_bps;
+                    note_request(adopt, requested_amount(pair, tier.side, tier.price, tier.size));
                     co_await retire_offer_failed_expiry(
                         adopt, *expiry_max_time, "batch fallback");
                     continue;
@@ -5804,6 +5839,7 @@ asio::awaitable<int> OfferManager::post_merged_side(
                 po.post_spread_bps  = tier.spread_bps;
                 // [S70] Past expiry_echo_ok above: the wallet's echo.
                 po.expiry_max_time  = expiry_max_time.value_or(0);
+                note_request(po, requested_amount(pair, tier.side, tier.price, tier.size));
                 state_->upsert_offer(po);
                 fallback_mark.release();  // [S74] recorded
                 ++fallback_count;
@@ -5889,6 +5925,7 @@ asio::awaitable<int> OfferManager::post_merged_side(
                 pending.created_at_ts    = std::chrono::system_clock::now();
                 pending.fee_mojos        = current_fee_mojos_;
                 pending.post_spread_bps  = tiers.front().spread_bps;
+                note_request(pending, merged_asks_for);
                 state_->upsert_offer(pending);
             }
             try {
@@ -5955,6 +5992,7 @@ asio::awaitable<int> OfferManager::post_merged_side(
         adopt.created_at_ts    = std::chrono::system_clock::now();
         adopt.fee_mojos        = current_fee_mojos_;
         adopt.post_spread_bps  = tiers.front().spread_bps;
+        note_request(adopt, merged_asks_for);
         co_await retire_offer_failed_expiry(adopt, *expiry_max_time,
                                             "merged batch");
         co_return 0;
@@ -5985,6 +6023,8 @@ asio::awaitable<int> OfferManager::post_merged_side(
         pending.dexie_id         = batch_dexie_id;
         // [S70] Past expiry_echo_ok above: the wallet's echo.
         pending.expiry_max_time  = expiry_max_time.value_or(0);
+        // [UNIQUE-REQUEST] The trade's request, not this tier's share of it.
+        note_request(pending, merged_asks_for);
         state_->upsert_offer(pending);
     }
     batch_mark.release();  // [S74] every constituent tier is in State
@@ -6242,6 +6282,14 @@ std::optional<PendingOffer> OfferManager::try_parse_wallet_offer(
     }
 
     if (!matched) return std::nullopt;
+
+    // [UNIQUE-REQUEST review #255] What it asks for, to the mojo, as the
+    // summary gives it: the price above is from raw mojos and cannot be run
+    // back into the amount (unique_request.hpp).
+    if (const auto pc_it = pair_config_map_.find(po.pair_name);
+        pc_it != pair_config_map_.end()) {
+        note_request(po, request_from_summary(pc_it->second, po.side, requested));
+    }
 
     // Extract fee.
     if (summary.contains("fees") && summary["fees"].is_number()) {

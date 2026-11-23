@@ -30,6 +30,7 @@
 #include "xop/execution/crossed_book.hpp"
 #include "xop/execution/take_sizing.hpp"
 #include "xop/execution/take_retry.hpp"
+#include "xop/execution/unique_request.hpp"
 #include "xop/execution/cancel_escalation_config.hpp"
 #include "xop/execution/cancel_retry.hpp"
 #include "xop/execution/coin_pool_verdict.hpp"
@@ -2902,6 +2903,8 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         rec.status        = db_status_for(po);
                         rec.created_block = po.created_at_block;
                         rec.fee_mojos     = po.fee_mojos;
+                        rec.requested_asset = po.requested_asset;  // [UNIQUE-REQUEST]
+                        rec.requested_mojos = po.requested_mojos;
                         db_->insert_offer(rec);
                         if (po.cancel_pending) {
                             // The row's cause and an event.
@@ -17905,6 +17908,55 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                                      : a.tier_index < b.tier_index;
                 });
         }
+        // [UNIQUE-REQUEST 2026-11-22] Operator-approved (Dorkmo). No tier
+        // posted now asks for an amount a resting offer -- of any pair --
+        // already asks for: two offers asking for the same coin cannot be
+        // taken together (unique_request.hpp, which also says why each move
+        // is the way it is). Done here, on the list this step both posts and
+        // records, so State and offer_log hold what each offer really asks
+        // for, also after a restart. Batching posts one offer a side, the
+        // sum of its tiers, so there is nothing per tier to move.
+        if (!config_.strategy.batch_offers_enabled && !fee_filtered_tiers.empty()) {
+            auto requested = execution::requested_by(
+                state_->get_all_offers(),
+                [&](const std::string& name) { return find_pair_config(name); });
+            // [PACE] A managed pair's resting bids are held to its pool to
+            // the mojo, so its bids do not grow.
+            const bool bids_may_grow = !pcs.pace.managed;
+            std::size_t still_shared = 0;
+            const auto moved = execution::make_requests_unique(
+                *pair_cfg, fee_filtered_tiers, requested,
+                [&](const TierQuote& tq) {
+                    execution::RequestBounds bounds;
+                    bounds.bid_may_grow = bids_may_grow;
+                    // [TIERMIN] A resting offer under its tier's minimum is
+                    // retired ("tier_min_undersized"). [review #255] With no
+                    // tier minimum the pair's own minimum size holds, the
+                    // one Step 7's dust filter enforces.
+                    if (tq.side == Side::Bid) {
+                        const auto min_it = pcs.tier_min_mojos.find({tq.side, tq.tier_index});
+                        bounds.min_bid_size = execution::min_bid_size_mojos(
+                            *pair_cfg, config_.strategy.min_offer_size_units,
+                            min_it != pcs.tier_min_mojos.end()
+                                ? std::optional<Mojo>{min_it->second}
+                                : std::nullopt);
+                    }
+                    return bounds;
+                },
+                &still_shared);
+            for (const auto& change : moved) {
+                spdlog::info("[Engine] Step 8: {} {} tier {} asks for {} mojos "
+                             "instead of {} -- another live offer asks for "
+                             "that amount",
+                             pair_name, (change.side == Side::Bid) ? "BID" : "ASK",
+                             change.tier_index, change.asked_now, change.asked_before);
+            }
+            if (still_shared > 0) {
+                spdlog::debug("[Engine] Step 8: {} posts {} tier(s) asking for an "
+                              "amount another live offer asks for -- no allowed "
+                              "move clears it", pair_name, still_shared);
+            }
+        }
         int posted = co_await offer_mgr_->post_quotes(
             *pair_cfg, fee_filtered_tiers, block_height, fee_override);
 
@@ -17988,7 +18040,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     // [S14] post_quotes may already have cancelled this offer
                     // (asymmetric ladder, late create, failed expiry) and
                     // flagged it cancel_pending: persist what State says.
-                    orec.status = db_status_for(state_->get_offer(orec.offer_id));
+                    const PendingOffer in_state = state_->get_offer(orec.offer_id);
+                    orec.status = db_status_for(in_state);
+                    // [UNIQUE-REQUEST review #255] ...and what State says it
+                    // asks for. The offer manager wrote that from the payload
+                    // it sent: this tier's own amount, or for a merged offer
+                    // the total of its tiers, which no tier asks for alone.
+                    orec.requested_asset = in_state.requested_asset;
+                    orec.requested_mojos = in_state.requested_mojos;
                 } else {
                     // post_quotes may have skipped this tier due to a wallet
                     // RPC error (for example insufficient funds).  Do not
@@ -18124,6 +18183,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         rec.status        = db_status_for(po);
                         rec.created_block = po.created_at_block;
                         rec.fee_mojos     = po.fee_mojos;
+                        rec.requested_asset = po.requested_asset;  // [UNIQUE-REQUEST]
+                        rec.requested_mojos = po.requested_mojos;
                         db_->insert_offer(rec);
                     } catch (...) {
                         // Already exists or DB constraint - fine.

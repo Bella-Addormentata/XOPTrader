@@ -170,6 +170,10 @@ struct OrphanEvaluation {
     Side               side{Side::Bid};
     Mojo               price{0};            ///< Implied price from summary.
     Mojo               size{0};             ///< Offered quantity.
+    /// [UNIQUE-REQUEST] What the offer asks to be paid, as its summary gives
+    /// it; "" and 0 when the summary does not name it.
+    std::string        requested_asset;
+    Mojo               requested_mojos{0};
     double             price_deviation{0};  ///< Fractional deviation from mid.
     bool               adverse{false};      ///< True if deviation hurts us.
     bool               inventory_helper{false}; ///< Helps reduce imbalance.
