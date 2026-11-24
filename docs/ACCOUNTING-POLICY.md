@@ -39,6 +39,7 @@ of legs**. Summing `delta_mojos` per asset gives the ledger's implied balance.
 | `options_withdrawal` | capital that left for the options sub-account: a top-up (`options −amount`, `fee −fee` on `xch`), or the fence going up (`options −held`, one leg per asset) |
 | `options_deposit` | the fence going down: `options +held`, one leg per asset |
 | `adjust` | single leg, explicitly labelled, for movements with no internal event; also the correction of an earlier auto-adjust (below) |
+| `fee` | network fees paid outside any fill or take (cancels, coin splits): `xch −fee`; posted so far only by the 2026-11 repair (§8) |
 | `reversal` | one leg per leg of the booking it reverses: same `leg`, `asset_id`, `pair_name` and `block_height`, `delta_mojos` negated |
 
 **Sign convention**: positive is an inflow to the bot, negative an outflow.
@@ -406,7 +407,10 @@ at post time would manufacture a systematic phantom XCH outflow.
 
 Known gap: cancelled-offer fees (roughly 32× the filled-offer fees in
 aggregate) are recorded only in `offer_log` and are not yet part of the P&L
-fee leg.
+fee leg.  The 2026-11 ledger repair measured the network fees paid outside
+fills and takes from 2026-09-03 to 2026-11-24 from the coin store (0.34
+XCH) and booked them as one `fee` event (`docs/LEDGER-GAP-REPAIR-2026-11.md`);
+later ones are still unbooked.
 
 ## 9. Tax reporting — known divergence
 
