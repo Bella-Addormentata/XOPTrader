@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from gui.services.options import config
@@ -502,6 +504,17 @@ def test_puts_take_their_share_of_the_counts() -> None:
     # Room for one more contract a Friday at 10 XCH: it goes to a call here,
     # and the planner gives it to whichever is nearer the money.
     assert config.call_ladder(_caps(44, 10, 5), 2, 2, put_strikes=2) == ((1, 4), (10, 2))
+
+
+def test_puts_with_an_unlimited_cap_take_room_only_at_the_smallest_size() -> None:
+    """[review #261] The planner keeps a side with an unlimited cap at 1 XCH, so those
+    puts leave Max contracts and Max per expiry to the larger calls."""
+    unlimited = dataclasses.replace(_caps(44, 16, 8), max_locked_quote=config.UNLIMITED)
+    assert config.call_ladder(unlimited, 2, 2, put_strikes=2) == ((1, 4), (10, 4))
+    wider = dataclasses.replace(unlimited, max_locked_xch=144 * config.XCH_MOJOS)
+    assert config.call_ladder(wider, 2, 2, put_strikes=2) == ((1, 4), (10, 4), (100, 1))
+    capped = dataclasses.replace(wider, max_locked_quote=1000)
+    assert config.call_ladder(capped, 2, 2, put_strikes=2) == ((1, 4), (10, 4))
 
 
 @pytest.mark.parametrize("written", ["auto", " AUTO ", "Auto", None])

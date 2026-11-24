@@ -669,6 +669,48 @@ def test_puts_take_their_share_of_the_counts_in_the_hint(panel, tmp_path):
     )
 
 
+def test_puts_with_an_unlimited_cap_leave_room_for_larger_calls(panel, tmp_path):
+    """[review #261] Unlimited Max quote locked keeps puts at 1 XCH, as the book does."""
+    limits = {
+        "max_locked_xch": 44,
+        "max_locked_quote": "unlimited",
+        "max_contracts": 16,
+        "max_contracts_per_expiry": 8,
+    }
+    panel.load_config(str(_auto_book(tmp_path, put_strikes_pct=[90, 80], limits=limits)))
+    tab = panel._options_section
+    assert tab.size_hint.text() == (
+        "Calls, smallest first: 4 of 1 XCH, then 4 of 10 XCH (44 XCH locked). "
+        "Max XCH locked 144 adds a 100 XCH call. "
+        "Puts stay at 1 XCH: Max quote locked has no number to size them from."
+    )
+
+
+def test_the_ladder_hint_counts_a_month_end_that_is_also_a_weekly_once(panel, tmp_path):
+    """[review #261] On 2026-11-24 the next two weeklies are Nov 27 and Dec 4, and
+    November's month-end is Nov 27 too: two expiries, as the book counts them."""
+    limits = {
+        **_FOUR_SLOTS,
+        "max_locked_xch": 44,
+        "max_contracts": 8,
+        "max_contracts_per_expiry": 4,
+    }
+    cfg_path = _auto_book(tmp_path, expiries={"weekly": 2, "monthly": 1}, limits=limits)
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+
+    tab._clock = lambda: 1795536000  # 2026-11-24 16:00Z
+    tab._sync_rows()
+    assert tab.size_hint.text().startswith(
+        "Calls, smallest first: 4 of 1 XCH, then 4 of 10 XCH (44 XCH locked)."
+    )
+    tab._clock = lambda: 1796112000  # 2026-12-01 08:00Z: Dec 4, Dec 11 and Dec 25
+    tab._sync_rows()
+    assert tab.size_hint.text().startswith(
+        "Calls, smallest first: 6 of 1 XCH, then 2 of 10 XCH (26 XCH locked)."
+    )
+
+
 def test_switching_to_fixed_writes_the_number_in_the_box(panel, tmp_path):
     cfg_path = _auto_book(tmp_path)
     panel.load_config(str(cfg_path))

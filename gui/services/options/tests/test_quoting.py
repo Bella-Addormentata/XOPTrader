@@ -358,6 +358,53 @@ def test_the_ladder_fills_the_smallest_size_everywhere_first() -> None:
     assert plan.mint[-1].strike_asset.amount == 11_000, "10 XCH at 1.10, in mojos"
 
 
+@pytest.mark.parametrize(
+    ("limits", "puts"),
+    [
+        ({"max_locked_xch": 14, "max_contracts": 8, "max_contracts_per_expiry": 4}, []),
+        ({"max_locked_xch": 444, "max_contracts": 12, "max_contracts_per_expiry": 6}, []),
+        (
+            {
+                "max_locked_xch": 1000,
+                "max_contracts": "unlimited",
+                "max_contracts_per_expiry": "unlimited",
+            },
+            [],
+        ),
+        (
+            {
+                "max_locked_xch": 44,
+                "max_locked_quote": 10_000,
+                "max_contracts": 16,
+                "max_contracts_per_expiry": 8,
+            },
+            [90, 80],
+        ),
+        (
+            {
+                "max_locked_xch": 144,
+                "max_locked_quote": "unlimited",
+                "max_contracts": 16,
+                "max_contracts_per_expiry": 8,
+            },
+            [90, 80],
+        ),
+    ],
+)
+def test_the_settings_preview_matches_what_the_planner_mints(limits, puts) -> None:
+    """[review #261] config.call_ladder is what Settings and `status` show: on an empty
+    book it must come to the calls the planner mints, size by size."""
+    cfg = _config(
+        contract_xch="auto", put_strikes_pct=puts, limits={"max_locked_quote": 1, **limits}
+    )
+    minted: dict[int, int] = {}
+    for item in quoting.plan(cfg, _market(), [], NOW).mint:
+        if item.side == "call":
+            minted[item.size_mojos // XCH] = minted.get(item.size_mojos // XCH, 0) + 1
+    preview = config.call_ladder(cfg.limits, 2, 2, put_strikes=len(puts))
+    assert dict(preview) == minted
+
+
 def test_one_slot_holds_a_contract_of_each_size() -> None:
     cfg = _ladder(max_locked_xch=44)
     small, *_ = quoting.plan(cfg, _market(), [], NOW).mint

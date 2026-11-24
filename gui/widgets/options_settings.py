@@ -24,6 +24,7 @@ import copy
 import dataclasses
 import datetime
 import math
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -162,6 +163,21 @@ def _rule_counts(value: Any) -> tuple[int, int] | None:
     return None
 
 
+#: The book's own default for options.stop_before_expiry_seconds.
+_DEFAULT_STOP_SECONDS = 6 * 3600
+
+
+def _stop_seconds(value: Any) -> int:
+    """``stop_before_expiry_seconds`` as the book reads it; its default when malformed."""
+    if value is None or isinstance(value, bool):
+        return _DEFAULT_STOP_SECONDS
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return _DEFAULT_STOP_SECONDS
+    return int(seconds) if math.isfinite(seconds) and seconds >= 0 else _DEFAULT_STOP_SECONDS
+
+
 def _same_number(first: Any, second: Any) -> bool:
     """Whether two config values are the same number (0.5 and "0.5" are)."""
     if first is None or second is None or isinstance(first, bool) or isinstance(second, bool):
@@ -207,6 +223,11 @@ class OptionsSettingsSection:
         #: to match when loaded, or None: a save that changes the size takes
         #: that Dexie check back to its default with it.
         self._hedge_follows: Any = None
+        #: [LADDER] config.yaml's stop_before_expiry_seconds (not on this tab):
+        #: where the book counts a rolling rule's expiries from.
+        self._stop_seconds = _DEFAULT_STOP_SECONDS
+        #: The clock a rolling rule's expiries are counted at (tests set it).
+        self._clock: Callable[[], float] = time.time
         #: The number boxes edited since the last load.
         self._touched: set[str] = set()
         self.widget = self._build()
@@ -567,11 +588,19 @@ class OptionsSettingsSection:
             # [review #254] Too large to count in mojos (1e300): the book
             # refuses it, so it is no number to size from. Save says so.
             xch_cap = cap_mojos = None
+        try:
+            quote = _limit_value(self.limit_fields["max_locked_quote"].text())
+        except ValueError:
+            quote = None
         limits = options_config.Limits(
             max_locked_xch=(
                 options_config.UNSET if cap_mojos is None else int(math.floor(cap_mojos))
             ),
-            max_locked_quote=options_config.UNSET,
+            # call_ladder reads only whether puts have a cap: unlimited keeps
+            # them at the smallest size. It never counts the quote asset.
+            max_locked_quote=(
+                options_config.UNLIMITED if quote == "unlimited" else options_config.UNSET
+            ),
             max_contracts=count("max_contracts"),
             max_contracts_per_expiry=count("max_contracts_per_expiry"),
             max_fee_mojos=0,
@@ -584,7 +613,12 @@ class OptionsSettingsSection:
                 strikes.append(0)
         mode = self.expiry_mode.currentIndex()
         if mode == _EXPIRY_ROLLING:
-            expiries = self.expiry_weeks.value() + self.expiry_months.value()
+            # [review #261] As the book counts them now: a month-end Friday
+            # that is also one of the weeklies is one expiry, not two.
+            rule = options_config.ExpiryRule(
+                weekly=self.expiry_weeks.value(), monthly=self.expiry_months.value()
+            )
+            expiries = len(rule.at(int(self._clock()) + self._stop_seconds))
         elif mode == _EXPIRY_FIXED:
             dates = _text_list(self.expiries.text())
             try:
@@ -612,7 +646,11 @@ class OptionsSettingsSection:
         from gui.services.options import config as options_config
 
         limits, calls, puts, expiries, cap = self._grid()
-        tail = " Puts get the same sizes, as far as Max quote locked allows." if puts else ""
+        tail = ""
+        if puts and limits.max_locked_quote == options_config.UNLIMITED:
+            tail = " Puts stay at 1 XCH: Max quote locked has no number to size them from."
+        elif puts:
+            tail = " Puts get the same sizes, as far as Max quote locked allows."
         if calls <= 0 or expiries <= 0:
             return "1 XCH contracts first, then 10, 100... as far as the limits allow." + tail
         if cap is None:
@@ -720,6 +758,7 @@ class OptionsSettingsSection:
         else:
             self.target_mode.setCurrentIndex(_TARGET_LIMITS)
 
+        self._stop_seconds = _stop_seconds(section.get("stop_before_expiry_seconds"))
         size = section.get("contract_xch")
         self._hedge_follows = None
         if size is None or (isinstance(size, str) and size.strip().lower() == "auto"):

@@ -353,9 +353,11 @@ def call_ladder(
     fills them: every call strike and expiry at 1 XCH, then at 10 XCH, and so
     on, until ``max_locked_xch``, ``max_contracts`` or
     ``max_contracts_per_expiry`` stops it. Puts take their share of the two
-    counts at each size before the next size starts; how much of the quote
-    asset they lock depends on the price, so ``max_locked_quote`` is not
-    counted here, and when it stops puts the calls may go further than this.
+    counts at each size before the next size starts -- at the smallest size
+    only when ``max_locked_quote`` is unlimited, as the planner mints them.
+    How much of the quote asset they lock depends on the price, so a number
+    in ``max_locked_quote`` is not counted here: when it stops puts, the
+    calls may go further than this.
 
     Empty when no call can be minted: no call strikes or expiries, one of the
     three limits read here not set, or ``max_locked_xch`` under 1 XCH. With
@@ -373,9 +375,11 @@ def call_ladder(
     for size in LADDER_XCH:
         if out and limits.max_locked_xch == UNLIMITED:
             break
+        # With nothing to size them from, puts stay at the smallest size.
+        puts = 0 if out and limits.max_locked_quote == UNLIMITED else put_strikes
         calls = 0
         for index in range(expiries):
-            room = call_strikes + put_strikes
+            room = call_strikes + puts
             if limits.max_contracts_per_expiry != UNLIMITED:
                 room = min(room, limits.max_contracts_per_expiry - on_expiry[index])
             if limits.max_contracts != UNLIMITED:
@@ -385,7 +389,7 @@ def call_ladder(
             here = min(call_strikes, room)
             if limits.max_locked_xch != UNLIMITED:
                 here = min(here, (limits.max_locked_xch - locked) // (size * XCH_MOJOS))
-            taken = here + min(put_strikes, room - here)
+            taken = here + min(puts, room - here)
             calls += here
             locked += here * size * XCH_MOJOS
             on_expiry[index] += taken
