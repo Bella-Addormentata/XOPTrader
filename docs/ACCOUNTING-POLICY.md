@@ -35,6 +35,7 @@ of legs**. Summing `delta_mojos` per asset gives the ledger's implied balance.
 | `opening` | one leg per asset = wallet confirmed balance at genesis |
 | `fill` (bid) | base `+size`, quote `−quote_mojos`, `xch −fee` |
 | `fill` (ask) | base `−size`, quote `+quote_mojos`, `xch −fee` |
+| `take` | a take of ours that settled: base `±size`, quote `∓quote_mojos`, `xch −fee` (below) |
 | `options_withdrawal` | capital that left for the options sub-account: a top-up (`options −amount`, `fee −fee` on `xch`), or the fence going up (`options −held`, one leg per asset) |
 | `options_deposit` | the fence going down: `options +held`, one leg per asset |
 | `adjust` | single leg, explicitly labelled, for movements with no internal event; also the correction of an earlier auto-adjust (below) |
@@ -114,6 +115,32 @@ the books had not yet heard of when the engine stopped, and the fence taken
 away by switching the options book off in `config.yaml`.
 
 `accounting.options_transfer_ingest_enabled: false` stops all of it.
+
+### A take is booked when it settles (2026-11-24)
+
+A take is one of our `take_offer` calls: we accept another maker's offer.
+The wallet accepting the call is not the take happening: another taker, or
+an earlier take of ours, may spend the maker's coins first, and the wallet
+then marks ours FAILED or CANCELLED.  From the 2026-09-03 re-tie to
+2026-11-24 the engine booked 13 such takes at the moment of the call, and
+the ledger held 44.54 XCH that never moved.
+
+- **Booked on settlement.**  A take's legs are posted only once the wallet
+  reports its trade CONFIRMED and the coin it pays us -- exactly each amount
+  the maker offered -- is in our coin store at that height.  The legs are the
+  wallet's own amounts, at the height the take settled.
+- **A take that fails books nothing.**  FAILED or CANCELLED in the wallet: no
+  legs, no `taker_fills` row.
+- **One take of an offer at a time.**  While a take of a Dexie offer is
+  unsettled the engine does not take that offer again, and a take request that
+  may have reached the wallet unanswered is never re-sent.
+- **The sweep.**  A settled take of ours that the ledger does not hold and the
+  engine is not tracking -- a request that timed out, a take of a process that
+  has since stopped -- is booked from the wallet's record of it after the same
+  proof, under strategy `wallet_sweep`, with fee 0 (the wallet's record does
+  not state our fee).  It looks back one day; older history is a repair's.
+
+Rules and measurements: `cpp/include/xop/execution/take_settlement.hpp`.
 
 ### Reversal: a booking proven wrong (2026-09-26)
 

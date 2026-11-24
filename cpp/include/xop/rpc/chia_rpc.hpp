@@ -815,6 +815,18 @@ public:
         const std::vector<std::uint64_t>& amounts);
 
     /**
+     * @brief [TAKE-SETTLE 2026-11-24] The wallet's newest takes of ours --
+     * other makers' offers we accepted (exclude_my_offers), completed ones
+     * included -- newest confirmation first (the default CONFIRMED_AT_HEIGHT
+     * order, which sorts pending ones last), at most @p count.
+     *
+     * The missed-take sweep's source (execution/take_settlement.hpp).
+     *
+     * @return The trade records, as get_all_offers returns them.
+     */
+    asio::awaitable<std::vector<json>> get_recent_takes(std::int64_t count);
+
+    /**
      * @brief Retrieve offers with pagination.
      *
      * [WALLET-LOAD 2026-08-04] Verified against docs.chia.net offer-rpc

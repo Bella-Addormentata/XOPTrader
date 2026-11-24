@@ -1288,6 +1288,32 @@ ChiaWalletRPC::get_coin_records_at_height(std::uint64_t                     heig
 }
 
 asio::awaitable<std::vector<json>>
+ChiaWalletRPC::get_recent_takes(std::int64_t count)
+{
+    // No sort_key: the wallet's default CONFIRMED_AT_HEIGHT order, newest
+    // confirmation first.  exclude_my_offers leaves only the offers we took.
+    const json payload = {
+        {"start",             0},
+        {"end",               count},
+        {"exclude_my_offers", true},
+        {"include_completed", true},
+        {"file_contents",     false}
+    };
+    const json resp = co_await rpc_post("get_all_offers", payload);
+
+    const auto listed = resp.find("trade_records");
+    if (listed == resp.end() || !listed->is_array()) {
+        throw ChiaRPCError("get_all_offers: response has no trade_records list");
+    }
+    std::vector<json> records;
+    records.reserve(listed->size());
+    for (const auto& rec : *listed) {
+        records.push_back(rec);
+    }
+    co_return records;
+}
+
+asio::awaitable<std::vector<json>>
 ChiaWalletRPC::get_all_offers(std::int64_t start,
                                std::int64_t end,
                                bool         file_contents,

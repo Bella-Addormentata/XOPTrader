@@ -40,6 +40,17 @@
 // ledger's opening block for the asset (older inflows are already inside the
 // opening balance).
 //
+// [REWARD-CATCHUP 2026-11-24] RE-MEASURED.  Reward coins have grown: the
+// 2026-11 bursts carry coins up to 4,395 mojos (h9584747), and a burst can
+// hold more than 200 coins (h9575482: 220).  Against the live ledger, 47.855
+// DBX of reward coins from 2026-11-12..21 were never booked: every coin over
+// the old 2,000-mojo ceiling, the 20 coins of the 220-coin burst that the
+// newest-200 window could not hold, and three whole bursts that arrived while
+// the engine was stopped for more than two days (2026-11-16..18, too stale
+// by the rule below once it restarted).  The ceiling is now 20,000 mojos --
+// the smallest trading flow is now ~77,000 mojos, 1 XCH of DBX at ~77
+// DBX/XCH -- and the scan reads back past its first page (reward_scan_reads_on).
+//
 // ACCOUNTING TREATMENT (owner-approved): recognize on receipt at fair
 // value; FMV becomes cost basis; kept OUT of trading P&L as a separate
 // reward-income figure.  FMV comes from the live CoinGecko dexie-bucks
@@ -56,6 +67,7 @@
 
 #include "xop/types.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -139,6 +151,46 @@ inline constexpr BlockHeight kMaxRewardBacklogBlocks{9'216};
     if (max_backlog_blocks == 0) return true;             // bound disabled
     if (confirmed_height >= current_height) return true;  // same block, or ahead
     return (current_height - confirmed_height) <= max_backlog_blocks;
+}
+
+/// [REWARD-CATCHUP 2026-11-24] The scan reads the wallet's transactions in
+/// pages of this many rows, newest first ...
+inline constexpr std::int64_t kRewardScanPageRows{200};
+/// ... at most this many pages back (2,000 rows) ...
+inline constexpr std::int64_t kRewardScanMaxPages{10};
+/// ... and past the first page only on a deep-scan heartbeat, this often
+/// (~10 min): one page per heartbeat is enough between bursts.
+inline constexpr BlockHeight kRewardDeepScanEveryBlocks{30};
+
+/// Is a deep scan due at `now`, given the height of the last one (0: never)?
+[[nodiscard]] constexpr bool reward_deep_scan_due(BlockHeight last_deep,
+                                                  BlockHeight now) noexcept
+{
+    return now > 0
+        && (last_deep == 0 || now < last_deep
+            || now - last_deep >= kRewardDeepScanEveryBlocks);
+}
+
+/// Should the reward scan read the page after the one it just read?
+///
+/// Only on a deep-scan heartbeat; only while the page just read was full (a
+/// short page is the wallet's last); only while that page's oldest row is
+/// unconfirmed (0) or still young enough to book (reward_receipt_is_recent --
+/// past that, nothing further back can be booked anyway); and never past
+/// kRewardScanMaxPages.  The wallet orders unconfirmed rows first, then
+/// confirmed rows newest first (ChiaWalletRPC::get_transactions), so a page's
+/// last row is its oldest.
+[[nodiscard]] constexpr bool reward_scan_reads_on(bool         deep,
+                                                  std::int64_t pages_read,
+                                                  std::int64_t rows_in_page,
+                                                  BlockHeight  oldest_in_page,
+                                                  BlockHeight  current_height) noexcept
+{
+    if (!deep) return false;
+    if (pages_read >= kRewardScanMaxPages) return false;
+    if (rows_in_page < kRewardScanPageRows) return false;
+    if (oldest_in_page == 0) return true;
+    return reward_receipt_is_recent(oldest_in_page, current_height);
 }
 
 /// What the reward scan should do with ONE wallet row.

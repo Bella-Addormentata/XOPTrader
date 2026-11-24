@@ -53,6 +53,7 @@
 #include "xop/execution/market_data.hpp"
 #include "xop/execution/offer_manager.hpp"
 #include "xop/execution/take_retry.hpp"
+#include "xop/execution/take_settlement.hpp"
 #include "xop/execution/wallet_sync_watch.hpp"
 
 // Data / analytics
@@ -1542,6 +1543,17 @@ private:
     /// memory: a restart forgets them, and a cancel adopted at boot (fee
     /// unknown) never gets one.
     std::unordered_map<std::string, strategy::fee::Ticket> fee_tickets_;
+
+    /// [TAKE-SETTLE 2026-11-24] Takes the wallet accepted that are not booked
+    /// yet, by trade id (execution/take_settlement.hpp).
+    std::unordered_map<std::string, execution::PendingTake> pending_takes_;
+    /// Dexie offer id -> height of a take request for it that may have
+    /// reached the wallet without an answer.
+    std::unordered_map<std::string, BlockHeight> uncertain_take_offers_;
+    /// Height the missed-take sweep last ran at (0: not yet).
+    BlockHeight last_take_sweep_block_{0};
+    /// Settled takes the sweep could not book (no configured pair), warned once.
+    std::unordered_set<std::string> take_sweep_warned_;
     /// [review #163 r2] The height the engine is working at NOW: the startup
     /// height while the startup reconcile runs, then each cycle's own height,
     /// stamped at the TOP of on_new_block_coro.  last_block_ cannot serve: it
@@ -1861,15 +1873,23 @@ private:
     /// balance) and a taker_fills row (so the trade is attributable to the
     /// strategy that placed it).
     ///
-    /// Every take_offer() success site must call this.  Before 2026-07-30
-    /// none of them did: 70 taker trades across the retained logs wrote
-    /// nothing to trade_log, offer_log or the ledger, which is why the
-    /// strategies placing them had no measurable P&L.
+    /// Before 2026-07-30 no take site recorded anything: 70 taker trades
+    /// across the retained logs wrote nothing to trade_log, offer_log or the
+    /// ledger, which is why the strategies placing them had no measurable P&L.
     ///
-    /// @param we_bought_base true when we acquired the base asset and paid
-    ///                       quote; false for the reverse.
-    /// @param base_mojos     Absolute size of the base leg.
-    /// @param price_mojos    Execution price in engine pseudo-units.
+    /// [TAKE-SETTLE 2026-11-24] Called only for a take that SETTLED: by
+    /// step_settle_pending_takes for one a take site tracked
+    /// (track_pending_take), and by step_sweep_missed_takes for one nothing
+    /// tracked.  Never at a take site -- 13 takes booked there since
+    /// 2026-09-03 never settled (execution/take_settlement.hpp).
+    ///
+    /// @param we_bought_base     true when we acquired the base asset and
+    ///                           paid quote; false for the reverse.
+    /// @param base_mojos         Absolute size of the base leg.
+    /// @param price_mojos        Execution price in engine pseudo-units.
+    /// @param block_height       The height the take settled at.
+    /// @param exact_quote_mojos  The quote leg as the wallet states it, when
+    ///                           known; else derived from base and price.
     void record_taker_fill(const std::string& strategy,
                            const std::string& trade_id,
                            const std::string& counterparty_offer_id,
@@ -1878,7 +1898,47 @@ private:
                            Mojo base_mojos,
                            Mojo price_mojos,
                            std::uint64_t fee_mojos,
-                           BlockHeight block_height) noexcept;
+                           BlockHeight block_height,
+                           std::optional<Mojo> exact_quote_mojos = std::nullopt) noexcept;
+
+    /// [TAKE-SETTLE 2026-11-24] A take the wallet ACCEPTED: tracked, not
+    /// booked.  step_settle_pending_takes books it through record_taker_fill
+    /// once the wallet reports it settled and its payment is in our coin
+    /// store; one that failed or was cancelled books nothing.  The same
+    /// arguments every take site used to pass to record_taker_fill.
+    void track_pending_take(const std::string& strategy,
+                            const std::string& trade_id,
+                            const std::string& counterparty_offer_id,
+                            const PairConfig& pc,
+                            bool we_bought_base,
+                            Mojo base_mojos,
+                            Mojo price_mojos,
+                            std::uint64_t fee_mojos,
+                            BlockHeight block_height) noexcept;
+
+    /// [TAKE-SETTLE 2026-11-24] The one door to the wallet's take_offer.
+    /// Refuses -- {"success": false, "error": ...}, and no RPC -- a take of a
+    /// Dexie offer an unsettled take of ours already holds, or whose last
+    /// take request may have reached the wallet unanswered.  A request that
+    /// fails that way (rpc::request_possibly_submitted) is noted against the
+    /// offer for execution::kUncertainTakeHoldBlocks and rethrown.
+    asio::awaitable<nlohmann::json> take_offer_guarded(
+        const std::string& counterparty_offer_id,
+        const std::string& offer_text,
+        std::uint64_t      fee,
+        BlockHeight        block_height);
+
+    /// [TAKE-SETTLE 2026-11-24] Book the tracked takes that settled; drop the
+    /// ones that failed or were cancelled.  At most
+    /// execution::kTakeSettlePerHeartbeat wallet reads, oldest take first.
+    /// Runs before the invariant.
+    asio::awaitable<void> step_settle_pending_takes(BlockHeight block_height);
+
+    /// [TAKE-SETTLE 2026-11-24] Every execution::kTakeSweepEveryBlocks, book
+    /// a settled take of ours that the ledger does not hold and nothing
+    /// tracks, from the wallet's own record of it and after the same payment
+    /// proof.  Runs before the invariant.
+    asio::awaitable<void> step_sweep_missed_takes(BlockHeight block_height);
 
     /// Notional of asset @p asset_id currently committed to live offers.
     /// This bounds how much the wallet can legitimately move before the
@@ -3549,6 +3609,9 @@ private:
     /// repeated LOG LINE, not an accounting decision, so a restart
     /// legitimately re-reports whatever it still finds unbooked.
     std::unordered_set<std::string> reward_stale_warned_;
+    /// [REWARD-CATCHUP 2026-11-24] Height of the last reward scan that read
+    /// past its first page (0: none yet; accounting/reward_ingest.hpp).
+    BlockHeight last_reward_deep_scan_block_{0};
 
     // -- [T4-05] GUI-requested pause via signal file ----------------------
     // The GUI creates / removes a "pause.flag" file next to the database.

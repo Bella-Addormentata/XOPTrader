@@ -2447,10 +2447,12 @@ struct AccountingConfig {
 
     /// Per-coin ceiling (mojos) separating reward coins from trading
     /// flows.  Measured reward coins: 1-219 mojos (41 daily bursts,
-    /// 2026-06-11..07-31).  Smallest observed trading flow: 100,589
-    /// mojos.  2,000 (2 DBX) gives ~10x headroom over the largest
-    /// observed reward coin while staying 50x below the smallest trade.
-    std::int64_t reward_max_mojos_per_coin{2'000LL};
+    /// 2026-06-11..07-31); [REWARD-CATCHUP 2026-11-24] up to 4,395 mojos
+    /// in the 2026-11 bursts, when the old 2,000 ceiling dropped every
+    /// larger coin.  Smallest trading flow: 1 XCH of DBX, ~77,000 mojos at
+    /// 2026-11 prices.  20,000 (20 DBX) gives ~4.5x headroom over the
+    /// largest reward coin while staying ~4x below the smallest trade.
+    std::int64_t reward_max_mojos_per_coin{20'000LL};
 
     // -- Warp bridge flow ingestion ([S19 2026-08-23]) ---------------------
     //

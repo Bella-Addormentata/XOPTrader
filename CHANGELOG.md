@@ -7,6 +7,37 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### A take is booked when it settles, not when the wallet accepts it
+
+A trace of the live ledger on 2026-11-24 found it 17.4 XCH above the wallet.
+Most of that was takes: 13 takes booked since September never happened (the
+wallet holds them FAILED or CANCELLED, and nothing was paid in), while 5
+takes that did settle on 2026-11-20 were never booked. On that day the
+engine took several Dexie offers two or three times, because Dexie keeps
+listing an offer while our first take of it waits to be mined.
+
+- **Booked on settlement.** Every take path (crossed book, cross-stable,
+  peg arb, drift correction, XCH recovery) now only tracks a take the wallet
+  accepted. It is booked once the wallet shows it settled and the coin it
+  pays us is in the wallet, at the wallet's own amounts and height. A take
+  that failed or was cancelled books nothing.
+- **One take of an offer at a time.** An offer with an unsettled take of
+  ours is not taken again.
+- **A take request is never re-sent.** After a timeout the wallet may still
+  be taking the offer, so the engine leaves that offer alone for about 20
+  minutes instead of sending a second copy.
+- **Missed takes are swept in.** Every few minutes the engine looks at the
+  wallet's takes of the last day and books any settled one it does not hold,
+  from the wallet's own record of it.
+
+### Dexie rewards: bigger coins and bigger bursts are booked
+
+- Reward coins up to 20 DBX each are booked (was 2 DBX): November's coins
+  reach 4.4 DBX and the larger ones were left out.
+- Every ten minutes the reward scan reads back past its newest 200 wallet
+  rows, so a burst of more than 200 coins is booked whole. On 2026-11-15 a
+  burst of 220 coins left 20 unbooked.
+
 ### Offers left in the wallet are read at engine start (#260)
 
 At start the engine checks each offer in the wallet it has no record of,

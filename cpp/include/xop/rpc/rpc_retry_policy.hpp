@@ -104,10 +104,8 @@ enum class RpcRetryPolicy {
 
 /// The policy for an rpc_post endpoint name (e.g. "cancel_offers").
 ///
-/// The two cancel endpoints, create_offer_for_ids and split_coins are
-/// NeverResend.
-/// take_offer is not idempotent either; it is still out of scope and keeps
-/// the transient retry.
+/// The two cancel endpoints, create_offer_for_ids, split_coins and
+/// take_offer are NeverResend.
 ///
 /// [MIN-INPUT-COIN review #162, round 2] WHY create_offer_for_ids JOINED THEM.
 /// A second copy of a create is a second offer.  That was already true, but
@@ -128,11 +126,21 @@ enum class RpcRetryPolicy {
 /// spend of the coin.  On 2026-11-01 a CAT split timed out three times and
 /// was sent four times in 94 s, the wallet answering the last copy "needs to
 /// be fully synced" while it was still building the first.
+///
+/// [TAKE-SETTLE 2026-11-24] take_offer joined them: a second copy is a second
+/// take.  On 2026-11-20 five takes settled in the wallet -- each paid us
+/// exactly 5 XCH -- whose trade ids the engine never learned, so they were
+/// never booked; a timed-out request re-sent while its first copy was still
+/// running is the likeliest source.  A take that may have reached the wallet
+/// unanswered now fails the call, Engine::take_offer_guarded holds that offer
+/// back for a while, and the missed-take sweep books the take if it settled
+/// (execution/take_settlement.hpp).
 [[nodiscard]] constexpr RpcRetryPolicy retry_policy_for_endpoint(
     std::string_view endpoint) noexcept
 {
     if (endpoint == "cancel_offers" || endpoint == "cancel_offer"
-        || endpoint == "create_offer_for_ids" || endpoint == "split_coins") {
+        || endpoint == "create_offer_for_ids" || endpoint == "split_coins"
+        || endpoint == "take_offer") {
         return RpcRetryPolicy::NeverResend;
     }
     return RpcRetryPolicy::RetryTransient;

@@ -162,9 +162,28 @@ TEST(RpcRetryPolicy, ACreateIsNeverResentOnceItMayHaveReachedTheWallet) {
     EXPECT_TRUE(may_resend(create, CURLE_COULDNT_CONNECT, true));
     EXPECT_TRUE(may_resend(create, CURLE_SSL_CONNECT_ERROR, true));
 
-    // Deliberately narrow: the other non-idempotent endpoint is unchanged.
+    // [TAKE-SETTLE 2026-11-24] take_offer is no longer the exception: see
+    // ATakeIsNeverResentOnceItMayHaveReachedTheWallet.
     EXPECT_EQ(retry_policy_for_endpoint("take_offer"),
-              RpcRetryPolicy::RetryTransient);
+              RpcRetryPolicy::NeverResend);
+}
+
+// [TAKE-SETTLE 2026-11-24] take_offer: a second copy is a second take. On
+// 2026-11-20 five takes settled that the engine never learned the ids of.
+TEST(RpcRetryPolicy, ATakeIsNeverResentOnceItMayHaveReachedTheWallet) {
+    // Spelled exactly as ChiaWalletRPC::take_offer passes it.
+    const RpcRetryPolicy take = retry_policy_for_endpoint("take_offer");
+    ASSERT_EQ(take, RpcRetryPolicy::NeverResend);
+
+    // A timeout, a dropped reply, a 5xx: the wallet may be taking it now.
+    EXPECT_FALSE(may_resend(take, CURLE_OPERATION_TIMEDOUT, /*transient=*/true));
+    EXPECT_FALSE(may_resend(take, CURLE_RECV_ERROR, true));
+    EXPECT_FALSE(may_resend(take, CURLE_GOT_NOTHING, true));
+    EXPECT_FALSE(may_resend(take, CURLE_OK, true));
+
+    // A wallet that was never reached is still worth another attempt.
+    EXPECT_TRUE(may_resend(take, CURLE_COULDNT_CONNECT, true));
+    EXPECT_TRUE(may_resend(take, CURLE_SSL_CONNECT_ERROR, true));
 }
 
 // [SPLIT-FEE 2026-11-02] split_coins: a second copy is a second spend of the
