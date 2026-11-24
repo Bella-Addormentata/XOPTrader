@@ -2026,6 +2026,10 @@ private:
         /// and every confirmed top-up then arrived before it.
         std::optional<std::vector<std::string>> coin_ids;
         double at_unix{0.0};  ///< When the fence went down.
+        /// Every coin a list had while the fence was up before it went down,
+        /// and when those sightings begin (rpc::CoinFence::Transition).
+        std::vector<std::string> seen_ids;
+        double seen_since_unix{0.0};
     };
     /// One pass over the options book's top-ups, in the order they were
     /// sent.  `lowering`: the fence-down event this pass goes before, or

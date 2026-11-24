@@ -623,6 +623,50 @@ TEST(CoinFenceCapital, EveryChangeIsKeptInOrderWithItsOwnList)
     EXPECT_TRUE(f.fence.transitions().empty());
 }
 
+TEST(CoinFenceCapital, GoingDownKeepsEveryCoinTheListsHadWhileUp)
+{
+    CapitalFence f;
+    f.fence.update({{"aa", kPuzzle, 500}});
+    f.fence.begin_transitions();
+    const double after_begin = unix_now();
+    // A top-up's coin arrives and is listed, then is spent (a mint) before
+    // the fence goes down: the last list lacks it, the sightings do not.
+    f.fence.update({{"aa", kPuzzle, 500}, {"0xTT", kPuzzle, 1'500'000'000'000}});
+    f.fence.update({{"aa", kPuzzle, 500}, {"cc", f.usd_ph, 1000}});
+    ASSERT_TRUE(f.fence.set_active(false));
+    auto log = f.fence.transitions();
+    ASSERT_EQ(log.size(), 2u);
+    ASSERT_TRUE(log[1].holding);
+    EXPECT_EQ(log[1].holding->coin_ids, (Ids{"aa", "cc"})) << "the last list";
+    EXPECT_EQ(log[1].seen, (Ids{"aa", "cc", "tt"})) << "every coin a list had while up, by id";
+    EXPECT_GT(log[1].seen_since_unix, 0.0);
+    EXPECT_LE(log[1].seen_since_unix, after_begin) << "from the first list of that stretch";
+    EXPECT_TRUE(log[0].seen.empty()) << "an entry that is not a lowering has none";
+
+    // A stretch with the fence up begins afresh: what was seen before the
+    // fence last went down is not this stretch's.
+    ASSERT_TRUE(f.fence.set_active(true));
+    const double rise = unix_now();
+    f.fence.update({{"dd", kPuzzle, 7}});
+    ASSERT_TRUE(f.fence.set_active(false));
+    log = f.fence.transitions();
+    ASSERT_EQ(log.size(), 4u);
+    EXPECT_EQ(log[3].seen, (Ids{"dd"}));
+    EXPECT_GE(log[3].seen_since_unix, rise);
+    // Up and down with no list in between: nothing was seen, and nothing
+    // says since when.
+    ASSERT_TRUE(f.fence.set_active(true));
+    ASSERT_TRUE(f.fence.set_active(false));
+    log = f.fence.transitions();
+    EXPECT_TRUE(log.back().seen.empty());
+    EXPECT_EQ(log.back().seen_since_unix, 0.0);
+    // A list had while down is no sighting.
+    f.fence.update({{"ee", kPuzzle, 9}});
+    ASSERT_TRUE(f.fence.set_active(true));
+    ASSERT_TRUE(f.fence.set_active(false));
+    EXPECT_TRUE(f.fence.transitions().back().seen.empty());
+}
+
 TEST(CoinFenceCapital, UpAndDownAgainBeforeAnyListIsUnknownNeverZero)
 {
     CapitalFence f;

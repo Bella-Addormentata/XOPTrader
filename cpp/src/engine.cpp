@@ -24704,6 +24704,10 @@ asio::awaitable<Engine::OptionsBooking> Engine::book_options_flow(
                           flow.reference);
             co_return OptionsBooking::Failed;
         }
+        // A marker queued to go with the next write (an earlier flow's, after
+        // a write that failed) is this flow's now: it stays until this flow
+        // is settled in turn.
+        options_marker_clear_pending_.erase(asset_id);
     }
 
     // -- 1. Journal first (crash-consistent, and the idempotency gate): every
@@ -24941,9 +24945,9 @@ asio::awaitable<bool> Engine::book_options_topups(
         facts.recent         = recent;
         facts.book_confirmed = flow.status == accounting::OptionsFlowStatus::Ready;
         facts.lowering       = going_down;
-        facts.sent_near_lowering = going_down
-            && lowering->at_unix - static_cast<double>(row.sent_at)
-                   <= static_cast<double>(accounting::kOptionsPendingSlackSeconds);
+        facts.sent_before_sightings = going_down
+            && (lowering->seen_since_unix <= 0.0
+                || static_cast<double>(row.sent_at) < lowering->seen_since_unix);
         std::optional<std::string> coin_id;
         if (!facts.book_confirmed || need_coin) {
             if (const auto proof = co_await options_topup_proof(
@@ -24957,6 +24961,9 @@ asio::awaitable<bool> Engine::book_options_topups(
                         const auto& ids = *lowering->coin_ids;
                         facts.coin_returned =
                             std::find(ids.begin(), ids.end(), *coin_id) != ids.end();
+                        const auto& seen = lowering->seen_ids;
+                        facts.coin_seen =
+                            std::find(seen.begin(), seen.end(), *coin_id) != seen.end();
                     }
                 }
             }
@@ -24999,7 +25006,10 @@ asio::awaitable<bool> Engine::book_options_topups(
         if (verdict == accounting::OptionsTopUpVerdict::Inside) {
             if (check_rise && !coin_id && recent) {
                 // Whether that event took it is its coin's to say: next time.
+                // A fence-down event waits for that too: the coin may be in
+                // the list it returns.
                 owe(parts.principal);
+                if (going_down) waiting = true;
                 continue;
             }
             if (!check_rise || accounting::topup_in_rise(options_rise_coin_ids_, coin_id)) {
@@ -25036,7 +25046,9 @@ asio::awaitable<bool> Engine::book_options_topups(
         }
         if (outcome == OptionsBooking::Failed) refused = true;
     }
-    co_return waiting;
+    // A refused write left parts unbooked that may belong before a fence-down
+    // event: it waits too.
+    co_return waiting || refused;
 }
 
 asio::awaitable<void> Engine::step_ingest_options_transfers(BlockHeight block_height)
@@ -25236,7 +25248,9 @@ asio::awaitable<void> Engine::step_ingest_options_transfers(BlockHeight block_he
             std::optional<rpc::CoinFence::Holding> back = entry.holding;
             OptionsLowering lowering;
             if (back) {
-                lowering.coin_ids = back->coin_ids;
+                lowering.coin_ids        = back->coin_ids;
+                lowering.seen_ids        = entry.seen;
+                lowering.seen_since_unix = entry.seen_since_unix;
             } else {
                 back = co_await coin_fence_->list_holding();
             }

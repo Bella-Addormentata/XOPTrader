@@ -279,6 +279,8 @@ public:
         first_list_.reset();
         log_.clear();
         logging_ = false;
+        seen_up_.clear();
+        seen_since_unix_ = 0.0;
     }
 
     /// Which asset each fenced puzzle hash holds ("xch", or a CAT's asset id),
@@ -330,6 +332,10 @@ public:
             change.up      = active;
             change.at_unix = unix_now();
             if (!active && listed_) change.holding = holding_of(coins_, change.at_unix);
+            if (!active) {
+                change.seen.assign(seen_up_.begin(), seen_up_.end());
+                change.seen_since_unix = seen_since_unix_;
+            }
             // Never expected: more changes than the books could be told of.
             // The oldest round trip after the first entry is given up (the
             // two are opposite, so the rest still alternates).
@@ -337,6 +343,9 @@ public:
             log_.push_back(std::move(change));
         }
         first_list_.reset();
+        // [OPTIONS-CAPITAL] Sightings are of one stretch with the fence up.
+        seen_up_.clear();
+        seen_since_unix_ = 0.0;
         active_ = active;
         coins_.clear();
         listed_ = false;
@@ -374,6 +383,13 @@ public:
             if (!log_.empty() && log_.back().up && !log_.back().holding) {
                 log_.back().holding = first_list_;
             }
+        }
+        // [OPTIONS-CAPITAL] Every coin a list had while the fence was up: the
+        // engine's balances left it out then, whether or not it is still
+        // there when the fence goes down.
+        if (on()) {
+            if (seen_since_unix_ <= 0.0) seen_since_unix_ = refreshed_unix_;
+            for (const auto& c : coins_) seen_up_.insert(fence_normalise_hex(c.id));
         }
     }
 
@@ -466,6 +482,12 @@ public:
         /// up: the amount is then unknown, never zero.
         std::optional<Holding> holding;
         double        at_unix{0.0};  ///< When (Unix seconds).
+        /// Down only: every coin a list had while the fence was up, from
+        /// `seen_since_unix` (the first list of that stretch in this
+        /// process; 0 = none) to the change -- its sightings, spent since
+        /// or not.
+        std::vector<std::string> seen;
+        double                   seen_since_unix{0.0};
     };
 
     /// [OPTIONS-CAPITAL] Starts the log anew, with the state the fence is in
@@ -632,6 +654,10 @@ private:
     bool                               logging_{false};
     std::uint64_t                      next_serial_{1};
     std::vector<Transition>            log_;
+    /// The coins listed since the fence last went up, and the time of the
+    /// first of those lists.
+    std::set<std::string>              seen_up_;
+    double                             seen_since_unix_{0.0};
     std::optional<Clock::time_point>   refreshed_at_;
     double                             refreshed_unix_{0.0};
     std::string                        last_error_;

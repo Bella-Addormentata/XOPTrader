@@ -85,10 +85,11 @@
 //   * The fence going down returns the coins of its list.  A top-up the
 //     books do not hold yet is booked ahead of that event when the list
 //     holds ITS coin -- the one its own transaction created, by id, never a
-//     coin that merely looks like it -- whatever any record says yet.  One
-//     sent shortly before the fence went down that has arrived and is not in
-//     the list arrived after the list was taken: it is the next fence-up
-//     event's.  One whose coin
+//     coin that merely looks like it -- whatever any record says yet -- or
+//     when any list the fence had while up held that coin (its sightings:
+//     the engine's balances left it out then, though it was spent since).
+//     One that has arrived and that no list ever had came after the last
+//     one: it is the next fence-up event's.  One whose coin
 //     cannot be found yet (the wallet does not answer) holds the event, for
 //     as long as the send can still be on its way: two hours
 //     (kOptionsPendingSlackSeconds).  All of it is place_topup.  A fence
@@ -640,11 +641,14 @@ struct OptionsTopUpFacts {
     bool         lowering{false};
     /// ...holds that coin.
     bool         coin_returned{false};
-    /// The send went out at most kOptionsPendingSlackSeconds before the fence
-    /// went down (or after): only such a send can have arrived after the list
-    /// that event returns was taken.  The fence's moment, not the time the
-    /// books get to it.
-    bool         sent_near_lowering{false};
+    /// ...or any list the fence had while up before it went down holds it
+    /// (rpc::CoinFence::Transition::seen): the engine's balances left it
+    /// out then, though it may have been spent since.
+    bool         coin_seen{false};
+    /// The send went out before those sightings begin (this process started
+    /// listing, or the fence last went up), so whether a list had it is not
+    /// known.
+    bool         sent_before_sightings{false};
 };
 
 /// Where a top-up the books do not hold yet stands.
@@ -673,14 +677,16 @@ enum class OptionsTopUpPlace {
     if (!f.lowering) return arrived ? OptionsTopUpPlace::Book : OptionsTopUpPlace::NotYet;
     if (f.coin_known) {
         // In the list the event returns: the event's deposit gives it back,
-        // so its withdrawal goes first.
-        if (f.coin_returned) return OptionsTopUpPlace::Book;
+        // so its withdrawal goes first.  Listed earlier while the fence was
+        // up and spent since (a mint, a cancel): it left the trading funds
+        // when the list took it in.
+        if (f.coin_returned || f.coin_seen) return OptionsTopUpPlace::Book;
         if (!arrived) return OptionsTopUpPlace::NotYet;
-        // Arrived, and not in that list.  A send of shortly before the fence
-        // went down arrived after the list was taken: the fence went down
-        // with its coin uncounted.  An older one was listed while the fence
-        // was up and spent since (a mint): it left the trading funds then.
-        return f.sent_near_lowering ? OptionsTopUpPlace::After : OptionsTopUpPlace::Book;
+        // Arrived, and no list ever had it while the fence was up: it came
+        // after the last one, and the fence went down with it uncounted --
+        // unless it was sent before the sightings begin, and an earlier list
+        // that is not kept had it.
+        return f.sent_before_sightings ? OptionsTopUpPlace::Book : OptionsTopUpPlace::After;
     }
     // Without the wallet's record there is no telling where its coin is:
     // the event waits while the send can still be on its way.  After that

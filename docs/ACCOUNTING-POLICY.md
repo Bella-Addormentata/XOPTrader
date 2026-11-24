@@ -90,8 +90,9 @@ list, when this process booked it, lacks the top-up's own coin: it was still
 on its way); and when
 the fence goes down, a top-up the books do not hold yet is booked ahead of
 that event when the list it returns holds the top-up's own coin, by id,
-whatever any record says yet. A recent one that has arrived and is not in
-that list came after the list was taken, and is the next fence-up event's.
+whatever any record says yet, or when any list the fence had while up held
+it (it was spent since). One that has arrived and that no list ever had came
+after the last one, and is the next fence-up event's.
 One whose coin cannot be found yet (the wallet does not answer) holds the
 event for up to two hours after its send.
 

@@ -509,13 +509,12 @@ TEST(OptionsTransfer, ATopUpIsBookedWhenItLeftTheTradingFunds)
     EXPECT_EQ(place_topup(OptionsTopUpFacts{}), Place::NotYet) << "never confirmed";
 }
 
-TEST(OptionsTransfer, GoingDownATopUpIsPlacedByItsOwnCoinInTheListReturned)
+TEST(OptionsTransfer, GoingDownATopUpIsPlacedByItsOwnCoinInTheListsTheFenceHad)
 {
     using Place = OptionsTopUpPlace;
     OptionsTopUpFacts f;
     f.lowering = true;
     f.recent = true;
-    f.sent_near_lowering = true;
     f.coin_known = true;
 
     // In the list the fence-down event returns: its withdrawal goes first,
@@ -526,28 +525,37 @@ TEST(OptionsTransfer, GoingDownATopUpIsPlacedByItsOwnCoinInTheListReturned)
     f.wallet_confirmed = true;
     EXPECT_EQ(place_topup(f), Place::Book);
 
-    // Not in that list, and arrived: sent shortly before the fence went down,
-    // it came after the list was taken -- the trading funds never lost it,
-    // and the next fence-up event takes it.
+    // Not in that list, but an earlier list had it while the fence was up:
+    // the engine's balances left it out then, and it was spent since (a mint
+    // and a cancel while its booking waited for a price).
     f.coin_returned = false;
+    f.coin_seen = true;
+    EXPECT_EQ(place_topup(f), Place::Book);
+    f.wallet_confirmed = false;
+    EXPECT_EQ(place_topup(f), Place::Book) << "a sighting is arrival";
+
+    // No list ever had it, and it arrived: it came after the last list, and
+    // the fence went down with it uncounted -- the trading funds never lost
+    // it, and the next fence-up event takes it. However long the event then
+    // waits to be booked.
+    f.coin_seen = false;
+    f.wallet_confirmed = true;
     EXPECT_EQ(place_topup(f), Place::After);
+    f.recent = false;
+    EXPECT_EQ(place_topup(f), Place::After) << "the lists decide, not the books' clock";
     f.wallet_confirmed = false;
     f.book_confirmed = true;
     EXPECT_EQ(place_topup(f), Place::After);
-    // Not in that list, and not arrived: nothing yet.
+    // Not arrived and not listed: nothing yet.
     f.book_confirmed = false;
     EXPECT_EQ(place_topup(f), Place::NotYet);
 
-    // Sent long before the fence went down, and not in its list: it was
-    // listed while the fence was up and spent since (a mint).
+    // Sent before the sightings begin (this process started listing, or the
+    // fence last went up, after it): a list that is not kept may have had
+    // it, and it left the trading funds then.
+    f.sent_before_sightings = true;
     f.wallet_confirmed = true;
-    f.sent_near_lowering = false;
     EXPECT_EQ(place_topup(f), Place::Book);
-    // That is the fence's moment, not the books': the same send is After
-    // however long the event then waits to be booked.
-    f.sent_near_lowering = true;
-    f.recent = false;
-    EXPECT_EQ(place_topup(f), Place::After) << "two hours after the send, the lowering is what counts";
     f.wallet_confirmed = false;
     EXPECT_EQ(place_topup(f), Place::NotYet) << "never confirmed, and not listed";
 }
@@ -851,7 +859,9 @@ TEST(OptionsTransferWiring, EveryFenceChangeIsBookedInOrderAndAcknowledgedOnlyTh
     EXPECT_NE(position_of(step, "accounting::options_fence_flow( /*went_up=*/true, sequence, "
                                 "entry.holding->totals, stamp_of(entry.holding->at_unix));"),
               npos);
-    EXPECT_NE(position_of(step, "if (back) { lowering.coin_ids = back->coin_ids; } else { "
+    EXPECT_NE(position_of(step, "if (back) { lowering.coin_ids = back->coin_ids; "
+                                "lowering.seen_ids = entry.seen; "
+                                "lowering.seen_since_unix = entry.seen_since_unix; } else { "
                                 "back = co_await coin_fence_->list_holding(); }"),
               npos);
     EXPECT_NE(position_of(step, "accounting::options_fence_flow( /*went_up=*/false, sequence, "
@@ -950,11 +960,17 @@ TEST(OptionsTransferWiring, ATopUpIsConfirmedByItsOwnTransactionBeforeItIsBooked
     EXPECT_NE(position_of(pass, "if (!check_rise || accounting::topup_in_rise(options_rise_coin_ids_, coin_id)) {"),
               npos);
     EXPECT_EQ(position_of(pass, "amount"), npos);
-    // "Shortly before the fence went down" is the fence's moment.
-    EXPECT_NE(position_of(pass, "facts.sent_near_lowering = going_down && lowering->at_unix - "
-                                "static_cast<double>(row.sent_at) <= "
-                                "static_cast<double>(accounting::kOptionsPendingSlackSeconds);"),
+    // The lists the fence had while up: its own coin in any of them, and
+    // whether the send is older than those sightings.
+    EXPECT_NE(position_of(pass, "facts.coin_seen = std::find(seen.begin(), seen.end(), *coin_id) != seen.end();"),
               npos);
+    EXPECT_NE(position_of(pass, "facts.sent_before_sightings = going_down && (lowering->seen_since_unix <= 0.0 "
+                                "|| static_cast<double>(row.sent_at) < lowering->seen_since_unix);"),
+              npos);
+    // Every case that cannot place a send holds a fence-down event: one
+    // whose coin cannot be read yet, and one a refused write left unbooked.
+    EXPECT_NE(position_of(pass, "owe(parts.principal); if (going_down) waiting = true; continue; }"), npos);
+    EXPECT_NE(position_of(pass, "co_return waiting || refused;"), npos);
     // Hold keeps the fence-down event waiting; NotYet and a booking that
     // waits are owed to the invariant, once a heartbeat; After is neither.
     EXPECT_NE(position_of(pass, "case accounting::OptionsTopUpPlace::Hold: "), npos);
@@ -1057,6 +1073,11 @@ TEST(OptionsTransferWiring, AFlowIsJournalledBeforeAnythingElseMoves)
     ASSERT_NE(stamped, npos);
     EXPECT_LT(stamped, marker);
     EXPECT_NE(position_of(book, "if (bridge_owned && !in_process) continue;"), npos);
+    // A marker queued to go after a failed write becomes this flow's.
+    const std::size_t requeued = position_of(book, "options_marker_clear_pending_.erase(asset_id);");
+    ASSERT_NE(requeued, npos);
+    EXPECT_LT(marker, requeued);
+    EXPECT_LT(requeued, journal);
     // An opening that cannot be read waits; only one that is not there
     // decides.
     const std::size_t unread = position_of(book, "if (opened && opening_time.empty()) {");
