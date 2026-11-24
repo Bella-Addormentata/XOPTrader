@@ -7,6 +7,55 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Options: 1, 10, 100... XCH contracts side by side (#261)
+
+- **`contract_xch: auto` is now a ladder of sizes**, so small and large
+  buyers both find a contract at every strike and date. Every strike and
+  expiry gets a 1 XCH contract first, then a 10 XCH one, then 100, as far as
+  the limits allow: calls stop at `max_locked_xch`, puts at
+  `max_locked_quote`. Within a size the nearest expiry and the strikes nearest
+  the money go first. Two call strikes on two Fridays are four calls a size:
+  `max_locked_xch: 4` gives four 1 XCH calls, `14` adds one 10 XCH call, `44`
+  four of them. `max_contracts` and `max_contracts_per_expiry` count every
+  size, so those two sizes need 8 and 4. 0.10.57 picked one size for the
+  whole grid instead.
+- **Refills go smallest first.** A sold contract is replaced at its own size
+  once its collateral (locked until expiry) fits under the limits again. A
+  larger contract is never cancelled to make room for a smaller one, and a
+  lower cap stops new contracts without cancelling those on offer.
+- **A size no longer on offer is cancelled when unsold**: a Fixed size
+  changed, or 0.5 XCH after switching to Automatic. The sold ones run to
+  expiry. Before, an unsold contract kept its old size until it drifted or
+  neared expiry.
+- **A written number is still that one size**, and nothing changes for a book
+  on Fixed. With a cap set to `unlimited` that side stays at 1 XCH: there is
+  nothing to size the ladder from.
+- **The book says when a limit stops the 1 XCH grid**:
+  `options.limits.max_locked_xch reached`, and likewise for
+  `max_locked_quote` and `max_contracts_per_expiry`, beside the
+  `max_contracts` note it already gave. Before, those three stopped mints
+  without a word. A limit that stops a larger size is the ladder working, and
+  is not reported.
+- **Top-ups keep the larger refills funded.** The target from the limits is
+  still `max_locked_xch` plus one contract of the smallest size, but the
+  address is now topped up once it is half a contract short, or 20%,
+  whichever comes first. At 20% of a large target, an exercised call could
+  leave the address too low to mint its refill and too high to be topped up.
+- **The Dexie depth check** (`market.hedge_size_xch`, when not written) is
+  one contract of the smallest size: 1 XCH with Automatic, so a thin Dexie
+  book never stops the 1 XCH contracts.
+- **Settings > Options** shows what the ladder comes to for calls with the
+  limits as they are, and what one more call needs, for example "Calls,
+  smallest first: 4 of 1 XCH, then 1 of 10 XCH (14 XCH locked). Max XCH
+  locked 24 adds a 10 XCH call." It counts the calls first, so where puts
+  share Max contracts and Max per expiry with them it says that the strikes
+  nearest the money go first and puts may take some of that room; `status`
+  says the same. Changing the contract size there also takes a
+  `market.hedge_size_xch` that was set to match the old size (the live
+  test's 0.5 XCH) back to its default.
+- Log lines and the `status` command name each contract's size, since one
+  slot now holds a contract of each.
+
 ### Offers left in the wallet are read at engine start (#260)
 
 At start the engine checks each offer in the wallet it has no record of,

@@ -304,6 +304,28 @@ def test_spot_outside_the_executable_range_stops_quoting() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_the_ladder_mints_a_1_xch_call_then_a_10_xch_one_in_the_same_slot() -> None:
+    """[LADDER] contract_xch: auto, on the chain simulator. Each line says the size,
+    since one slot now holds a contract of each."""
+    rig = Rig(
+        contract_xch="auto",
+        put_strikes_pct=[],
+        limits={"max_locked_xch": 11, "max_contracts": 2, "max_contracts_per_expiry": 2},
+    )
+
+    reports = rig.steps(3)
+
+    small, big = sorted(rig.contracts(store.OPEN), key=lambda item: item.underlying_amount)
+    assert (small.underlying_amount, big.underlying_amount) == (XCH, 10 * XCH)
+    assert small.slot == big.slot
+    assert (small.strike_amount, big.strike_amount) == (1_200, 12 * CAT)  # at 1.20
+    actions = [action for report in reports for action in report.actions]
+    assert any(action.startswith("minting") and "1 XCH)" in action for action in actions)
+    assert any(action.startswith("minting") and "10 XCH)" in action for action in actions)
+    assert f"mint of {big.slot} ({big.launcher_id.hex()[:10]}, 10 XCH) confirmed" in actions
+    assert all(report.blocked == "" for report in reports)
+
+
 def test_grid_is_minted_one_contract_a_step_then_offered() -> None:
     rig = Rig()
 

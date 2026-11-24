@@ -106,7 +106,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
 from gui.services.options import builder, chain, fees, quoting, safety, signing, store
-from gui.services.options.config import OptionsConfig
+from gui.services.options.config import XCH_MOJOS, OptionsConfig
 from gui.services.options.desk import DeskError
 from gui.services.options.market import Market, MarketError
 from gui.services.options.splash import SplashError
@@ -268,6 +268,14 @@ def _sdk() -> Any:
 
 def _paying(fee: int) -> str:
     return f", fee {fee} mojos" if fee else ""
+
+
+def _name(contract: store.Contract) -> str:
+    """A contract as the log names it: its launcher id's start, and [LADDER] its size.
+
+    A slot holds a contract of each size, so the slot alone no longer says which.
+    """
+    return f"{contract.launcher_id.hex()[:10]}, {quoting.contract_size_xch(contract):g} XCH"
 
 
 def _cover(coins: list[Coin], short: int) -> list[Coin]:
@@ -763,7 +771,7 @@ class OptionsBook:
         if contract is None:
             self._store.settle_broadcast(row.id, "confirmed", now=now)
             return
-        name = row.launcher_id.hex()[:10]
+        name = _name(contract)
         asset = None if contract.underlying_asset is None else contract.underlying_asset.hex()
         # The fee the confirmed bundle paid, in XCH mojos (None if recorded before fees were).
         detail = {"asset": asset, "amount": contract.underlying_amount, "fee": row.fee}
@@ -873,14 +881,14 @@ class OptionsBook:
         clawing = {row.launcher_id for row in unresolved if row.kind == store.CLAWBACK}
         ours = self._ours()
         for contract in self._store.contracts((store.OPEN, store.SOLD, store.CLOSING)):
-            name = contract.launcher_id.hex()[:10]
+            name = _name(contract)
             try:
                 loaded = chain.load_option(self._chain, contract.launcher_id, now_seconds=now)
             except chain.ChainError as exc:
-                report.problem(f"could not read {name} from the chain: {exc}")
+                report.problem(f"could not read {contract.slot} ({name}) from the chain: {exc}")
                 continue
             except chain.InvalidOptionError as exc:
-                report.problem(f"{name} no longer validates on chain: {exc}")
+                report.problem(f"{contract.slot} ({name}) no longer validates on chain: {exc}")
                 continue
             self._loaded[contract.launcher_id] = loaded
             expired = loaded.status is chain.OptionStatus.EXPIRED  # collateral still locked
@@ -927,7 +935,7 @@ class OptionsBook:
 
     def _sold(self, contract: store.Contract, now: int, report: StepReport) -> bool:
         """Record a sale: the taken offer says what was paid. False if it could not be read."""
-        name = contract.launcher_id.hex()[:10]
+        name = _name(contract)
         taken: store.OfferRow | None = None
         unread = False
         # Newest first: the offer a taker is likeliest to have held.
@@ -975,7 +983,7 @@ class OptionsBook:
     ) -> None:
         if loaded.locked is None:
             return
-        name = contract.launcher_id.hex()[:10]
+        name = _name(contract)
         if not act:
             prefix = "dry run: " if report.dry_run else ""
             report.did(f"{prefix}would claw back {contract.slot} ({name})")
@@ -1021,7 +1029,7 @@ class OptionsBook:
                 fee=fee,
             )
         except (builder.OptionBuildError, safety.SafetyError, signing.SigningError) as exc:
-            report.problem(f"clawback of {name} not sent: {exc}")
+            report.problem(f"clawback of {contract.slot} ({name}) not sent: {exc}")
             return
         report.did(f"clawback of {contract.slot} ({name}) sent{_paying(fee)}")
 
@@ -1031,7 +1039,7 @@ class OptionsBook:
         loaded = self._loaded.get(contract.launcher_id)
         if loaded is None or loaded.option is None or loaded.locked is None:
             return
-        name = contract.launcher_id.hex()[:10]
+        name = _name(contract)
         amount = contract.underlying_amount
         option, locked = loaded.option, loaded.locked
         # Unconfirmed by then, it can no longer confirm, and the contract goes
@@ -1116,6 +1124,8 @@ class OptionsBook:
         # long it can no longer confirm, and the slot is minted afresh.
         valid_until = self._valid_until(now + self._config.confirm_timeout_seconds)
         for wanted in plan.mint:
+            # [LADDER] A slot holds a contract of each size: say which.
+            what = f"{wanted.slot} ({wanted.size_mojos / XCH_MOJOS:g} XCH)"
             try:
                 (_, minted, expected), fee = self._priced(
                     lambda fee, wanted=wanted: self._build_mint(wanted, fee, valid_until),
@@ -1124,17 +1134,18 @@ class OptionsBook:
                 )
                 self._check(minted.coin_spends, expected, bytes(minted.underlying.puzzle_hash()))
             except builder.OptionBuildError as exc:
-                report.problem(f"cannot mint {wanted.slot}: {exc}")
+                report.problem(f"cannot mint {what}: {exc}")
                 continue
             except signing.SigningError as exc:  # the wallet would not give the key
-                report.problem(f"cannot mint {wanted.slot}: {exc}")
+                report.problem(f"cannot mint {what}: {exc}")
                 return
             except safety.SafetyError as exc:
-                report.problem(f"mint of {wanted.slot} refused by the safety check: {exc}")
+                report.problem(f"mint of {what} refused by the safety check: {exc}")
                 return
             label = (
                 f"{wanted.slot} strike {wanted.strike:g} "
-                f"({minted.launcher_id.hex()[:10]}){_paying(fee)}"
+                f"({minted.launcher_id.hex()[:10]}, {wanted.size_mojos / XCH_MOJOS:g} XCH)"
+                f"{_paying(fee)}"
             )
             if self._config.dry_run:
                 report.did(f"dry run: would mint {label}")
@@ -1159,7 +1170,7 @@ class OptionsBook:
                 )
                 self._wallet.push(minted.coin_spends, signature)
             except signing.SigningError as exc:
-                report.problem(f"mint of {wanted.slot} not sent: {exc}")
+                report.problem(f"mint of {what} not sent: {exc}")
                 return
             report.did(f"minting {label}")
             return  # one mint a step: the next waits for this one's change
@@ -1180,7 +1191,7 @@ class OptionsBook:
             for offer in self._store.offers(contract.launcher_id, "live")
             if offer.expires_at is None or offer.expires_at > now
         ]
-        name = contract.launcher_id.hex()[:10]
+        name = _name(contract)
         sent = self._withdrawn_at.get(contract.launcher_id)
         if sent is not None and now - sent < self._config.withdraw_cooldown_seconds:
             # Its offers were just withdrawn because the price ran away from
@@ -1296,7 +1307,7 @@ class OptionsBook:
         except SplashError as exc:
             self._splash_down = True
             # The offer is valid without it; it just is not announced there.
-            name = contract.launcher_id.hex()[:10]
+            name = _name(contract)
             report.problem(
                 f"offer for {contract.slot} ({name}) not announced on Splash: {exc}. "
                 "It will be tried again while the offer stands"
@@ -1315,7 +1326,7 @@ class OptionsBook:
         option = loaded.option
         if option is None:
             return False
-        name = contract.launcher_id.hex()[:10]
+        name = _name(contract)
         address = self._address()
         # A withdrawal is only worth having while an offer it kills is alive.
         # Once the last of them has run out it must not confirm any more, so
@@ -1664,7 +1675,7 @@ class OptionsBook:
             if act:
                 self._withdraw(contract, loaded, now, report)
             else:
-                name = contract.launcher_id.hex()[:10]
+                name = _name(contract)
                 report.did(f"dry run: would withdraw offers for {contract.slot} ({name})")
         if not act and not found:
             report.problem("dry run: no live offers on record, so there is nothing to withdraw")

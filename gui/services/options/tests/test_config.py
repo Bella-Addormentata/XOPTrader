@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from gui.services.options import config
@@ -444,7 +446,9 @@ def test_the_example_config_writes_both_sides() -> None:
     assert section["put_strikes_pct"] == list(config.DEFAULT_PUT_STRIKES_PCT)
 
 
-# -- [AUTO-SIZE] options.contract_xch: auto ---------------------------------------
+# -- [LADDER] options.contract_xch: auto --------------------------------------------
+
+LADDER = tuple(size * config.XCH_MOJOS for size in config.LADDER_XCH)
 
 
 def _caps(xch, contracts=config.UNLIMITED, per_expiry=config.UNLIMITED) -> config.Limits:
@@ -460,99 +464,109 @@ def _caps(xch, contracts=config.UNLIMITED, per_expiry=config.UNLIMITED) -> confi
 
 
 @pytest.mark.parametrize(
-    ("limits", "calls", "expiries", "size"),
+    ("limits", "calls", "expiries", "ladder"),
     [
-        # Two strikes on two Fridays: four call slots.
-        (_caps(4, 4, 2), 2, 2, 1),
-        (_caps(39.99, 4, 2), 2, 2, 1),
-        (_caps(40, 4, 2), 2, 2, 10),
-        (_caps(400, 4, 2), 2, 2, 100),
-        (_caps(4000, 4, 2), 2, 2, 1000),
-        # The trading PC's limits on 2026-11-22: one 1 XCH contract fits.
-        (_caps(1.0, 2, 2), 2, 2, 1),
-        # The counts hold the grid to two contracts, so two 10 XCH ones fit in 20.
-        (_caps(20, 2, 2), 2, 2, 10),
-        (_caps(20, config.UNLIMITED, 1), 2, 2, 10),
-        # No count caps: all four slots, and 10 XCH each would be 40.
-        (_caps(20), 2, 2, 1),
-        (_caps(20, config.UNSET, config.UNSET), 2, 2, 1),
-        # More variety, smaller contracts.
-        (_caps(100), 2, 2, 10),
-        (_caps(100), 3, 4, 1),
-        # Nothing to size from: the smallest.
-        (_caps(config.UNSET), 2, 2, 1),
-        (_caps(config.UNLIMITED), 2, 2, 1),
-        (_caps(1000), 0, 2, 1),
-        (_caps(1000), 2, 0, 1),
-        # Under one contract: still 1 XCH, and the cap then lets none be written.
-        (_caps(0.5, 4, 2), 2, 2, 1),
+        # Two strikes on two Fridays: four calls a size.
+        (_caps(4, 4, 2), 2, 2, ((1, 4),)),
+        (_caps(13.99, 8, 4), 2, 2, ((1, 4),)),
+        (_caps(14, 8, 4), 2, 2, ((1, 4), (10, 1))),
+        (_caps(44, 8, 4), 2, 2, ((1, 4), (10, 4))),
+        (_caps(444, 12, 6), 2, 2, ((1, 4), (10, 4), (100, 4))),
+        # The counts cover two sizes: the cap's room for a third is not used.
+        (_caps(444, 8, 4), 2, 2, ((1, 4), (10, 4))),
+        (_caps(444, config.UNLIMITED, 4), 2, 2, ((1, 4), (10, 4))),
+        # The trading PC's limits on 2026-11-24: one 1 XCH call fits.
+        (_caps(1.0, 2, 2), 2, 2, ((1, 1),)),
+        # No count caps: as far as the cap goes.
+        (_caps(1000), 2, 2, ((1, 4), (10, 4), (100, 4))),
+        # Nothing to size the ladder from: 1 XCH only.
+        (_caps(config.UNLIMITED), 2, 2, ((1, 4),)),
+        (_caps(config.UNLIMITED, 3, 2), 2, 2, ((1, 3),)),
+        # Nothing minted at all.
+        (_caps(config.UNSET), 2, 2, ()),
+        (_caps(100, config.UNSET, 2), 2, 2, ()),
+        (_caps(1000), 0, 2, ()),
+        (_caps(1000), 2, 0, ()),
+        (_caps(0.5, 4, 2), 2, 2, ()),
         # Bounded, whatever the cap.
-        (_caps(10**12), 1, 1, config.AUTO_CONTRACT_MAX_XCH),
+        (_caps(10**12), 1, 1, tuple((size, 1) for size in config.LADDER_XCH)),
     ],
 )
-def test_auto_is_the_largest_power_of_ten_that_covers_every_call_slot(
-    limits, calls, expiries, size
-) -> None:
-    """[AUTO-SIZE] Variety first, then size; never under 1 XCH."""
-    assert config.auto_contract_xch(limits, calls, expiries) == size
+def test_the_ladder_fills_each_size_before_the_next(limits, calls, expiries, ladder) -> None:
+    """[LADDER] 1 XCH on every strike and date, then 10 XCH, as far as the limits go."""
+    assert config.call_ladder(limits, calls, expiries) == ladder
 
 
-def test_the_call_slots_the_grid_can_hold() -> None:
-    assert config.held_call_slots(_caps(1), 2, 2) == 4
-    assert config.held_call_slots(_caps(1, contracts=3), 2, 2) == 3
-    assert config.held_call_slots(_caps(1, per_expiry=1), 2, 2) == 2
-    assert config.held_call_slots(_caps(1, contracts=1, per_expiry=1), 2, 2) == 1
-    assert config.held_call_slots(_caps(1, config.UNSET, config.UNSET), 2, 3) == 6
-    assert config.held_call_slots(_caps(1), 0, 3) == 0
+def test_puts_take_their_share_of_the_counts() -> None:
+    """[LADDER] Two calls and two puts a Friday: the 1 XCH grid alone is eight contracts."""
+    assert config.call_ladder(_caps(44, 8, 4), 2, 2, put_strikes=2) == ((1, 4),)
+    assert config.call_ladder(_caps(44, 16, 8), 2, 2, put_strikes=2) == ((1, 4), (10, 4))
+    # Room for one more contract a Friday at 10 XCH: it goes to a call here,
+    # and the planner gives it to whichever is nearer the money.
+    assert config.call_ladder(_caps(44, 10, 5), 2, 2, put_strikes=2) == ((1, 4), (10, 2))
+
+
+def test_the_ladder_says_when_puts_share_the_counts() -> None:
+    """[review #261] Calls are counted first, but the planner mints the strikes nearest
+    the money first, calls or puts: where the counts cannot hold both, Settings and
+    `status` say so."""
+    assert not config.ladder_counts_shared(_caps(44, 16, 8), 2, 2, put_strikes=2)
+    assert not config.ladder_counts_shared(_caps(44, 8, 4), 2, 2, put_strikes=2), (
+        "the 1 XCH grid fits whole, and nothing is left for 10 XCH"
+    )
+    assert config.ladder_counts_shared(_caps(44, 10, 5), 2, 2, put_strikes=2)
+    assert not config.ladder_counts_shared(_caps(44, 10, 5), 2, 2), "no puts"
+    # One call strike and one put strike, room for one contract: counted as the call.
+    assert config.call_ladder(_caps(10, 1, 1), 1, 1, put_strikes=1) == ((1, 1),)
+    assert config.ladder_counts_shared(_caps(10, 1, 1), 1, 1, put_strikes=1)
+    # The XCH cap, not the counts, stops the 10 XCH calls: nothing is shared.
+    assert config.call_ladder(_caps(4, 16, 8), 2, 2, put_strikes=2) == ((1, 4),)
+    assert not config.ladder_counts_shared(_caps(4, 16, 8), 2, 2, put_strikes=2)
+
+
+def test_puts_with_an_unlimited_cap_take_room_only_at_the_smallest_size() -> None:
+    """[review #261] The planner keeps a side with an unlimited cap at 1 XCH, so those
+    puts leave Max contracts and Max per expiry to the larger calls."""
+    unlimited = dataclasses.replace(_caps(44, 16, 8), max_locked_quote=config.UNLIMITED)
+    assert config.call_ladder(unlimited, 2, 2, put_strikes=2) == ((1, 4), (10, 4))
+    wider = dataclasses.replace(unlimited, max_locked_xch=144 * config.XCH_MOJOS)
+    assert config.call_ladder(wider, 2, 2, put_strikes=2) == ((1, 4), (10, 4), (100, 1))
+    capped = dataclasses.replace(wider, max_locked_quote=1000)
+    assert config.call_ladder(capped, 2, 2, put_strikes=2) == ((1, 4), (10, 4))
 
 
 @pytest.mark.parametrize("written", ["auto", " AUTO ", "Auto", None])
-def test_a_size_written_auto_or_null_is_worked_out(written) -> None:
-    # Two call strikes on one date, at most 5 an expiry and 10 in all: two
-    # slots, and 100 XCH lockable covers them at 10 XCH each, not at 100.
+def test_a_size_written_auto_or_null_is_the_ladder(written) -> None:
     parsed = _parse(contract_xch=written)
     assert parsed.contract_auto is True
-    assert parsed.contract_xch_mojos == 10 * config.XCH_MOJOS
-    assert parsed.market.hedge_size_xch == 10.0, "the price is read at the size written"
+    assert parsed.sizes_mojos == LADDER
+    assert parsed.contract_xch_mojos == config.XCH_MOJOS, "the smallest size"
+    assert parsed.market.hedge_size_xch == 1.0, "the Dexie check is one 1 XCH contract"
 
 
 def test_a_size_left_out_is_auto_too() -> None:
-    """[AUTO-SIZE] As an unwritten expiries is weekly: nothing more to set."""
+    """[LADDER] As an unwritten expiries is weekly: nothing more to set."""
     section = _section()
     del section["contract_xch"]
     parsed = config.parse({"options": section})
     assert parsed is not None and parsed.contract_auto is True
-    assert parsed.contract_xch_mojos == 10 * config.XCH_MOJOS
+    assert parsed.sizes_mojos == LADDER
 
 
 def test_a_written_size_is_kept_as_written() -> None:
     parsed = _parse(contract_xch=0.5)
     assert parsed.contract_auto is False
     assert parsed.contract_xch_mojos == config.XCH_MOJOS // 2
+    assert parsed.sizes_mojos == (config.XCH_MOJOS // 2,), "one size, no ladder"
     assert _parse(contract_xch="20").contract_xch_mojos == 20 * config.XCH_MOJOS
 
 
-def test_auto_counts_the_expiries_of_a_rule() -> None:
-    limits = {
-        "max_locked_xch": 40,
-        "max_locked_quote": 1,
-        "max_contracts": 4,
-        "max_contracts_per_expiry": 2,
-    }
-    weekly = _parse(
-        contract_xch="auto", expiries="weekly", call_strikes_pct=[110, 120], limits=limits
-    )
-    assert weekly.contract_xch_mojos == 10 * config.XCH_MOJOS, "four slots of 10 XCH in 40"
-    # Three weeklies and a month-end, two strikes each, eight contracts allowed.
-    more = _parse(
-        contract_xch="auto",
-        expiries={"weekly": 3, "monthly": 1},
-        call_strikes_pct=[110, 120],
-        limits={**limits, "max_contracts": 8},
-    )
-    assert more.contract_xch_mojos == config.XCH_MOJOS, "eight slots: 10 XCH each would be 80"
-    none = _parse(contract_xch="auto", expiries="none", limits=limits)
-    assert none.contract_xch_mojos == config.XCH_MOJOS, "no new contracts: nothing to size"
+def test_the_ladder_is_the_same_whatever_the_limits() -> None:
+    """[LADDER] The limits decide how far up it is minted (quoting.plan), not which sizes
+    exist: a contract of a size on the ladder is never retired because a cap moved."""
+    for cap in (1, 40, 4000, "unlimited"):
+        parsed = _parse(contract_xch="auto", limits={**_section()["limits"], "max_locked_xch": cap})
+        assert parsed.sizes_mojos == LADDER
 
 
 def test_a_malformed_size_says_auto_is_a_choice() -> None:
@@ -562,7 +576,7 @@ def test_a_malformed_size_says_auto_is_a_choice() -> None:
         _parse(contract_xch=0)
 
 
-def test_the_example_config_sizes_its_contracts_from_the_limits() -> None:
+def test_the_example_config_sizes_its_contracts_by_the_ladder() -> None:
     from pathlib import Path
 
     yaml = pytest.importorskip("yaml")
@@ -572,23 +586,26 @@ def test_the_example_config_sizes_its_contracts_from_the_limits() -> None:
 
 
 def test_the_same_expiry_written_twice_is_one_expiry() -> None:
-    """[review #254] What auto sizes from, and what the Settings preview must match."""
+    """[review #254] What the Settings preview counts, as the book does."""
     same = ["2026-12-01T13:00:00Z", "2026-12-01T14:00:00+01:00", 1796130000]
     assert config.distinct_expiries(same) == 1
     assert config.distinct_expiries([*same, "2026-12-08T13:00:00Z"]) == 2
     assert config.distinct_expiries([]) == 0
+    # [review #261] Only those the book still mints for: later than now plus the stop window.
+    stop_ends = 1796734800 - 3600  # 2026-12-08 12:00Z, an hour before the later date
+    assert config.distinct_expiries([*same, "2026-12-08T13:00:00Z"], after=stop_ends) == 1
+    assert config.distinct_expiries(same, after=stop_ends) == 0
     with pytest.raises(config.OptionsConfigError):
         config.distinct_expiries(["next friday"])
+    assert _parse(contract_xch="auto", expiries=same).expiries == (1796130000,)
 
-    # Two call strikes on that one expiry, 20 XCH lockable: two slots of 10 XCH.
-    parsed = _parse(
-        contract_xch="auto",
-        expiries=same,
-        call_strikes_pct=[110, 120],
-        limits={**_section()["limits"], "max_locked_xch": 20},
-    )
-    assert parsed.expiries == (1796130000,)
-    assert parsed.contract_xch_mojos == 10 * config.XCH_MOJOS
+
+def test_the_quotable_expiries_leave_out_the_stop_window() -> None:
+    parsed = _parse(expiries=[1796130000, 1796734800], stop_before_expiry_seconds=3600)
+    assert parsed.quotable_expiries(1796130000 - 7200) == (1796130000, 1796734800)
+    assert parsed.quotable_expiries(1796130000 - 3600) == (1796734800,)
+    weekly = _parse(expiries="weekly", stop_before_expiry_seconds=3600)
+    assert len(weekly.quotable_expiries(1796130000)) == 2, "a rule counts past the window"
 
 
 def test_a_cap_too_large_to_count_is_refused_as_a_cap() -> None:

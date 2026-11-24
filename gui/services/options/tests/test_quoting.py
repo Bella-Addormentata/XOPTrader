@@ -321,6 +321,218 @@ def test_a_small_contract_s_target_is_the_strike_it_will_really_have() -> None:
 
 
 # ---------------------------------------------------------------------------
+# [LADDER] contract_xch: auto -- 1, 10, 100, ... XCH side by side
+# ---------------------------------------------------------------------------
+
+
+def _ladder(**limits) -> config.OptionsConfig:
+    """Two call strikes on two dates, no puts, sized by the ladder."""
+    caps = {
+        "max_locked_xch": 14,
+        "max_locked_quote": 1,
+        "max_contracts": 8,
+        "max_contracts_per_expiry": 4,
+        **limits,
+    }
+    return _config(contract_xch="auto", put_strikes_pct=[], limits=caps)
+
+
+def _sizes(plan: quoting.Plan) -> list[tuple[int, int, float]]:
+    return [(item.size_mojos // XCH, item.expiration, item.strike) for item in plan.mint]
+
+
+def test_the_ladder_fills_the_smallest_size_everywhere_first() -> None:
+    plan = quoting.plan(_ladder(), _market(), [], NOW)
+
+    # The whole 1 XCH grid, nearest date and nearest the money first, then
+    # the 10 XCH call that still fits in 14 XCH.
+    assert _sizes(plan) == [
+        (1, NEAR, 1.10),
+        (1, NEAR, 1.20),
+        (1, FAR, 1.10),
+        (1, FAR, 1.20),
+        (10, NEAR, 1.10),
+    ]
+    assert plan.blocked == "", "the cap stopping a larger size is the ladder working"
+    assert plan.mint[-1].underlying == quoting.Asset(None, 10 * XCH)
+    assert plan.mint[-1].strike_asset.amount == 11_000, "10 XCH at 1.10, in mojos"
+
+
+@pytest.mark.parametrize(
+    ("limits", "puts"),
+    [
+        ({"max_locked_xch": 14, "max_contracts": 8, "max_contracts_per_expiry": 4}, []),
+        ({"max_locked_xch": 444, "max_contracts": 12, "max_contracts_per_expiry": 6}, []),
+        (
+            {
+                "max_locked_xch": 1000,
+                "max_contracts": "unlimited",
+                "max_contracts_per_expiry": "unlimited",
+            },
+            [],
+        ),
+        (
+            {
+                "max_locked_xch": 44,
+                "max_locked_quote": 10_000,
+                "max_contracts": 16,
+                "max_contracts_per_expiry": 8,
+            },
+            [90, 80],
+        ),
+        (
+            {
+                "max_locked_xch": 144,
+                "max_locked_quote": "unlimited",
+                "max_contracts": 16,
+                "max_contracts_per_expiry": 8,
+            },
+            [90, 80],
+        ),
+    ],
+)
+def test_the_settings_preview_matches_what_the_planner_mints(limits, puts) -> None:
+    """[review #261] config.call_ladder is what Settings and `status` show: on an empty
+    book it must come to the calls the planner mints, size by size."""
+    cfg = _config(
+        contract_xch="auto", put_strikes_pct=puts, limits={"max_locked_quote": 1, **limits}
+    )
+    minted: dict[int, int] = {}
+    for item in quoting.plan(cfg, _market(), [], NOW).mint:
+        if item.side == "call":
+            minted[item.size_mojos // XCH] = minted.get(item.size_mojos // XCH, 0) + 1
+    preview = config.call_ladder(cfg.limits, 2, 2, put_strikes=len(puts))
+    assert dict(preview) == minted
+
+
+def test_puts_nearer_the_money_take_count_room_before_calls() -> None:
+    """[review #261] The planner goes nearest the money first, calls or puts. The
+    preview counts the calls first, so it says when the two share the counts."""
+    cfg = _config(
+        contract_xch="auto",
+        expiries=[NEAR],
+        call_strikes_pct=[120],
+        put_strikes_pct=[100],
+        limits={
+            "max_locked_xch": 10,
+            "max_locked_quote": 10,
+            "max_contracts": 1,
+            "max_contracts_per_expiry": 1,
+        },
+    )
+    plan = quoting.plan(cfg, _market(), [], NOW)
+    assert [(item.side, item.size_mojos // XCH) for item in plan.mint] == [("put", 1)]
+    assert config.call_ladder(cfg.limits, 1, 1, put_strikes=1) == ((1, 1),)
+    assert config.ladder_counts_shared(cfg.limits, 1, 1, put_strikes=1)
+
+
+def test_one_slot_holds_a_contract_of_each_size() -> None:
+    cfg = _ladder(max_locked_xch=44)
+    small, *_ = quoting.plan(cfg, _market(), [], NOW).mint
+    held = [_contract(small, store.OPEN, 1)]
+
+    plan = quoting.plan(cfg, _market(), held, NOW)
+
+    assert small.slot in {item.slot for item in plan.mint if item.size_mojos == 10 * XCH}
+    assert small.slot not in {item.slot for item in plan.mint if item.size_mojos == XCH}
+    assert list(plan.asks) == [held[0].launcher_id] and plan.retire == ()
+
+
+def test_a_limit_that_stops_the_smallest_size_is_said() -> None:
+    """[LADDER] Max XCH locked used to stop mints without a word."""
+    short = quoting.plan(_ladder(max_locked_xch=2), _market(), [], NOW)
+    assert _sizes(short) == [(1, NEAR, 1.10), (1, NEAR, 1.20)]
+    assert short.blocked == "options.limits.max_locked_xch reached"
+
+    none = quoting.plan(_ladder(max_locked_xch=0.5), _market(), [], NOW)
+    assert none.mint == () and none.blocked == "options.limits.max_locked_xch reached"
+
+    crowded = quoting.plan(_ladder(max_contracts_per_expiry=1), _market(), [], NOW)
+    assert _sizes(crowded) == [(1, NEAR, 1.10), (1, FAR, 1.10)]
+    assert crowded.blocked == "options.limits.max_contracts_per_expiry reached"
+
+    few = quoting.plan(_ladder(max_contracts=3), _market(), [], NOW)
+    assert len(few.mint) == 3 and few.blocked == "options.limits.max_contracts reached"
+
+    puts = _config(contract_xch="auto", limits={"max_locked_quote": 0.5})
+    assert quoting.plan(puts, _market(), [], NOW).blocked == (
+        "options.limits.max_locked_quote reached"
+    )
+
+
+def test_a_sold_small_contract_is_refilled_first_when_there_is_room() -> None:
+    """A sold contract frees its slot but its collateral stays locked until expiry."""
+    counts = {"max_contracts": 12, "max_contracts_per_expiry": 6}
+    cfg = _ladder(max_locked_xch=44, **counts)
+    grid = quoting.plan(cfg, _market(), [], NOW).mint
+    assert [item.size_mojos // XCH for item in grid] == [1] * 4 + [10] * 4
+    held = [
+        _contract(item, store.SOLD if index == 0 else store.OPEN, index + 1)
+        for index, item in enumerate(grid)
+    ]
+
+    full = quoting.plan(cfg, _market(), held, NOW)
+    assert full.mint == (), "44 XCH are locked: the refill waits for room"
+    assert full.blocked == "options.limits.max_locked_xch reached"
+    assert full.retire == (), "a larger contract is never cancelled to make room"
+
+    room = quoting.plan(_ladder(max_locked_xch=45, **counts), _market(), held, NOW)
+    assert _sizes(room) == [(1, NEAR, 1.10)], "the 1 XCH refill, the same slot"
+    assert room.mint[0].slot == grid[0].slot
+
+
+def test_a_size_off_the_ladder_is_retired_and_ladder_sizes_are_kept() -> None:
+    """[LADDER] The 0.5 XCH calls of the live test: cancelled once auto is on."""
+    old = quoting.plan(_config(contract_xch=0.5, put_strikes_pct=[]), _market(), [], NOW).mint
+    cfg = _ladder(max_locked_xch=44)
+    new = quoting.plan(cfg, _market(), [], NOW).mint
+    held = [
+        _contract(old[0], store.OPEN, 1),
+        _contract(old[1], store.SOLD, 2),
+        _contract(new[0], store.OPEN, 3),
+        _contract(new[-1], store.OPEN, 4),  # 10 XCH
+    ]
+
+    plan = quoting.plan(cfg, _market(), held, NOW)
+
+    assert plan.retire == (held[0].launcher_id,), "unsold and off the ladder"
+    assert set(plan.asks) == {held[2].launcher_id, held[3].launcher_id}
+
+
+def test_a_lower_cap_stops_new_mints_and_keeps_what_is_on_offer() -> None:
+    big = quoting.plan(_ladder(max_locked_xch=44), _market(), [], NOW).mint[-1]
+    assert big.size_mojos == 10 * XCH
+    held = [_contract(big, store.OPEN, 1)]
+
+    plan = quoting.plan(_ladder(max_locked_xch=4), _market(), held, NOW)
+
+    assert plan.retire == () and list(plan.asks) == [held[0].launcher_id]
+    assert plan.mint == () and plan.blocked == "options.limits.max_locked_xch reached"
+
+
+def test_an_unlimited_cap_keeps_its_side_at_the_smallest_size() -> None:
+    """[LADDER] With nothing to size from, the ladder would climb to its top at once."""
+    plan = quoting.plan(_config(contract_xch="auto"), _market(), [], NOW)
+    assert len(plan.mint) == 6 and {item.size_mojos for item in plan.mint} == {XCH}
+    assert plan.blocked == ""
+
+
+def test_puts_climb_the_ladder_on_their_own_cap() -> None:
+    """A put locks the quote asset: max_locked_quote decides how far up puts go."""
+    cfg = _config(
+        contract_xch="auto",
+        call_strikes_pct=[],
+        put_strikes_pct=[90],
+        limits={"max_locked_xch": 1, "max_locked_quote": 22},
+    )
+    plan = quoting.plan(cfg, _market(), [], NOW)
+    # At spot 1.10 a 90% put strikes at 1.00: 1 quote unit per XCH.
+    assert _sizes(plan) == [(1, NEAR, 1.00), (1, FAR, 1.00), (10, NEAR, 1.00), (10, FAR, 1.00)]
+    assert plan.mint[-1].underlying == quoting.Asset(USD, 10_000)
+    assert plan.blocked == ""
+
+
+# ---------------------------------------------------------------------------
 # The record kept with each offer
 # ---------------------------------------------------------------------------
 

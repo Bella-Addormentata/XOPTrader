@@ -552,7 +552,7 @@ def test_strike_lists_written_null_stay_blank_and_save_empty(panel, tmp_path):
     assert saved["call_strikes_pct"] == [] and saved["put_strikes_pct"] == []
 
 
-# -- [AUTO-SIZE] options.contract_xch: auto ---------------------------------------
+# -- [LADDER] options.contract_xch: auto ------------------------------------------
 
 _FOUR_SLOTS = {
     "max_locked_xch": 4,
@@ -560,10 +560,11 @@ _FOUR_SLOTS = {
     "max_contracts": 4,
     "max_contracts_per_expiry": 2,
 }
+_NO_ROOM = "Max contracts and Max per expiry leave no room for more calls."
 
 
 def _auto_book(tmp_path: Path, **extra) -> Path:
-    """Two call strikes on the next two Fridays, sized by the book: four slots."""
+    """Two call strikes on the next two Fridays, sized by the book: four calls a size."""
     return _shared_book(
         tmp_path, **{"contract_xch": "auto", "expiries": "weekly", "limits": _FOUR_SLOTS, **extra}
     )
@@ -577,7 +578,7 @@ def test_an_auto_size_shows_as_automatic_and_is_saved_as_auto(panel, tmp_path):
     assert tab.size_mode.currentIndex() == _SIZE_AUTO
     assert tab.contract_xch.isHidden() and tab._size_label.isHidden()
     assert not tab.size_hint.isHidden()
-    assert tab.size_hint.text() == "1 XCH a contract: all 4 call slots fit inside Max XCH locked."
+    assert tab.size_hint.text() == f"Calls, smallest first: 4 of 1 XCH (4 XCH locked). {_NO_ROOM}"
     assert "5 XCH and 2 of the quote asset" in tab.target_hint.text(), "4 XCH plus one contract"
     assert tab.limits_hint.text() == ""
     assert not panel._dirty, "showing it is not an edit"
@@ -589,7 +590,7 @@ def test_an_auto_size_shows_as_automatic_and_is_saved_as_auto(panel, tmp_path):
 
 @pytest.mark.parametrize("written", [None, "AUTO"])
 def test_a_size_not_written_shows_as_automatic(panel, tmp_path, written):
-    """[AUTO-SIZE] The book reads no size as auto, so the tab shows that."""
+    """[LADDER] The book reads no size as auto, so the tab shows that."""
     cfg_path = _auto_book(tmp_path, contract_xch=written)
     panel.load_config(str(cfg_path))
     tab = panel._options_section
@@ -600,37 +601,156 @@ def test_a_size_not_written_shows_as_automatic(panel, tmp_path, written):
     assert _saved_options(cfg_path)["contract_xch"] == "auto", "written out once saved"
 
 
-def test_the_auto_hint_follows_the_limits_and_the_grid(panel, tmp_path):
+def test_the_ladder_hint_follows_the_limits_and_the_grid(panel, tmp_path):
+    """[LADDER] What the ladder comes to for calls, and what one more call needs."""
     panel.load_config(str(_auto_book(tmp_path)))
     tab = panel._options_section
     cap = tab.limit_fields["max_locked_xch"]
 
     cap.setText("40")
-    assert tab.size_hint.text().startswith("10 XCH a contract: all 4 call slots fit")
-    assert "50 XCH" in tab.target_hint.text()
+    assert tab.size_hint.text().endswith(_NO_ROOM), "four contracts: the 1 XCH grid only"
+    assert "41 XCH" in tab.target_hint.text(), "the headroom is one 1 XCH contract"
 
-    tab.call_strikes.setText("110, 120, 130")  # more variety: six slots wanted, four allowed
-    assert tab.size_hint.text().startswith("10 XCH a contract: all 4 call slots fit")
-    tab.limit_fields["max_contracts"].setText("6")
-    tab.limit_fields["max_contracts_per_expiry"].setText("3")
-    assert tab.size_hint.text().startswith("1 XCH a contract: all 6 call slots fit")
+    tab.limit_fields["max_contracts"].setText("8")
+    tab.limit_fields["max_contracts_per_expiry"].setText("4")
+    assert tab.size_hint.text() == (
+        "Calls, smallest first: 4 of 1 XCH, then 3 of 10 XCH (34 XCH locked). "
+        "Max XCH locked 44 adds a 10 XCH call."
+    )
+    cap.setText("44")
+    assert tab.size_hint.text() == (
+        f"Calls, smallest first: 4 of 1 XCH, then 4 of 10 XCH (44 XCH locked). {_NO_ROOM}"
+    )
+    tab.limit_fields["max_contracts"].setText("12")
+    tab.limit_fields["max_contracts_per_expiry"].setText("6")
+    assert tab.size_hint.text().endswith("Max XCH locked 144 adds a 100 XCH call.")
 
+    tab.call_strikes.setText("110, 120, 130")  # more variety: six calls a size
+    assert tab.size_hint.text() == (
+        "Calls, smallest first: 6 of 1 XCH, then 3 of 10 XCH (36 XCH locked). "
+        "Max XCH locked 46 adds a 10 XCH call."
+    )
     cap.setText("2")
     assert tab.size_hint.text() == (
-        "1 XCH a contract, the smallest it goes: Max XCH locked covers 2 of the 6 call "
-        "slots, nearest expiry first."
+        "Calls, smallest first: 2 of 1 XCH (2 XCH locked). Max XCH locked 3 adds a 1 XCH call."
     )
 
     cap.setText("0.5")
     assert "less than one contract" in tab.limits_hint.text()
+    assert tab.size_hint.text() == "", "the limits hint says it"
 
     for no_number in ("", "unlimited"):
         cap.setText(no_number)
-        assert "has no number to size it from" in tab.size_hint.text()
+        assert "has no number to size more from" in tab.size_hint.text()
 
     cap.setText("40")
+    tab.put_strikes.setText("90, 80")  # five strikes a Friday, room for six
+    assert tab.size_hint.text().endswith(
+        "Puts get the same sizes, as far as Max quote locked allows. Where puts and calls "
+        "share Max contracts and Max per expiry, the strikes nearest the money go first, so "
+        "puts may take some of the room shown for calls."
+    )
     tab.call_strikes.setText("")
-    assert "no call slots to size it from" in tab.size_hint.text()
+    assert tab.size_hint.text().startswith("1 XCH contracts first, then 10, 100...")
+
+
+def test_puts_take_their_share_of_the_counts_in_the_hint(panel, tmp_path):
+    """[LADDER] Two puts a Friday at each size: 8 contracts are the 1 XCH grid alone."""
+    panel.load_config(str(_auto_book(tmp_path, put_strikes_pct=[90, 80])))
+    tab = panel._options_section
+    tab.limit_fields["max_locked_xch"].setText("44")
+    tab.limit_fields["max_contracts"].setText("8")
+    tab.limit_fields["max_contracts_per_expiry"].setText("4")
+    assert tab.size_hint.text().startswith(
+        f"Calls, smallest first: 4 of 1 XCH (4 XCH locked). {_NO_ROOM}"
+    )
+    tab.limit_fields["max_contracts"].setText("16")
+    tab.limit_fields["max_contracts_per_expiry"].setText("8")
+    assert tab.size_hint.text().startswith(
+        "Calls, smallest first: 4 of 1 XCH, then 4 of 10 XCH (44 XCH locked)."
+    )
+
+
+def test_puts_with_an_unlimited_cap_leave_room_for_larger_calls(panel, tmp_path):
+    """[review #261] Unlimited Max quote locked keeps puts at 1 XCH, as the book does."""
+    limits = {
+        "max_locked_xch": 44,
+        "max_locked_quote": "unlimited",
+        "max_contracts": 16,
+        "max_contracts_per_expiry": 8,
+    }
+    panel.load_config(str(_auto_book(tmp_path, put_strikes_pct=[90, 80], limits=limits)))
+    tab = panel._options_section
+    assert tab.size_hint.text() == (
+        "Calls, smallest first: 4 of 1 XCH, then 4 of 10 XCH (44 XCH locked). "
+        "Max XCH locked 144 adds a 100 XCH call. "
+        "Puts stay at 1 XCH: Max quote locked has no number to size them from."
+    )
+
+
+def test_the_hint_says_when_puts_share_the_counts_with_calls(panel, tmp_path):
+    """[review #261] The hint counts the calls first; the book mints the strikes nearest
+    the money first, calls or puts, so where the counts cannot hold both it says so."""
+    limits = {
+        "max_locked_xch": 44,
+        "max_locked_quote": 100,
+        "max_contracts": 10,
+        "max_contracts_per_expiry": 5,
+    }
+    panel.load_config(str(_auto_book(tmp_path, put_strikes_pct=[90, 80], limits=limits)))
+    assert panel._options_section.size_hint.text() == (
+        "Calls, smallest first: 4 of 1 XCH, then 2 of 10 XCH (24 XCH locked). "
+        "Max contracts and Max per expiry leave no room for more calls. "
+        "Puts get the same sizes, as far as Max quote locked allows. "
+        "Where puts and calls share Max contracts and Max per expiry, the strikes nearest "
+        "the money go first, so puts may take some of the room shown for calls."
+    )
+
+
+def test_the_ladder_hint_counts_a_month_end_that_is_also_a_weekly_once(panel, tmp_path):
+    """[review #261] On 2026-11-24 the next two weeklies are Nov 27 and Dec 4, and
+    November's month-end is Nov 27 too: two expiries, as the book counts them."""
+    limits = {
+        **_FOUR_SLOTS,
+        "max_locked_xch": 44,
+        "max_contracts": 8,
+        "max_contracts_per_expiry": 4,
+    }
+    cfg_path = _auto_book(tmp_path, expiries={"weekly": 2, "monthly": 1}, limits=limits)
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+
+    tab._clock = lambda: 1795536000  # 2026-11-24 16:00Z
+    tab._sync_rows()
+    assert tab.size_hint.text().startswith(
+        "Calls, smallest first: 4 of 1 XCH, then 4 of 10 XCH (44 XCH locked)."
+    )
+    tab._clock = lambda: 1796112000  # 2026-12-01 08:00Z: Dec 4, Dec 11 and Dec 25
+    tab._sync_rows()
+    assert tab.size_hint.text().startswith(
+        "Calls, smallest first: 6 of 1 XCH, then 2 of 10 XCH (26 XCH locked)."
+    )
+
+
+def test_the_ladder_hint_leaves_out_dates_the_book_no_longer_mints_for(panel, tmp_path):
+    """[review #261] Fixed dates already past or inside the stop window (6 h) get no
+    new contract, so the hint counts only the ones the book still mints for."""
+    dates = ["2026-11-20T08:00:00Z", "2026-11-24T20:00:00Z", "2026-11-27T08:00:00Z"]
+    limits = {**_FOUR_SLOTS, "max_locked_xch": 22, "max_contracts": 4}
+    cfg_path = _auto_book(tmp_path, expiries=dates, call_strikes_pct=[110], limits=limits)
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+
+    tab._clock = lambda: 1795536000  # 2026-11-24 16:00Z: only Nov 27 is left
+    tab._sync_rows()
+    assert tab.size_hint.text() == (
+        "Calls, smallest first: 1 of 1 XCH, then 1 of 10 XCH (11 XCH locked). " + _NO_ROOM
+    )
+    tab._clock = lambda: 1795334400  # 2026-11-22 08:00Z: Nov 24 and Nov 27
+    tab._sync_rows()
+    assert tab.size_hint.text().startswith(
+        "Calls, smallest first: 2 of 1 XCH, then 2 of 10 XCH (22 XCH locked)."
+    )
 
 
 def test_switching_to_fixed_writes_the_number_in_the_box(panel, tmp_path):
@@ -657,7 +777,7 @@ def test_switching_a_written_size_to_automatic_writes_auto(panel, tmp_path):
 
     tab.size_mode.setCurrentIndex(_SIZE_AUTO)
     assert panel._dirty
-    assert "1 XCH a contract" in tab.size_hint.text()
+    assert tab.size_hint.text().startswith("Calls, smallest first: 2 of 1 XCH"), "one date"
     assert panel.save_config(str(cfg_path)) is True, _SAID
     assert _saved_options(cfg_path)["contract_xch"] == "auto"
 
@@ -666,9 +786,47 @@ def test_switching_a_written_size_to_automatic_writes_auto(panel, tmp_path):
     assert tab.contract_xch.value() == 1.0, "a save rebased the tab on auto"
 
 
-def test_the_auto_hint_counts_fixed_dates_as_the_book_does(panel, tmp_path):
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda tab: tab.size_mode.setCurrentIndex(_SIZE_AUTO),
+        lambda tab: tab.contract_xch.setValue(2.0),
+    ],
+    ids=["to automatic", "to another number"],
+)
+def test_a_dexie_check_sized_to_the_old_size_goes_with_it(panel, tmp_path, change):
+    """[LADDER] The live test wrote hedge_size_xch: 0.5 beside contract_xch: 0.5. A new
+    size takes the Dexie check back to its default, one contract of the smallest size,
+    instead of leaving it at 0.5 unseen; the rest of options.market stays."""
+    cfg_path = _shared_book(tmp_path, limits=_FOUR_SLOTS, market={"hedge_size_xch": 0.5})
+    panel.load_config(str(cfg_path))
+    change(panel._options_section)
+
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    market = _saved_options(cfg_path)["market"]
+    assert "hedge_size_xch" not in market
+    assert market["max_spread_pct"] == 10, "the rest of the section is kept"
+
+
+def test_a_dexie_check_chosen_on_its_own_is_kept(panel, tmp_path):
+    """[LADDER] Only a check sized to the old contract goes; one set apart from it stays,
+    and so does one beside a size that did not change."""
+    cfg_path = _shared_book(tmp_path, limits=_FOUR_SLOTS, market={"hedge_size_xch": 5})
+    panel.load_config(str(cfg_path))
+    panel._options_section.size_mode.setCurrentIndex(_SIZE_AUTO)
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["market"]["hedge_size_xch"] == 5
+
+    cfg_path = _shared_book(tmp_path, limits=_FOUR_SLOTS, market={"hedge_size_xch": 0.5})
+    panel.load_config(str(cfg_path))
+    panel._options_section.limit_fields["max_contracts"].setText("6")  # the size stays 0.5
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["market"]["hedge_size_xch"] == 0.5
+
+
+def test_the_ladder_hint_counts_fixed_dates_as_the_book_does(panel, tmp_path):
     """[review #254] The same expiry listed twice, or in two UTC offsets, is one expiry:
-    two call strikes and 20 XCH lockable are two slots of 10 XCH, not four of 1 XCH."""
+    two call strikes and per-expiry room for two are two 1 XCH calls, not four."""
     limits = {**_FOUR_SLOTS, "max_locked_xch": 20}
     cfg_path = _auto_book(
         tmp_path,
@@ -678,16 +836,14 @@ def test_the_auto_hint_counts_fixed_dates_as_the_book_does(panel, tmp_path):
     panel.load_config(str(cfg_path))
     tab = panel._options_section
 
-    assert tab.size_hint.text() == (
-        "10 XCH a contract: all 2 call slots fit inside Max XCH locked."
-    )
-    assert "30 XCH" in tab.target_hint.text(), "20 XCH plus one 10 XCH contract"
+    assert tab.size_hint.text() == f"Calls, smallest first: 2 of 1 XCH (2 XCH locked). {_NO_ROOM}"
+    assert "21 XCH" in tab.target_hint.text(), "20 XCH plus one 1 XCH contract"
 
     tab.expiries.setText("2026-12-04T14:00:00Z, 2026-12-11T14:00:00Z")  # two expiries
-    assert tab.size_hint.text().startswith("1 XCH a contract: all 4 call slots fit")
+    assert tab.size_hint.text().startswith("Calls, smallest first: 4 of 1 XCH")
 
     tab.expiries.setText("next friday, next friday")  # the book refuses it on Save
-    assert "XCH a contract" in tab.size_hint.text(), "the preview still shows a size"
+    assert tab.size_hint.text().startswith("Calls, smallest first:"), "the preview still shows"
 
 
 def test_a_cap_too_large_to_count_does_not_break_the_preview(panel, tmp_path):
@@ -699,7 +855,7 @@ def test_a_cap_too_large_to_count_does_not_break_the_preview(panel, tmp_path):
 
     tab.limit_fields["max_locked_xch"].setText("1e300")
 
-    assert "has no number to size it from" in tab.size_hint.text()
+    assert "has no number to size more from" in tab.size_hint.text()
     assert tab.size_mode.currentIndex() == _SIZE_AUTO
     assert panel.save_config(str(cfg_path)) is False
     assert any("too large" in said for said in _SAID), _SAID

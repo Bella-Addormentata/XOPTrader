@@ -10,6 +10,15 @@ sits in it. When that contract sells, the slot is empty again and a new one is
 minted, at the strike the current spot implies, until a limit says stop. So the
 book is always offering the same shape of market around wherever the price is.
 
+[LADDER] A slot holds one contract of each size on offer
+(:attr:`OptionsConfig.sizes_mojos`): with ``contract_xch: auto``, 1, 10,
+100, ... XCH side by side. The smallest size goes out everywhere first, then
+the next, as far as the limits allow, so a refill of a small contract that
+sold comes before any larger one. A larger contract is never cancelled to
+make room for a smaller one. A limit that stops a contract of the smallest
+size is reported (``Plan.blocked``); one that stops a larger size is the
+ladder working as meant, and is not.
+
 A minted contract's strike can never change. When spot has drifted far enough
 that an unsold contract no longer resembles its slot (``strike_drift_pct``), or
 its expiry is close (``stop_before_expiry_seconds``), it is *retired*:
@@ -47,6 +56,11 @@ class Wanted:
     expiration: int
     underlying: Asset
     strike_asset: Asset
+
+    @property
+    def size_mojos(self) -> int:
+        """[LADDER] How many XCH mojos the contract is over."""
+        return self.underlying.amount if self.side == CALL else self.strike_asset.amount
 
     def terms(self, creator_puzzle_hash: bytes) -> OptionTerms:
         return OptionTerms(
@@ -93,10 +107,10 @@ class AskQuote:
 
 @dataclasses.dataclass(frozen=True)
 class Plan:
-    mint: tuple[Wanted, ...]  # in priority order; empty when a limit blocks
+    mint: tuple[Wanted, ...]  # in priority order
     retire: tuple[bytes, ...]  # launcher ids of unsold contracts to cancel
     asks: dict[bytes, int]  # launcher id -> ask in quote-asset mojos, for unsold contracts
-    blocked: str  # why nothing more is minted, or ""
+    blocked: str  # why the grid at its smallest size is not all minted, or ""
     net_delta_xch: float
     # launcher id -> how its ask was worked out, for the record kept with each offer
     quotes: dict[bytes, AskQuote] = dataclasses.field(default_factory=dict)
@@ -113,10 +127,14 @@ def strike_for(spot: float, percent: int, step: float) -> float:
     return round(steps * step, 9)
 
 
+def contract_size_mojos(contract: store.Contract) -> int:
+    """How many XCH mojos a contract is over."""
+    return int(contract.underlying_amount if contract.side == CALL else contract.strike_amount)
+
+
 def contract_size_xch(contract: store.Contract) -> float:
     """How many XCH a contract is over."""
-    mojos = contract.underlying_amount if contract.side == CALL else contract.strike_amount
-    return mojos / XCH_MOJOS
+    return contract_size_mojos(contract) / XCH_MOJOS
 
 
 def contract_strike(contract: store.Contract, quote_unit_mojos: int) -> float:
@@ -126,15 +144,15 @@ def contract_strike(contract: store.Contract, quote_unit_mojos: int) -> float:
 
 
 def _wanted(
-    config: OptionsConfig, side: str, percent: int, expiration: int, spot: float
+    config: OptionsConfig, side: str, percent: int, expiration: int, spot: float, size_mojos: int
 ) -> Wanted | None:
-    """The contract a slot should hold, or None if it is too small to strike.
+    """The contract of ``size_mojos`` a slot should hold, or None if it is too small to strike.
 
     The quote leg is a whole number of the quote asset's mojos. A contract so
     small that its strike rounds to none of them cannot be written at all.
     """
     strike = strike_for(spot, percent, config.strike_step)
-    size_xch = config.contract_xch_mojos / XCH_MOJOS
+    size_xch = size_mojos / XCH_MOJOS
     quote_mojos = int(round(strike * size_xch * config.quote_unit_mojos))
     if quote_mojos < 1:
         return None
@@ -143,7 +161,7 @@ def _wanted(
     # a target that kept the grid's would see its own contract as having
     # drifted, retire it, and mint the same one again, for ever.
     strike = quote_mojos / config.quote_unit_mojos / size_xch
-    xch = Asset(None, config.contract_xch_mojos)
+    xch = Asset(None, size_mojos)
     quote = Asset(config.quote_asset_id, quote_mojos)
     return Wanted(
         slot=slot_name(side, percent, expiration),
@@ -261,37 +279,40 @@ def plan(config: OptionsConfig, market: Market, contracts: list[store.Contract],
     delta_xch = net_delta_xch(active, market, config, now)
     lean = max(-1.0, min(1.0, delta_xch / config.pricing.steer_scale_xch))
 
-    targets: dict[str, Wanted] = {}
+    # [LADDER] One target per slot and size: a slot holds a contract of each.
+    sizes = config.sizes_mojos
+    targets: dict[tuple[str, int], Wanted] = {}
     too_small: set[str] = set()
-    for expiration in config.expiries_at(now):
-        if expiration - now <= config.stop_before_expiry_seconds:
-            continue
+    for expiration in config.quotable_expiries(now):
         sides = [(CALL, percent) for percent in config.call_strikes_pct]
         sides += [(PUT, percent) for percent in config.put_strikes_pct]
         for side, percent in sides:
-            wanted = _wanted(config, side, percent, expiration, market.spot)
-            if wanted is None:
-                too_small.add(slot_name(side, percent, expiration))
-            else:
-                targets[wanted.slot] = wanted
+            for size in sizes:
+                wanted = _wanted(config, side, percent, expiration, market.spot, size)
+                if wanted is None:
+                    too_small.add(slot_name(side, percent, expiration))
+                else:
+                    targets[(wanted.slot, size)] = wanted
 
     retire: list[bytes] = []
-    filled: set[str] = set()
+    filled: set[tuple[str, int]] = set()
     asks: dict[bytes, int] = {}
     quotes: dict[bytes, AskQuote] = {}
     for contract in unsold:
-        target = targets.get(contract.slot)
+        held = (contract.slot, contract_size_mojos(contract))
+        target = targets.get(held)
         strike = contract_strike(contract, config.quote_unit_mojos)
         if target is None:
-            # No longer in the grid: retire it. One whose slot merely cannot be
-            # struck at today's contract size is left as it is.
+            # No longer in the grid, or [LADDER] not a size on offer (0.5 XCH
+            # after the switch to auto): retire it. One whose slot merely
+            # cannot be struck at today's contract size is left as it is.
             stale = contract.slot not in too_small
         else:
             stale = abs(strike - target.strike) / target.strike * 100.0 > config.strike_drift_pct
         if contract.status == store.OPEN and stale:
             retire.append(contract.launcher_id)
             continue
-        filled.add(contract.slot)
+        filled.add(held)
         if contract.status == store.OPEN and contract.expiration > now:
             quoted = ask_quote(contract, market, config, now, lean)
             asks[contract.launcher_id] = quoted.units
@@ -321,34 +342,48 @@ def plan(config: OptionsConfig, market: Market, contracts: list[store.Contract],
 
     mint: list[Wanted] = []
     if not blocked:
-        # Nearest expiry first, and within it the strikes nearest the money,
-        # which are the ones takers want most.
+        # [LADDER] The smallest size everywhere first; within a size, nearest
+        # expiry first, and within it the strikes nearest the money, which
+        # are the ones takers want most.
         ordered = sorted(
-            (wanted for slot, wanted in targets.items() if slot not in filled),
+            (wanted for key, wanted in targets.items() if key not in filled),
             key=lambda wanted: (
+                wanted.size_mojos,
                 wanted.expiration,
                 abs(wanted.strike - market.spot),
                 wanted.side,
             ),
         )
+        smallest = sizes[0]
+        stopped = ""  # the first limit that stopped a contract of the smallest size
         for wanted in ordered:
+            first = wanted.size_mojos == smallest
             if _over(limits.max_contracts, count + 1):
-                blocked = "options.limits.max_contracts reached"
+                stopped = stopped or ("options.limits.max_contracts reached" if first else "")
                 break
             if _over(limits.max_contracts_per_expiry, per_expiry.get(wanted.expiration, 0) + 1):
+                if first:
+                    stopped = stopped or "options.limits.max_contracts_per_expiry reached"
                 continue
             amount = wanted.underlying.amount
+            cap = limits.max_locked_xch if wanted.side == CALL else limits.max_locked_quote
+            if cap == UNLIMITED and not first:
+                # [LADDER] Nothing to size the ladder from: the smallest size only.
+                continue
+            locked = locked_xch if wanted.side == CALL else locked_quote
+            if _over(cap, locked + amount):
+                if first:
+                    name = "max_locked_xch" if wanted.side == CALL else "max_locked_quote"
+                    stopped = stopped or f"options.limits.{name} reached"
+                continue
             if wanted.side == CALL:
-                if _over(limits.max_locked_xch, locked_xch + amount):
-                    continue
                 locked_xch += amount
             else:
-                if _over(limits.max_locked_quote, locked_quote + amount):
-                    continue
                 locked_quote += amount
             per_expiry[wanted.expiration] = per_expiry.get(wanted.expiration, 0) + 1
             count += 1
             mint.append(wanted)
+        blocked = stopped
 
     return Plan(
         mint=tuple(mint),
