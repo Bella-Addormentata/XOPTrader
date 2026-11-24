@@ -1350,7 +1350,7 @@ std::vector<DbSnapshotMidTick> Database::get_recent_snapshot_mids(
 // Inventory state (cost-basis persistence, PNL-BASIS-PERSIST 2026-07-30)
 // ===========================================================================
 
-void Database::save_inventory_state(
+bool Database::save_inventory_state(
     const std::vector<DbInventoryState>& records) noexcept
 {
     // Fills arrive a handful of times per day; a one-off prepared statement
@@ -1375,7 +1375,8 @@ void Database::save_inventory_state(
         if (rc != SQLITE_OK) {
             spdlog::error("[Database] save_inventory_state prepare failed: {}",
                           sqlite3_errmsg(db_));
-            return;
+            sqlite3_finalize(stmt);
+            return false;
         }
 
         // The snapshot must be all-or-nothing: restore_record() replays these
@@ -1395,7 +1396,7 @@ void Database::save_inventory_state(
                           "previous state retained",
                           rc, sqlite3_errmsg(db_));
             sqlite3_finalize(stmt);
-            return;
+            return false;
         }
 
         bool ok = true;
@@ -1432,7 +1433,9 @@ void Database::save_inventory_state(
             if (!sqlite3_get_autocommit(db_)) {
                 sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
             }
+            return false;
         }
+        return ok;
     } catch (...) {
         // noexcept contract: persistence must never disrupt trading.
         if (!sqlite3_get_autocommit(db_)) {
@@ -1440,6 +1443,7 @@ void Database::save_inventory_state(
         }
         spdlog::error("[Database] save_inventory_state: unexpected exception");
     }
+    return false;
 }
 
 std::vector<DbInventoryState> Database::load_inventory_state() const

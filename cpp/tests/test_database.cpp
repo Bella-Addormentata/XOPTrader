@@ -820,6 +820,14 @@ TEST(DatabaseTest, ACapitalFlowTheTrackerMayNotHoldYetIsNotedAcrossARestart) {
     EXPECT_TRUE(db.capital_reconcile_pending().value_or(std::vector<std::string>{"?"}).empty());
     // It never touched a balance.
     EXPECT_TRUE(db.ledger_balances().empty());
+
+    // The inventory write a marker waits on says whether it committed.
+    xop::DbInventoryState rec;
+    rec.asset_id = "xch";
+    rec.total_quantity = 1'500'000'000'000LL;
+    rec.total_cost = 7.8;
+    EXPECT_TRUE(db.save_inventory_state({rec}));
+    EXPECT_TRUE(db.save_inventory_state({})) << "nothing to write commits nothing, and fails nothing";
 }
 
 TEST(DatabaseTest, LedgerSurvivesReopen) {

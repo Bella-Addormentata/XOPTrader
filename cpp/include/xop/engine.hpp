@@ -1817,7 +1817,10 @@ private:
 
     /// Snapshot all InventoryTracker records into the inventory_state table
     /// (PNL-BASIS-PERSIST).  Called after every mutation; never throws.
-    void persist_inventory_state() noexcept;
+    /// @return whether the snapshot was committed.  [OPTIONS-CAPITAL] Only
+    ///         then do the restart markers of options_marker_clear_pending_
+    ///         go.
+    bool persist_inventory_state() noexcept;
 
     /// [SEED-FAIL-CLOSED 2026-09-22] Make State's position in `asset` the
     /// wallet's confirmed balance, whatever State held
@@ -1998,10 +2001,10 @@ private:
     /// What one pass booked, for its tail (peak, window, persistence).
     struct OptionsTally {
         bool                  reset_peak{false};
-        /// A flow of the bridge asset was booked: the bridge scan moves its
-        /// tracked quantity, in this heartbeat or the next (see
-        /// options_peak_reset_again_).
-        bool                  reset_again{false};
+        /// A flow of the bridge asset was booked in this process: the bridge
+        /// scan moves its tracked quantity when it next has a settled balance
+        /// (see options_bridge_reanchor_block_).
+        bool                  bridge_reanchor{false};
         bool                  inv_changed{false};
         std::set<std::string> rebase_assets;
         /// Assets whose tracked quantity moved with a flow (relatively): once
@@ -2078,12 +2081,18 @@ private:
     /// options_owed_ids_: the flows already counted in this pass.
     std::unordered_map<std::string, Mojo> options_pending_slack_;
     std::set<std::string>                 options_owed_ids_;
-    /// The heartbeat from which the drawdown peak is discarded once more
-    /// (0 = none owed).  A bridge-asset flow reaches equity through the
-    /// bridge scan's own wallet reconcile, which may have read its balance
-    /// before the fence's list had the flow's coin: equity then falls one
-    /// heartbeat after the booking discarded the peak.
-    BlockHeight           options_peak_reset_again_{0};
+    /// The heartbeat of the newest bridge-asset options flow whose re-anchor
+    /// waits for the bridge writer (0 = none).  That asset's tracked
+    /// quantity is the bridge scan's alone, and it takes the flow in only
+    /// from a settled balance -- possibly heartbeats after the booking
+    /// discarded the peak, which equity has re-anchored at since.  The peak
+    /// is discarded once more in the heartbeat the tracker first holds a
+    /// settled post-flow balance; bounded by risk.loss_window_blocks.
+    BlockHeight           options_bridge_reanchor_block_{0};
+    /// Assets whose flows the tracker holds: their restart markers go once
+    /// inventory_state has been written (persist_inventory_state), and not
+    /// before -- a write that failed keeps them for the next.
+    std::set<std::string> options_marker_clear_pending_;
     /// The assets options_wallet_snapshot read in heartbeat
     /// options_snapshot_block_.
     BlockHeight           options_snapshot_block_{0};

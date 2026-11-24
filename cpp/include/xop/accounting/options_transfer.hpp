@@ -76,11 +76,15 @@
 //   * Top-ups go first: a fence-down event is booked only in a pass where no
 //     confirmed top-up that belongs before it is still waiting (for a price,
 //     a wallet snapshot).
-//   * The fence going down returns the coins of its list.  A confirmed top-up
-//     the books do not hold yet arrived before that if the list holds ITS
-//     coin -- the one its own transaction created, by id, not any coin of
-//     the same amount -- and is then booked ahead of the event; otherwise it
-//     arrived with the fence down (topup_arrived_before_lowering).  A fence
+//   * The fence going down returns the coins of its list.  A top-up the
+//     books do not hold yet is booked ahead of that event when the list
+//     holds ITS coin -- the one its own transaction created, by id, never a
+//     coin that merely looks like it -- whatever any record says yet.  A
+//     recent one that has arrived and is not in the list arrived after the
+//     list was taken: it is the next fence-up event's.  One whose coin
+//     cannot be found yet (the wallet does not answer) holds the event, for
+//     as long as the send can still be on its way: two hours
+//     (kOptionsPendingSlackSeconds).  All of it is place_topup.  A fence
 //     found down at start returns the address as it is, and every confirmed
 //     top-up is before that.
 //   * A fence event is written at EVERY transition, also when the address
@@ -94,17 +98,22 @@
 // A FLOW AND THE INVENTORY TRACKER.  The journal comes first, so a stop can
 // fall between it and the tracker holding the flow.  Before the journal a
 // marker is written for each asset (Database::mark_capital_reconcile_pending)
-// and dropped only once the tracker holds the flow and is written.  A start
-// that finds one knows that Step 11's wallet reconcile, when it corrects that
-// asset, is the flow reaching the tracker: it re-anchors the drawdown peak,
-// with no second Net Deposits entry and no second move.
+// and dropped only once the tracker holds the flow and inventory_state has
+// been written -- a write that failed keeps it, and the next write retries.
+// A start that finds one knows that Step 11's wallet reconcile, when it
+// corrects that asset, is the flow reaching the tracker: it re-anchors the
+// drawdown peak, with no second Net Deposits entry and no second move.  The
+// bridge asset's tracked quantity is the bridge scan's alone, and it takes
+// a flow in only from a settled balance: the drawdown peak is discarded once
+// more when it has.
 //
-// UNTIL A TOP-UP IS BOOKED the wallet may already be short of it (a price
-// or a wallet snapshot is missing; the wallet could not be asked).  The
-// engine widens the divergence control's tolerance by the amount for that
-// long (topup_slack_applies), and by a fence event it knows of and could not
-// book yet, so a transfer is not "reconciled" away as unexplained before it
-// is booked.
+// UNTIL A FLOW IS BOOKED the wallet may already have moved by it (a price
+// or a wallet snapshot is missing; the wallet could not be asked; an
+// earlier fence event is not booked yet).  The engine widens the divergence
+// control's tolerance by every such flow it knows of -- the fence events
+// after one that could not be booked, and the top-ups not booked yet, each
+// within two hours of its send (topup_slack_applies) -- so a transfer is not
+// "reconciled" away as unexplained before it is booked.
 //
 // KNOWN LIMITS.  Each leaves a gap the divergence control absorbs.
 //   * A premium is paid to an ordinary address of the wallet, so it reaches
@@ -555,21 +564,66 @@ struct OptionsTopUpProof {
     return proof;
 }
 
-/// Whether a confirmed top-up the books do not hold yet arrived BEFORE the
-/// fence went down.  Then the event that returns the address's coins returns
-/// its coin too, and its withdrawal is booked ahead of that event; otherwise
-/// it arrived with the fence down, and its coin is trading funds until the
-/// fence goes up and takes it.  `coin_returned`: whether the list that event
-/// books holds the top-up's OWN coin, when the wallet's record shows which
-/// coin that is.  Without it, only a confirmation the options book recorded
-/// (`book_confirmed_at`, 0 = none) no later than the fence went down
-/// (`lowered_at_unix`) says "before".
-[[nodiscard]] constexpr bool topup_arrived_before_lowering(std::optional<bool> coin_returned,
-                                                           std::int64_t book_confirmed_at,
-                                                           double lowered_at_unix) noexcept
+/// What the engine knows about a top-up the books do not hold yet, in one
+/// pass (see place_topup).
+struct OptionsTopUpFacts {
+    /// topup_slack_applies: the send can still be on its way.
+    bool         recent{false};
+    /// The options book recorded its confirmation.
+    bool         book_confirmed{false};
+    /// The wallet's own record of the send says it confirmed.
+    bool         wallet_confirmed{false};
+    /// That record names the coin the send created at the options address...
+    bool         coin_known{false};
+    /// ...and the fence lists that coin now (the fence is up).
+    bool         coin_listed{false};
+    /// A fence-down event follows this pass, and the list it returns...
+    bool         lowering{false};
+    /// ...holds that coin.
+    bool         coin_returned{false};
+};
+
+/// Where a top-up the books do not hold yet stands.
+enum class OptionsTopUpPlace {
+    Book,    ///< It left the trading funds: book it (ahead of the event, if one follows).
+    NotYet,  ///< Not arrived: nothing to book; the divergence control carries it while recent.
+    /// Arrived with the fence going down and not in the list that event
+    /// returns: the trading funds never lost it, and the next fence-up event
+    /// takes it.  Nothing to book.
+    After,
+    /// Going down, and which side of the event it belongs on cannot be told
+    /// yet: the event waits for it.
+    Hold,
+};
+
+/// See WHAT IS BOOKED.  The engine's balance is the wallet's less the
+/// fence's list, so what decides is the send's OWN coin and the lists it is
+/// in -- never a coin that merely looks like it.
+[[nodiscard]] constexpr OptionsTopUpPlace place_topup(const OptionsTopUpFacts& f) noexcept
 {
-    if (coin_returned.has_value()) return *coin_returned;
-    return book_confirmed_at > 0 && static_cast<double>(book_confirmed_at) <= lowered_at_unix;
+    // Its own coin listed -- by the fence now, or in the list a fence-down
+    // event returns (the fence's own list is gone by then) -- is arrival,
+    // whatever any record says yet.
+    const bool listed = f.coin_known && (f.coin_listed || (f.lowering && f.coin_returned));
+    const bool arrived = f.book_confirmed || f.wallet_confirmed || listed;
+    if (!f.lowering) return arrived ? OptionsTopUpPlace::Book : OptionsTopUpPlace::NotYet;
+    if (f.coin_known) {
+        // In the list the event returns: the event's deposit gives it back,
+        // so its withdrawal goes first.
+        if (f.coin_returned) return OptionsTopUpPlace::Book;
+        if (!arrived) return OptionsTopUpPlace::NotYet;
+        // Arrived, and not in that list.  A recent send arrived after the
+        // list was taken: the fence went down with its coin uncounted.  An
+        // older one was listed while the fence was up and spent since (a
+        // mint): it left the trading funds then.
+        return f.recent ? OptionsTopUpPlace::After : OptionsTopUpPlace::Book;
+    }
+    // Without the wallet's record there is no telling where its coin is:
+    // the event waits while the send can still be on its way.  After that
+    // the records decide: a confirmed send of two hours ago arrived long
+    // before the fence went down.
+    if (f.recent) return OptionsTopUpPlace::Hold;
+    return arrived ? OptionsTopUpPlace::Book : OptionsTopUpPlace::NotYet;
 }
 
 /// How often the wallet is asked about a top-up the options book has not
@@ -605,6 +659,12 @@ inline constexpr BlockHeight kOptionsProofEveryBlocks = 120;
     if (a > kCeiling) a = kCeiling;
     if (b > kCeiling) b = kCeiling;
     return a > kCeiling - b ? kCeiling : a + b;
+}
+
+/// add_slack of what a fence list holds of one asset (rpc::CoinFence::Totals).
+[[nodiscard]] constexpr Mojo add_held_slack(Mojo a, std::uint64_t held) noexcept
+{
+    return add_slack(a, to_mojo_saturating(held));
 }
 
 /// The number of the next fence event, from the newest one the ledger holds

@@ -86,16 +86,22 @@ fallback for a transaction the wallet no longer knows.
 Nothing is counted twice: while the books stand fence-down no top-up is
 booked, because its coins are trading funds and the next fence-up event
 takes them; a top-up sent before that event's list is inside it; and when
-the fence goes down, a confirmed top-up the books do not hold yet is booked
-ahead of that event only if the list it returns holds the top-up's own coin,
-by id.
+the fence goes down, a top-up the books do not hold yet is booked ahead of
+that event when the list it returns holds the top-up's own coin, by id,
+whatever any record says yet. A recent one that has arrived and is not in
+that list came after the list was taken, and is the next fence-up event's.
+One whose coin cannot be found yet (the wallet does not answer) holds the
+event for up to two hours after its send.
 
 The journal comes first, so a stop can fall between it and the inventory
 tracker holding the flow. A marker per asset (`capital_reconcile_pending`)
 is written before the journal and dropped once the tracker holds the flow
-and is written. A start that finds one treats Step 11's wallet correction of
-that asset as the flow reaching the tracker: it re-anchors the drawdown
-peak, with no second Net Deposits entry.
+and `inventory_state` has been written; a write that failed keeps it, and
+the next write retries. A start that finds one treats Step 11's wallet
+correction of that asset as the flow reaching the tracker: it re-anchors the
+drawdown peak, with no second Net Deposits entry. wUSDC.b's tracked quantity
+is the bridge scan's alone, and it takes a flow in only from a settled
+balance; the drawdown peak is discarded once more when it has.
 
 Still without an event, and so left to the divergence control: a premium
 (paid to an ordinary address of the wallet), a top-up the book never wrote
@@ -267,7 +273,8 @@ while 1% of the XCH wallet is 1.2 XCH — enough to swallow an entire missed
 Two more terms widen it while they apply: the wallet's `pending_change`
 (coins in flight), and capital the options sub-account has taken or returned
 that is known and not yet booked — a top-up waiting to book (for at most two
-hours after it was sent), or a fence event that could not be booked yet.
+hours after it was sent), a fence event that could not be booked yet, and
+every fence event and top-up behind it.
 
 **Persistence requirement**: escalation needs N consecutive **same-signed**
 breaches (alert at 2, pause at 3). The ledger can only ever *lag* the wallet,

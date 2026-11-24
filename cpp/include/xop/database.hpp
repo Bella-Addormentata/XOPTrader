@@ -618,7 +618,10 @@ public:
     /// Called by the engine after every fill / seed / reconcile so the
     /// cost basis survives restarts.  Never throws: persistence failures
     /// are logged and must not disrupt live trading.
-    void save_inventory_state(const std::vector<DbInventoryState>& records) noexcept;
+    /// @return true once the set is committed; false when it was not, and
+    ///         the previous set is what a restart reads.  [OPTIONS-CAPITAL]
+    ///         A capital flow's restart marker goes only on true.
+    bool save_inventory_state(const std::vector<DbInventoryState>& records) noexcept;
 
     /// Load all persisted inventory records.  Returns an empty vector when
     /// the table is empty (first run) or on error.
