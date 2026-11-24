@@ -99,9 +99,10 @@ def test_the_default_target_comes_from_the_limits() -> None:
         put_strikes_pct=[],
         limits={"max_locked_xch": 1.0, "max_locked_quote": 1, "max_contracts": 2},
     )
-    assert calls.target == config.TargetConfig(
-        xch_mojos=1_500_000_000_000, quote_mojos=2_000, tolerance=0.2
-    )
+    assert calls.target is not None
+    assert (calls.target.xch_mojos, calls.target.quote_mojos) == (1_500_000_000_000, 2_000)
+    # [LADDER] Topped up once short by half a contract (0.25 of 1.5 XCH), or 20%.
+    assert calls.target.tolerance == pytest.approx(0.25 / 1.5)
     puts = _parse(
         _shared(),
         contract_xch=0.5,
@@ -115,8 +116,9 @@ def test_the_default_target_comes_from_the_limits() -> None:
     assert written.target is not None and written.target.xch_mojos == 3 * config.XCH_MOJOS
 
 
-def test_the_default_target_follows_an_auto_size() -> None:
-    """[AUTO-SIZE] "One contract" of headroom is one contract of the size worked out."""
+def test_the_default_target_follows_the_ladder_s_smallest_size() -> None:
+    """[LADDER] "One contract" of headroom is one of the smallest size: the larger
+    ones are inside max_locked_xch already."""
     parsed = _parse(
         _shared(),
         contract_xch="auto",
@@ -124,16 +126,47 @@ def test_the_default_target_follows_an_auto_size() -> None:
         call_strikes_pct=[110, 120],
         put_strikes_pct=[],
         limits={
-            "max_locked_xch": 40,
+            "max_locked_xch": 44,
             "max_locked_quote": 1,
-            "max_contracts": 4,
-            "max_contracts_per_expiry": 2,
+            "max_contracts": 8,
+            "max_contracts_per_expiry": 4,
         },
     )
-    assert parsed.contract_xch_mojos == 10 * config.XCH_MOJOS
-    assert parsed.target == config.TargetConfig(
-        xch_mojos=50 * config.XCH_MOJOS, quote_mojos=2_000, tolerance=0.2
+    assert parsed.contract_xch_mojos == config.XCH_MOJOS
+    assert parsed.target is not None
+    assert parsed.target.xch_mojos == 45 * config.XCH_MOJOS
+    assert parsed.target.quote_mojos == 2_000
+
+
+@pytest.mark.parametrize(
+    ("cap", "size", "below"),
+    [
+        # A cap of one contract: 20% short comes first, as before.
+        (1, 1, 1.6),
+        (4, 1, 4.5),
+        (1.0, 0.5, 1.25),
+        # A ladder up to 100 XCH: 20% of 445 is 89 XCH, more than a 10 XCH
+        # refill can do without. Half a contract short comes first.
+        (444, 1, 444.5),
+        (40, 10, 45.0),
+    ],
+)
+def test_the_default_target_tops_up_before_a_refill_is_short(cap, size, below) -> None:
+    """[LADDER] An exercised call takes its collateral with it. Topped up only at 20%
+    short, the address could hold too little to mint the refill and too much to be
+    topped up: it is topped up once half a contract short, if that comes first."""
+    parsed = _parse(
+        _shared(),
+        contract_xch=size if size != 1 else "auto",
+        put_strikes_pct=[],
+        limits={"max_locked_xch": cap, "max_locked_quote": 1, "max_contracts": 8},
     )
+    target = parsed.target
+    assert target is not None
+    threshold = target.xch_mojos * (1.0 - target.tolerance) / config.XCH_MOJOS
+    assert threshold == pytest.approx(below)
+    # Short by less than that, it still holds every mint the cap allows, and fees.
+    assert threshold >= cap
 
 
 # -- the app's own spends -------------------------------------------------------

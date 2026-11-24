@@ -14,16 +14,28 @@ The straightforward set-up, with the app alone:
    says so. Leave the rest as it is: the engine fence follows the book,
    expiries roll on their own (the next two Fridays at 08:00 UTC), the grid
    writes calls at 110% and 120% and puts at 90% and 80% of spot, and the
-   top-up target and the contract size come from your limits.
+   top-up target and the contract sizes come from your limits.
 
-   **Contract size** (0.10.57 and later) is Automatic unless you choose Fixed:
-   the largest of 1, 10, 100, ... XCH at which every call slot (strikes x
-   expiries, within Max contracts and Max per expiry) still fits inside Max
-   XCH locked, and never under 1 XCH. So variety comes first and size second.
-   Two call strikes on two Fridays are four slots: Max XCH locked 4 gives
-   1 XCH contracts, 40 gives 10 XCH ones. With less than 1 XCH a slot, the
-   nearest expiry and the strikes nearest the money are written first. The
-   tab shows what it comes to. In config.yaml this is `contract_xch: auto`.
+   **Contract size** is Automatic unless you choose Fixed. Automatic offers
+   1, 10, 100, ... XCH contracts side by side, so small and large buyers both
+   find one at every strike and date: every strike and Friday gets a 1 XCH
+   contract first, then a 10 XCH one, and so on, as far as Max XCH locked
+   (calls), Max quote locked (puts), Max contracts and Max per expiry allow.
+   Within a size the nearest Friday and the strikes nearest the money go
+   first. Two call strikes on two Fridays are four calls a size: Max XCH
+   locked 4 gives four 1 XCH calls, 14 adds one 10 XCH call, 44 four of them.
+   Max contracts and Max per expiry count every size, so those two sizes need
+   8 and 4 (16 and 8 with two put strikes as well). The tab shows what the
+   ladder comes to for calls, and what one more call needs. It counts the
+   calls first: where puts share Max contracts and Max per expiry with them,
+   the strikes nearest the money go first, so puts may take some of that
+   room, and the tab says so. In config.yaml
+   this is `contract_xch: auto`; Fixed writes one number, that one size only.
+   A sold contract is refilled at its own size, smallest sizes first, once its
+   collateral fits under the limits again; a larger one is never cancelled to
+   make room. An unsold contract of a size no longer on offer (a Fixed size
+   changed, or 0.5 XCH after switching to Automatic) is cancelled and its
+   collateral backs the new sizes.
 3. **The Options page** (or the OPTIONS switch in the toolbar): Rehearse first,
    to see what the book would mint and list, then Live. With the fence the
    engine keeps trading beside it, so the book can simply be left on: it tops

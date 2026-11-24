@@ -856,8 +856,45 @@ def test_status_prints_the_book(tmp_path, monkeypatch, capsys) -> None:
     assert "fees: 0 mojos a transaction" in out
     assert cli.contract_size_line(cfg) == "contract size: 20 XCH"
     assert cli.contract_size_line(cfg) in out.splitlines()
-    assert cli.contract_size_line(dataclasses.replace(cfg, contract_auto=True)) == (
-        "contract size: 20 XCH (auto, from the limits)"
+    # [LADDER] auto: the sizes, and what the limits hold of them for calls.
+    ladder = _config(
+        tmp_path,
+        usd,
+        contract_xch="auto",
+        expiries="weekly",
+        call_strikes_pct=[110, 120],
+        put_strikes_pct=[],
+        limits={
+            "max_locked_xch": 14,
+            "max_locked_quote": 1,
+            "max_contracts": 8,
+            "max_contracts_per_expiry": 4,
+        },
+    )
+    head = "contract sizes: 1, 10, 100... XCH side by side (auto, smallest first)"
+    assert cli.contract_size_line(ladder, now=world.now()) == (
+        f"{head}; calls these limits hold: 4 of 1 XCH, 1 of 10 XCH"
+    )
+    shared = dataclasses.replace(
+        ladder,
+        put_strikes_pct=(90, 80),
+        limits=dataclasses.replace(ladder.limits, max_contracts=6, max_contracts_per_expiry=3),
+    )
+    assert cli.contract_size_line(shared, now=world.now()) == (
+        f"{head}; calls these limits hold: 4 of 1 XCH"
+        " (puts share the counts, and the strikes nearest the money go first)"
+    )
+    unset = dataclasses.replace(ladder, limits=cfg.limits)
+    assert cli.contract_size_line(unset, now=world.now()) == (
+        f"{head}; a limit is not set, so nothing is minted"
+    )
+    small = dataclasses.replace(
+        ladder, limits=dataclasses.replace(ladder.limits, max_locked_xch=config.XCH_MOJOS // 2)
+    )
+    assert cli.contract_size_line(small, now=world.now()) == f"{head}; no call fits these limits"
+    puts_only = dataclasses.replace(ladder, call_strikes_pct=(), put_strikes_pct=(90,))
+    assert cli.contract_size_line(puts_only, now=world.now()).endswith(
+        "puts only, as far as max_locked_quote allows"
     )
     assert "wallet: synced (no fingerprint set, so whichever key it has open)" in out
     assert "splash: off" in out
