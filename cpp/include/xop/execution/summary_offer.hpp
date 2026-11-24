@@ -35,6 +35,14 @@
 // comment: "this codebase has hit 1e9-class unit errors twice").  The two
 // readers were the third and fourth copies, and the ones without the
 // denominations.  There is now ONE: price_from_legs.
+//
+// [ORPHAN-AMOUNTS 2026-11-24] The amounts themselves.  The 2.7.4 wallet on
+// the trading PC writes them as decimal TEXT -- get_all_offers and get_offer
+// alike ({"ae15...": "1045"}).  Two readers took text; the boot orphan check
+// took JSON numbers only, so at the engine start of 2026-11-24 08:10 CT every
+// orphan read as "empty offered or requested": an XCH/DBX bid of 10 XCH was
+// cancelled instead of judged, and three were force-adopted as "BID 0 on
+// UNKNOWN".  There is now ONE reader of a summary side too: summary_side.
 // ---------------------------------------------------------------------------
 
 #include "xop/config.hpp"
@@ -43,11 +51,62 @@
 #include "xop/types.hpp"
 
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
 
+#include <nlohmann/json.hpp>
+
 namespace xop::execution {
+
+/// One amount of a wallet offer summary, in mojos: a JSON integer, or the
+/// decimal text the wallet writes ("1045").  nullopt for anything else -- a
+/// fraction, a sign, a blank, text that is not all digits, a value no Mojo
+/// holds -- so a malformed amount never reads as some other number.
+[[nodiscard]] inline std::optional<Mojo> summary_amount(const nlohmann::json& amount)
+{
+    constexpr auto kMost = static_cast<std::uint64_t>(std::numeric_limits<Mojo>::max());
+    if (amount.is_number_unsigned()) {
+        const auto v = amount.get<std::uint64_t>();
+        if (v > kMost) return std::nullopt;
+        return static_cast<Mojo>(v);
+    }
+    if (amount.is_number_integer()) return amount.get<Mojo>();
+    if (!amount.is_string()) return std::nullopt;
+    const std::string& text = amount.get_ref<const std::string&>();
+    if (text.empty() || text.size() > 19) return std::nullopt;
+    std::uint64_t v = 0;
+    for (const char c : text) {
+        if (c < '0' || c > '9') return std::nullopt;
+        v = v * 10 + static_cast<std::uint64_t>(c - '0');
+    }
+    if (v > kMost) return std::nullopt;
+    return static_cast<Mojo>(v);
+}
+
+/// One side of a wallet offer summary ("offered" or "requested"): asset id to
+/// mojos, through summary_amount.  An amount that cannot be read leaves its
+/// asset out; a side that is not an object is empty.
+[[nodiscard]] inline std::unordered_map<std::string, Mojo> summary_side(const nlohmann::json& side)
+{
+    std::unordered_map<std::string, Mojo> out;
+    if (!side.is_object()) return out;
+    for (const auto& [asset_id, amount] : side.items()) {
+        if (const auto mojos = summary_amount(amount)) out[asset_id] = *mojos;
+    }
+    return out;
+}
+
+/// summary_side of `summary[key]`; empty when the summary has no such key.
+[[nodiscard]] inline std::unordered_map<std::string, Mojo> summary_side(const nlohmann::json& summary,
+                                                                        const char* key)
+{
+    if (!summary.is_object()) return {};
+    const auto it = summary.find(key);
+    return it == summary.end() ? std::unordered_map<std::string, Mojo>{} : summary_side(*it);
+}
 
 /// The engine's price of a trade, from the raw mojos of its two legs:
 ///
