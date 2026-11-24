@@ -940,3 +940,23 @@ def test_a_tolerance_deleted_in_the_editor_goes_from_the_file(panel, tmp_path, m
     market = _saved_options(cfg_path)["market"]
     assert "peg_tolerance_pct" not in market
     assert market["max_spread_pct"] == 10
+
+
+def test_a_blank_tolerance_is_the_default_to_the_book_and_the_tab(panel, tmp_path):
+    """[review #263] `peg_tolerance_pct:` left blank (null) is read by the book as left
+    out, so the tab's showing it as the default and saving it as left out changes
+    nothing the book does."""
+    from gui.services.config_split import load_merged
+    from gui.services.options import config as options_config
+
+    cfg_path = _shared_book(tmp_path, market={"peg_tolerance_pct": None})
+    parsed = options_config.parse(load_merged(cfg_path))
+    assert parsed is not None and parsed.market.peg_tolerance_pct == 3.0
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.peg_tolerance.value() == 3.0
+    tab.limit_fields["max_contracts"].setText("3")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert "peg_tolerance_pct" not in _saved_options(cfg_path)["market"]
+    parsed = options_config.parse(load_merged(cfg_path))
+    assert parsed is not None and parsed.market.peg_tolerance_pct == 3.0

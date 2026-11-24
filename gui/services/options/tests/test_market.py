@@ -464,3 +464,28 @@ def test_a_dexie_offer_with_an_amount_that_is_not_a_number_is_left_out() -> None
     assert view.ask == pytest.approx(1.13)
     assert market.executable_price([(float("nan"), 50.0), (1.10, 50.0)], 20.0) == 1.10
     assert market.executable_price([(1.0, float("nan")), (1.10, 50.0)], 20.0) == 1.10
+
+
+@pytest.mark.parametrize(
+    "view",
+    [
+        _view(spot=1.6, bid=1.624, ask=1.576),  # crossed by 3%: 3.0000000000000027 in floats
+        _view(spot=0.97, bid=1.0, ask=1.01),  # spot 3% under the bid, the same
+    ],
+    ids=["crossed", "outside"],
+)
+def test_a_gap_at_the_tolerance_is_within_it(view) -> None:
+    """[review #263] Floating point must not move the line: 3% is within a 3% tolerance."""
+    assert max(view.gaps_pct()) > 3.0, "the rounding the check has to absorb"
+    _check(view, 3.0)
+    with pytest.raises(market.MarketError):
+        _check(view, 2.99)
+
+
+def test_a_tolerance_of_zero_stays_strict_by_any_margin() -> None:
+    with pytest.raises(market.MarketError) as caught:
+        _check(_view(spot=1.09 * (1 - 1e-12), bid=1.09, ask=1.13), 0.0)
+    assert caught.value.reason == market.OFF_PEG
+    with pytest.raises(market.MarketError) as caught:
+        _check(_view(spot=1.10, bid=1.10 * (1 + 1e-12), ask=1.10), 0.0)
+    assert caught.value.reason == market.CROSSED

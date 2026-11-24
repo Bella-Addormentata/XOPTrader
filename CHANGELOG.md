@@ -10,7 +10,8 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Options: stale Dexie offers no longer stop the book as a depeg
 
 - **The off-peg check has a tolerance**, `options.market.peg_tolerance_pct`
-  (3% when left out, also in Settings > Options > Market checks). The book
+  (3% when left out or blank, also in Settings > Options > Market checks; a
+  gap at the tolerance is within it). The book
   used to stop quoting whenever CoinGecko's XCH price sat outside the Dexie
   bid-ask for the hedge size by any amount. Dexie offers sit until someone
   takes them, and on 2026-11-24 a ladder of 5 XCH bids, 0.3% apart from

@@ -977,6 +977,12 @@ def parse(root: Any) -> OptionsConfig | None:
     fee = 0 if fee_auto else int(_number(section, "fee_mojos", 0))
     if fee > limits.max_fee_mojos:
         raise OptionsConfigError("options.fee_mojos is above options.limits.max_fee_mojos")
+    # [PEG] A blank `peg_tolerance_pct:` (null) is the default, as left out is:
+    # the Settings tab shows both as the default and saves both as left out.
+    # [review #263]
+    peg_tolerance = DEFAULT_PEG_TOLERANCE_PCT
+    if market_raw.get("peg_tolerance_pct") is not None:
+        peg_tolerance = _number(market_raw, "peg_tolerance_pct", None)
 
     return OptionsConfig(
         enabled=True,
@@ -1018,7 +1024,7 @@ def parse(root: Any) -> OptionsConfig | None:
             max_spread_pct=_number(market_raw, "max_spread_pct", 10.0, minimum=0.01),
             require_book=_flag(market_raw, "require_book", True),
             hedge_size_xch=_number(market_raw, "hedge_size_xch", contract_xch, minimum=1e-9),
-            peg_tolerance_pct=_number(market_raw, "peg_tolerance_pct", DEFAULT_PEG_TOLERANCE_PCT),
+            peg_tolerance_pct=peg_tolerance,
         ),
         node=node,
         coinset_url=str(section.get("coinset_url") or "").strip(),

@@ -127,6 +127,16 @@ def realized_volatility(series: Sequence[tuple[float, float]]) -> float:
     return sigma
 
 
+def _beyond(gap_pct: float, tolerance_pct: float) -> bool:
+    """[review #263] Whether ``gap_pct`` is past ``tolerance_pct``; a gap at it is within.
+
+    Gaps are worked out in floating point ((1.0 - 0.97) / 1.0 * 100 is
+    3.0000000000000027), so one within a part in a billion of the tolerance
+    counts as at it. A tolerance of 0 stays strict: any gap at all is past it.
+    """
+    return gap_pct > tolerance_pct and not math.isclose(gap_pct, tolerance_pct, rel_tol=1e-9)
+
+
 def executable_price(levels: Sequence[tuple[float, float]], size: float) -> float | None:
     """Average price of filling ``size`` through whole offers, best price first.
 
@@ -220,7 +230,7 @@ class Market:
         # hours. Dexie's fills meanwhile straddled the external price.
         allowed = f", more than the {peg_tolerance_pct:g}% allowed" if peg_tolerance_pct else ""
         crossed_pct, outside_pct = self.gaps_pct()
-        if crossed_pct > peg_tolerance_pct:
+        if _beyond(crossed_pct, peg_tolerance_pct):
             raise MarketError(
                 f"the Dexie book is crossed by {crossed_pct:.2f}% at the hedge size{allowed}",
                 CROSSED,
@@ -231,7 +241,7 @@ class Market:
             raise MarketError(
                 f"the Dexie spread is {spread_pct:.1f}%, above {max_spread_pct}%", TOO_WIDE
             )
-        if outside_pct > peg_tolerance_pct:
+        if _beyond(outside_pct, peg_tolerance_pct):
             low, high = min(self.bid, self.ask), max(self.bid, self.ask)
             raise MarketError(
                 f"spot {self.spot:.4f} is {outside_pct:.2f}% outside the executable range "

@@ -1831,8 +1831,8 @@ options:
     # hedge size, and how far that book may be crossed, before quotes stop.
     # Dexie offers sit until someone takes them, so a stale one a percent or
     # two off the market is common and no depeg. 0 = the strict rule: spot
-    # inside the range, never crossed. Left out: 3. Quotes are priced on the
-    # external spot either way.
+    # inside the range, never crossed. Left out or blank: 3. Quotes are priced
+    # on the external spot either way.
     peg_tolerance_pct: 3
     # [OPTIONAL] The size the Dexie book must be able to fill. Left out, one
     # contract of the smallest size (1 XCH with contract_xch: auto).

@@ -638,6 +638,8 @@ def test_the_off_peg_tolerance_defaults_to_three_percent_and_zero_is_strict() ->
     assert _parse().market.peg_tolerance_pct == config.DEFAULT_PEG_TOLERANCE_PCT == 3.0
     assert _parse(market={"peg_tolerance_pct": 0}).market.peg_tolerance_pct == 0.0
     assert _parse(market={"peg_tolerance_pct": 1.5}).market.peg_tolerance_pct == 1.5
+    # [review #263] Blank is left out, as the Settings tab shows and saves it.
+    assert _parse(market={"peg_tolerance_pct": None}).market.peg_tolerance_pct == 3.0
 
 
 @pytest.mark.parametrize("raw", [-1, "wide", True, float("nan")])
