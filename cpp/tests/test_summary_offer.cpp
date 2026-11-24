@@ -17,8 +17,10 @@
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -38,6 +40,8 @@ using xop::execution::OfferManager;
 using xop::execution::price_from_legs;
 using xop::execution::price_standing;
 using xop::execution::PriceStanding;
+using xop::execution::summary_amount;
+using xop::execution::summary_side;
 using xop::execution::requested_amount;
 using xop::execution::RequestedAmount;
 using xop::execution::SummaryOffer;
@@ -301,6 +305,66 @@ TEST(SummaryOffer, ASettledFillIsPricedByTheSameFormula)
 }
 
 // ---------------------------------------------------------------------------
+// [ORPHAN-AMOUNTS 2026-11-24] The amounts, as the wallet writes them
+// ---------------------------------------------------------------------------
+
+TEST(SummaryAmounts, TheWalletsTextIsReadLikeANumber)
+{
+    // get_all_offers on the trading PC, 2026-11-24: every amount is text.
+    const nlohmann::json live = nlohmann::json::parse(R"({
+        "offered": {"ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac": "1045"},
+        "requested": {"fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d": "1082"}})");
+    const auto offered = summary_side(live, "offered");
+    const auto requested = summary_side(live, "requested");
+    ASSERT_EQ(offered.size(), 1u);
+    ASSERT_EQ(requested.size(), 1u);
+    EXPECT_EQ(offered.at("ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac"), 1'045);
+    EXPECT_EQ(requested.at("fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"), 1'082);
+
+    // The bid the engine cancelled at boot on 2026-11-24: 10 XCH for DBX.
+    const nlohmann::json bid = nlohmann::json::parse(R"({
+        "offered": {"db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20": "895929"},
+        "requested": {"xch": "10000000000000"}})");
+    EXPECT_EQ(summary_side(bid, "requested").at("xch"), 10'000'000'000'000);
+    EXPECT_EQ(summary_side(bid, "offered").size(), 1u);
+
+    // Numbers read as before.
+    const nlohmann::json numbers = nlohmann::json::parse(R"({"offered": {"xch": 5, "a": 18446744073709551615}})");
+    const auto side = summary_side(numbers, "offered");
+    EXPECT_EQ(side.at("xch"), 5);
+    EXPECT_EQ(side.count("a"), 0u) << "no Mojo holds it";
+}
+
+TEST(SummaryAmounts, AnAmountThatCannotBeReadIsLeftOutNotGuessed)
+{
+    using nlohmann::json;
+    EXPECT_EQ(summary_amount(json("1045")), std::optional<Mojo>{1'045});
+    EXPECT_EQ(summary_amount(json("0")), std::optional<Mojo>{0});
+    EXPECT_EQ(summary_amount(json("9223372036854775807")),
+              std::optional<Mojo>{std::numeric_limits<Mojo>::max()});
+    // stoll would have read each of these as some number.
+    for (const char* text : {"", " 1045", "1045 ", "+1045", "-1045", "10.5", "1e3", "12abc",
+                             "9223372036854775808", "99999999999999999999"}) {
+        EXPECT_FALSE(summary_amount(json(text))) << '"' << text << '"';
+    }
+    EXPECT_FALSE(summary_amount(json(10.5)));
+    EXPECT_FALSE(summary_amount(json(nullptr)));
+    EXPECT_FALSE(summary_amount(json::array()));
+    EXPECT_FALSE(summary_amount(json(std::numeric_limits<std::uint64_t>::max())));
+    EXPECT_EQ(summary_amount(json(std::uint64_t{7})), std::optional<Mojo>{7});
+    EXPECT_EQ(summary_amount(json(std::int64_t{7})), std::optional<Mojo>{7});
+
+    // A side that is not an object, or is missing, is empty; one bad amount
+    // leaves only its own asset out.
+    EXPECT_TRUE(summary_side(json::array()).empty());
+    EXPECT_TRUE(summary_side(json::parse(R"({"requested": {"xch": "1"}})"), "offered").empty());
+    EXPECT_TRUE(summary_side(json("text"), "offered").empty());
+    const auto mixed = summary_side(json::parse(R"({"offered": {"xch": "1", "bad": "x1"}})"), "offered");
+    EXPECT_EQ(mixed.size(), 1u);
+    EXPECT_EQ(mixed.at("xch"), 1);
+}
+
+// ---------------------------------------------------------------------------
 // The wiring, by source scan: no unit test can construct an OfferManager
 // (engine_source_scan.hpp).
 // ---------------------------------------------------------------------------
@@ -335,4 +399,11 @@ TEST(SummaryOfferWiring, BothReadersAndTheFillParserShareTheOnePrice)
               1u);
     // ...and no copy of the raw-mojo ratio is left.
     EXPECT_EQ(count_of(manager, "quote_d / base_d"), 0u);
+
+    // [ORPHAN-AMOUNTS] All three read a summary's amounts through the one
+    // reader that takes the wallet's text: the boot orphan check too.
+    EXPECT_EQ(count_of(manager, "summary_side(summary, \"offered\")"), 3u);
+    EXPECT_EQ(count_of(manager, "summary_side(summary, \"requested\")"), 3u);
+    EXPECT_EQ(count_of(manager, "parse_side"), 0u) << "no local copy left";
+    EXPECT_EQ(count_of(manager, "std::stoll(amount_val"), 0u);
 }

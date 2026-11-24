@@ -5,6 +5,24 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Offers left in the wallet are read at engine start (#260)
+
+At start the engine checks each offer in the wallet it has no record of,
+and keeps or cancels it by its price. The wallet writes an offer's amounts
+as text, and this check read only numbers, so every such offer looked
+empty: it was cancelled, or kept as an "unknown" placeholder when the
+cancel failed. On 2026-11-24 at 8:10 CT, the first start of v0.10.57, a
+10 XCH bid on XCH/DBX was cancelled that way.
+
+- The start-up check now reads the amounts as the two other readers of an
+  offer already did, through one shared reader, so a leftover offer is
+  judged by its price like any other (priced right since #257).
+- The shared reader is stricter than the one it replaces for text: a
+  number with a sign, a blank or a stray character is left out rather than
+  read as some other number.
+
 ## [0.10.57] — 2026-11-24 — wide-book protection, option contracts sized from your limits, distinct offer amounts, options top-ups booked as transfers, quieter alerts, and a read-only Circuit page
 
 ### A book too wide to price (#252, #254)
