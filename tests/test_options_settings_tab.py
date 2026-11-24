@@ -1012,6 +1012,27 @@ def test_a_percent_sign_alone_is_refused_not_saved_as_the_default(panel, tmp_pat
     assert _saved_options(cfg_path)["market"]["peg_tolerance_pct"] == 0, "nothing written"
 
 
+def test_typing_the_tolerance_shown_corrects_a_string_the_book_refuses(panel, tmp_path):
+    """[review #263] `peg_tolerance_pct: "3%"` is a string the book's parser refuses, shown
+    as the 3% the field itself takes. Typing in the field is an edit even when it ends at
+    the text loaded, so typing the 3% shown saves the number 3."""
+    from PySide6.QtTest import QTest
+
+    cfg_path = _shared_book(tmp_path, market={"peg_tolerance_pct": "3%"})
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.peg_tolerance.text() == "3%"
+    tab.limit_fields["max_contracts"].setText("3")
+    assert panel.save_config(str(cfg_path)) is False, "unedited, it goes to the parser as is"
+    assert any("peg_tolerance_pct" in said for said in _SAID), _SAID
+
+    tab.peg_tolerance.selectAll()
+    QTest.keyClicks(tab.peg_tolerance, "3%")
+    assert tab.peg_tolerance.text() == "3%"
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["market"]["peg_tolerance_pct"] == 3
+
+
 def test_a_tolerance_written_as_an_empty_string_is_the_default_it_shows(panel, tmp_path):
     """[review #263] `peg_tolerance_pct: ''` shows blank, as the default, and the book
     reads it as the default too, as it does a blank limit: Save works with the field

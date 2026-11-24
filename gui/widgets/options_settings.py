@@ -252,6 +252,8 @@ class OptionsSettingsSection:
         self._touched: set[str] = set()
         #: [PEG] market.peg_tolerance_pct as loaded, and the field's text for it.
         self._loaded_tolerance: tuple[Any, str] = (None, "")
+        #: [review #263] Typed in since the load, even back to the text loaded.
+        self._tolerance_typed = False
         #: [review #263] options.market loaded as something other than a mapping,
         #: and that value as loaded.
         self._market_malformed = False
@@ -501,6 +503,8 @@ class OptionsSettingsSection:
         layout.addWidget(checks)
         layout.addStretch(1)
 
+        # [review #263] textEdited is the operator typing, never setText.
+        self.peg_tolerance.textEdited.connect(self._tolerance_typed_in)
         for box in (self.enabled, self.share):
             box.toggled.connect(self._changed)
         for combo in (
@@ -580,6 +584,9 @@ class OptionsSettingsSection:
             *self.limit_fields.values(),
             self.peg_tolerance,
         ]
+
+    def _tolerance_typed_in(self, *_args: Any) -> None:
+        self._tolerance_typed = True
 
     def _changed(self, *_args: Any) -> None:
         self._sync_rows()
@@ -842,6 +849,7 @@ class OptionsSettingsSection:
         tolerance = market.get("peg_tolerance_pct")
         self.peg_tolerance.setText(_limit_text(tolerance))
         self._loaded_tolerance = (tolerance, self.peg_tolerance.text())
+        self._tolerance_typed = False
         size = section.get("contract_xch")
         self._hedge_follows = None
         if size is None or (isinstance(size, str) and size.strip().lower() == "auto"):
@@ -908,10 +916,13 @@ class OptionsSettingsSection:
         but nothing at all under a market section that is not a mapping, which
         stays for the book's parser to refuse [review #263]. Edited: the
         field's number, None when blank, or its text for the parser to judge.
+        Typing in the field is an edit even when it ends at the text loaded
+        [review #263]: ``peg_tolerance_pct: "3%"``, a string the parser
+        refuses, is corrected by typing the ``3%`` it shows.
         """
         loaded, shown = self._loaded_tolerance
         text = self.peg_tolerance.text().strip()
-        if text == shown:
+        if text == shown and not self._tolerance_typed:
             return not self._market_malformed, loaded
         return True, _tolerance_value(text)
 
