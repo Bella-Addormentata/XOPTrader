@@ -135,8 +135,11 @@ the ledger held 44.54 XCH that never moved.
   record does not read as two legs of its pair as configured is kept tracked,
   never booked from estimates.  The `taker_fills` row, the legs, the payment
   coins the take claims (`take_receipts`: one coin pays one take, for good)
-  and the end of its hold commit in one transaction.  Evidence is read only
-  from a wallet that reports itself synced.
+  and the end of its hold commit in one transaction; a payment coin another
+  take claimed stops the booking whole.  Evidence is read only from a wallet
+  that reports itself synced, and the balances of the assets a booking moves
+  are read again after the proof and before the booking, so the divergence
+  control ties the booked take to a snapshot that holds it.
 - **A take that fails books nothing.**  FAILED or CANCELLED in the wallet: no
   legs, no `taker_fills` row.
 - **One take of an offer at a time.**  While a take of a Dexie offer is
@@ -145,13 +148,16 @@ the ledger held 44.54 XCH that never moved.
   to `take_holds` before the take is sent, and kept across restarts.  While a
   take is tracked, or an unanswered request held, the divergence control's
   tolerance includes what that take moves, so a take about to be booked is
-  not absorbed by an auto-adjust first.
+  not absorbed by an auto-adjust first.  Until the saved holds are read back
+  at start, no take is sent and the divergence control does not run.
 - **The sweep.**  A settled take of ours that the ledger does not hold and the
   engine is not tracking -- a request that timed out, a take of a process that
   has since stopped -- is booked from the wallet's record of it after the same
   proof, under strategy `wallet_sweep`, with fee 0 (the wallet's record does
-  not state our fee).  It leaves the GUI's bridge top-up takes to their own
-  ingest, asks the ledger under both spellings of a take's event id
+  not state our fee).  It leaves to the top-up ingest every GUI take the GUI
+  may still confirm (every `dexie_takes` row but a `failed` one), and waits
+  when that table cannot be read; the ingest in turn books nothing the sweep
+  booked.  It asks the ledger under both spellings of a take's event id
   (`take:0x<id>` and the top-up ingest's `take:<id>`), and looks back one day;
   older history is a repair's.
 

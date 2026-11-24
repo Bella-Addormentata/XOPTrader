@@ -762,8 +762,11 @@ public:
     /// [TAKE-SETTLE] Book a settled take in ONE transaction: its taker_fills
     /// row, its ledger legs, the receipt coins it claims (take_receipts), and
     /// the end of its hold (`release_hold_key`, "" for none).  All of it or
-    /// none of it, and idempotent: a replay inserts nothing new.  Never throws.
-    /// @return std::nullopt when nothing could be written.
+    /// none of it, and idempotent: a replay inserts nothing new.  A receipt
+    /// coin another take has claimed (either spelling of the ids compared)
+    /// stops the booking: nothing is written and the hold stays.  Never
+    /// throws.
+    /// @return std::nullopt when nothing was written.
     [[nodiscard]] std::optional<TakeBooking> book_take(
         const DbTakerFill&                fill,
         const std::vector<DbLedgerEntry>& legs,

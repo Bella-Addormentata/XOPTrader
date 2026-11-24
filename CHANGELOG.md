@@ -25,11 +25,14 @@ listing an offer while our first take of it waits to be mined.
   moves. Its history row, ledger entries and the end of its hold are written
   together in one database transaction, and one payment coin can only ever
   pay one take. Settlement is read only from a wallet that says it is
-  synced.
+  synced, and the wallet's balances are read again just before a take is
+  booked, so the ledger check compares the booked take with a wallet that
+  shows it.
 - **One take of an offer at a time.** An offer with an unsettled take of
   ours is not taken again. The hold is written to the database before the
   take is even sent, and read back at start, so a restart does not forget
-  it. No take is sent until those holds have been read back.
+  it. No take is sent, and the ledger check does not run, until those
+  holds have been read back.
 - **A take request is never re-sent.** After a timeout the wallet may still
   be taking the offer, so the engine leaves that offer alone for about 20
   minutes instead of sending a second copy. Meanwhile the ledger check
@@ -38,7 +41,8 @@ listing an offer while our first take of it waits to be mined.
 - **Missed takes are swept in.** Every few minutes the engine looks at the
   wallet's takes of the last day and books any settled one it does not hold,
   from the wallet's own record of it. The GUI's bridge top-up takes are left
-  to their own booking.
+  to their own booking, including one that settled while the GUI was
+  closed.
 
 ### Dexie rewards: bigger coins and bigger bursts are booked
 

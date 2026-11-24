@@ -32,6 +32,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace xop {
 
@@ -53,6 +54,19 @@ bool is_terminal_status(const std::string& status)
     return status == "filled"
         || status == "cancelled"
         || status == "expired";
+}
+
+// [TAKE-SETTLE] One spelling of a trade id: no "0x", lower case.
+std::string bare_lower_id(std::string_view id)
+{
+    if (id.size() >= 2 && id[0] == '0' && (id[1] == 'x' || id[1] == 'X')) {
+        id.remove_prefix(2);
+    }
+    std::string out(id);
+    for (char& c : out) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return out;
 }
 
 // -- Schema DDL (idempotent via IF NOT EXISTS) --------------------------------
@@ -2018,6 +2032,11 @@ std::optional<Database::TakeBooking> Database::book_take(
     static constexpr const char* kClaim = R"SQL(
         INSERT OR IGNORE INTO take_receipts (coin_id, trade_id) VALUES (?1, ?2);
     )SQL";
+    // The claim's owner, read back inside the transaction: INSERT OR IGNORE
+    // is DONE as well when another take claimed the coin first.
+    static constexpr const char* kOwner = R"SQL(
+        SELECT trade_id FROM take_receipts WHERE coin_id = ?1;
+    )SQL";
     static constexpr const char* kRelease = R"SQL(
         DELETE FROM take_holds WHERE hold_key = ?1;
     )SQL";
@@ -2027,17 +2046,20 @@ std::optional<Database::TakeBooking> Database::book_take(
     sqlite3_stmt* leg_stmt     = nullptr;
     sqlite3_stmt* claim_stmt   = nullptr;
     sqlite3_stmt* release_stmt = nullptr;
+    sqlite3_stmt* owner_stmt   = nullptr;
     const auto finalize_all = [&] {
         sqlite3_finalize(fill_stmt);
         sqlite3_finalize(leg_stmt);
         sqlite3_finalize(claim_stmt);
         sqlite3_finalize(release_stmt);
+        sqlite3_finalize(owner_stmt);
     };
     try {
         if (sqlite3_prepare_v2(db_, kFill, -1, &fill_stmt, nullptr) != SQLITE_OK
             || sqlite3_prepare_v2(db_, kLeg, -1, &leg_stmt, nullptr) != SQLITE_OK
             || sqlite3_prepare_v2(db_, kClaim, -1, &claim_stmt, nullptr) != SQLITE_OK
-            || sqlite3_prepare_v2(db_, kRelease, -1, &release_stmt, nullptr) != SQLITE_OK) {
+            || sqlite3_prepare_v2(db_, kRelease, -1, &release_stmt, nullptr) != SQLITE_OK
+            || sqlite3_prepare_v2(db_, kOwner, -1, &owner_stmt, nullptr) != SQLITE_OK) {
             spdlog::error("[Database] book_take prepare failed: {}", sqlite3_errmsg(db_));
             finalize_all();
             return std::nullopt;
@@ -2087,24 +2109,50 @@ std::optional<Database::TakeBooking> Database::book_take(
             }
             out.legs_inserted += static_cast<std::size_t>(sqlite3_changes(db_));
         }
+        // A coin is claimed by one take only.  One that another take owns
+        // stops the whole booking -- nothing of it is written and its hold
+        // stays -- while a replay of the same take, in either spelling of its
+        // id, passes.
+        std::string conflict;
         for (const auto& coin : receipt_coin_ids) {
             if (!ok) break;
             sqlite3_reset(claim_stmt);
             sqlite3_clear_bindings(claim_stmt);
             sqlite3_bind_text(claim_stmt, 1, coin.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(claim_stmt, 2, fill.trade_id.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(claim_stmt) != SQLITE_DONE) ok = false;
+            if (sqlite3_step(claim_stmt) != SQLITE_DONE) {
+                ok = false;
+                break;
+            }
+            sqlite3_reset(owner_stmt);
+            sqlite3_clear_bindings(owner_stmt);
+            sqlite3_bind_text(owner_stmt, 1, coin.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(owner_stmt) != SQLITE_ROW) {
+                ok = false;
+                break;
+            }
+            const char* owner_text =
+                reinterpret_cast<const char*>(sqlite3_column_text(owner_stmt, 0));
+            const std::string owner = owner_text != nullptr ? owner_text : "";
+            if (bare_lower_id(owner) != bare_lower_id(fill.trade_id)) {
+                conflict = coin + " (claimed by take " + owner + ")";
+                ok = false;
+                break;
+            }
         }
         if (ok && !release_hold_key.empty()) {
             sqlite3_bind_text(release_stmt, 1, release_hold_key.c_str(), -1, SQLITE_TRANSIENT);
             if (sqlite3_step(release_stmt) != SQLITE_DONE) ok = false;
         }
-        if (!ok) {
+        if (!conflict.empty()) {
+            spdlog::error("[Database] book_take: take {} not booked -- its payment coin {} "
+                          "belongs to another take; nothing written", fill.trade_id, conflict);
+        } else if (!ok) {
             spdlog::error("[Database] book_take failed for {}: {}", fill.trade_id,
                           sqlite3_errmsg(db_));
         }
         finalize_all();
-        fill_stmt = leg_stmt = claim_stmt = release_stmt = nullptr;
+        fill_stmt = leg_stmt = claim_stmt = release_stmt = owner_stmt = nullptr;
         char* err = nullptr;
         if (sqlite3_exec(db_, ok ? "COMMIT;" : "ROLLBACK;", nullptr, nullptr, &err) != SQLITE_OK) {
             spdlog::error("[Database] book_take: {} failed: {}", ok ? "COMMIT" : "ROLLBACK",

@@ -535,7 +535,7 @@ TEST(TakeSettlementWiring, BookingNeedsThePaymentProof) {
     EXPECT_EQ(count_of(sweep, "in_ledger(take->trade_id)"), 2u);
     EXPECT_NE(position_of(sweep, "tracked.count(id) > 0 || topups.count(id) > 0 "
                                  "|| take_sweep_done_.count(id) > 0"), std::string::npos);
-    EXPECT_NE(position_of(sweep, "for (const auto& row : read_topup_take_rows(store))"),
+    EXPECT_NE(position_of(sweep, "const auto ids = read_gui_take_ids(store);"),
               std::string::npos);
     EXPECT_NE(position_of(sweep, "execution::in_sweep_window(take->height, block_height)"),
               std::string::npos);
@@ -606,6 +606,58 @@ TEST(TakeSettlementWiring, ABookingIsOneTransactionAndReplaysNothing) {
     ASSERT_NE(stamp, std::string::npos);
     EXPECT_LT(position_of(reward, "persist_inventory_state();"), stamp);
     EXPECT_EQ(count_of(reward, "last_reward_deep_scan_block_ = block_height;"), 1u);
+}
+
+TEST(TakeSettlementWiring, ABookingTiesToFreshBalancesAndNoGuiTakeIsSweptTwice) {
+    const std::string raw = read_engine_cpp();
+    const std::string all = squeeze(raw);
+    // Both steps read the balances a booking moves after its proof and
+    // before it books; a read that fails books nothing this time.
+    const std::string settle = function_body(
+        raw, "asio::awaitable<void> Engine::step_settle_pending_takes(BlockHeight block_height)");
+    const std::size_t settle_fresh = position_of(
+        settle, "if (!co_await refresh_take_balances(std::move(moved), block_height)) {");
+    ASSERT_NE(settle_fresh, std::string::npos);
+    EXPECT_LT(position_of(settle, "proof = prove_take_receipts(*take, coins);"), settle_fresh);
+    EXPECT_LT(settle_fresh, position_of(settle, "record_taker_fill("));
+    EXPECT_NE(position_of(settle, "if (p.fee_mojos > 0) moved.emplace_back(\"xch\");"),
+              std::string::npos);
+    const std::string sweep = function_body(
+        raw, "asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)");
+    const std::size_t sweep_fresh = position_of(
+        sweep, "if (!co_await refresh_take_balances({pc->base_asset_id, pc->quote_asset_id}, "
+               "block_height)) {");
+    ASSERT_NE(sweep_fresh, std::string::npos);
+    EXPECT_LT(position_of(sweep, "proof = prove_take_receipts(*take, coins);"), sweep_fresh);
+    // The re-check after the awaits comes after this one too.
+    EXPECT_LT(sweep_fresh, sweep.rfind(squeeze("in_ledger(take->trade_id)")));
+    EXPECT_LT(sweep_fresh, position_of(sweep, "record_taker_fill("));
+    const std::string fresh = function_body(
+        raw, "asio::awaitable<bool> Engine::refresh_take_balances(");
+    EXPECT_NE(position_of(fresh, "(void)co_await fetch_bridge_balance(asset, block_height, "
+                                 "&validated); if (!validated) co_return false;"),
+              std::string::npos);
+    // Every GUI take it may still confirm is the GUI's, and a store that
+    // cannot be read stops the sweep before it reads the wallet.
+    const std::size_t owners = position_of(sweep, "const auto ids = read_gui_take_ids(store); "
+                                                  "if (!ids) {");
+    ASSERT_NE(owners, std::string::npos);
+    const std::size_t deferred = sweep.find(squeeze("co_return;"), owners);
+    EXPECT_LT(deferred, position_of(sweep, "co_await wallet_->get_recent_takes("));
+    EXPECT_EQ(count_of(all, "SELECT trade_id FROM dexie_takes WHERE status <> 'failed';"), 1u);
+    EXPECT_EQ(count_of(sweep, "read_topup_take_rows("), 0u);
+    // ... and the top-up ingest books nothing the sweep booked.
+    const std::string topup = function_body(
+        raw, "asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)");
+    const std::size_t swept = position_of(topup, "swept != legs.event_id && db_->ledger_has_event(swept)");
+    ASSERT_NE(swept, std::string::npos);
+    EXPECT_LT(swept, position_of(topup, "db_->append_ledger_entries(entries)"));
+    // The invariant does not run before the saved holds are read back.
+    const std::string invariant = function_body(
+        raw, "void Engine::step_check_ledger_invariant(BlockHeight block_height)");
+    const std::size_t waits = position_of(invariant, "if (!take_holds_restored_) {");
+    ASSERT_NE(waits, std::string::npos);
+    EXPECT_LT(waits, position_of(invariant, "db_->ledger_balances()"));
 }
 
 TEST(TakeSettlementWiring, TheHoldIsWrittenBeforeTheTakeIsSent) {

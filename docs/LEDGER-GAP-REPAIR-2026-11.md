@@ -106,9 +106,9 @@ All commands run from `C:\GitHub\XOPTrader`, with the Chia wallet running and sy
    options runner too if it runs in a terminal. `--apply` refuses while
    `xop_trader.exe` or `xop_trader_gui.exe` runs, or a Python process runs
    `gui.main` or `gui.services.options`. It also refuses if it cannot read
-   the process list. It checks before planning, and inside its write
-   transaction it refuses if the ledger or `taker_fills` changed since the
-   plan was read.
+   the process list, or the command line of any Python process. It checks
+   before planning, and inside its write transaction it refuses if the
+   ledger or `taker_fills` changed since the plan was read.
 3. Dry run, and read the summary. "XCH left after every item" must be
    within ±0.01. A fill taken while the engine was stopped shows up there;
    if so, wait for it to be booked.

@@ -662,6 +662,65 @@ TEST(DatabaseTest, BookTakeIsOneTransactionAndIdempotent) {
     EXPECT_TRUE(db.taker_fill_exists("0x0b5bba65"));
 }
 
+TEST(DatabaseTest, BookTakeRefusesACoinAnotherTakeClaimed) {
+    TempDbPath temp("book_take_owner");
+    xop::Database db(temp.path().string());
+
+    xop::DbTakerFill fill;
+    fill.taken_at          = "2026-11-20T10:13:23.000Z";
+    fill.block_height      = 9'600'516;
+    fill.strategy          = "crossed_book";
+    fill.trade_id          = "0x72a48007";
+    fill.pair_name         = "XCH/DBX";
+    fill.we_bought_base    = true;
+    fill.base_asset        = "xch";
+    fill.base_delta_mojos  = 5'000'000'000'000LL;
+    fill.quote_asset       = "db1a";
+    fill.quote_delta_mojos = -427'000;
+    fill.price_mojos       = 85'400'000'000'000LL;
+
+    xop::DbLedgerEntry leg;
+    leg.entry_time  = "2026-11-20T10:13:23.000Z";
+    leg.event_type  = "take";
+    leg.event_id    = "take:0x72a48007";
+    leg.leg         = "base";
+    leg.asset_id    = "xch";
+    leg.delta_mojos = 5'000'000'000'000LL;
+    ASSERT_TRUE(db.book_take(fill, {leg}, {"c0ffee"}, "").has_value());
+
+    // A second take whose proof names the same coin writes nothing at all,
+    // and keeps its hold for the next heartbeat.
+    xop::DbTakeHold hold;
+    hold.hold_key = "take:0x5ed85168";
+    hold.kind     = "pending";
+    hold.offer_id = "AkA6GJ";
+    hold.trade_id = "0x5ed85168";
+    ASSERT_TRUE(db.save_take_hold(hold));
+    xop::DbTakerFill other = fill;
+    other.trade_id = "0x5ed85168";
+    xop::DbLedgerEntry other_leg = leg;
+    other_leg.event_id = "take:0x5ed85168";
+    EXPECT_FALSE(db.book_take(other, {other_leg}, {"beef", "c0ffee"}, "take:0x5ed85168")
+                     .has_value());
+    EXPECT_FALSE(db.taker_fill_exists("0x5ed85168"));
+    EXPECT_FALSE(db.ledger_has_event("take:0x5ed85168"));
+    auto owners = db.take_receipt_owners({"beef", "c0ffee"});
+    ASSERT_TRUE(owners.has_value());
+    ASSERT_EQ(owners->size(), 1u);   // not even the free coin was claimed
+    EXPECT_EQ(owners->at("c0ffee"), "0x72a48007");
+    auto holds = db.take_holds();
+    ASSERT_TRUE(holds.has_value());
+    ASSERT_EQ(holds->size(), 1u);
+    EXPECT_EQ(holds->front().hold_key, "take:0x5ed85168");
+
+    // The same take replayed in the other spelling of its id still passes.
+    xop::DbTakerFill replay = fill;
+    replay.trade_id = "72A48007";
+    const auto again = db.book_take(replay, {}, {"c0ffee"}, "");
+    ASSERT_TRUE(again.has_value());
+    EXPECT_EQ(again->legs_inserted, 0u);
+}
+
 TEST(DatabaseTest, InventoryStateUpsertReplacesPriorSnapshot) {
     TempDbPath temp("inventory_state_upsert");
     xop::Database db(temp.path().string());

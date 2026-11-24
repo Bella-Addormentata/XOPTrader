@@ -617,43 +617,63 @@ WRITER_EXES = ("xop_trader.exe", "xop_trader_gui.exe")
 # Command-line marks of a GUI run from source and of the options runner.  Not
 # "xop_trader": this script's own --db argument names the database.
 WRITER_COMMANDS = ("gui.main", "gui\\main", "gui/main", "gui.services.options")
+# python.exe, pythonw.exe, python3.13.exe, py.exe, pyw.exe.
+PYTHON_EXE = re.compile(r"^(pythonw?[0-9.]*|pyw?)\.exe$")
 
 
 def writers_running(processes: list) -> list:
     """The engine, the GUI (installed, or run from source as python gui.main)
-    and the options book's own runner, among (name, command line) pairs."""
+    and the options book's own runner, among (name, command line) pairs.  A
+    Python process whose command line cannot be read could be either of the
+    last two, so it counts too: fail closed, as the September repair does."""
     found = []
     for name, command in processes:
         exe = (name or "").lower()
-        cmd = (command or "").lower()
         if exe in WRITER_EXES:
             found.append(exe)
-        elif exe in ("python.exe", "pythonw.exe") and any(w in cmd for w in WRITER_COMMANDS):
-            found.append(f"{exe}: {command}")
+        elif PYTHON_EXE.match(exe):
+            if not (command or "").strip():
+                found.append(f"{exe}: a Python process whose command line cannot be read")
+            elif any(w in command.lower() for w in WRITER_COMMANDS):
+                found.append(f"{exe}: {command}")
     return found
 
 
 def require_stopped() -> None:
     """Refuse unless every writer of the database and the wallet is stopped.
-    Fails closed: a process list that cannot be read refuses too."""
+    Fails closed: a process list that cannot be read or trusted refuses too."""
     if os.name != "nt":
         raise SystemExit("--apply runs on the trading PC (Windows) only")
     root = pathlib.Path(os.environ.get("SystemRoot", r"C:\Windows"))
     shell = root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
-    query = ("Get-CimInstance Win32_Process | Select-Object ProcessId, Name, CommandLine | "
+    query = ("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+             "Get-CimInstance Win32_Process | "
+             "Select-Object ProcessId, ParentProcessId, Name, CommandLine | "
              "ConvertTo-Json -Compress")
     try:
-        out = subprocess.run([str(shell), "-NoProfile", "-Command", query],  # noqa: S603
-                             capture_output=True, text=True, check=True, timeout=60).stdout
-        rows = json.loads(out)
+        out = subprocess.run(  # noqa: S603
+            [str(shell), "-NoProfile", "-NonInteractive", "-Command", query],
+            capture_output=True, check=True, timeout=120).stdout
+        rows = json.loads(out.decode("utf-8-sig", "replace"))
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         raise SystemExit(f"the process list could not be read ({exc}); not applying") from exc
     if isinstance(rows, dict):
         rows = [rows]
-    if not rows:
+    if not isinstance(rows, list) or not rows:
         raise SystemExit("the process list came back empty; not applying")
-    running = writers_running([(r.get("Name"), r.get("CommandLine")) for r in rows
-                               if r.get("ProcessId") != os.getpid()])
+    by_pid = {r.get("ProcessId"): r for r in rows if isinstance(r, dict)}
+    if os.getpid() not in by_pid:
+        raise SystemExit("the process list does not include this process; not applying")
+    # This process, and the Python launchers above it: a venv's python.exe
+    # starts the interpreter as its child, with the same command line.
+    mine = {os.getpid()}
+    parent = by_pid[os.getpid()].get("ParentProcessId")
+    while (parent in by_pid and parent not in mine
+           and PYTHON_EXE.match((by_pid[parent].get("Name") or "").lower())):
+        mine.add(parent)
+        parent = by_pid[parent].get("ParentProcessId")
+    running = writers_running([(r.get("Name"), r.get("CommandLine"))
+                               for pid, r in by_pid.items() if pid not in mine])
     if running:
         raise SystemExit("stop these first: " + "; ".join(running))
 

@@ -1561,7 +1561,9 @@ private:
     /// onto their pair as configured now, warned once.
     std::unordered_set<std::string> take_unmapped_warned_;
     /// take_holds has been read back (restore_take_holds).  Until it has, no
-    /// take is sent: an unread hold may be holding the very offer.
+    /// take is sent (an unread hold may be holding the very offer) and the
+    /// ledger invariant does not run (what a take in flight could move is
+    /// unknown).
     bool take_holds_restored_{false};
     /// [review #163 r2] The height the engine is working at NOW: the startup
     /// height while the startup reconcile runs, then each cycle's own height,
@@ -1988,6 +1990,15 @@ private:
     /// (take_receipts).  std::nullopt when unproven or the claims are unread.
     [[nodiscard]] std::optional<execution::ReceiptProof> prove_take_receipts(
         const execution::WalletTake& take, const std::vector<nlohmann::json>& coins) const;
+
+    /// [TAKE-SETTLE 2026-11-24] Fresh, validated wallet balances of `assets`
+    /// at `block_height` (fetch_bridge_balance), read after a take's payment
+    /// was proven and before it is booked: the invariant must tie books that
+    /// carry the take to a snapshot that carries it too, not to one a paused
+    /// Step 8 left from before it.  False when any read fails or is
+    /// incomplete; the booking then waits a heartbeat.
+    asio::awaitable<bool> refresh_take_balances(std::vector<AssetId> assets,
+                                                BlockHeight block_height);
 
     /// [TAKE-SETTLE 2026-11-24] Book the tracked takes that settled; drop the
     /// ones that failed or were cancelled.  At most
