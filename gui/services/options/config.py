@@ -977,11 +977,12 @@ def parse(root: Any) -> OptionsConfig | None:
     fee = 0 if fee_auto else int(_number(section, "fee_mojos", 0))
     if fee > limits.max_fee_mojos:
         raise OptionsConfigError("options.fee_mojos is above options.limits.max_fee_mojos")
-    # [PEG] A blank `peg_tolerance_pct:` (null) is the default, as left out is:
-    # the Settings tab shows both as the default and saves both as left out.
-    # [review #263]
+    # [PEG] A blank `peg_tolerance_pct:` (null, or an empty string) is the
+    # default, as left out is, the way a blank limit is unset: the Settings tab
+    # shows each of them as the default. [review #263]
     peg_tolerance = DEFAULT_PEG_TOLERANCE_PCT
-    if market_raw.get("peg_tolerance_pct") is not None:
+    raw_tolerance = market_raw.get("peg_tolerance_pct")
+    if raw_tolerance is not None and str(raw_tolerance).strip() != "":
         peg_tolerance = _number(market_raw, "peg_tolerance_pct", None)
 
     return OptionsConfig(

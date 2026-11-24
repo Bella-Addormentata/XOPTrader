@@ -1000,6 +1000,43 @@ def test_a_tolerance_that_is_not_a_number_is_refused_by_the_book_s_parser(panel,
     assert _saved_options(cfg_path)["market"]["peg_tolerance_pct"] == 3, "nothing written"
 
 
+@pytest.mark.parametrize("typed", ["%", " % "])
+def test_a_percent_sign_alone_is_refused_not_saved_as_the_default(panel, tmp_path, typed):
+    """[review #263] Read as blank, a lone % went in as the default, 3%: typed over a
+    written 0, it loosened the check unasked. The book's parser refuses it on Save."""
+    cfg_path = _shared_book(tmp_path, market={"peg_tolerance_pct": 0})
+    panel.load_config(str(cfg_path))
+    panel._options_section.peg_tolerance.setText(typed)
+    assert panel.save_config(str(cfg_path)) is False
+    assert any("peg_tolerance_pct" in said for said in _SAID), _SAID
+    assert _saved_options(cfg_path)["market"]["peg_tolerance_pct"] == 0, "nothing written"
+
+
+def test_a_tolerance_written_as_an_empty_string_is_the_default_it_shows(panel, tmp_path):
+    """[review #263] `peg_tolerance_pct: ''` shows blank, as the default, and the book
+    reads it as the default too, as it does a blank limit: Save works with the field
+    left alone, and with a number typed and cleared again."""
+    from gui.services.config_split import load_merged
+    from gui.services.options import config as options_config
+
+    cfg_path = _shared_book(tmp_path, market={"peg_tolerance_pct": ""})
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.peg_tolerance.text() == ""
+    tab.limit_fields["max_contracts"].setText("3")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    parsed = options_config.parse(load_merged(cfg_path))
+    assert parsed is not None and parsed.market.peg_tolerance_pct == 3.0
+
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    tab.peg_tolerance.setText("1")
+    tab.peg_tolerance.setText("")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    parsed = options_config.parse(load_merged(cfg_path))
+    assert parsed is not None and parsed.market.peg_tolerance_pct == 3.0
+
+
 def test_a_market_section_that_is_not_a_mapping_is_refused_until_corrected(panel, tmp_path):
     """[review #263] An edit elsewhere must not swap a malformed options.market for the
     defaults unseen: the book's parser refuses it on Save, as before the field existed.

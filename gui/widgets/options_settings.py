@@ -192,14 +192,15 @@ def _same_number(first: Any, second: Any) -> bool:
 def _tolerance_value(text: str) -> Any:
     """[PEG] The off-peg tolerance field as YAML: None when blank, else a number.
 
-    A trailing ``%`` is allowed. Anything else is written as typed, for the
-    book's parser to refuse with its reason.
+    A ``%`` after the number is allowed. Anything else, a ``%`` on its own too
+    [review #263], is written as typed, for the book's parser to refuse with
+    its reason.
     """
-    text = text.strip().removesuffix("%").strip()
+    text = text.strip()
     if not text:
         return None
     try:
-        number = float(text)
+        number = float(text.removesuffix("%").strip())
     except ValueError:
         return text
     if math.isfinite(number) and number == int(number):
