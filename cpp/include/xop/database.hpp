@@ -753,6 +753,32 @@ public:
     /// read.
     [[nodiscard]] std::optional<std::vector<DbTakeHold>> take_holds() const;
 
+    /// [TAKE-SETTLE] What book_take wrote.
+    struct TakeBooking {
+        bool        fill_inserted{false};   ///< the taker_fills row is new
+        std::size_t legs_inserted{0};       ///< ledger legs that are new
+    };
+
+    /// [TAKE-SETTLE] Book a settled take in ONE transaction: its taker_fills
+    /// row, its ledger legs, the receipt coins it claims (take_receipts), and
+    /// the end of its hold (`release_hold_key`, "" for none).  All of it or
+    /// none of it, and idempotent: a replay inserts nothing new.  Never throws.
+    /// @return std::nullopt when nothing could be written.
+    [[nodiscard]] std::optional<TakeBooking> book_take(
+        const DbTakerFill&                fill,
+        const std::vector<DbLedgerEntry>& legs,
+        const std::vector<std::string>&   receipt_coin_ids,
+        const std::string&                release_hold_key) noexcept;
+
+    /// [TAKE-SETTLE] Which of `coin_ids` a booked take has claimed: coin id
+    /// -> trade id.  std::nullopt when the table could not be read.
+    [[nodiscard]] std::optional<std::unordered_map<std::string, std::string>> take_receipt_owners(
+        const std::vector<std::string>& coin_ids) const;
+
+    /// [TAKE-SETTLE] Does taker_fills hold this trade, under either spelling
+    /// of its id ("0x..." or bare)?
+    [[nodiscard]] bool taker_fill_exists(const std::string& trade_id) const;
+
     /// The entry_time of this asset's 'opening' leg (ISO-8601 UTC), or ""
     /// when none exists / the query fails.  [S19] The bridge ingester
     /// skips jobs completed at or before this instant: their flow is

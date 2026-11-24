@@ -315,6 +315,7 @@ def proven_trades(trades: list, coins: dict, booked: dict) -> dict:
 
 def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
                pairs: list) -> dict:
+    snapshot = ledger_snapshot(db)
     led = db.execute(LEDGER_QUERY).fetchall()
     if any(TAG in (r[9] or "") for r in led):
         raise SystemExit(f"the ledger already holds rows tagged {TAG}: the repair has run")
@@ -568,7 +569,7 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
          f"{RETIE_EVENT_ID} to block {end_h}, measured from the coin store: {left_wallet} "
          f"mojos left trading coins, {paid_xch} of them trades' XCH legs and {booked_fees} "
          "fees already booked; ACCOUNTING-POLICY s.8 known gap")
-    return {"entries": entries, "taker_rows": taker_rows,
+    return {"entries": entries, "taker_rows": taker_rows, "snapshot": snapshot,
             "phantoms": [(e, t, s) for e, t, s, _ in phantoms],
             "missed": [norm(t["trade_id"]) for t in missed], "coins": coins, "oph": oph,
             "led": led, "measured_fee": measured, "leftovers": leftovers}
@@ -670,6 +671,12 @@ def backup(db_path: pathlib.Path) -> pathlib.Path:
     return dest
 
 
+def ledger_snapshot(con: sqlite3.Connection) -> tuple:
+    """What the plan was built on: the ledger's and taker_fills' size and last id."""
+    return (con.execute("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM ledger_entries").fetchone()
+            + con.execute("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM taker_fills").fetchone())
+
+
 def apply(db_path: pathlib.Path, plan: dict) -> None:
     require_stopped()
     dest = backup(db_path)
@@ -678,6 +685,10 @@ def apply(db_path: pathlib.Path, plan: dict) -> None:
     con = sqlite3.connect(db_path.as_posix(), isolation_level=None)
     try:
         con.execute("BEGIN IMMEDIATE")
+        # Inside the write lock: the books must be the ones the plan read.
+        if ledger_snapshot(con) != plan["snapshot"]:
+            raise SystemExit("the ledger changed since the plan was made (an engine ran?) -- "
+                             "nothing written; run the dry run again")
         for e in plan["entries"]:
             cur = con.execute(
                 "INSERT OR IGNORE INTO ledger_entries (entry_time, event_type, event_id, leg, "
@@ -747,6 +758,8 @@ def main() -> None:
             print(f"  {asset[:8]:8} ledger-wallet {fmt(asset, gap[asset])}")
         return
 
+    if args.apply:
+        require_stopped()   # before planning: the plan is read with every writer stopped
     pairs = [(str(p.get("name")), norm(p.get("base_asset_id")), norm(p.get("quote_asset_id")))
              for p in (cfg.get("pairs") or [])]
     db = sqlite3.connect(f"file:{args.db.as_posix()}?mode=ro", uri=True)

@@ -133,7 +133,10 @@ the ledger held 44.54 XCH that never moved.
   own amounts, at the block that payment landed in; a leg at or below its
   asset's opening block is suppressed, as for a fill.  A settled take whose
   record does not read as two legs of its pair as configured is kept tracked,
-  never booked from estimates.
+  never booked from estimates.  The `taker_fills` row, the legs, the payment
+  coins the take claims (`take_receipts`: one coin pays one take, for good)
+  and the end of its hold commit in one transaction.  Evidence is read only
+  from a wallet that reports itself synced.
 - **A take that fails books nothing.**  FAILED or CANCELLED in the wallet: no
   legs, no `taker_fills` row.
 - **One take of an offer at a time.**  While a take of a Dexie offer is

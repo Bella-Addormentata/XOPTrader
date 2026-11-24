@@ -22,11 +22,14 @@ listing an offer while our first take of it waits to be mined.
   pays us is in the wallet, at the wallet's own amounts and at the block
   that payment landed in. A take that failed or was cancelled books nothing.
   Until a take is booked or dropped, the ledger check allows for what it
-  moves.
+  moves. Its history row, ledger entries and the end of its hold are written
+  together in one database transaction, and one payment coin can only ever
+  pay one take. Settlement is read only from a wallet that says it is
+  synced.
 - **One take of an offer at a time.** An offer with an unsettled take of
   ours is not taken again. The hold is written to the database before the
   take is even sent, and read back at start, so a restart does not forget
-  it.
+  it. No take is sent until those holds have been read back.
 - **A take request is never re-sent.** After a timeout the wallet may still
   be taking the offer, so the engine leaves that offer alone for about 20
   minutes instead of sending a second copy. Meanwhile the ledger check

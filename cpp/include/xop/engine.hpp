@@ -1560,6 +1560,9 @@ private:
     /// Settled takes the settle step keeps because their record does not map
     /// onto their pair as configured now, warned once.
     std::unordered_set<std::string> take_unmapped_warned_;
+    /// take_holds has been read back (restore_take_holds).  Until it has, no
+    /// take is sent: an unread hold may be holding the very offer.
+    bool take_holds_restored_{false};
     /// [review #163 r2] The height the engine is working at NOW: the startup
     /// height while the startup reconcile runs, then each cycle's own height,
     /// stamped at the TOP of on_new_block_coro.  last_block_ cannot serve: it
@@ -1896,6 +1899,12 @@ private:
     /// @param block_height       The height the take settled at.
     /// @param exact_quote_mojos  The quote leg as the wallet states it, when
     ///                           known; else derived from base and price.
+    /// @param receipt_coin_ids   [TAKE-SETTLE] The payment coins the take
+    ///                           claims (take_receipts), and
+    /// @param release_hold_key   the hold its booking ends -- all written in
+    ///                           ONE transaction with the taker_fills row and
+    ///                           the ledger legs (Database::book_take).
+    /// @param booked             Set true when that transaction committed.
     void record_taker_fill(const std::string& strategy,
                            const std::string& trade_id,
                            const std::string& counterparty_offer_id,
@@ -1905,7 +1914,10 @@ private:
                            Mojo price_mojos,
                            std::uint64_t fee_mojos,
                            BlockHeight block_height,
-                           std::optional<Mojo> exact_quote_mojos = std::nullopt) noexcept;
+                           std::optional<Mojo> exact_quote_mojos = std::nullopt,
+                           const std::vector<std::string>& receipt_coin_ids = {},
+                           const std::string& release_hold_key = {},
+                           bool* booked = nullptr) noexcept;
 
     /// [TAKE-SETTLE 2026-11-24] A take the wallet ACCEPTED: tracked, not
     /// booked.  step_settle_pending_takes books it through record_taker_fill
@@ -1961,13 +1973,21 @@ private:
     /// [TAKE-SETTLE 2026-11-24] Read take_holds back at start, before any
     /// take step runs: the takes the last process left unsettled, and its
     /// uncertain requests.
-    void restore_take_holds() noexcept;
+    /// @return true when the hold set was read (or there is no database).
+    bool restore_take_holds() noexcept;
 
     /// [TAKE-SETTLE 2026-11-24] Each received asset's wallet id, for the
     /// payment proof (execution::receipts_paid); an unresolved asset is left
     /// out, which fails the proof.
     [[nodiscard]] std::unordered_map<std::string, std::int64_t> receipt_wallet_ids(
         const std::vector<execution::AssetAmount>& received) const;
+
+    /// [TAKE-SETTLE 2026-11-24] The payment proof for `take` from `coins`
+    /// (execution::prove_receipts): each receipt in its own asset's wallet,
+    /// within kReceiptGiveBlocks, and not a coin another booked take claimed
+    /// (take_receipts).  std::nullopt when unproven or the claims are unread.
+    [[nodiscard]] std::optional<execution::ReceiptProof> prove_take_receipts(
+        const execution::WalletTake& take, const std::vector<nlohmann::json>& coins) const;
 
     /// [TAKE-SETTLE 2026-11-24] Book the tracked takes that settled; drop the
     /// ones that failed or were cancelled.  At most

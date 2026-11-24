@@ -592,6 +592,76 @@ TEST(DatabaseTest, TakeHoldsRoundTripAcrossReopen) {
     EXPECT_EQ(holds->front().hold_key, "uncertain:nMDyHor9J8");
 }
 
+// [TAKE-SETTLE 2026-11-24] A settled take books in one transaction, and a
+// replay writes nothing new.
+TEST(DatabaseTest, BookTakeIsOneTransactionAndIdempotent) {
+    TempDbPath temp("book_take");
+    xop::Database db(temp.path().string());
+
+    xop::DbTakeHold hold;
+    hold.hold_key = "take:0x72a48007";
+    hold.kind     = "pending";
+    hold.offer_id = "Dq3TqEWpW5";
+    hold.trade_id = "0x72a48007";
+    ASSERT_TRUE(db.save_take_hold(hold));
+
+    xop::DbTakerFill fill;
+    fill.taken_at          = "2026-11-20T10:13:23.000Z";
+    fill.block_height      = 9'600'516;
+    fill.strategy          = "crossed_book";
+    fill.trade_id          = "0x72a48007";
+    fill.pair_name         = "XCH/DBX";
+    fill.we_bought_base    = true;
+    fill.base_asset        = "xch";
+    fill.base_delta_mojos  = 5'000'000'000'000LL;
+    fill.quote_asset       = "db1a";
+    fill.quote_delta_mojos = -427'000;
+    fill.price_mojos       = 85'400'000'000'000LL;
+    fill.fee_mojos         = 330'000;
+
+    std::vector<xop::DbLedgerEntry> legs(2);
+    legs[0].entry_time = "2026-11-20T10:13:23.000Z";
+    legs[0].event_type = "take";
+    legs[0].event_id   = "take:0x72a48007";
+    legs[0].leg        = "base";
+    legs[0].asset_id   = "xch";
+    legs[0].delta_mojos = 5'000'000'000'000LL;
+    legs[1] = legs[0];
+    legs[1].leg        = "quote";
+    legs[1].asset_id   = "db1a";
+    legs[1].delta_mojos = -427'000;
+
+    const auto first = db.book_take(fill, legs, {"c0ffee"}, "take:0x72a48007");
+    ASSERT_TRUE(first.has_value());
+    EXPECT_TRUE(first->fill_inserted);
+    EXPECT_EQ(first->legs_inserted, 2u);
+    EXPECT_TRUE(db.ledger_has_event("take:0x72a48007"));
+    EXPECT_TRUE(db.taker_fill_exists("72a48007"));
+    EXPECT_TRUE(db.taker_fill_exists("0x72A48007"));
+    EXPECT_FALSE(db.taker_fill_exists("0x5ed85168"));
+    auto holds = db.take_holds();
+    ASSERT_TRUE(holds.has_value());
+    EXPECT_TRUE(holds->empty());   // the booking ended the hold
+    auto owners = db.take_receipt_owners({"c0ffee", "beef"});
+    ASSERT_TRUE(owners.has_value());
+    ASSERT_EQ(owners->size(), 1u);
+    EXPECT_EQ(owners->at("c0ffee"), "0x72a48007");
+
+    // A replay inserts nothing new.
+    const auto again = db.book_take(fill, legs, {"c0ffee"}, "take:0x72a48007");
+    ASSERT_TRUE(again.has_value());
+    EXPECT_FALSE(again->fill_inserted);
+    EXPECT_EQ(again->legs_inserted, 0u);
+
+    // Every leg suppressed: the row alone still marks the take booked.
+    fill.trade_id = "0x0b5bba65";
+    const auto rowless = db.book_take(fill, {}, {}, "");
+    ASSERT_TRUE(rowless.has_value());
+    EXPECT_TRUE(rowless->fill_inserted);
+    EXPECT_EQ(rowless->legs_inserted, 0u);
+    EXPECT_TRUE(db.taker_fill_exists("0x0b5bba65"));
+}
+
 TEST(DatabaseTest, InventoryStateUpsertReplacesPriorSnapshot) {
     TempDbPath temp("inventory_state_upsert");
     xop::Database db(temp.path().string());

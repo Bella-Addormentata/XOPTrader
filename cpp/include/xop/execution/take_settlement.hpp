@@ -78,6 +78,7 @@
 #include <string_view>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -345,38 +346,61 @@ struct WalletTake {
     return id->get<std::int64_t>();
 }
 
+/// The coin id a flat wallet coin record carries (`id`), normalised, or
+/// nullopt when it has none.
+[[nodiscard]] inline std::optional<std::string> coin_record_id(const nlohmann::json& record)
+{
+    if (!record.is_object()) return std::nullopt;
+    const auto id = record.find("id");
+    if (id == record.end() || !id->is_string()) return std::nullopt;
+    std::string out = normalize_id(id->get_ref<const std::string&>());
+    if (out.empty()) return std::nullopt;
+    return out;
+}
+
+/// A take's payment, proven: the block it landed in, and the coins it was.
+struct ReceiptProof {
+    std::uint64_t            settled_at{0};
+    std::vector<std::string> coin_ids;   ///< normalised; claimed by the booking
+};
+
 /// When did the take pay us -- or did it?  Every received amount must be
 /// matched by its own coin record -- the wallet's flat get_coin_records rows,
 /// which span every wallet -- of exactly that amount, IN THAT ASSET'S WALLET
 /// (`wallet_ids`: normalised asset id -> wallet id), created from `height` to
-/// `height + give`.  The earliest such coin is taken for each receipt.  A
-/// 1,000-mojo DBX coin never pays a 1,000-mojo BYC receipt, and one record
-/// never vouches for two receipts.  Returns the height of the latest receipt
-/// matched -- the block the take settled in, which books it -- or nullopt.
-/// Fail closed: no receipts, no height, an asset with no wallet, or any
-/// record that cannot be read proves nothing.
-[[nodiscard]] inline std::optional<std::uint64_t> receipts_settled_at(
+/// `height + give`, and not a coin another booked take already claimed
+/// (`claimed_elsewhere`, normalised coin ids: the take_receipts table).  The
+/// earliest such coin is taken for each receipt.  A 1,000-mojo DBX coin never
+/// pays a 1,000-mojo BYC receipt, and one coin never vouches for two receipts
+/// -- in this call or, through the claims, in any later one.  Returns the
+/// height of the latest receipt matched -- the block the take settled in,
+/// which books it -- and the coins, or nullopt.  Fail closed: no receipts,
+/// no height, an asset with no wallet, or any record that cannot be read
+/// proves nothing.
+[[nodiscard]] inline std::optional<ReceiptProof> prove_receipts(
     const std::vector<AssetAmount>&                      received,
     const std::vector<nlohmann::json>&                   records,
     std::uint64_t                                        height,
     const std::unordered_map<std::string, std::int64_t>& wallet_ids,
-    std::uint64_t                                        give = 0)
+    std::uint64_t                                        give,
+    const std::unordered_set<std::string>&               claimed_elsewhere)
 {
     if (received.empty() || height == 0U) return std::nullopt;
-    // (created height, wallet id, amount), earliest first.
-    std::vector<std::tuple<std::uint64_t, std::int64_t, std::uint64_t>> coins;
+    // (created height, wallet id, amount, coin id), earliest first.
+    std::vector<std::tuple<std::uint64_t, std::int64_t, std::uint64_t, std::string>> coins;
     coins.reserve(records.size());
     for (const auto& record : records) {
         const auto ref     = parse_coin_ref(record);
         const auto created = coin_record_confirmed_height(record);
         const auto wallet  = coin_record_wallet_id(record);
-        if (!ref || !created || !wallet) return std::nullopt;
-        if (*created >= height && *created - height <= give) {
-            coins.emplace_back(*created, *wallet, ref->amount);
+        const auto id      = coin_record_id(record);
+        if (!ref || !created || !wallet || !id) return std::nullopt;
+        if (*created >= height && *created - height <= give && claimed_elsewhere.count(*id) == 0) {
+            coins.emplace_back(*created, *wallet, ref->amount, *id);
         }
     }
     std::sort(coins.begin(), coins.end());
-    std::uint64_t settled = 0;
+    ReceiptProof proof;
     for (const auto& r : received) {
         if (r.second <= 0) return std::nullopt;
         const auto wid = wallet_ids.find(r.first);
@@ -386,10 +410,49 @@ struct WalletTake {
             return std::get<1>(c) == wid->second && std::get<2>(c) == want;
         });
         if (it == coins.end()) return std::nullopt;
-        settled = std::max(settled, std::get<0>(*it));
+        proof.settled_at = std::max(proof.settled_at, std::get<0>(*it));
+        proof.coin_ids.push_back(std::get<3>(*it));
         coins.erase(it);
     }
-    return settled;
+    return proof;
+}
+
+/// prove_receipts with no claims to honour: the settlement height only.
+[[nodiscard]] inline std::optional<std::uint64_t> receipts_settled_at(
+    const std::vector<AssetAmount>&                      received,
+    const std::vector<nlohmann::json>&                   records,
+    std::uint64_t                                        height,
+    const std::unordered_map<std::string, std::int64_t>& wallet_ids,
+    std::uint64_t                                        give = 0)
+{
+    const auto proof = prove_receipts(received, records, height, wallet_ids, give, {});
+    if (!proof) return std::nullopt;
+    return proof->settled_at;
+}
+
+/// The coin ids `records` name, normalised (unreadable ones left out): what
+/// to ask take_receipts about before a proof.
+[[nodiscard]] inline std::vector<std::string> record_coin_ids(const std::vector<nlohmann::json>& records)
+{
+    std::vector<std::string> out;
+    out.reserve(records.size());
+    for (const auto& record : records) {
+        if (auto id = coin_record_id(record)) out.push_back(std::move(*id));
+    }
+    return out;
+}
+
+/// The coins claimed by a take other than `trade_id` (owners: coin id ->
+/// owning trade id, both normalised).
+[[nodiscard]] inline std::unordered_set<std::string> claimed_by_others(
+    const std::unordered_map<std::string, std::string>& owners, std::string_view trade_id)
+{
+    const std::string self = normalize_id(trade_id);
+    std::unordered_set<std::string> out;
+    for (const auto& [coin, owner] : owners) {
+        if (normalize_id(owner) != self) out.insert(coin);
+    }
+    return out;
 }
 
 /// Did the take pay us at exactly `height`?  receipts_settled_at with no give.

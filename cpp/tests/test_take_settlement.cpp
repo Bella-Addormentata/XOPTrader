@@ -18,6 +18,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -51,10 +52,13 @@ nlohmann::json take_record(const std::string& status = "CONFIRMED",
     };
 }
 
-// A flat wallet coin record (get_coin_records), in wallet `wallet_id`.
+// A flat wallet coin record (get_coin_records), in wallet `wallet_id`, with
+// its own coin id.
 nlohmann::json coin(std::uint64_t amount, std::uint64_t height, std::int64_t wallet_id = 1)
 {
+    static int serial = 0;
     return {
+        {"id", "0xC" + std::to_string(++serial)},
         {"amount", amount},
         {"confirmed_height", height},
         {"spent_height", 0},
@@ -261,6 +265,32 @@ TEST(TakeSettlement, APaymentABlockLateStillSettlesTheTakeAtItsOwnBlock) {
     EXPECT_EQ(receipts_settled_at(two, {coin(1'000, 51, 4), coin(1'000, 50, 4), coin(2'000, 51, 8)},
                                   50, kWallets, kReceiptGiveBlocks),
               std::optional<std::uint64_t>{51});
+}
+
+TEST(TakeSettlement, ACoinAnotherBookedTakeClaimedPaysNothing) {
+    // [review #262] Proofs run per trade, over fresh lists: the claims carry
+    // "one coin pays one take" across them, booked trades included.
+    const std::vector<AssetAmount> received{{"xch", 5'000'000'000'000}};
+    const auto paid = coin(5'000'000'000'000, 9'600'516);
+    const std::string id = paid.at("id").get<std::string>();
+    const auto proof = prove_receipts(received, {paid}, 9'600'516, kWallets, kReceiptGiveBlocks, {});
+    ASSERT_TRUE(proof.has_value());
+    EXPECT_EQ(proof->settled_at, 9'600'516u);
+    EXPECT_EQ(proof->coin_ids, (std::vector<std::string>{normalize_id(id)}));
+    // Claimed by another take: no proof.
+    EXPECT_FALSE(prove_receipts(received, {paid}, 9'600'516, kWallets, kReceiptGiveBlocks,
+                                {normalize_id(id)}).has_value());
+    // Its own claim does not stop a replay of the same take.
+    const std::unordered_map<std::string, std::string> owners{{normalize_id(id), "0xE08EBC5A"}};
+    EXPECT_TRUE(claimed_by_others(owners, "e08ebc5a").empty());
+    EXPECT_EQ(claimed_by_others(owners, "0x72a48007"),
+              (std::unordered_set<std::string>{normalize_id(id)}));
+    // A record with no coin id proves nothing.
+    auto anonymous = paid;
+    anonymous.erase("id");
+    EXPECT_FALSE(prove_receipts(received, {anonymous}, 9'600'516, kWallets, kReceiptGiveBlocks, {})
+                     .has_value());
+    EXPECT_EQ(record_coin_ids({paid, anonymous}), (std::vector<std::string>{normalize_id(id)}));
 }
 
 TEST(TakeSettlement, ATrackedTakeIsToleranceUntilItIsBookedOrDropped) {
@@ -492,9 +522,7 @@ TEST(TakeSettlementWiring, BookingNeedsThePaymentProof) {
           "asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)"}) {
         const std::string body = function_body(raw, signature);
         ASSERT_FALSE(body.empty()) << signature;
-        const std::size_t proof = position_of(
-            body, "settled_at = execution::receipts_settled_at( take->received, coins, take->height, "
-                  "receipt_wallet_ids(take->received), execution::kReceiptGiveBlocks);");
+        const std::size_t proof = position_of(body, "proof = prove_take_receipts(*take, coins);");
         ASSERT_NE(proof, std::string::npos) << signature;
         EXPECT_LT(proof, position_of(body, "record_taker_fill(")) << signature;
     }
@@ -511,14 +539,73 @@ TEST(TakeSettlementWiring, BookingNeedsThePaymentProof) {
               std::string::npos);
     EXPECT_NE(position_of(sweep, "execution::in_sweep_window(take->height, block_height)"),
               std::string::npos);
-    // Both proofs match each receipt in its own wallet, over the give, and
-    // both book at the block the payment landed in.
+    // Both proofs match each receipt in its own wallet, over the give,
+    // honouring other takes' claims, and both book at the block the payment
+    // landed in, claiming its coins.
     const std::string all = squeeze(raw);
-    EXPECT_EQ(count_of(all, "receipt_wallet_ids(take->received)"), 2u);
+    EXPECT_EQ(count_of(all, "proof = prove_take_receipts(*take, coins);"), 2u);
+    const std::string helper = function_body(
+        raw, "std::optional<execution::ReceiptProof> Engine::prove_take_receipts(");
+    EXPECT_NE(position_of(helper, "db_->take_receipt_owners(execution::record_coin_ids(coins))"),
+              std::string::npos);
+    EXPECT_NE(position_of(helper, "receipt_wallet_ids(take.received)"), std::string::npos);
+    EXPECT_NE(position_of(helper, "execution::claimed_by_others(*owners, take.trade_id)"),
+              std::string::npos);
     EXPECT_EQ(count_of(all, "co_await wallet_->get_coin_records_in_range( take->height, "
                             "take->height + execution::kReceiptGiveBlocks,"), 2u);
-    EXPECT_EQ(count_of(all, "static_cast<BlockHeight>(*settled_at)"), 2u);
+    EXPECT_EQ(count_of(all, "static_cast<BlockHeight>(proof->settled_at)"), 2u);
+    EXPECT_EQ(count_of(all, "proof->coin_ids"), 2u);
     EXPECT_EQ(count_of(all, "get_coin_records_at_height(take->height"), 0u);
+    // Both read evidence only from a wallet synced this heartbeat.
+    for (const char* signature :
+         {"asio::awaitable<void> Engine::step_settle_pending_takes(BlockHeight block_height)",
+          "asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)"}) {
+        const std::string body = function_body(raw, signature);
+        const std::size_t synced = position_of(body, "co_await secondary_wallet_synced(block_height)");
+        ASSERT_NE(synced, std::string::npos) << signature;
+        EXPECT_LT(synced, position_of(body, "co_await wallet_->get_coin_records_in_range(")) << signature;
+    }
+}
+
+TEST(TakeSettlementWiring, ABookingIsOneTransactionAndReplaysNothing) {
+    const std::string raw = read_engine_cpp();
+    const std::string record = function_body(raw, "void Engine::record_taker_fill(");
+    ASSERT_FALSE(record.empty());
+    // The row, the legs, the claims and the hold's end commit together.
+    EXPECT_NE(position_of(record, "db_->book_take(f, legs, receipt_coin_ids, release_hold_key);"),
+              std::string::npos);
+    EXPECT_EQ(count_of(record, "db_->insert_taker_fill("), 0u);
+    EXPECT_EQ(count_of(record, "db_->append_ledger_entries("), 0u);
+    // Revive flows move once: only when this booking wrote the row.
+    const std::size_t revive = position_of(record, "if (written->fill_inserted && pc.revive_market");
+    ASSERT_NE(revive, std::string::npos);
+    EXPECT_LT(position_of(record, "const auto written = db_->book_take("), revive);
+    // The settle step forgets a take only once its booking committed.
+    const std::string settle = function_body(
+        raw, "asio::awaitable<void> Engine::step_settle_pending_takes(BlockHeight block_height)");
+    EXPECT_NE(position_of(settle, "proof->coin_ids, \"take:\" + p.trade_id, &booked);"),
+              std::string::npos);
+    EXPECT_NE(position_of(settle, "if (booked) pending_takes_.erase(trade_id);"), std::string::npos);
+    // The sweep sees a booking with every leg suppressed through its row.
+    const std::string sweep = function_body(
+        raw, "asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)");
+    EXPECT_EQ(count_of(sweep, "db_->taker_fill_exists(take->trade_id)"), 2u);
+    EXPECT_NE(position_of(sweep, "if (booked) take_sweep_done_.insert(id);"), std::string::npos);
+    // No take is sent before the last process's holds are read; the settle
+    // step keeps trying to read them.
+    const std::string guard = function_body(
+        raw, "asio::awaitable<nlohmann::json> Engine::take_offer_guarded(");
+    EXPECT_LT(position_of(guard, "if (!take_holds_restored_) {"),
+              position_of(guard, "wallet_->take_offer(offer_text, intent.fee_mojos)"));
+    EXPECT_NE(position_of(settle, "if (!take_holds_restored_ && !restore_take_holds()) co_return;"),
+              std::string::npos);
+    // A deep reward scan is stamped done only at the end of the step.
+    const std::string reward = function_body(
+        raw, "asio::awaitable<void> Engine::step_ingest_reward_inflows(");
+    const std::size_t stamp = position_of(reward, "if (deep_scan) last_reward_deep_scan_block_ = block_height;");
+    ASSERT_NE(stamp, std::string::npos);
+    EXPECT_LT(position_of(reward, "persist_inventory_state();"), stamp);
+    EXPECT_EQ(count_of(reward, "last_reward_deep_scan_block_ = block_height;"), 1u);
 }
 
 TEST(TakeSettlementWiring, TheHoldIsWrittenBeforeTheTakeIsSent) {
