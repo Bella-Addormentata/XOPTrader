@@ -258,6 +258,12 @@ def distinct_expiries(dates: Any, after: int | None = None) -> int:
 DEFAULT_CALL_STRIKES_PCT: tuple[int, ...] = (110, 120)
 DEFAULT_PUT_STRIKES_PCT: tuple[int, ...] = (90, 80)
 
+#: [PEG] ``options.market.peg_tolerance_pct`` left out: how far the external
+#: spot may sit outside the Dexie range, and the Dexie book may be crossed,
+#: before quoting stops. Every off-peg stop from 2026-11-20 to 11-24 was within
+#: 2.5%, stale offers; a quote-asset depeg goes further. 0 is the strict rule.
+DEFAULT_PEG_TOLERANCE_PCT = 3.0
+
 
 def _percents(raw: Any, key: str) -> tuple[int, ...]:
     if raw is None:
@@ -470,6 +476,8 @@ class MarketConfig:
     max_spread_pct: float
     require_book: bool
     hedge_size_xch: float
+    #: [PEG] How far a stale Dexie offer may be off before quoting stops.
+    peg_tolerance_pct: float = DEFAULT_PEG_TOLERANCE_PCT
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1010,6 +1018,7 @@ def parse(root: Any) -> OptionsConfig | None:
             max_spread_pct=_number(market_raw, "max_spread_pct", 10.0, minimum=0.01),
             require_book=_flag(market_raw, "require_book", True),
             hedge_size_xch=_number(market_raw, "hedge_size_xch", contract_xch, minimum=1e-9),
+            peg_tolerance_pct=_number(market_raw, "peg_tolerance_pct", DEFAULT_PEG_TOLERANCE_PCT),
         ),
         node=node,
         coinset_url=str(section.get("coinset_url") or "").strip(),

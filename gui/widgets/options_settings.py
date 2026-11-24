@@ -3,9 +3,10 @@
 What it covers is what a new book needs: switching it on, the wallet it signs
 from (the trading wallet, shared, or a dedicated one), the options address,
 the engine fence, the top-up target, the grid (contract size, expiries,
-strikes) and the limits. Everything else in ``options:`` (the quote asset,
-the node, pricing, fees) keeps its config.yaml value: a save merges these
-keys onto the file as it was loaded, as every Settings tab does.
+strikes), the limits and [PEG] the off-peg tolerance. Everything else in
+``options:`` (the quote asset, the node, pricing, fees, the other market
+checks) keeps its config.yaml value: a save merges these keys onto the file
+as it was loaded, as every Settings tab does.
 
 The options book's own parser (:func:`gui.services.options.config.parse`) is
 the one judge of what is valid, so the tab never accepts something the book
@@ -444,6 +445,30 @@ class OptionsSettingsSection:
         self.limits_hint.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
         limits_form.addRow("", self.limits_hint)
         layout.addWidget(limits)
+
+        # -- [PEG] the market checks --
+        checks = QGroupBox("Market checks")
+        checks_form = QFormLayout(checks)
+        self.peg_tolerance = QDoubleSpinBox()
+        self.peg_tolerance.setRange(0.0, 50.0)
+        self.peg_tolerance.setDecimals(1)
+        self.peg_tolerance.setSingleStep(0.5)
+        self.peg_tolerance.setSuffix(" %")
+        self.peg_tolerance.setToolTip(
+            "options.market.peg_tolerance_pct: how far CoinGecko's XCH price may sit outside "
+            "what the Dexie book pays and asks for the hedge size, and how far that book may "
+            "be crossed, before quoting stops as a possible depeg of the quote asset. "
+            "0 = strictly inside it, never crossed."
+        )
+        checks_form.addRow("Off-peg tolerance:", self.peg_tolerance)
+        checks_hint = QLabel(
+            "Stale Dexie offers often sit a percent or two off the market; a depeg of the "
+            "quote asset goes further. Quotes are priced on CoinGecko's price either way."
+        )
+        checks_hint.setWordWrap(True)
+        checks_hint.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        checks_form.addRow("", checks_hint)
+        layout.addWidget(checks)
         layout.addStretch(1)
 
         for box in (self.enabled, self.share):
@@ -476,6 +501,7 @@ class OptionsSettingsSection:
             self.contract_xch,
             self.expiry_weeks,
             self.expiry_months,
+            self.peg_tolerance,
         ):
             spin.valueChanged.connect(self._changed)
         for key, box in self._number_boxes().items():
@@ -490,6 +516,7 @@ class OptionsSettingsSection:
             "target_xch": self.target_xch,
             "target_quote": self.target_quote,
             "target_tolerance": self.target_tolerance,
+            "peg_tolerance": self.peg_tolerance,
         }
 
     def inputs(self) -> list[QWidget]:
@@ -518,6 +545,7 @@ class OptionsSettingsSection:
             self.call_strikes,
             self.put_strikes,
             *self.limit_fields.values(),
+            self.peg_tolerance,
         ]
 
     def _changed(self, *_args: Any) -> None:
@@ -770,6 +798,16 @@ class OptionsSettingsSection:
             self.target_mode.setCurrentIndex(_TARGET_LIMITS)
 
         self._stop_seconds = _stop_seconds(section.get("stop_before_expiry_seconds"))
+        market = section.get("market") if isinstance(section.get("market"), dict) else {}
+        # [PEG] Not written: the box shows the book's default, and a save leaves
+        # it unwritten until the box is edited.
+        from gui.services.options import config as options_config
+
+        tolerance = market.get("peg_tolerance_pct")
+        default = options_config.DEFAULT_PEG_TOLERANCE_PCT
+        shown = default if tolerance is None else tolerance
+        _show_number(self.peg_tolerance, _number(shown, default))
+        self._loaded_numbers["peg_tolerance"] = tolerance
         size = section.get("contract_xch")
         self._hedge_follows = None
         if size is None or (isinstance(size, str) and size.strip().lower() == "auto"):
@@ -786,7 +824,6 @@ class OptionsSettingsSection:
             self.size_mode.setCurrentIndex(_SIZE_FIXED)
             _show_number(self.contract_xch, max(_number(size, 0.0), 0.0))
             self._loaded_numbers["contract_xch"] = size
-            market = section.get("market") if isinstance(section.get("market"), dict) else {}
             if _same_number(market.get("hedge_size_xch"), size):
                 # [LADDER] The Dexie check sized to match this contract size
                 # (the 0.5 XCH live test wrote both): it goes with the size.
@@ -810,8 +847,6 @@ class OptionsSettingsSection:
         if "call_strikes_pct" not in section and "put_strikes_pct" not in section:
             # [DEFAULTS] What the book writes with no strikes written: shown, so
             # a save keeps both sides instead of writing none.
-            from gui.services.options import config as options_config
-
             calls = list(options_config.DEFAULT_CALL_STRIKES_PCT)
             puts = list(options_config.DEFAULT_PUT_STRIKES_PCT)
         self.call_strikes.setText(_list_text(calls))
@@ -829,6 +864,13 @@ class OptionsSettingsSection:
             return raw
         value = box.value()
         return value if isinstance(box, QSpinBox) else round(value, digits)
+
+    def _peg_tolerance_out(self) -> Any:
+        """[PEG] The off-peg tolerance to write: None while unwritten and unedited."""
+        unwritten = self._loaded_numbers.get("peg_tolerance") is None
+        if unwritten and "peg_tolerance" not in self._touched:
+            return None
+        return self._number_out("peg_tolerance", self.peg_tolerance, 1)
 
     def load_from_editor(self, options: Any, on_disk: Any) -> None:
         """[review] Load from Editor: show the editor's ``options``, told from ``on_disk``.
@@ -918,13 +960,21 @@ class OptionsSettingsSection:
             "put_strikes_pct": _number_list(self.put_strikes.text()),
             "limits": {key: _limit_value(field.text()) for key, field in self.limit_fields.items()},
         }
+        market: dict[str, Any] = {}
+        tolerance = self._peg_tolerance_out()
+        if tolerance is not None:
+            # [PEG] Only once written or edited: unwritten, the book's default
+            # applies, and options.market is left as config.yaml has it.
+            market["peg_tolerance_pct"] = tolerance
         if self._hedge_follows is not None and not _same_number(
             options["contract_xch"], self._hedge_follows
         ):
             # [LADDER] The size changed and the Dexie check was sized to the
             # old one: back to its default, one contract of the smallest size
             # (finish() removes the None).
-            options["market"] = {"hedge_size_xch": None}
+            market["hedge_size_xch"] = None
+        if market:
+            options["market"] = market
         mode = self.target_mode.currentIndex()
         if mode == _TARGET_OFF:
             options["target"] = False

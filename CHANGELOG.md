@@ -7,6 +7,28 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Options: stale Dexie offers no longer stop the book as a depeg
+
+- **The off-peg check has a tolerance**, `options.market.peg_tolerance_pct`
+  (3% when left out, also in Settings > Options > Market checks). The book
+  used to stop quoting whenever CoinGecko's XCH price sat outside the Dexie
+  bid-ask for the hedge size by any amount. Dexie offers sit until someone
+  takes them, and on 2026-11-24 a ladder of 5 XCH bids, 0.3% apart from
+  0.9686 down, stayed put while XCH fell 3.5%, leaving spot up to 2.4% under
+  its top bid. The strict rule stopped the book all afternoon, and on about a
+  fifth of its steps since 2026-11-20, with no gap over 2.5%. It was no
+  depeg: Dexie's fills straddled CoinGecko's price, asks taken above it and
+  bids below. Spot further out than the tolerance still stops quoting as a
+  possible depeg of the quote asset. `0` keeps the strict rule.
+- **A crossed Dexie book is judged the same way.** A book crossed by no more
+  than the tolerance (a stale bid over a fresh ask) is read as stale offers:
+  spot then has to sit within the tolerance of the two prices. Before, any
+  crossing stopped the book.
+- **Quotes are still priced on CoinGecko's spot**, as before. When the book
+  quotes with spot outside the Dexie range or a crossed book, its `market:`
+  log line says by how much, so a depeg that builds up slowly shows in the
+  log before it stops the book.
+
 ### Options: 1, 10, 100... XCH contracts side by side (#261)
 
 - **`contract_xch: auto` is now a ladder of sizes**, so small and large

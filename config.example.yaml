@@ -1819,14 +1819,21 @@ options:
     max_fee_mojos: 1000000000
 
   # Quotes stop when the price view is stale, the Dexie book cannot fill the
-  # hedge size, is wider than max_spread_pct, or does not contain the external
-  # spot (the sign of a quote-asset depeg). max_age_seconds is measured from
-  # the time the price feed says the spot was observed, not from when it was
-  # fetched.
+  # hedge size, is wider than max_spread_pct, or the external spot sits more
+  # than peg_tolerance_pct outside it (the sign of a quote-asset depeg).
+  # max_age_seconds is measured from the time the price feed says the spot was
+  # observed, not from when it was fetched.
   market:
     max_age_seconds: 600
     max_spread_pct: 10
     require_book: true
+    # How far the external spot may sit outside the Dexie bid-ask for the
+    # hedge size, and how far that book may be crossed, before quotes stop.
+    # Dexie offers sit until someone takes them, so a stale one a percent or
+    # two off the market is common and no depeg. 0 = the strict rule: spot
+    # inside the range, never crossed. Left out: 3. Quotes are priced on the
+    # external spot either way.
+    peg_tolerance_pct: 3
     # [OPTIONAL] The size the Dexie book must be able to fill. Left out, one
     # contract of the smallest size (1 XCH with contract_xch: auto).
     # hedge_size_xch: 20

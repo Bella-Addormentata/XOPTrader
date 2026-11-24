@@ -8,11 +8,14 @@ Three numbers, from two places, with one rule between them:
   bots anchored on the same external number.
 * **The executable range** comes from the Dexie book: what buying or selling
   the hedge size would really cost through whole third-party offers.
-* **The rule:** if the external spot lies outside that range, or the range is
-  wider than allowed, :meth:`Market.require_usable` refuses and nothing is
-  quoted. That is also the only place a wUSDC.b discount shows up -- CoinGecko
-  prices USDC, not the bridged token -- so a depeg stops the quotes instead of
-  mispricing them.
+* **The rule:** if the external spot lies further outside that range than
+  ``options.market.peg_tolerance_pct`` (3% by default), or the range is wider
+  than allowed, :meth:`Market.require_usable` refuses and nothing is quoted.
+  That is also the only place a wUSDC.b discount shows up -- CoinGecko prices
+  USDC, not the bridged token -- so a depeg stops the quotes instead of
+  mispricing them. The tolerance is for stale Dexie offers, which sit until
+  someone takes them: a percent or two off the market is common and is no
+  depeg. Quotes are priced on the external spot either way.
 
 Volatility is never taken from Dexie trades. Prints bounce across a spread of
 several percent and come out at more than twice the real figure.
@@ -151,10 +154,43 @@ class Market:
     ask: float | None  # what buying it would cost
     as_of: float  # unix seconds at which the feed observed the spot, not when we asked
 
+    def gaps_pct(self) -> tuple[float, float]:
+        """[PEG] How far the Dexie book is crossed, and how far spot sits outside it, in %.
+
+        Both are 0 for a book whose bid is under its ask with spot between
+        them, and for a view with no book. The range of a crossed book runs
+        from its lower price to its higher one.
+        """
+        if self.bid is None or self.ask is None:
+            return 0.0, 0.0
+        low, high = min(self.bid, self.ask), max(self.bid, self.ask)
+        crossed = (self.bid - self.ask) / ((self.bid + self.ask) / 2.0) * 100.0
+        if self.spot < low:
+            outside = (low - self.spot) / low * 100.0
+        elif self.spot > high:
+            outside = (self.spot - high) / high * 100.0
+        else:
+            outside = 0.0
+        return max(crossed, 0.0), outside
+
     def require_usable(
-        self, *, now: float, max_age_seconds: float, max_spread_pct: float, require_book: bool
+        self,
+        *,
+        now: float,
+        max_age_seconds: float,
+        max_spread_pct: float,
+        require_book: bool,
+        peg_tolerance_pct: float = 0.0,
     ) -> None:
-        """Raise :class:`MarketError` unless this view is safe to quote from."""
+        """Raise :class:`MarketError` unless this view is safe to quote from.
+
+        [PEG] ``peg_tolerance_pct`` is how far a stale Dexie offer may be off
+        before the view is refused: how far the external spot may sit outside
+        the executable range, and how far the book may be crossed. 0, the
+        default here for a caller that does not say, is the strict rule: spot
+        inside the range, and no crossing at all. The book passes
+        ``options.market.peg_tolerance_pct``, 3% when left out.
+        """
         if not math.isfinite(self.spot) or self.spot <= 0:
             raise MarketError("no spot price")
         if not math.isfinite(self.sigma) or self.sigma <= 0:
@@ -167,18 +203,30 @@ class Market:
                     "the Dexie book cannot fill the hedge size on both sides", NO_BOOK
                 )
             return
-        if self.bid > self.ask:
-            raise MarketError("the Dexie book is crossed at the hedge size", CROSSED)
+        # [PEG] A stale offer is not a depeg. Dexie offers sit until taken or
+        # cancelled, and small ones are not worth anyone's while to take: on
+        # 2026-11-24 a ladder of 5 XCH bids, 0.3% apart from 0.9686 down,
+        # stayed put while XCH fell 3.5%, crossing the book or leaving spot up
+        # to 2.4% under its top bid, and the strict rule stopped the book for
+        # hours. Dexie's fills meanwhile straddled the external price.
+        allowed = f", more than the {peg_tolerance_pct:g}% allowed" if peg_tolerance_pct else ""
+        crossed_pct, outside_pct = self.gaps_pct()
+        if crossed_pct > peg_tolerance_pct:
+            raise MarketError(
+                f"the Dexie book is crossed by {crossed_pct:.2f}% at the hedge size{allowed}",
+                CROSSED,
+            )
         middle = (self.bid + self.ask) / 2.0
         spread_pct = (self.ask - self.bid) / middle * 100.0
         if spread_pct > max_spread_pct:
             raise MarketError(
                 f"the Dexie spread is {spread_pct:.1f}%, above {max_spread_pct}%", TOO_WIDE
             )
-        if not self.bid <= self.spot <= self.ask:
+        if outside_pct > peg_tolerance_pct:
+            low, high = min(self.bid, self.ask), max(self.bid, self.ask)
             raise MarketError(
-                f"spot {self.spot:.4f} is outside the executable range "
-                f"{self.bid:.4f}-{self.ask:.4f}; the quote asset may be off its peg",
+                f"spot {self.spot:.4f} is {outside_pct:.2f}% outside the executable range "
+                f"{low:.4f}-{high:.4f}{allowed}; the quote asset may be off its peg",
                 OFF_PEG,
             )
 

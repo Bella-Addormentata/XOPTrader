@@ -859,3 +859,59 @@ def test_a_cap_too_large_to_count_does_not_break_the_preview(panel, tmp_path):
     assert tab.size_mode.currentIndex() == _SIZE_AUTO
     assert panel.save_config(str(cfg_path)) is False
     assert any("too large" in said for said in _SAID), _SAID
+
+
+def _without_peg_tolerance(cfg_path: Path) -> Path:
+    root = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    root["options"]["market"].pop("peg_tolerance_pct")
+    cfg_path.write_text(yaml.safe_dump(root, sort_keys=False), encoding="utf-8")
+    return cfg_path
+
+
+def test_the_off_peg_tolerance_is_shown_and_kept_as_written(panel, tmp_path):
+    """[PEG] config.example.yaml writes 3: shown, and written back as it was when the
+    tab is saved for something else."""
+    cfg_path = _shared_book(tmp_path)
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.peg_tolerance.value() == 3.0
+    tab.limit_fields["max_contracts"].setText("3")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    market = _saved_options(cfg_path)["market"]
+    assert market["peg_tolerance_pct"] == 3 and isinstance(market["peg_tolerance_pct"], int)
+    assert market["max_spread_pct"] == 10, "the rest of the section is kept"
+
+
+def test_an_edited_off_peg_tolerance_is_saved_and_the_book_reads_it(panel, tmp_path):
+    cfg_path = _shared_book(tmp_path)
+    panel.load_config(str(cfg_path))
+    panel._options_section.peg_tolerance.setValue(1.5)
+    assert panel._dirty
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+
+    assert _saved_options(cfg_path)["market"]["peg_tolerance_pct"] == 1.5
+    from gui.services.config_split import load_merged
+    from gui.services.options import config as options_config
+
+    parsed = options_config.parse(load_merged(cfg_path))  # with secrets.yaml, as the book reads
+    assert parsed is not None and parsed.market.peg_tolerance_pct == 1.5
+
+
+def test_an_unwritten_off_peg_tolerance_stays_the_book_s_default(panel, tmp_path):
+    """[PEG] Installs from before it existed have no key: the box shows the book's
+    default, and a save for something else leaves it unwritten, so a later default
+    still applies. Edited, it is written."""
+    cfg_path = _without_peg_tolerance(_shared_book(tmp_path))
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.peg_tolerance.value() == 3.0, "the default"
+    tab.limit_fields["max_contracts"].setText("3")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    market = _saved_options(cfg_path)["market"]
+    assert "peg_tolerance_pct" not in market
+    assert market["max_spread_pct"] == 10
+
+    panel.load_config(str(cfg_path))
+    panel._options_section.peg_tolerance.setValue(0.0)  # the strict rule, chosen
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["market"]["peg_tolerance_pct"] == 0.0
