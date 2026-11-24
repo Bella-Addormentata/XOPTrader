@@ -67,6 +67,7 @@
 
 #include "xop/types.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -182,6 +183,10 @@ inline constexpr BlockHeight kRewardDeepScanEveryBlocks{30};
 /// be booked anyway); and never past kRewardScanMaxPages.  The wallet orders
 /// unconfirmed rows first, then confirmed rows newest first
 /// (ChiaWalletRPC::get_transactions), so a page's last row is its oldest.
+///
+/// [review #262 r5] A full page whose oldest row is unconfirmed is followed
+/// on every heartbeat, deep or not: it holds no confirmed receipt at all, so
+/// it says nothing about the confirmed rows behind it.
 [[nodiscard]] constexpr bool reward_scan_reads_on(bool         deep,
                                                   bool         page_has_new_reward,
                                                   std::int64_t pages_read,
@@ -189,11 +194,28 @@ inline constexpr BlockHeight kRewardDeepScanEveryBlocks{30};
                                                   BlockHeight  oldest_in_page,
                                                   BlockHeight  current_height) noexcept
 {
-    if (!deep && !page_has_new_reward) return false;
     if (pages_read >= kRewardScanMaxPages) return false;
     if (rows_in_page < kRewardScanPageRows) return false;
     if (oldest_in_page == 0) return true;
+    if (!deep && !page_has_new_reward) return false;
     return reward_receipt_is_recent(oldest_in_page, current_height);
+}
+
+/// [review #262 r5] A coin up to the old 2,000-mojo ceiling reads as a reward
+/// on its size alone (it always has).  A larger one, up to
+/// reward_max_mojos_per_coin, only inside a payout burst: dexie pays a day's
+/// rewards as many coins in one block (49 of the 79 blocks booked to
+/// 2026-11-24 held 50 or more), while a deposit of 5 DBX is one coin.  A coin
+/// that fails this stays wallet divergence, as an unexplained inflow should.
+inline constexpr Mojo        kRewardLoneCoinMaxMojos{2'000};
+inline constexpr std::size_t kRewardBurstMinCoins{5};
+
+/// Is a reward-sized coin of `amount_mojos` evidenced as a reward, given how
+/// many reward-sized receipts its block holds (itself included)?
+[[nodiscard]] constexpr bool reward_size_evidenced(Mojo        amount_mojos,
+                                                   std::size_t receipts_in_block) noexcept
+{
+    return amount_mojos <= kRewardLoneCoinMaxMojos || receipts_in_block >= kRewardBurstMinCoins;
 }
 
 /// What the reward scan should do with ONE wallet row.

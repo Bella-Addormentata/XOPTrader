@@ -91,34 +91,50 @@ PendingTake pending(const std::string& trade_id, const std::string& offer_id,
 // ============================================================================
 
 TEST(TakeSettlement, ASettledTakeWithItsPaymentBooks) {
-    EXPECT_EQ(judge_take(WalletCancelState::Confirmed, true, 100, 101), TakeVerdict::Book);
+    EXPECT_EQ(judge_take(WalletCancelState::Confirmed, true, true, 100, 101), TakeVerdict::Book);
 }
 
 TEST(TakeSettlement, ConfirmedWithoutThePaymentWaits) {
     // The wallet's status is its bookkeeping, not evidence (fill_proof.hpp).
-    EXPECT_EQ(judge_take(WalletCancelState::Confirmed, false, 100, 101), TakeVerdict::Wait);
+    EXPECT_EQ(judge_take(WalletCancelState::Confirmed, false, true, 100, 101), TakeVerdict::Wait);
 }
 
 TEST(TakeSettlement, AFailedOrCancelledTakeBooksNothing) {
     // 2026-11-20: da716925 / f8a59d4b / 7b95898e FAILED; 8acbdbfe, 1f3a9fd8,
     // a757b5f6, 43cbe65b CANCELLED.  All seven were booked as takes.
-    EXPECT_EQ(judge_take(WalletCancelState::Failed, false, 100, 101), TakeVerdict::Drop);
-    EXPECT_EQ(judge_take(WalletCancelState::Cancelled, false, 100, 101), TakeVerdict::Drop);
+    EXPECT_EQ(judge_take(WalletCancelState::Failed, false, true, 100, 101), TakeVerdict::Drop);
+    EXPECT_EQ(judge_take(WalletCancelState::Cancelled, false, true, 100, 101), TakeVerdict::Drop);
     // Even a payment-looking coin does not revive a take the wallet failed.
-    EXPECT_EQ(judge_take(WalletCancelState::Failed, true, 100, 101), TakeVerdict::Drop);
+    EXPECT_EQ(judge_take(WalletCancelState::Failed, true, true, 100, 101), TakeVerdict::Drop);
 }
 
-TEST(TakeSettlement, PendingOrUnreadableWaitsThenGivesUp) {
+TEST(TakeSettlement, ATakeIsGivenUpOnlyOnEvidence) {
+    // Still pending in the wallet long after it was sent: given up.
     for (const auto state : {WalletCancelState::PendingConfirm, WalletCancelState::PendingAccept,
-                             WalletCancelState::Unknown, WalletCancelState::PendingCancel}) {
-        EXPECT_EQ(judge_take(state, false, 100, 100 + kTakeSettleGiveUpBlocks), TakeVerdict::Wait);
-        EXPECT_EQ(judge_take(state, false, 100, 101 + kTakeSettleGiveUpBlocks), TakeVerdict::GiveUp);
+                             WalletCancelState::PendingCancel}) {
+        EXPECT_EQ(judge_take(state, false, true, 100, 100 + kTakeSettleGiveUpBlocks),
+                  TakeVerdict::Wait);
+        EXPECT_EQ(judge_take(state, false, true, 100, 101 + kTakeSettleGiveUpBlocks),
+                  TakeVerdict::GiveUp);
+        // [review #262 r5] Not on a read that did not answer: after downtime the
+        // first status read may time out, and that proves nothing.
+        EXPECT_EQ(judge_take(state, false, false, 100, 101 + 10 * kTakeSettleGiveUpBlocks),
+                  TakeVerdict::Wait);
     }
+    // An unreadable record is no evidence, however old the take.
+    EXPECT_EQ(judge_take(WalletCancelState::Unknown, false, true, 100,
+                         101 + 10 * kTakeSettleGiveUpBlocks), TakeVerdict::Wait);
+    // CONFIRMED with no payment: given up only when the coin store answered.
+    EXPECT_EQ(judge_take(WalletCancelState::Confirmed, false, true, 100,
+                         101 + kTakeSettleGiveUpBlocks), TakeVerdict::GiveUp);
+    EXPECT_EQ(judge_take(WalletCancelState::Confirmed, false, false, 100,
+                         101 + kTakeSettleGiveUpBlocks), TakeVerdict::Wait);
     // A settled take is booked however late it is noticed.
-    EXPECT_EQ(judge_take(WalletCancelState::Confirmed, true, 100, 100 + 10 * kTakeSettleGiveUpBlocks),
-              TakeVerdict::Book);
+    EXPECT_EQ(judge_take(WalletCancelState::Confirmed, true, true, 100,
+                         100 + 10 * kTakeSettleGiveUpBlocks), TakeVerdict::Book);
     // A height that went backwards is not age.
-    EXPECT_EQ(judge_take(WalletCancelState::PendingConfirm, false, 100, 50), TakeVerdict::Wait);
+    EXPECT_EQ(judge_take(WalletCancelState::PendingConfirm, false, true, 100, 50),
+              TakeVerdict::Wait);
 }
 
 TEST(TakeSettlement, TheZeroVerdictAuthorisesNothing) {
@@ -301,13 +317,21 @@ TEST(TakeSettlement, ATrackedTakeIsToleranceUntilItIsBookedOrDropped) {
     takes.emplace(p.trade_id, p);
     const std::unordered_map<std::string, UncertainTake> uncertain{
         {"nMDyHor9J8", UncertainTake{9'600'463, {{kDbx, 423'000}}}}};
-    // Long after the uncertain hold lapsed, the tracked take still counts.
-    const auto later = take_hold_slack(takes, uncertain, 9'600'463 + kUncertainTakeHoldBlocks);
+    const auto now = take_hold_slack(takes, uncertain);
+    EXPECT_EQ(now.at("xch"), 5'000'000'330'000);
+    EXPECT_EQ(now.at(kDbx), 406'000 + 423'000);
+    // Once the settle step drops the uncertain hold, the tracked take still counts.
+    const auto later = take_hold_slack(takes, {});
     EXPECT_EQ(later.at("xch"), 5'000'000'330'000);
     EXPECT_EQ(later.at(kDbx), 406'000);
-    const auto now = take_hold_slack(takes, uncertain, 9'600'463);
-    EXPECT_EQ(now.at(kDbx), 406'000 + 423'000);
-    EXPECT_TRUE(take_hold_slack({}, {}, 9'600'463).empty());
+    EXPECT_TRUE(take_hold_slack({}, {}).empty());
+    // The sweep's and the GUI's unresolved takes add in, saturating.
+    auto all = now;
+    add_slack_map(all, {{kDbx, 1}, {kByc, 7}});
+    add_slack_map(all, {{"xch", std::numeric_limits<Mojo>::max()}});
+    EXPECT_EQ(all.at(kDbx), 406'000 + 423'000 + 1);
+    EXPECT_EQ(all.at(kByc), 7);
+    EXPECT_EQ(all.at("xch"), std::numeric_limits<Mojo>::max());
 }
 
 TEST(TakeSettlement, ATakesEventIdHasTwoSpellings) {
@@ -363,25 +387,42 @@ TEST(TakeSettlement, AnOfferWithAnUnsettledTakeIsNotTakenAgain) {
     std::unordered_map<std::string, PendingTake> takes;
     takes.emplace("0x3d58e29d", pending("0x3d58e29d", "AkA6GJrWFG", 9'600'106));
     const std::unordered_map<std::string, UncertainTake> none;
-    EXPECT_TRUE(take_refused(takes, none, "AkA6GJrWFG", 9'600'108));
-    EXPECT_FALSE(take_refused(takes, none, "FnrurLSVNv", 9'600'108));
-    EXPECT_FALSE(take_refused(takes, none, "", 9'600'108));
+    EXPECT_TRUE(take_refused(takes, none, "AkA6GJrWFG"));
+    EXPECT_FALSE(take_refused(takes, none, "FnrurLSVNv"));
+    EXPECT_FALSE(take_refused(takes, none, ""));
 }
 
-TEST(TakeSettlement, AnUncertainRequestHoldsTheOfferForAWhile) {
+TEST(TakeSettlement, AnUncertainRequestHoldsTheOfferUntilItsHoldEnds) {
     const std::unordered_map<std::string, PendingTake> none;
     const std::unordered_map<std::string, UncertainTake> uncertain{
         {"nMDyHor9J8", UncertainTake{9'600'463, {}}}};
-    EXPECT_TRUE(take_refused(none, uncertain, "nMDyHor9J8", 9'600'463));
-    EXPECT_TRUE(take_refused(none, uncertain, "nMDyHor9J8",
-                             9'600'463 + kUncertainTakeHoldBlocks - 1));
-    EXPECT_FALSE(take_refused(none, uncertain, "nMDyHor9J8",
-                              9'600'463 + kUncertainTakeHoldBlocks));
-    EXPECT_FALSE(take_refused(none, uncertain, "nMDyHor9J8", 9'600'000));   // went back
-    EXPECT_FALSE(take_refused(none, uncertain, "Dq3TqEWpW5", 9'600'463));
+    EXPECT_TRUE(take_refused(none, uncertain, "nMDyHor9J8"));
+    EXPECT_FALSE(take_refused(none, uncertain, "Dq3TqEWpW5"));
+    EXPECT_FALSE(take_refused(none, {}, "nMDyHor9J8"));   // the settle step ended it
 }
 
-TEST(TakeSettlement, AnUncertainTakeIsToleranceUntilTheSweepCanBookIt) {
+TEST(TakeSettlement, AnUncertainHoldEndsOnEvidenceNotOnTimeAlone) {
+    constexpr BlockHeight kAt = 9'600'463;
+    // Never before its least duration, whatever the sweeps found.
+    EXPECT_FALSE(uncertain_hold_ends(kAt, kAt, kAt));
+    EXPECT_FALSE(uncertain_hold_ends(kAt, kAt + kUncertainTakeHoldBlocks - 1,
+                                     kAt + kUncertainTakeHoldBlocks - 1));
+    // After it, only once a sweep that late found no take of ours unresolved.
+    EXPECT_FALSE(uncertain_hold_ends(kAt, kAt + kUncertainTakeHoldBlocks, 0));
+    EXPECT_FALSE(uncertain_hold_ends(kAt, kAt + kUncertainTakeHoldBlocks,
+                                     kAt + kUncertainTakeHoldBlocks - 1));
+    EXPECT_TRUE(uncertain_hold_ends(kAt, kAt + kUncertainTakeHoldBlocks,
+                                    kAt + kUncertainTakeHoldBlocks));
+    // [review #262 r5] Sent at H, settled at H+50, booked by the sweep at
+    // H+70: the H+60 sweep saw it settled and unbooked, so at H+64 it is held.
+    EXPECT_FALSE(uncertain_hold_ends(kAt, kAt + 64, kAt + 40));
+    // The last resort, whatever the sweeps found.
+    EXPECT_TRUE(uncertain_hold_ends(kAt, kAt + kTakeSettleGiveUpBlocks, 0));
+    // [review #262 r5] A node behind the last process: no age, still held.
+    EXPECT_FALSE(uncertain_hold_ends(kAt, kAt - 100, kAt + kTakeSettleGiveUpBlocks));
+}
+
+TEST(TakeSettlement, AnUncertainTakeIsToleranceWhileItsHoldLasts) {
     // [review #262] What it could move widens the divergence control's
     // tolerance for the whole hold, which outlasts the sweep's grace.
     UncertainTake hold{9'600'463, {{"xch", 5'000'000'000'000}, {kDbx, 423'000}}};
@@ -389,16 +430,59 @@ TEST(TakeSettlement, AnUncertainTakeIsToleranceUntilTheSweepCanBookIt) {
     add_fee_exposure(hold, 0);
     const std::unordered_map<std::string, UncertainTake> uncertain{
         {"nMDyHor9J8", hold}, {"5Uoyw6hrnJ", UncertainTake{9'600'463, {{"xch", 7}}}}};
-    const auto slack = uncertain_take_slack(uncertain, 9'600'463 + kTakeSweepGraceBlocks
-                                                           + kTakeSweepEveryBlocks);
+    const auto slack = uncertain_take_slack(uncertain);
     EXPECT_EQ(slack.at("xch"), 5'000'000'000'000 + 330'000 + 7);
     EXPECT_EQ(slack.at(kDbx), 423'000);
-    EXPECT_TRUE(uncertain_take_slack(uncertain, 9'600'463 + kUncertainTakeHoldBlocks).empty());
+    EXPECT_TRUE(uncertain_take_slack({}).empty());
     // Saturating, never wrapping.
     const std::unordered_map<std::string, UncertainTake> huge{
         {"a", UncertainTake{1, {{"xch", std::numeric_limits<Mojo>::max()}}}},
         {"b", UncertainTake{1, {{"xch", 5}}}}};
-    EXPECT_EQ(uncertain_take_slack(huge, 1).at("xch"), std::numeric_limits<Mojo>::max());
+    EXPECT_EQ(uncertain_take_slack(huge).at("xch"), std::numeric_limits<Mojo>::max());
+}
+
+TEST(TakeSettlement, AHoldKeepsTheExposureItWasWrittenWith) {
+    // [review #262 r5] Restored as written, not recomputed from a pair that
+    // may have changed or gone since.
+    const std::vector<AssetAmount> exposure{{"xch", 5'000'000'000'000}, {kDbx, 423'000},
+                                            {"xch", 330'000}};
+    const std::string text = encode_exposure(exposure);
+    EXPECT_EQ(text, "xch=5000000000000;" + kDbx + "=423000;xch=330000");
+    const auto back = decode_exposure(text);
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(*back, exposure);
+    EXPECT_FALSE(decode_exposure("").has_value());           // a row written before the column
+    EXPECT_FALSE(decode_exposure("xch=").has_value());
+    EXPECT_FALSE(decode_exposure("=5").has_value());
+    EXPECT_FALSE(decode_exposure("xch=5;").has_value());
+    EXPECT_FALSE(decode_exposure("xch=5x").has_value());
+    EXPECT_FALSE(decode_exposure("xch=-5").has_value());
+    EXPECT_FALSE(decode_exposure("xch=0").has_value());
+}
+
+TEST(TakeSettlement, AnUnresolvedTakeOfOursIsToleranceWhateverItsStatus) {
+    // [review #262 r5] From its wallet record: both sides, any status.
+    for (const char* status : {"PENDING_CONFIRM", "CONFIRMED"}) {
+        const auto exposure = take_record_exposure(take_record(status, 0));
+        ASSERT_TRUE(exposure.has_value()) << status;
+        EXPECT_EQ(*exposure, (std::vector<AssetAmount>{{"xch", 5'000'000'000'000},
+                                                       {kDbx, 420'000}}));
+    }
+    auto mine = take_record();
+    mine["is_my_offer"] = true;
+    EXPECT_FALSE(take_record_exposure(mine).has_value());
+    auto unreadable = take_record();
+    unreadable["summary"]["requested"] = {{kDbx, "lots"}};
+    EXPECT_FALSE(take_record_exposure(unreadable).has_value());
+}
+
+TEST(TakeSettlement, ATakeBooksOnlyOnceItsPaymentIsDeepEnough) {
+    // [review #262 r5] strategy.confirmation_depth_blocks, as for a maker fill.
+    EXPECT_FALSE(take_deep_enough(9'600'225, 9'600'225, 6));
+    EXPECT_FALSE(take_deep_enough(9'600'225, 9'600'230, 6));
+    EXPECT_TRUE(take_deep_enough(9'600'225, 9'600'231, 6));
+    EXPECT_FALSE(take_deep_enough(9'600'225, 9'600'100, 6));   // a node behind
+    EXPECT_TRUE(take_deep_enough(9'600'225, 9'600'225, 0));    // depth off
 }
 
 TEST(TakeSettlement, TakesSettleOldestFirstAndAFewAtATime) {
@@ -442,6 +526,20 @@ TEST(TakeSettlement, TheSweepLooksBetweenItsGraceAndItsLookback) {
     EXPECT_TRUE(take_sweep_due(kNow, kNow + kTakeSweepEveryBlocks));
     EXPECT_TRUE(take_sweep_due(kNow, kNow - 5));
     EXPECT_FALSE(take_sweep_due(0, 0));
+}
+
+TEST(TakeSettlement, TheSweepPagesBackToItsLookback) {
+    // [review #262 r5] 50 newer takes must not hide an unbooked one inside
+    // the day: page on while a full page's oldest take is still inside it.
+    constexpr BlockHeight kNow = 9'620'000;
+    EXPECT_TRUE(take_sweep_reads_on(kTakeSweepWindow, kNow - 100, kNow, 1));
+    EXPECT_TRUE(take_sweep_reads_on(kTakeSweepWindow, kNow - kTakeSweepLookbackBlocks, kNow, 1));
+    EXPECT_FALSE(take_sweep_reads_on(kTakeSweepWindow, kNow - kTakeSweepLookbackBlocks - 1,
+                                     kNow, 1));
+    EXPECT_FALSE(take_sweep_reads_on(kTakeSweepWindow - 1, kNow - 100, kNow, 1));   // the last
+    EXPECT_FALSE(take_sweep_reads_on(kTakeSweepWindow, kNow - 100, kNow, kTakeSweepMaxPages));
+    EXPECT_FALSE(take_sweep_reads_on(kTakeSweepWindow, 0, kNow, 1));   // pending sort last
+    EXPECT_TRUE(take_sweep_reads_on(kTakeSweepWindow, kNow + 3, kNow, 1));   // a node behind
 }
 
 TEST(TakeSettlement, IdsCompareWithoutPrefixOrCase) {
@@ -522,7 +620,7 @@ TEST(TakeSettlementWiring, BookingNeedsThePaymentProof) {
           "asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)"}) {
         const std::string body = function_body(raw, signature);
         ASSERT_FALSE(body.empty()) << signature;
-        const std::size_t proof = position_of(body, "proof = prove_take_receipts(*take, coins);");
+        const std::size_t proof = position_of(body, "proof = prove_take_receipts(*take, coins");
         ASSERT_NE(proof, std::string::npos) << signature;
         EXPECT_LT(proof, position_of(body, "record_taker_fill(")) << signature;
     }
@@ -533,9 +631,11 @@ TEST(TakeSettlementWiring, BookingNeedsThePaymentProof) {
     EXPECT_NE(position_of(sweep, "for (const auto& id : execution::take_event_ids(trade_id))"),
               std::string::npos);
     EXPECT_EQ(count_of(sweep, "in_ledger(take->trade_id)"), 2u);
-    EXPECT_NE(position_of(sweep, "tracked.count(id) > 0 || topups.count(id) > 0 "
-                                 "|| take_sweep_done_.count(id) > 0"), std::string::npos);
-    EXPECT_NE(position_of(sweep, "const auto ids = read_gui_take_ids(store);"),
+    EXPECT_NE(position_of(sweep, "if (tracked.count(id) > 0 || take_sweep_done_.count(id) > 0) "
+                                 "continue;"), std::string::npos);
+    EXPECT_NE(position_of(sweep, "if (topups.count(id) > 0 || too_fresh) { unresolved(record, id); "
+                                 "continue; }"), std::string::npos);
+    EXPECT_NE(position_of(sweep, "const auto takes = read_gui_takes(store);"),
               std::string::npos);
     EXPECT_NE(position_of(sweep, "execution::in_sweep_window(take->height, block_height)"),
               std::string::npos);
@@ -543,7 +643,9 @@ TEST(TakeSettlementWiring, BookingNeedsThePaymentProof) {
     // honouring other takes' claims, and both book at the block the payment
     // landed in, claiming its coins.
     const std::string all = squeeze(raw);
-    EXPECT_EQ(count_of(all, "proof = prove_take_receipts(*take, coins);"), 2u);
+    EXPECT_EQ(count_of(all, "proof = prove_take_receipts(*take, coins"), 2u);
+    // The settle step learns whether the claims could be read at all.
+    EXPECT_EQ(count_of(all, "proof = prove_take_receipts(*take, coins, &claims_read);"), 1u);
     const std::string helper = function_body(
         raw, "std::optional<execution::ReceiptProof> Engine::prove_take_receipts(");
     EXPECT_NE(position_of(helper, "db_->take_receipt_owners(execution::record_coin_ids(coins))"),
@@ -553,7 +655,10 @@ TEST(TakeSettlementWiring, BookingNeedsThePaymentProof) {
               std::string::npos);
     EXPECT_EQ(count_of(all, "co_await wallet_->get_coin_records_in_range( take->height, "
                             "take->height + execution::kReceiptGiveBlocks,"), 2u);
-    EXPECT_EQ(count_of(all, "static_cast<BlockHeight>(proof->settled_at)"), 2u);
+    // Two bookings, and the two depth checks before them.
+    EXPECT_EQ(count_of(all, "static_cast<BlockHeight>(proof->settled_at)"), 4u);
+    EXPECT_EQ(count_of(all, "execution::take_deep_enough(static_cast<BlockHeight>(proof->settled_at),"),
+              2u);
     EXPECT_EQ(count_of(all, "proof->coin_ids"), 2u);
     EXPECT_EQ(count_of(all, "get_coin_records_at_height(take->height"), 0u);
     // Both read evidence only from a wallet synced this heartbeat.
@@ -590,7 +695,8 @@ TEST(TakeSettlementWiring, ABookingIsOneTransactionAndReplaysNothing) {
     const std::string sweep = function_body(
         raw, "asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)");
     EXPECT_EQ(count_of(sweep, "db_->taker_fill_exists(take->trade_id)"), 2u);
-    EXPECT_NE(position_of(sweep, "if (booked) take_sweep_done_.insert(id);"), std::string::npos);
+    EXPECT_NE(position_of(sweep, "if (booked) { take_sweep_done_.insert(id); } else { "
+                                 "unresolved(record, id); }"), std::string::npos);
     // No take is sent before the last process's holds are read; the settle
     // step keeps trying to read them.
     const std::string guard = function_body(
@@ -618,7 +724,7 @@ TEST(TakeSettlementWiring, ABookingTiesToFreshBalancesAndNoGuiTakeIsSweptTwice) 
     const std::size_t settle_fresh = position_of(
         settle, "if (!co_await refresh_take_balances(std::move(moved), block_height)) {");
     ASSERT_NE(settle_fresh, std::string::npos);
-    EXPECT_LT(position_of(settle, "proof = prove_take_receipts(*take, coins);"), settle_fresh);
+    EXPECT_LT(position_of(settle, "proof = prove_take_receipts(*take, coins"), settle_fresh);
     EXPECT_LT(settle_fresh, position_of(settle, "record_taker_fill("));
     EXPECT_NE(position_of(settle, "if (p.fee_mojos > 0) moved.emplace_back(\"xch\");"),
               std::string::npos);
@@ -639,12 +745,12 @@ TEST(TakeSettlementWiring, ABookingTiesToFreshBalancesAndNoGuiTakeIsSweptTwice) 
               std::string::npos);
     // Every GUI take it may still confirm is the GUI's, and a store that
     // cannot be read stops the sweep before it reads the wallet.
-    const std::size_t owners = position_of(sweep, "const auto ids = read_gui_take_ids(store); "
-                                                  "if (!ids) {");
+    const std::size_t owners = position_of(sweep, "const auto takes = read_gui_takes(store); "
+                                                  "if (!takes) {");
     ASSERT_NE(owners, std::string::npos);
     const std::size_t deferred = sweep.find(squeeze("co_return;"), owners);
     EXPECT_LT(deferred, position_of(sweep, "co_await wallet_->get_recent_takes("));
-    EXPECT_EQ(count_of(all, "SELECT trade_id FROM dexie_takes WHERE status <> 'failed';"), 1u);
+    EXPECT_EQ(count_of(all, "FROM dexie_takes WHERE status <> 'failed';"), 1u);
     EXPECT_EQ(count_of(sweep, "read_topup_take_rows("), 0u);
     // ... and the top-up ingest books nothing the sweep booked.
     const std::string topup = function_body(
@@ -658,6 +764,64 @@ TEST(TakeSettlementWiring, ABookingTiesToFreshBalancesAndNoGuiTakeIsSweptTwice) 
     const std::size_t waits = position_of(invariant, "if (!take_holds_restored_) {");
     ASSERT_NE(waits, std::string::npos);
     EXPECT_LT(waits, position_of(invariant, "db_->ledger_balances()"));
+}
+
+TEST(TakeSettlementWiring, Round5TheSweepAndTheSettleStepWaitForEvidence) {
+    const std::string raw = read_engine_cpp();
+    const std::string settle = function_body(
+        raw, "asio::awaitable<void> Engine::step_settle_pending_takes(BlockHeight block_height)");
+    const std::string sweep = function_body(
+        raw, "asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)");
+    ASSERT_FALSE(settle.empty());
+    ASSERT_FALSE(sweep.empty());
+    // An uncertain hold ends on a clear sweep, not on time alone.
+    EXPECT_NE(position_of(settle, "if (!execution::uncertain_hold_ends(it->second.at, "
+                                  "block_height, take_sweep_clear_block_)) {"),
+              std::string::npos);
+    // Given up only on evidence read whole.
+    EXPECT_NE(position_of(settle, "state, proof.has_value() && take.has_value(), evidence_read,"),
+              std::string::npos);
+    // Booked only into ready books, and only once deep enough -- in both.
+    const std::size_t ready = position_of(settle, "&& (!ledger_genesis_done_ || ledger_incomplete_)) {");
+    const std::size_t deep = position_of(settle, "if (!execution::take_deep_enough(");
+    ASSERT_NE(ready, std::string::npos);
+    ASSERT_NE(deep, std::string::npos);
+    EXPECT_LT(deep, position_of(settle, "record_taker_fill("));
+    EXPECT_NE(position_of(sweep, "if (!execution::take_deep_enough("), std::string::npos);
+    // The sweep waits for the saved holds, pages to its lookback, reads the
+    // pending takes, and records what it leaves unresolved.
+    EXPECT_LT(position_of(sweep, "if (!take_holds_restored_) co_return;"),
+              position_of(sweep, "last_take_sweep_block_ = block_height;"));
+    EXPECT_NE(position_of(sweep, "execution::take_sweep_reads_on("), std::string::npos);
+    EXPECT_NE(position_of(sweep, "0, execution::kTakePendingWindow, /*include_completed=*/false);"),
+              std::string::npos);
+    EXPECT_NE(position_of(sweep, "sweep_take_slack_ = std::move(unresolved_slack);"),
+              std::string::npos);
+    EXPECT_NE(position_of(sweep, "if (!engine_take_unresolved) take_sweep_clear_block_ = "
+                                 "block_height;"), std::string::npos);
+    // The GUI's unbooked takes are tolerance from the top-up ingest.
+    const std::string topup = function_body(
+        raw, "asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)");
+    EXPECT_NE(position_of(topup, "if (gui_read) gui_take_slack_ = std::move(gui_slack);"),
+              std::string::npos);
+    // A restored hold keeps the exposure it was written with.
+    const std::string restore = function_body(raw, "bool Engine::restore_take_holds() noexcept");
+    EXPECT_NE(position_of(restore, "execution::decode_exposure(h.exposure)"), std::string::npos);
+    EXPECT_EQ(count_of(squeeze(raw), "row.exposure = exposure;"), 2u);
+    // An asset opened by an earlier run is recognised, not dropped.
+    const std::string record = function_body(raw, "void Engine::record_taker_fill(");
+    EXPECT_NE(position_of(record, "&& db_->has_ledger_opening(asset)) { "
+                                  "ledger_opened_assets_.insert(asset);"), std::string::npos);
+    // The hold's quote is converted checked.
+    const std::string exposure = function_body(raw, "execution::UncertainTake Engine::take_exposure(");
+    ASSERT_FALSE(exposure.empty());
+    EXPECT_NE(position_of(exposure, "to_mojo_checked(quote_mojos_for("), std::string::npos);
+    EXPECT_EQ(count_of(exposure, "std::llround("), 0u);
+    // A reward coin above the old ceiling needs a payout burst.
+    const std::string reward = function_body(
+        raw, "asio::awaitable<void> Engine::step_ingest_reward_inflows(");
+    EXPECT_NE(position_of(reward, "reward_sized && accounting::reward_size_evidenced("),
+              std::string::npos);
 }
 
 TEST(TakeSettlementWiring, TheHoldIsWrittenBeforeTheTakeIsSent) {
@@ -720,8 +884,11 @@ TEST(TakeSettlementWiring, HoldsAreWrittenReadBackAndKeptWhileUncertain) {
     // The invariant widens its tolerance by the live uncertain holds.
     const std::string invariant = function_body(
         raw, "void Engine::step_check_ledger_invariant(BlockHeight block_height)");
-    EXPECT_NE(position_of(invariant, "execution::take_hold_slack(pending_takes_, "
-                                     "uncertain_take_offers_, block_height);"), std::string::npos);
+    EXPECT_NE(position_of(invariant, "auto take_slack = execution::take_hold_slack("
+                                     "pending_takes_, uncertain_take_offers_); "
+                                     "execution::add_slack_map(take_slack, sweep_take_slack_); "
+                                     "execution::add_slack_map(take_slack, gui_take_slack_);"),
+              std::string::npos);
     EXPECT_EQ(count_of(invariant, "exposure + fee_slack + held_slack"), 2u);
     EXPECT_EQ(count_of(invariant, "exposure + fee_slack + inflight_slack"), 0u);
     // A take inside an asset's opening books no leg (the fill path's rule).

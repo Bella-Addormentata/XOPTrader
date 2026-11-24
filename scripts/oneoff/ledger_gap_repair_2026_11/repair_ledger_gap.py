@@ -79,7 +79,10 @@ DBX = "db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20"
 FEE_MATCH_TOLERANCE = 10_000_000_000      # 0.01 XCH: measured fees vs the remainder
 FEE_PER_HEIGHT_MAX = 1_000_000_000        # 0.001 XCH: the most one block's fees may be
 REWARD_MAX_MOJOS = 20_000                 # accounting.reward_max_mojos_per_coin's default
+REWARD_LONE_MAX_MOJOS = 2_000             # accounting::kRewardLoneCoinMaxMojos
+REWARD_BURST_MIN_COINS = 5                # accounting::kRewardBurstMinCoins
 GIVE = 50                                 # blocks a payment coin may trail its trade
+PHANTOM_WINDOW = 4_608                    # blocks after a take's booking its payment is looked for
 MOJOS_PER_XCH = 10 ** 12
 
 TAKER_COLUMNS = ("taken_at", "block_height", "strategy", "trade_id", "counterparty_offer_id",
@@ -282,8 +285,9 @@ def engine_price(base: str, base_mojos: int, quote: str, quote_mojos: int) -> in
 
 
 # ---------------------------------------------------------------- the plan
-def proven_trades(trades: list, coins: dict, booked: dict) -> dict:
-    """The CONFIRMED trades whose payment coin is in our store, by trade id.
+def proven_trades(trades: list, coins: dict, booked: dict) -> tuple[dict, CoinPool]:
+    """The CONFIRMED trades whose payment coin is in our store, by trade id,
+    and the pool of the coins none of them claimed.
 
     Booked trades claim their coins first, so an unbooked twin never takes a
     booked trade's payment; a coin vouches for one receipt only."""
@@ -310,7 +314,7 @@ def proven_trades(trades: list, coins: dict, booked: dict) -> dict:
         # The block the payment landed in, which is the block of the spend:
         # the wallet's confirmed_at_index can lag it by a block.
         real[norm(t["trade_id"])] = dict(t, settled_at=max(at for _, at, _ in claims))
-    return real
+    return real, pool
 
 
 def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
@@ -332,7 +336,7 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
     for r in led:
         for h in re.findall(r"[0-9a-fA-F]{64}", r[3] or ""):
             booked[h.lower()].append(r)
-    real = proven_trades(trades, coins, booked)
+    real, unclaimed = proven_trades(trades, coins, booked)
 
     entries, taker_rows = [], []
 
@@ -351,10 +355,27 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
         tid = norm(eid.split(":", 1)[1])
         if tid in real:
             continue
-        status = wallet.offer("0x" + tid).get("status")
+        rec = wallet.offer("0x" + tid)
+        status = rec.get("status")
         if status not in ("FAILED", "CANCELLED"):
             raise SystemExit(f"{eid}: booked but not proven settled, and the wallet says "
                              f"{status} -- resolve it first")
+        # The wallet's status is its bookkeeping, not proof: an insecure cancel
+        # writes CANCELLED whatever happened.  A reversal also needs the
+        # payment to be absent: no coin of any amount the take would have paid
+        # us, from its booking to a day after, that no proven trade claimed.
+        recv, _ = receive_and_pay(rec)
+        if not recv:
+            raise SystemExit(f"{eid}: its wallet record states no amounts, so its payment "
+                             "cannot be checked -- resolve it by hand")
+        h0 = min(int(r[8] or 0) for r in legs)
+        payable = [asset for asset, amount in recv.items()
+                   if any(unclaimed.free[(asset, h, amount)] > 0
+                          for h in range(h0 - GIVE, h0 + PHANTOM_WINDOW + 1))]
+        if len(payable) == len(recv):
+            raise SystemExit(f"{eid}: the wallet holds it {status}, but a coin that could be "
+                             f"its payment is in the store and unclaimed ({sorted(recv.items())} "
+                             f"from block {h0}) -- resolve it by hand")
         phantoms.append((eid, tid, status, legs))
         for (rid, _t, _et, _eid, leg, asset, delta, pair, h, _note) in legs:
             post("A", "reversal", "reversal:" + eid, leg, norm(asset), -delta, pair, h,
@@ -504,6 +525,12 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
         if asset != DBX:
             leftovers[asset] = sorted(k for k, n in left.items() for _ in range(max(n, 0)))
             continue
+        # Reward-sized receipts per block, booked or not (the engine's count):
+        # a coin above the old ceiling is a reward only inside a payout burst.
+        in_block = collections.Counter()
+        for (h, amount), n in left.items():
+            if 0 < amount <= REWARD_MAX_MOJOS:
+                in_block[h] += max(n, 0)
         for key, n in list(left.items()):
             left[key] -= min(n, rewards_booked[key])
         names = collections.defaultdict(list)
@@ -512,8 +539,9 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
         booked_names = {norm(r[3].split(":", 1)[1]) for r in led if r[2] == "reward"}
         too_big = []
         for (h, amount), n in sorted(left.items()):
-            if amount > REWARD_MAX_MOJOS:   # not a reward by the engine's own rule
-                too_big += [(h, amount)] * max(n, 0)
+            if amount > REWARD_MAX_MOJOS or (amount > REWARD_LONE_MAX_MOJOS
+                                             and in_block[h] < REWARD_BURST_MIN_COINS):
+                too_big += [(h, amount)] * max(n, 0)   # not a reward by the engine's own rule
                 continue
             for _ in range(n):
                 free = [x for x in names.get((h, amount), []) if x not in booked_names]
@@ -613,10 +641,12 @@ def report(plan: dict) -> dict:
 
 
 # ---------------------------------------------------------------- apply/check
-WRITER_EXES = ("xop_trader.exe", "xop_trader_gui.exe")
-# Command-line marks of a GUI run from source and of the options runner.  Not
+# The engine, and the GUI under every name it is installed as (gui/main.py).
+WRITER_EXES = ("xop_trader.exe", "xop_trader_gui.exe", "xoptrader-gui.exe", "xoptrader_gui.exe")
+# Command-line marks of a GUI run from source (python -m gui.main, gui\main.py,
+# or the scripts\_run_gui.py launcher) and of the options runner.  Not
 # "xop_trader": this script's own --db argument names the database.
-WRITER_COMMANDS = ("gui.main", "gui\\main", "gui/main", "gui.services.options")
+WRITER_COMMANDS = ("gui.main", "gui\\main", "gui/main", "_run_gui", "gui.services.options")
 # python.exe, pythonw.exe, python3.13.exe, py.exe, pyw.exe.
 PYTHON_EXE = re.compile(r"^(pythonw?[0-9.]*|pyw?)\.exe$")
 

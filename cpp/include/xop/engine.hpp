@@ -1560,6 +1560,24 @@ private:
     /// Settled takes the settle step keeps because their record does not map
     /// onto their pair as configured now, warned once.
     std::unordered_set<std::string> take_unmapped_warned_;
+    /// [TAKE-SETTLE review r5] Per asset, what the takes of ours that the last
+    /// missed-take sweep found unresolved in the wallet could move: pending
+    /// ones nothing tracks, and settled ones not booked yet (inside the
+    /// sweep's grace, unproven, too shallow, or the GUI's awaiting its own
+    /// confirmation).  The divergence control's tolerance until the next sweep.
+    std::unordered_map<std::string, Mojo> sweep_take_slack_;
+    /// The last sweep that found no take of ours -- the GUI's aside --
+    /// unresolved in the wallet (0: none yet).  An uncertain hold ends only
+    /// after one (execution::uncertain_hold_ends).
+    BlockHeight take_sweep_clear_block_{0};
+    /// [TAKE-SETTLE review r5] Per asset, what the GUI's own takes that are
+    /// not booked yet could move (dexie_takes rows submitted and not
+    /// confirmed there, or confirmed and not booked here), read every
+    /// heartbeat by the top-up ingest, before the invariant.
+    std::unordered_map<std::string, Mojo> gui_take_slack_;
+    /// [review #262 r5] Reward-sized coins left unbooked for arriving outside
+    /// a payout burst, logged once.
+    std::unordered_set<std::string> reward_unevidenced_warned_;
     /// take_holds has been read back (restore_take_holds).  Until it has, no
     /// take is sent (an unread hold may be holding the very offer) and the
     /// ledger invariant does not run (what a take in flight could move is
@@ -1988,15 +2006,19 @@ private:
     /// (execution::prove_receipts): each receipt in its own asset's wallet,
     /// within kReceiptGiveBlocks, and not a coin another booked take claimed
     /// (take_receipts).  std::nullopt when unproven or the claims are unread.
+    /// `claims_read`, when given, is set false when the claims could not be
+    /// read (as opposed to a proof that failed).
     [[nodiscard]] std::optional<execution::ReceiptProof> prove_take_receipts(
-        const execution::WalletTake& take, const std::vector<nlohmann::json>& coins) const;
+        const execution::WalletTake& take, const std::vector<nlohmann::json>& coins,
+        bool* claims_read = nullptr) const;
 
     /// [TAKE-SETTLE 2026-11-24] Fresh, validated wallet balances of `assets`
     /// at `block_height` (fetch_bridge_balance), read after a take's payment
     /// was proven and before it is booked: the invariant must tie books that
     /// carry the take to a snapshot that carries it too, not to one a paused
-    /// Step 8 left from before it.  False when any read fails or is
-    /// incomplete; the booking then waits a heartbeat.
+    /// Step 8 left from before it.  An asset with no snapshot at all is not
+    /// compared by the invariant and needs none.  False when any read fails
+    /// or is incomplete; the booking then waits a heartbeat.
     asio::awaitable<bool> refresh_take_balances(std::vector<AssetId> assets,
                                                 BlockHeight block_height);
 

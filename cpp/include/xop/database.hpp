@@ -396,6 +396,10 @@ struct DbTakeHold {
     Mojo          price_mojos{0};
     std::uint64_t fee_mojos{0};
     BlockHeight   block_height{0};        ///< Submitted at (pending) / requested at (uncertain).
+    /// What the take moves, per asset, as it was when the hold was written
+    /// (execution::encode_exposure): restored as written, not recomputed from
+    /// a pair that may have changed since.  "" in a row written before it.
+    std::string   exposure;
 };
 
 // ---------------------------------------------------------------------------
@@ -762,10 +766,12 @@ public:
     /// [TAKE-SETTLE] Book a settled take in ONE transaction: its taker_fills
     /// row, its ledger legs, the receipt coins it claims (take_receipts), and
     /// the end of its hold (`release_hold_key`, "" for none).  All of it or
-    /// none of it, and idempotent: a replay inserts nothing new.  A receipt
-    /// coin another take has claimed (either spelling of the ids compared)
-    /// stops the booking: nothing is written and the hold stays.  Never
-    /// throws.
+    /// none of it, and idempotent: a replay inserts nothing new -- also one
+    /// spelled the other way ("0x<id>" or "<id>", any case), whose row or
+    /// legs are found under the first spelling; it only ends the hold.  A
+    /// receipt coin another take has claimed (either spelling of the ids
+    /// compared) stops the booking: nothing is written and the hold stays.
+    /// Never throws.
     /// @return std::nullopt when nothing was written.
     [[nodiscard]] std::optional<TakeBooking> book_take(
         const DbTakerFill&                fill,

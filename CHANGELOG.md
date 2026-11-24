@@ -19,8 +19,10 @@ listing an offer while our first take of it waits to be mined.
 - **Booked on settlement.** Every take path (crossed book, cross-stable,
   peg arb, drift correction, XCH recovery) now only tracks a take the wallet
   accepted. It is booked once the wallet shows it settled and the coin it
-  pays us is in the wallet, at the wallet's own amounts and at the block
-  that payment landed in. A take that failed or was cancelled books nothing.
+  pays us is in the wallet, as deep as a maker fill must be (6 blocks by
+  default), at the wallet's own amounts and at the block that payment
+  landed in. A take that failed or was cancelled books nothing, and one is
+  only given up on when the wallet answered, never on a read that timed out.
   Until a take is booked or dropped, the ledger check allows for what it
   moves. Its history row, ledger entries and the end of its hold are written
   together in one database transaction, and one payment coin can only ever
@@ -34,24 +36,30 @@ listing an offer while our first take of it waits to be mined.
   it. No take is sent, and the ledger check does not run, until those
   holds have been read back.
 - **A take request is never re-sent.** After a timeout the wallet may still
-  be taking the offer, so the engine leaves that offer alone for about 20
-  minutes instead of sending a second copy. Meanwhile the ledger check
-  allows for what that take could move, so the check does not book it as
-  an unexplained difference first.
-- **Missed takes are swept in.** Every few minutes the engine looks at the
-  wallet's takes of the last day and books any settled one it does not hold,
-  from the wallet's own record of it. The GUI's bridge top-up takes are left
-  to their own booking, including one that settled while the GUI was
-  closed.
+  be taking the offer, so the engine leaves that offer alone instead of
+  sending a second copy: for at least 20 minutes, and then until the wallet
+  shows no take of ours still pending or settled and unbooked (5 hours at
+  most). Meanwhile the ledger check allows for what that take could move,
+  so the check does not book it as an unexplained difference first.
+- **Missed takes are swept in.** Every few minutes the engine reads the
+  wallet's takes of the last day, page by page, and the ones still pending,
+  and books any settled one it does not hold, from the wallet's own record
+  of it. Until each is booked, the ledger check allows for what it moves.
+  The GUI's bridge top-up takes are left to their own booking, including
+  one that settled while the GUI was closed, and the ledger check allows
+  for them from the moment the GUI records them.
 
 ### Dexie rewards: bigger coins and bigger bursts are booked (#262)
 
-- Reward coins up to 20 DBX each are booked (was 2 DBX): November's coins
-  reach 4.4 DBX and the larger ones were left out.
+- Reward coins up to 20 DBX each are booked (was 2 DBX) when they come in a
+  payout burst of at least 5 coins in one block: November's coins reach
+  4.4 DBX and the larger ones were left out. A coin up to 2 DBX counts on its
+  own, as before, and a larger lone coin, such as a deposit, is not booked
+  as a reward.
 - The reward scan reads back past its newest 200 wallet rows every ten
-  minutes, and at once whenever a full page still holds an unbooked reward,
-  so a burst of more than 200 coins is booked whole. On 2026-11-15 a burst
-  of 220 coins left 20 unbooked.
+  minutes, and at once whenever a full page still holds an unbooked reward
+  or holds only unconfirmed rows, so a burst of more than 200 coins is
+  booked whole. On 2026-11-15 a burst of 220 coins left 20 unbooked.
 
 ### Options: 1, 10, 100... XCH contracts side by side (#261)
 

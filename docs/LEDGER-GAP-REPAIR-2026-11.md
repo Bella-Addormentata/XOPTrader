@@ -46,7 +46,11 @@ the options address. The script reports both.
   returned: 1bcf6dcc, bcd44195, 6d43bfe5, 083be5b2, da2edc43, e2d47d4e, the
   seven of 2026-11-20 (da716925, f8a59d4b, 8acbdbfe, 7b95898e, 1f3a9fd8,
   a757b5f6, 43cbe65b), and peg-arb #700, 35dcf500. The wallet holds each
-  FAILED or CANCELLED, and no coin of any was paid to us. Each gets one
+  FAILED or CANCELLED, and no coin of any was paid to us. The status alone is
+  not proof (an insecure cancel writes CANCELLED whatever happened), so the
+  script refuses a reversal while a coin that could be the take's payment is
+  in the store and unclaimed by every proven trade: any amount the take
+  would have paid us, from its booking to a day after. Each gets one
   `reversal` leg per leg, `event_id` `reversal:take:<trade_id>`. Each
   `taker_fills` row is archived as JSON in `offer_closure_events`
   (`phantom_take_correction`) and deleted, so pacing and history no longer
@@ -83,7 +87,8 @@ the options address. The script reports both.
   (2026-11-16 to 18). They are booked as `reward` rows keyed on their wallet
   transaction, valued at the `px_usd_per_unit` of the nearest reward the
   engine did book. A DBX coin above the engine's reward ceiling (20,000
-  mojos) is not a reward by the engine's own rule. It is reported, not
+  mojos), or above 2,000 mojos outside a payout burst of at least 5 coins in
+  its block, is not a reward by the engine's own rule. It is reported, not
   booked.
 - **F. Fees.** The XCH that left trading coins since the re-tie, less the
   XCH legs of the trades that settled and the fees already booked (less the
@@ -104,8 +109,9 @@ All commands run from `C:\GitHub\XOPTrader`, with the Chia wallet running and sy
 1. Merge and publish the release with the take fix. Do not install it yet.
 2. Stop the GUI. That stops the engine and the options book. Stop the
    options runner too if it runs in a terminal. `--apply` refuses while
-   `xop_trader.exe` or `xop_trader_gui.exe` runs, or a Python process runs
-   `gui.main` or `gui.services.options`. It also refuses if it cannot read
+   `xop_trader.exe` or the GUI runs (`xop_trader_gui.exe`,
+   `xoptrader-gui.exe`, `xoptrader_gui.exe`), or a Python process runs
+   `gui.main`, `scripts\_run_gui.py` or `gui.services.options`. It also refuses if it cannot read
    the process list, or the command line of any Python process. It checks
    before planning, and inside its write transaction it refuses if the
    ledger or `taker_fills` changed since the plan was read.

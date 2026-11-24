@@ -312,6 +312,17 @@ TEST(RewardIngestScanTest, DeepScanIsDueEveryThirtyBlocks) {
 }
 
 // A 220-coin burst does not fit one page of 200: the deep scan reads on.
+TEST(RewardIngestScanTest, ACoinAboveTheOldCeilingNeedsAPayoutBurst) {
+    // [review #262 r5] Up to 2,000 mojos a coin reads as a reward alone, as it
+    // always has; above that only among at least kRewardBurstMinCoins receipts
+    // in its block.  A 5 DBX deposit is one coin.
+    EXPECT_TRUE(reward_size_evidenced(2'000, 1));
+    EXPECT_FALSE(reward_size_evidenced(2'001, 1));
+    EXPECT_FALSE(reward_size_evidenced(5'000, kRewardBurstMinCoins - 1));
+    EXPECT_TRUE(reward_size_evidenced(4'395, kRewardBurstMinCoins));
+    EXPECT_TRUE(reward_size_evidenced(4'395, 219));
+}
+
 TEST(RewardIngestScanTest, AFullPageOfRecentRowsIsFollowedOnADeepScan) {
     constexpr xop::BlockHeight kNow = 9'575'500;
     EXPECT_TRUE(reward_scan_reads_on(true, false, 1, kRewardScanPageRows, 9'575'482, kNow));
@@ -321,6 +332,11 @@ TEST(RewardIngestScanTest, AFullPageOfRecentRowsIsFollowedOnADeepScan) {
     EXPECT_FALSE(reward_scan_reads_on(true, false, 1, kRewardScanPageRows - 1, 9'575'482, kNow));
     // A page whose oldest row is unconfirmed says nothing about age: read on.
     EXPECT_TRUE(reward_scan_reads_on(true, false, 1, kRewardScanPageRows, 0, kNow));
+    // [review #262 r5] ... on an ordinary heartbeat too: a full page of
+    // unconfirmed rows holds no candidate, and hides the confirmed ones.
+    EXPECT_TRUE(reward_scan_reads_on(false, false, 1, kRewardScanPageRows, 0, kNow));
+    EXPECT_FALSE(reward_scan_reads_on(false, false, kRewardScanMaxPages, kRewardScanPageRows, 0,
+                                      kNow));
     // [review #262] Between deep scans, a full page that still holds an
     // unbooked receipt is followed at once: the burst's tail must not wait.
     EXPECT_TRUE(reward_scan_reads_on(false, true, 1, kRewardScanPageRows, 9'575'482, kNow));

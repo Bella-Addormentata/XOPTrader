@@ -1313,15 +1313,17 @@ ChiaWalletRPC::get_coin_records_in_range(std::uint64_t                     start
 }
 
 asio::awaitable<std::vector<json>>
-ChiaWalletRPC::get_recent_takes(std::int64_t count)
+ChiaWalletRPC::get_recent_takes(std::int64_t start, std::int64_t end,
+                                bool include_completed)
 {
     // No sort_key: the wallet's default CONFIRMED_AT_HEIGHT order, newest
-    // confirmation first.  exclude_my_offers leaves only the offers we took.
+    // confirmation first.  exclude_my_offers leaves only the offers we took;
+    // include_completed false leaves only the pending ones.
     const json payload = {
-        {"start",             0},
-        {"end",               count},
+        {"start",             start},
+        {"end",               end},
         {"exclude_my_offers", true},
-        {"include_completed", true},
+        {"include_completed", include_completed},
         {"file_contents",     false}
     };
     const json resp = co_await rpc_post("get_all_offers", payload);

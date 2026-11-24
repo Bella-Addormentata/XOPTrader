@@ -242,7 +242,8 @@ CREATE TABLE IF NOT EXISTS take_holds (
     price_mojos     INTEGER NOT NULL,
     fee_mojos       INTEGER NOT NULL,
     block_height    INTEGER NOT NULL,
-    created_at      TEXT    DEFAULT CURRENT_TIMESTAMP
+    created_at      TEXT    DEFAULT CURRENT_TIMESTAMP,
+    exposure        TEXT    NOT NULL DEFAULT ''
 );
 )SQL";
 
@@ -1901,8 +1902,9 @@ bool Database::save_take_hold(const DbTakeHold& hold) noexcept
     static constexpr const char* kUpsert = R"SQL(
         INSERT OR REPLACE INTO take_holds
             (hold_key, kind, offer_id, trade_id, strategy, pair_name,
-             we_bought_base, base_mojos, price_mojos, fee_mojos, block_height)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);
+             we_bought_base, base_mojos, price_mojos, fee_mojos, block_height,
+             exposure)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12);
     )SQL";
 
     std::lock_guard<std::mutex> lock(mtx_);
@@ -1926,6 +1928,7 @@ bool Database::save_take_hold(const DbTakeHold& hold) noexcept
             std::min<std::uint64_t>(hold.fee_mojos,
                                     static_cast<std::uint64_t>(std::numeric_limits<sqlite3_int64>::max()))));
         sqlite3_bind_int64(stmt, 11, static_cast<sqlite3_int64>(hold.block_height));
+        sqlite3_bind_text(stmt, 12, hold.exposure.c_str(), -1, SQLITE_TRANSIENT);
         const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
         if (!ok) {
             spdlog::error("[Database] save_take_hold failed for {}: {}", hold.hold_key,
@@ -1971,7 +1974,8 @@ std::optional<std::vector<DbTakeHold>> Database::take_holds() const
 {
     static constexpr const char* kSelect = R"SQL(
         SELECT hold_key, kind, offer_id, trade_id, strategy, pair_name,
-               we_bought_base, base_mojos, price_mojos, fee_mojos, block_height
+               we_bought_base, base_mojos, price_mojos, fee_mojos, block_height,
+               COALESCE(exposure, '')
         FROM take_holds ORDER BY block_height, hold_key;
     )SQL";
 
@@ -2002,6 +2006,7 @@ std::optional<std::vector<DbTakeHold>> Database::take_holds() const
         h.fee_mojos      = fee > 0 ? static_cast<std::uint64_t>(fee) : 0U;
         const sqlite3_int64 height = sqlite3_column_int64(stmt, 10);
         h.block_height   = height > 0 ? static_cast<BlockHeight>(height) : BlockHeight{0};
+        h.exposure       = text(11);
         holds.push_back(std::move(h));
     }
     sqlite3_finalize(stmt);
@@ -2037,6 +2042,17 @@ std::optional<Database::TakeBooking> Database::book_take(
     static constexpr const char* kOwner = R"SQL(
         SELECT trade_id FROM take_receipts WHERE coin_id = ?1;
     )SQL";
+    // The take booked already under the other spelling of its id: the UNIQUE
+    // keys compare the raw text, so a replay as "<id>" after "0x<id>" (or in
+    // another case) would otherwise write a second row and second legs.
+    static constexpr const char* kFillSpelled = R"SQL(
+        SELECT trade_id FROM taker_fills
+        WHERE lower(trade_id) = ?1 OR lower(trade_id) = ?2 LIMIT 1;
+    )SQL";
+    static constexpr const char* kLegSpelled = R"SQL(
+        SELECT event_id FROM ledger_entries
+        WHERE lower(event_id) = ?1 OR lower(event_id) = ?2 LIMIT 1;
+    )SQL";
     static constexpr const char* kRelease = R"SQL(
         DELETE FROM take_holds WHERE hold_key = ?1;
     )SQL";
@@ -2047,19 +2063,25 @@ std::optional<Database::TakeBooking> Database::book_take(
     sqlite3_stmt* claim_stmt   = nullptr;
     sqlite3_stmt* release_stmt = nullptr;
     sqlite3_stmt* owner_stmt   = nullptr;
+    sqlite3_stmt* fill_spelled = nullptr;
+    sqlite3_stmt* leg_spelled  = nullptr;
     const auto finalize_all = [&] {
         sqlite3_finalize(fill_stmt);
         sqlite3_finalize(leg_stmt);
         sqlite3_finalize(claim_stmt);
         sqlite3_finalize(release_stmt);
         sqlite3_finalize(owner_stmt);
+        sqlite3_finalize(fill_spelled);
+        sqlite3_finalize(leg_spelled);
     };
     try {
         if (sqlite3_prepare_v2(db_, kFill, -1, &fill_stmt, nullptr) != SQLITE_OK
             || sqlite3_prepare_v2(db_, kLeg, -1, &leg_stmt, nullptr) != SQLITE_OK
             || sqlite3_prepare_v2(db_, kClaim, -1, &claim_stmt, nullptr) != SQLITE_OK
             || sqlite3_prepare_v2(db_, kRelease, -1, &release_stmt, nullptr) != SQLITE_OK
-            || sqlite3_prepare_v2(db_, kOwner, -1, &owner_stmt, nullptr) != SQLITE_OK) {
+            || sqlite3_prepare_v2(db_, kOwner, -1, &owner_stmt, nullptr) != SQLITE_OK
+            || sqlite3_prepare_v2(db_, kFillSpelled, -1, &fill_spelled, nullptr) != SQLITE_OK
+            || sqlite3_prepare_v2(db_, kLegSpelled, -1, &leg_spelled, nullptr) != SQLITE_OK) {
             spdlog::error("[Database] book_take prepare failed: {}", sqlite3_errmsg(db_));
             finalize_all();
             return std::nullopt;
@@ -2072,6 +2094,32 @@ std::optional<Database::TakeBooking> Database::book_take(
 
         TakeBooking out;
         bool ok = true;
+        // Booked under another spelling of its id?  Then this is a replay:
+        // nothing is written but the end of the hold.
+        const std::string bare = bare_lower_id(fill.trade_id);
+        const std::string prefixed = "0x" + bare;
+        const std::string own_event = legs.empty() ? "take:" + fill.trade_id
+                                                   : legs.front().event_id;
+        bool spelled_otherwise = false;
+        std::string conflict;   // a receipt coin another take owns, if any
+        const auto found_other = [&](sqlite3_stmt* stmt, const std::string& a,
+                                     const std::string& b, const std::string& own) {
+            sqlite3_bind_text(stmt, 1, a.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, b.c_str(), -1, SQLITE_TRANSIENT);
+            const int rc = sqlite3_step(stmt);
+            if (rc == SQLITE_ROW) {
+                const char* v = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                if (v != nullptr && own != v) spelled_otherwise = true;
+            } else if (rc != SQLITE_DONE) {
+                ok = false;
+            }
+        };
+        found_other(fill_spelled, bare, prefixed, fill.trade_id);
+        if (ok) found_other(leg_spelled, "take:" + bare, "take:" + prefixed, own_event);
+        if (ok && spelled_otherwise) {
+            spdlog::info("[Database] book_take: take {} is booked already under the other "
+                         "spelling of its id -- a replay; only its hold ends", fill.trade_id);
+        }
         sqlite3_bind_text (fill_stmt, 1, fill.taken_at.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(fill_stmt, 2, static_cast<std::int64_t>(fill.block_height));
         sqlite3_bind_text (fill_stmt, 3, fill.strategy.c_str(), -1, SQLITE_TRANSIENT);
@@ -2085,13 +2133,15 @@ std::optional<Database::TakeBooking> Database::book_take(
         sqlite3_bind_int64(fill_stmt, 11, fill.quote_delta_mojos);
         sqlite3_bind_int64(fill_stmt, 12, fill.price_mojos);
         sqlite3_bind_int64(fill_stmt, 13, fill.fee_mojos);
-        if (sqlite3_step(fill_stmt) != SQLITE_DONE) {
+        if (!ok || spelled_otherwise) {
+            // nothing to insert: unreadable, or a replay under the other spelling
+        } else if (sqlite3_step(fill_stmt) != SQLITE_DONE) {
             ok = false;
         } else {
             out.fill_inserted = sqlite3_changes(db_) > 0;
         }
         for (const auto& leg : legs) {
-            if (!ok) break;
+            if (!ok || spelled_otherwise) break;
             sqlite3_reset(leg_stmt);
             sqlite3_clear_bindings(leg_stmt);
             sqlite3_bind_text (leg_stmt, 1, leg.entry_time.c_str(), -1, SQLITE_TRANSIENT);
@@ -2113,9 +2163,8 @@ std::optional<Database::TakeBooking> Database::book_take(
         // stops the whole booking -- nothing of it is written and its hold
         // stays -- while a replay of the same take, in either spelling of its
         // id, passes.
-        std::string conflict;
         for (const auto& coin : receipt_coin_ids) {
-            if (!ok) break;
+            if (!ok || spelled_otherwise) break;
             sqlite3_reset(claim_stmt);
             sqlite3_clear_bindings(claim_stmt);
             sqlite3_bind_text(claim_stmt, 1, coin.c_str(), -1, SQLITE_TRANSIENT);
@@ -2153,6 +2202,7 @@ std::optional<Database::TakeBooking> Database::book_take(
         }
         finalize_all();
         fill_stmt = leg_stmt = claim_stmt = release_stmt = owner_stmt = nullptr;
+        fill_spelled = leg_spelled = nullptr;
         char* err = nullptr;
         if (sqlite3_exec(db_, ok ? "COMMIT;" : "ROLLBACK;", nullptr, nullptr, &err) != SQLITE_OK) {
             spdlog::error("[Database] book_take: {} failed: {}", ok ? "COMMIT" : "ROLLBACK",
@@ -2641,6 +2691,8 @@ void Database::run_migrations()
     // Forward-compatible column migrations for pre-existing databases.
     // We intentionally ignore "duplicate column name" errors.
     sqlite3_exec(db_, "ALTER TABLE trade_log ADD COLUMN offer_hash TEXT;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE take_holds ADD COLUMN exposure TEXT NOT NULL DEFAULT '';",
                  nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "ALTER TABLE trade_log ADD COLUMN acquisition_ts TEXT;",
                  nullptr, nullptr, nullptr);

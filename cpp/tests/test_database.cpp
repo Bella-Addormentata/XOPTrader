@@ -713,12 +713,53 @@ TEST(DatabaseTest, BookTakeRefusesACoinAnotherTakeClaimed) {
     ASSERT_EQ(holds->size(), 1u);
     EXPECT_EQ(holds->front().hold_key, "take:0x5ed85168");
 
-    // The same take replayed in the other spelling of its id still passes.
+    // [review #262 r5] The same take replayed in the other spelling of its id
+    // is a replay: no second row, no second legs, no claim; its hold ends.
+    xop::DbTakeHold replay_hold = hold;
+    replay_hold.hold_key = "take:72A48007";
+    replay_hold.trade_id = "72A48007";
+    ASSERT_TRUE(db.save_take_hold(replay_hold));
     xop::DbTakerFill replay = fill;
     replay.trade_id = "72A48007";
-    const auto again = db.book_take(replay, {}, {"c0ffee"}, "");
+    xop::DbLedgerEntry replay_leg = leg;
+    replay_leg.event_id = "take:72A48007";
+    const auto again = db.book_take(replay, {replay_leg}, {"c0ffee"}, "take:72A48007");
     ASSERT_TRUE(again.has_value());
+    EXPECT_FALSE(again->fill_inserted);
     EXPECT_EQ(again->legs_inserted, 0u);
+    EXPECT_EQ(db.ledger_balances().at("xch"), 5'000'000'000'000LL);
+    sqlite3* raw = nullptr;
+    ASSERT_EQ(sqlite3_open_v2(temp.path().string().c_str(), &raw, SQLITE_OPEN_READONLY, nullptr),
+              SQLITE_OK);
+    sqlite3_stmt* count = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(raw, "SELECT COUNT(*) FROM taker_fills;", -1, &count, nullptr),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(count), SQLITE_ROW);
+    EXPECT_EQ(sqlite3_column_int(count, 0), 1);
+    sqlite3_finalize(count);
+    sqlite3_close(raw);
+    holds = db.take_holds();
+    ASSERT_TRUE(holds.has_value());
+    for (const auto& h : *holds) EXPECT_NE(h.hold_key, "take:72A48007");
+}
+
+TEST(DatabaseTest, TakeHoldsKeepTheirExposure) {
+    // [review #262 r5] What a take moves is restored as it was written.
+    TempDbPath temp("take_hold_exposure");
+    {
+        xop::Database db(temp.path().string());
+        xop::DbTakeHold hold;
+        hold.hold_key = "uncertain:nMDyHor9J8";
+        hold.kind     = "uncertain";
+        hold.offer_id = "nMDyHor9J8";
+        hold.exposure = "xch=5000000000000;db1a=423000";
+        ASSERT_TRUE(db.save_take_hold(hold));
+    }
+    xop::Database reopened(temp.path().string());
+    const auto holds = reopened.take_holds();
+    ASSERT_TRUE(holds.has_value());
+    ASSERT_EQ(holds->size(), 1u);
+    EXPECT_EQ(holds->front().exposure, "xch=5000000000000;db1a=423000");
 }
 
 TEST(DatabaseTest, InventoryStateUpsertReplacesPriorSnapshot) {

@@ -129,7 +129,8 @@ the ledger held 44.54 XCH that never moved.
 - **Booked on settlement.**  A take's legs are posted only once the wallet
   reports its trade CONFIRMED and the coin it pays us -- exactly each amount
   the maker offered, in that asset's own wallet -- is in our coin store, at
-  the trade's height or up to two blocks after it.  The legs are the wallet's
+  the trade's height or up to two blocks after it, and as deep as a maker
+  fill's payment must be (`strategy.confirmation_depth_blocks`).  The legs are the wallet's
   own amounts, at the block that payment landed in; a leg at or below its
   asset's opening block is suppressed, as for a fill.  A settled take whose
   record does not read as two legs of its pair as configured is kept tracked,
@@ -141,7 +142,10 @@ the ledger held 44.54 XCH that never moved.
   are read again after the proof and before the booking, so the divergence
   control ties the booked take to a snapshot that holds it.
 - **A take that fails books nothing.**  FAILED or CANCELLED in the wallet: no
-  legs, no `taker_fills` row.
+  legs, no `taker_fills` row.  A take still pending is given up after five
+  hours only on an answer the wallet gave, never on a read that failed; the
+  sweep still books it if it settles.  A take booked under one spelling of
+  its id is not booked again under the other (`0x<id>` or `<id>`, any case).
 - **One take of an offer at a time.**  While a take of a Dexie offer is
   unsettled the engine does not take that offer again, and a take request that
   may have reached the wallet unanswered is never re-sent.  The hold is written
@@ -149,15 +153,21 @@ the ledger held 44.54 XCH that never moved.
   take is tracked, or an unanswered request held, the divergence control's
   tolerance includes what that take moves, so a take about to be booked is
   not absorbed by an auto-adjust first.  Until the saved holds are read back
-  at start, no take is sent and the divergence control does not run.
+  at start, no take is sent and the divergence control does not run.  A hold
+  keeps the per-asset exposure it was written with.  An unanswered request's
+  hold lasts at least 64 blocks, and then until a sweep finds no take of ours
+  unresolved in the wallet (960 blocks at most).
 - **The sweep.**  A settled take of ours that the ledger does not hold and the
   engine is not tracking -- a request that timed out, a take of a process that
   has since stopped -- is booked from the wallet's record of it after the same
   proof, under strategy `wallet_sweep`, with fee 0 (the wallet's record does
-  not state our fee).  It leaves to the top-up ingest every GUI take the GUI
-  may still confirm (every `dexie_takes` row but a `failed` one), and waits
-  when that table cannot be read; the ingest in turn books nothing the sweep
-  booked.  It asks the ledger under both spellings of a take's event id
+  not state our fee).  It reads the day's takes page by page and the pending
+  ones, and what each unresolved take moves -- pending, settled but not yet
+  booked -- is the divergence control's tolerance until the next sweep.  It
+  leaves to the top-up ingest every GUI take the GUI may still confirm (every
+  `dexie_takes` row but a `failed` one), and waits when that table cannot be
+  read; the ingest in turn books nothing the sweep booked, and counts the
+  GUI's unbooked takes as tolerance every heartbeat.  It asks the ledger under both spellings of a take's event id
   (`take:0x<id>` and the top-up ingest's `take:<id>`), and looks back one day;
   older history is a repair's.
 
