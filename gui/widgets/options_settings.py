@@ -612,19 +612,23 @@ class OptionsSettingsSection:
             except ValueError:
                 strikes.append(0)
         mode = self.expiry_mode.currentIndex()
+        # The book mints only for expiries past the stop window from now.
+        stop_ends = int(self._clock()) + self._stop_seconds
         if mode == _EXPIRY_ROLLING:
             # [review #261] As the book counts them now: a month-end Friday
             # that is also one of the weeklies is one expiry, not two.
             rule = options_config.ExpiryRule(
                 weekly=self.expiry_weeks.value(), monthly=self.expiry_months.value()
             )
-            expiries = len(rule.at(int(self._clock()) + self._stop_seconds))
+            expiries = len(rule.at(stop_ends))
         elif mode == _EXPIRY_FIXED:
             dates = _text_list(self.expiries.text())
             try:
                 # [review #254] As the book counts them: the same moment
                 # written twice, or in two UTC offsets, is one expiry.
-                expiries = options_config.distinct_expiries(dates)
+                # [review #261] A date already past, or inside the stop
+                # window, gets no new contract: it is not counted.
+                expiries = options_config.distinct_expiries(dates, after=stop_ends)
             except options_config.OptionsConfigError:
                 expiries = len(set(dates))  # Save says what is wrong with it
         else:

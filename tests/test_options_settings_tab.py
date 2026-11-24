@@ -732,6 +732,27 @@ def test_the_ladder_hint_counts_a_month_end_that_is_also_a_weekly_once(panel, tm
     )
 
 
+def test_the_ladder_hint_leaves_out_dates_the_book_no_longer_mints_for(panel, tmp_path):
+    """[review #261] Fixed dates already past or inside the stop window (6 h) get no
+    new contract, so the hint counts only the ones the book still mints for."""
+    dates = ["2026-11-20T08:00:00Z", "2026-11-24T20:00:00Z", "2026-11-27T08:00:00Z"]
+    limits = {**_FOUR_SLOTS, "max_locked_xch": 22, "max_contracts": 4}
+    cfg_path = _auto_book(tmp_path, expiries=dates, call_strikes_pct=[110], limits=limits)
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+
+    tab._clock = lambda: 1795536000  # 2026-11-24 16:00Z: only Nov 27 is left
+    tab._sync_rows()
+    assert tab.size_hint.text() == (
+        "Calls, smallest first: 1 of 1 XCH, then 1 of 10 XCH (11 XCH locked). " + _NO_ROOM
+    )
+    tab._clock = lambda: 1795334400  # 2026-11-22 08:00Z: Nov 24 and Nov 27
+    tab._sync_rows()
+    assert tab.size_hint.text().startswith(
+        "Calls, smallest first: 2 of 1 XCH, then 2 of 10 XCH (22 XCH locked)."
+    )
+
+
 def test_switching_to_fixed_writes_the_number_in_the_box(panel, tmp_path):
     cfg_path = _auto_book(tmp_path)
     panel.load_config(str(cfg_path))

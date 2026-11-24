@@ -239,13 +239,18 @@ def _expiry(raw: Any) -> int:
     return int(moment.timestamp())
 
 
-def distinct_expiries(dates: Any) -> int:
+def distinct_expiries(dates: Any, after: int | None = None) -> int:
     """[LADDER] How many expiries a written list of dates comes to, as :func:`parse` counts.
 
-    The same moment written twice, or in two UTC offsets, is one expiry. Raises
+    The same moment written twice, or in two UTC offsets, is one expiry. With
+    ``after``, only those later than it: with now plus the stop window, the
+    dates :meth:`OptionsConfig.quotable_expiries` still mints for. Raises
     OptionsConfigError for an entry :func:`parse` would refuse.
     """
-    return len({_expiry(item) for item in dates})
+    moments = {_expiry(item) for item in dates}
+    if after is not None:
+        moments = {moment for moment in moments if moment > after}
+    return len(moments)
 
 
 #: [DEFAULTS] With neither strike list written, the book writes both sides,

@@ -591,6 +591,10 @@ def test_the_same_expiry_written_twice_is_one_expiry() -> None:
     assert config.distinct_expiries(same) == 1
     assert config.distinct_expiries([*same, "2026-12-08T13:00:00Z"]) == 2
     assert config.distinct_expiries([]) == 0
+    # [review #261] Only those the book still mints for: later than now plus the stop window.
+    stop_ends = 1796734800 - 3600  # 2026-12-08 12:00Z, an hour before the later date
+    assert config.distinct_expiries([*same, "2026-12-08T13:00:00Z"], after=stop_ends) == 1
+    assert config.distinct_expiries(same, after=stop_ends) == 0
     with pytest.raises(config.OptionsConfigError):
         config.distinct_expiries(["next friday"])
     assert _parse(contract_xch="auto", expiries=same).expiries == (1796130000,)
