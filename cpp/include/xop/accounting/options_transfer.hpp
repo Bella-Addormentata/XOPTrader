@@ -154,6 +154,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -650,6 +651,18 @@ struct OptionsTopUpFacts {
     /// known.
     bool         sent_before_sightings{false};
 };
+
+/// Whether a send went out before the fence's sightings begin
+/// (OptionsTopUpFacts::sent_before_sightings).  The options book stamps a
+/// send in whole seconds, the fence its first list to the fraction: they are
+/// compared by whole second, and a send in the first list's own second is
+/// not before it (its coin cannot be in a list of that second: arriving takes
+/// a block).  No sightings at all (`seen_since_unix` <= 0): before.
+[[nodiscard]] inline bool sent_before_sightings(std::int64_t sent_at, double seen_since_unix) noexcept
+{
+    if (!(seen_since_unix > 0.0)) return true;
+    return static_cast<double>(sent_at) < std::floor(seen_since_unix);
+}
 
 /// Where a top-up the books do not hold yet stands.
 enum class OptionsTopUpPlace {

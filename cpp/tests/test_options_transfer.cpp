@@ -560,6 +560,22 @@ TEST(OptionsTransfer, GoingDownATopUpIsPlacedByItsOwnCoinInTheListsTheFenceHad)
     EXPECT_EQ(place_topup(f), Place::NotYet) << "never confirmed, and not listed";
 }
 
+TEST(OptionsTransfer, ASendIsBeforeTheSightingsByWholeSeconds)
+{
+    // The book stamps a send in whole seconds; the fence's first list has a
+    // fraction. A send in that list's own second is not before it: its coin
+    // cannot be in a list of the second it was sent in.
+    const double first_list = 1'795'300'000.4;
+    EXPECT_FALSE(sent_before_sightings(1'795'300'000, first_list)) << "the same second";
+    EXPECT_FALSE(sent_before_sightings(1'795'300'001, first_list));
+    EXPECT_TRUE(sent_before_sightings(1'795'299'999, first_list));
+    EXPECT_FALSE(sent_before_sightings(1'795'300'000, 1'795'300'000.0)) << "a tie is not before";
+    EXPECT_TRUE(sent_before_sightings(1'795'299'999, 1'795'300'000.0));
+    // No sightings at all: nothing says a list did not have it.
+    EXPECT_TRUE(sent_before_sightings(1'795'300'000, 0.0));
+    EXPECT_TRUE(sent_before_sightings(1'795'300'000, -1.0));
+}
+
 TEST(OptionsTransfer, GoingDownATopUpWhoseCoinCannotBeFoundHoldsTheEvent)
 {
     using Place = OptionsTopUpPlace;
@@ -964,8 +980,8 @@ TEST(OptionsTransferWiring, ATopUpIsConfirmedByItsOwnTransactionBeforeItIsBooked
     // whether the send is older than those sightings.
     EXPECT_NE(position_of(pass, "facts.coin_seen = std::find(seen.begin(), seen.end(), *coin_id) != seen.end();"),
               npos);
-    EXPECT_NE(position_of(pass, "facts.sent_before_sightings = going_down && (lowering->seen_since_unix <= 0.0 "
-                                "|| static_cast<double>(row.sent_at) < lowering->seen_since_unix);"),
+    EXPECT_NE(position_of(pass, "facts.sent_before_sightings = going_down && "
+                                "accounting::sent_before_sightings(row.sent_at, lowering->seen_since_unix);"),
               npos);
     // Every case that cannot place a send holds a fence-down event: one
     // whose coin cannot be read yet, and one a refused write left unbooked.

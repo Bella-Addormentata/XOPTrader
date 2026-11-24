@@ -24946,8 +24946,7 @@ asio::awaitable<bool> Engine::book_options_topups(
         facts.book_confirmed = flow.status == accounting::OptionsFlowStatus::Ready;
         facts.lowering       = going_down;
         facts.sent_before_sightings = going_down
-            && (lowering->seen_since_unix <= 0.0
-                || static_cast<double>(row.sent_at) < lowering->seen_since_unix);
+            && accounting::sent_before_sightings(row.sent_at, lowering->seen_since_unix);
         std::optional<std::string> coin_id;
         if (!facts.book_confirmed || need_coin) {
             if (const auto proof = co_await options_topup_proof(
