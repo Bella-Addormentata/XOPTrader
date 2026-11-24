@@ -189,6 +189,24 @@ def _same_number(first: Any, second: Any) -> bool:
         return False
 
 
+def _tolerance_value(text: str) -> Any:
+    """[PEG] The off-peg tolerance field as YAML: None when blank, else a number.
+
+    A trailing ``%`` is allowed. Anything else is written as typed, for the
+    book's parser to refuse with its reason.
+    """
+    text = text.strip().removesuffix("%").strip()
+    if not text:
+        return None
+    try:
+        number = float(text)
+    except ValueError:
+        return text
+    if math.isfinite(number) and number == int(number):
+        return int(number)
+    return number
+
+
 def _limit_text(value: Any) -> str:
     if value is None or value == "":
         return ""
@@ -231,6 +249,10 @@ class OptionsSettingsSection:
         self._clock: Callable[[], float] = time.time
         #: The number boxes edited since the last load.
         self._touched: set[str] = set()
+        #: [PEG] market.peg_tolerance_pct as loaded, and the field's text for it.
+        self._loaded_tolerance: tuple[Any, str] = (None, "")
+        #: [review #263] options.market loaded as something other than a mapping.
+        self._market_malformed = False
         self.widget = self._build()
 
     # -- building ----------------------------------------------------------------
@@ -447,20 +469,25 @@ class OptionsSettingsSection:
         layout.addWidget(limits)
 
         # -- [PEG] the market checks --
+        # A text field, not a number box [review #263]: the book takes any
+        # number from 0 up, and a box would round or clamp what config.yaml has
+        # (0.04 shown as 0.0, the strict rule) and could not be set to what it
+        # already shows. The field shows the number as written; blank is the
+        # default.
+        from gui.services.options import config as options_config
+
         checks = QGroupBox("Market checks")
         checks_form = QFormLayout(checks)
-        self.peg_tolerance = QDoubleSpinBox()
-        self.peg_tolerance.setRange(0.0, 50.0)
-        self.peg_tolerance.setDecimals(1)
-        self.peg_tolerance.setSingleStep(0.5)
-        self.peg_tolerance.setSuffix(" %")
+        self.peg_tolerance = QLineEdit()
+        default = f"{options_config.DEFAULT_PEG_TOLERANCE_PCT:g}"
+        self.peg_tolerance.setPlaceholderText(f"{default}, the default")
         self.peg_tolerance.setToolTip(
-            "options.market.peg_tolerance_pct: how far CoinGecko's XCH price may sit outside "
-            "what the Dexie book pays and asks for the hedge size, and how far that book may "
-            "be crossed, before quoting stops as a possible depeg of the quote asset. "
-            "0 = strictly inside it, never crossed."
+            "options.market.peg_tolerance_pct, in %: how far CoinGecko's XCH price may sit "
+            "outside what the Dexie book pays and asks for the hedge size, and how far that "
+            "book may be crossed, before quoting stops as a possible depeg of the quote asset. "
+            f"0 = strictly inside it, never crossed. Blank: the default, {default}."
         )
-        checks_form.addRow("Off-peg tolerance:", self.peg_tolerance)
+        checks_form.addRow("Off-peg tolerance (%):", self.peg_tolerance)
         checks_hint = QLabel(
             "Stale Dexie offers often sit a percent or two off the market; a depeg of the "
             "quote asset goes further. Quotes are priced on CoinGecko's price either way."
@@ -491,8 +518,15 @@ class OptionsSettingsSection:
             self.call_strikes,
             self.put_strikes,
             *self.limit_fields.values(),
+            self.peg_tolerance,
         ):
             edit.textChanged.connect(self._changed)
+        # [review #263] Before _changed: Qt calls slots in the order they were
+        # connected, and _changed's notification collects the tab, which must
+        # already count the box as edited, or the first edit is sent as the
+        # number loaded.
+        for key, box in self._number_boxes().items():
+            box.valueChanged.connect(lambda _value, key=key: self._touched.add(key))
         for spin in (
             self.dedicated_port,
             self.target_xch,
@@ -501,11 +535,8 @@ class OptionsSettingsSection:
             self.contract_xch,
             self.expiry_weeks,
             self.expiry_months,
-            self.peg_tolerance,
         ):
             spin.valueChanged.connect(self._changed)
-        for key, box in self._number_boxes().items():
-            box.valueChanged.connect(lambda _value, key=key: self._touched.add(key))
         self._sync_rows()
         return page
 
@@ -516,7 +547,6 @@ class OptionsSettingsSection:
             "target_xch": self.target_xch,
             "target_quote": self.target_quote,
             "target_tolerance": self.target_tolerance,
-            "peg_tolerance": self.peg_tolerance,
         }
 
     def inputs(self) -> list[QWidget]:
@@ -798,16 +828,16 @@ class OptionsSettingsSection:
             self.target_mode.setCurrentIndex(_TARGET_LIMITS)
 
         self._stop_seconds = _stop_seconds(section.get("stop_before_expiry_seconds"))
-        market = section.get("market") if isinstance(section.get("market"), dict) else {}
-        # [PEG] Not written: the box shows the book's default, and a save leaves
-        # it unwritten until the box is edited.
-        from gui.services.options import config as options_config
-
+        raw_market = section.get("market")
+        market = raw_market if isinstance(raw_market, dict) else {}
+        # [PEG] As written; blank when not written (or written blank), which
+        # the book reads as the default. [review #263] A market section that
+        # is not a mapping is kept for the book's parser to refuse on Save
+        # until the field is edited.
+        self._market_malformed = raw_market is not None and not isinstance(raw_market, dict)
         tolerance = market.get("peg_tolerance_pct")
-        default = options_config.DEFAULT_PEG_TOLERANCE_PCT
-        shown = default if tolerance is None else tolerance
-        _show_number(self.peg_tolerance, _number(shown, default))
-        self._loaded_numbers["peg_tolerance"] = tolerance
+        self.peg_tolerance.setText(_limit_text(tolerance))
+        self._loaded_tolerance = (tolerance, self.peg_tolerance.text())
         size = section.get("contract_xch")
         self._hedge_follows = None
         if size is None or (isinstance(size, str) and size.strip().lower() == "auto"):
@@ -847,6 +877,8 @@ class OptionsSettingsSection:
         if "call_strikes_pct" not in section and "put_strikes_pct" not in section:
             # [DEFAULTS] What the book writes with no strikes written: shown, so
             # a save keeps both sides instead of writing none.
+            from gui.services.options import config as options_config
+
             calls = list(options_config.DEFAULT_CALL_STRIKES_PCT)
             puts = list(options_config.DEFAULT_PUT_STRIKES_PCT)
         self.call_strikes.setText(_list_text(calls))
@@ -865,12 +897,19 @@ class OptionsSettingsSection:
         value = box.value()
         return value if isinstance(box, QSpinBox) else round(value, digits)
 
-    def _peg_tolerance_out(self) -> Any:
-        """[PEG] The off-peg tolerance to write: None while unwritten and unedited."""
-        unwritten = self._loaded_numbers.get("peg_tolerance") is None
-        if unwritten and "peg_tolerance" not in self._touched:
-            return None
-        return self._number_out("peg_tolerance", self.peg_tolerance, 1)
+    def _peg_tolerance_out(self) -> tuple[bool, Any]:
+        """[PEG] Whether a save sends ``market.peg_tolerance_pct``, and what.
+
+        Unedited: the value as loaded, None (left out) when it was not written,
+        but nothing at all under a market section that is not a mapping, which
+        stays for the book's parser to refuse [review #263]. Edited: the
+        field's number, None when blank, or its text for the parser to judge.
+        """
+        loaded, shown = self._loaded_tolerance
+        text = self.peg_tolerance.text().strip()
+        if text == shown:
+            return not self._market_malformed, loaded
+        return True, _tolerance_value(text)
 
     def load_from_editor(self, options: Any, on_disk: Any) -> None:
         """[review] Load from Editor: show the editor's ``options``, told from ``on_disk``.
@@ -961,10 +1000,13 @@ class OptionsSettingsSection:
             "limits": {key: _limit_value(field.text()) for key, field in self.limit_fields.items()},
         }
         # [PEG] None while unwritten and unedited: the book's default, which is
-        # what the box shows (finish() removes the None). Always sent, so a
+        # what the field shows (finish() removes the None). Sent then too, so a
         # value deleted in the YAML editor and loaded from it goes from the
-        # file too, instead of the merge keeping it unseen [review #263].
-        market: dict[str, Any] = {"peg_tolerance_pct": self._peg_tolerance_out()}
+        # file as well, instead of the merge keeping it unseen [review #263].
+        market: dict[str, Any] = {}
+        send, tolerance = self._peg_tolerance_out()
+        if send:
+            market["peg_tolerance_pct"] = tolerance
         if self._hedge_follows is not None and not _same_number(
             options["contract_xch"], self._hedge_follows
         ):
@@ -972,7 +1014,8 @@ class OptionsSettingsSection:
             # old one: back to its default, one contract of the smallest size
             # (finish() removes the None).
             market["hedge_size_xch"] = None
-        options["market"] = market
+        if market:
+            options["market"] = market
         mode = self.target_mode.currentIndex()
         if mode == _TARGET_OFF:
             options["target"] = False
