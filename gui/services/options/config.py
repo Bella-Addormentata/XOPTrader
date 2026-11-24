@@ -123,6 +123,21 @@ class OptionsConfigError(ValueError):
 _THIS_MACHINE = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
+def _mapping(section: dict, key: str) -> dict:
+    """``options.<key>``: a mapping, or empty when left out or blank (null).
+
+    [review #263] Only null reads as empty. ``[]``, ``false`` or ``0`` were read
+    as ``{}`` too, so a malformed section (a market with its strict 0, say)
+    passed as its defaults instead of being refused.
+    """
+    raw = section.get(key)
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise OptionsConfigError(f"options.{key} must be a mapping")
+    return raw
+
+
 def _number(section: dict, key: str, default: float | None, *, minimum: float = 0.0) -> float:
     raw = section.get(key, default)
     if raw is None:
@@ -705,9 +720,7 @@ def parse(root: Any) -> OptionsConfig | None:
     if network not in (MAINNET, TESTNET11):
         raise OptionsConfigError("options.network must be mainnet or testnet11")
 
-    wallet_raw = section.get("wallet") or {}
-    if not isinstance(wallet_raw, dict):
-        raise OptionsConfigError("options.wallet must be a mapping")
+    wallet_raw = _mapping(section, "wallet")
     if _flag(wallet_raw, "share_trading_wallet", False):
         # [DEFAULTS] Sharing the trading wallet: its own connection (chia.*)
         # for whatever options.wallet does not write itself.
@@ -910,20 +923,11 @@ def parse(root: Any) -> OptionsConfig | None:
             "options.refresh_before_seconds must be shorter than offer_ttl_seconds"
         )
 
-    pricing_raw = section.get("pricing") or {}
-    limits_raw = section.get("limits") or {}
-    market_raw = section.get("market") or {}
-    node_raw = section.get("node") or {}
-    splash_raw = section.get("splash") or {}
-    for name, value in (
-        ("pricing", pricing_raw),
-        ("limits", limits_raw),
-        ("market", market_raw),
-        ("node", node_raw),
-        ("splash", splash_raw),
-    ):
-        if not isinstance(value, dict):
-            raise OptionsConfigError(f"options.{name} must be a mapping")
+    pricing_raw = _mapping(section, "pricing")
+    limits_raw = _mapping(section, "limits")
+    market_raw = _mapping(section, "market")
+    node_raw = _mapping(section, "node")
+    splash_raw = _mapping(section, "splash")
 
     try:
         splash_config = SplashConfig(

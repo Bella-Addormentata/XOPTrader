@@ -1055,13 +1055,14 @@ def test_a_market_section_that_is_not_a_mapping_is_refused_until_corrected(panel
     assert _saved_options(cfg_path)["market"] == {"peg_tolerance_pct": 2}
 
 
+@pytest.mark.parametrize("malformed", [["peg_tolerance_pct", 0], [], False, 0])
 def test_a_market_made_malformed_in_the_editor_is_refused_not_swapped_for_the_file_s(
-    panel, tmp_path, monkeypatch
+    panel, tmp_path, monkeypatch, malformed
 ):
     """[review #263] Loaded from the editor, a market section that is not a mapping showed
     the default in the field, while a save merged onto the file on disk kept that file's
     market, its strict 0 too, unseen. It is sent as loaded, for the book's parser to
-    refuse, until a tolerance is typed."""
+    refuse, an empty one too, until a tolerance is typed."""
     monkeypatch.setattr(
         QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
     )
@@ -1071,7 +1072,7 @@ def test_a_market_made_malformed_in_the_editor_is_refused_not_swapped_for_the_fi
     tab = panel._options_section
 
     root = yaml.safe_load(panel._yaml_editor.toPlainText())
-    root["options"]["market"] = ["peg_tolerance_pct", 0]
+    root["options"]["market"] = malformed
     panel._yaml_editor.setPlainText(yaml.safe_dump(root, sort_keys=False))
     panel._on_load_from_editor()
 
