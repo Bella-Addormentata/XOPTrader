@@ -71,17 +71,24 @@
 //         (judge_topup: Deferred).  Its coins are trading funds, and the
 //         next fence-up event takes them with everything else there;
 //       - a top-up SENT before the newest fence-up event's list is inside
-//         that event (topup_inside_fence_event): never booked;
+//         that event (topup_inside_fence_event): never booked -- unless that
+//         list, when this process booked the event, does not hold the send's
+//         own coin (topup_in_rise): it was still on its way, and is booked
+//         when it arrives;
 //       - any other confirmed top-up is booked.
+//   * A top-up's fee is booked on its own (split_topup), once the send has
+//     confirmed, wherever its principal goes: a fence event takes coins at
+//     the address, and the fee was burned from the trading funds.
 //   * Top-ups go first: a fence-down event is booked only in a pass where no
 //     confirmed top-up that belongs before it is still waiting (for a price,
 //     a wallet snapshot).
 //   * The fence going down returns the coins of its list.  A top-up the
 //     books do not hold yet is booked ahead of that event when the list
 //     holds ITS coin -- the one its own transaction created, by id, never a
-//     coin that merely looks like it -- whatever any record says yet.  A
-//     recent one that has arrived and is not in the list arrived after the
-//     list was taken: it is the next fence-up event's.  One whose coin
+//     coin that merely looks like it -- whatever any record says yet.  One
+//     sent shortly before the fence went down that has arrived and is not in
+//     the list arrived after the list was taken: it is the next fence-up
+//     event's.  One whose coin
 //     cannot be found yet (the wallet does not answer) holds the event, for
 //     as long as the send can still be on its way: two hours
 //     (kOptionsPendingSlackSeconds).  All of it is place_topup.  A fence
@@ -130,7 +137,9 @@
 //     the address holds at that start, less whatever was spent from it.
 //   * The fence's log lives in the process.  Changes it had not yet told the
 //     books of at a stop are lost; the next start compares the books with
-//     where it finds the fence.
+//     where it finds the fence.  So does the list a fence-up event took: after
+//     a restart, a top-up sent before that event is inside it by its send
+//     time alone.
 //   * Switching the options book off in config.yaml (options.enabled, not
 //     the toolbar) takes the fence away with no event.
 //
@@ -142,6 +151,7 @@
 
 #include "xop/types.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -162,6 +172,8 @@ inline constexpr const char* kOptionsLeg             = "options";
 inline constexpr const char* kOptionsFeeLeg          = "fee";
 inline constexpr const char* kOptionsEventPrefix     = "options_";
 inline constexpr const char* kOptionsTopUpPrefix     = "options_topup:";
+/// A top-up's fee, booked on its own (split_topup).
+inline constexpr const char* kOptionsTopUpFeePrefix  = "options_topup_fee:";
 inline constexpr const char* kOptionsFencePrefix     = "options_fence_";
 inline constexpr const char* kOptionsFenceUpPrefix   = "options_fence_up:";
 inline constexpr const char* kOptionsFenceDownPrefix = "options_fence_down:";
@@ -389,6 +401,38 @@ namespace detail {
     return flow;
 }
 
+/// A top-up's two parts, booked apart: the capital it moved to the options
+/// address, and the fee its send burned from the trading funds' XCH.  The
+/// fee left the trading funds once the send confirmed, wherever the
+/// principal is placed -- a fence event can take the principal (it is at the
+/// address), never the fee.  `fee` is nullopt for a send that paid none.
+struct OptionsTopUpParts {
+    OptionsFlow                principal;
+    std::optional<OptionsFlow> fee;
+};
+
+[[nodiscard]] inline OptionsTopUpParts split_topup(const OptionsFlow& topup)
+{
+    OptionsTopUpParts parts;
+    parts.principal = topup;
+    parts.principal.legs.clear();
+    const std::string_view prefix{kOptionsTopUpPrefix};
+    const std::string transaction = topup.event_id.rfind(prefix, 0) == 0
+        ? topup.event_id.substr(prefix.size()) : topup.event_id;
+    for (const auto& leg : topup.legs) {
+        if (leg.leg != kOptionsFeeLeg) {
+            parts.principal.legs.push_back(leg);
+            continue;
+        }
+        OptionsFlow fee = topup;
+        fee.legs      = {leg};
+        fee.event_id  = std::string{kOptionsTopUpFeePrefix} + transaction;
+        fee.reference = "fee of " + topup.reference;
+        parts.fee     = std::move(fee);
+    }
+    return parts;
+}
+
 /// The fence going up (`went_up`) or down, holding `held` (the total of
 /// each asset at the options address, at the transition).  Up, that capital
 /// leaves the trading funds; down, it returns.  An asset with nothing held
@@ -461,6 +505,21 @@ enum class OptionsFenceBooked { Unknown, Up, Down };
 {
     if (up_stamp.empty()) return false;
     return detail::iso_before(topup_floor_iso, up_stamp).value_or(true);
+}
+
+/// Whether a top-up the send time puts inside the newest fence-up event
+/// (topup_inside_fence_event) is in what that event took.  The event booked
+/// its list; a send still on its way when the list was taken went out
+/// before and is not in it -- the book switched off and on again within
+/// minutes.  `rise_coin_ids`: that list's coins, when this process booked the
+/// event (nullopt otherwise); `coin_id`: the send's own coin, from the
+/// wallet's record of it (nullopt: unknown).  Without either the send time
+/// decides, as it must after a restart.
+[[nodiscard]] inline bool topup_in_rise(const std::optional<std::vector<std::string>>& rise_coin_ids,
+                                        const std::optional<std::string>& coin_id)
+{
+    if (!rise_coin_ids || !coin_id) return true;
+    return std::find(rise_coin_ids->begin(), rise_coin_ids->end(), *coin_id) != rise_coin_ids->end();
 }
 
 /// What becomes of a confirmed top-up the ledger does not hold yet.
@@ -581,6 +640,11 @@ struct OptionsTopUpFacts {
     bool         lowering{false};
     /// ...holds that coin.
     bool         coin_returned{false};
+    /// The send went out at most kOptionsPendingSlackSeconds before the fence
+    /// went down (or after): only such a send can have arrived after the list
+    /// that event returns was taken.  The fence's moment, not the time the
+    /// books get to it.
+    bool         sent_near_lowering{false};
 };
 
 /// Where a top-up the books do not hold yet stands.
@@ -612,11 +676,11 @@ enum class OptionsTopUpPlace {
         // so its withdrawal goes first.
         if (f.coin_returned) return OptionsTopUpPlace::Book;
         if (!arrived) return OptionsTopUpPlace::NotYet;
-        // Arrived, and not in that list.  A recent send arrived after the
-        // list was taken: the fence went down with its coin uncounted.  An
-        // older one was listed while the fence was up and spent since (a
-        // mint): it left the trading funds then.
-        return f.recent ? OptionsTopUpPlace::After : OptionsTopUpPlace::Book;
+        // Arrived, and not in that list.  A send of shortly before the fence
+        // went down arrived after the list was taken: the fence went down
+        // with its coin uncounted.  An older one was listed while the fence
+        // was up and spent since (a mint): it left the trading funds then.
+        return f.sent_near_lowering ? OptionsTopUpPlace::After : OptionsTopUpPlace::Book;
     }
     // Without the wallet's record there is no telling where its coin is:
     // the event waits while the send can still be on its way.  After that

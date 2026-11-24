@@ -65,7 +65,7 @@ engine runs re-anchors the drawdown peak. The rules and their limits are in
 
 | What happens | What is booked |
 |---|---|
-| The options book tops the sub-account up while the fence is up | `options_withdrawal` of the amount and the send's fee, once the wallet's own record of that transaction says it confirmed. Event id `options_topup:<transaction>` |
+| The options book tops the sub-account up while the fence is up | `options_withdrawal` of the amount once it has arrived (event id `options_topup:<transaction>`), and of the send's fee once the send has confirmed, wherever the amount is placed (`options_topup_fee:<transaction>`) |
 | The fence goes up | `options_withdrawal` of what the address held at the first list after it went up. Event id `options_fence_up:<n>` |
 | The fence goes down | `options_deposit` of what the address held at the last list before it went down. Event id `options_fence_down:<n>` |
 | A mint, a clawback, an expiry | nothing: collateral moves between the options address and a contract, and no balance the engine reads changes |
@@ -85,7 +85,9 @@ fallback for a transaction the wallet no longer knows.
 
 Nothing is counted twice: while the books stand fence-down no top-up is
 booked, because its coins are trading funds and the next fence-up event
-takes them; a top-up sent before that event's list is inside it; and when
+takes them; a top-up sent before that event's list is inside it (unless that
+list, when this process booked it, lacks the top-up's own coin: it was still
+on its way); and when
 the fence goes down, a top-up the books do not hold yet is booked ahead of
 that event when the list it returns holds the top-up's own coin, by id,
 whatever any record says yet. A recent one that has arrived and is not in

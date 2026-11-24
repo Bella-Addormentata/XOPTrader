@@ -2062,6 +2062,12 @@ private:
     bool        options_books_loaded_{false};
     std::string options_last_fence_event_id_;
     std::string options_fence_up_stamp_;
+    /// The newest fence-up event's id, from the ledger ("" = none).
+    std::string options_fence_up_event_id_;
+    /// The newest fence-up event THIS process booked, and the coins of the
+    /// list it took (accounting::topup_in_rise).
+    std::string                             options_rise_event_id_;
+    std::optional<std::vector<std::string>> options_rise_coin_ids_;
     /// The fence's log of its changes was begun (rpc::CoinFence::
     /// begin_transitions): from then on every change reaches the books.
     bool        options_log_begun_{false};
@@ -2089,6 +2095,9 @@ private:
     /// is discarded once more in the heartbeat the tracker first holds a
     /// settled post-flow balance; bounded by risk.loss_window_blocks.
     BlockHeight           options_bridge_reanchor_block_{0};
+    /// The last process left that re-anchor owed (its marker in
+    /// capital_reconcile_pending): it is owed from the first heartbeat.
+    bool                  options_bridge_reanchor_restored_{false};
     /// Assets whose flows the tracker holds: their restart markers go once
     /// inventory_state has been written (persist_inventory_state), and not
     /// before -- a write that failed keeps them for the next.

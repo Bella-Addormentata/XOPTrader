@@ -125,6 +125,62 @@ TEST(OptionsTransfer, AQuoteTopUpMovesTheQuoteAssetAndPaysItsFeeInXch)
     EXPECT_EQ(flow.legs[1].delta_mojos, -10'000'000);
 }
 
+TEST(OptionsTransfer, ATopUpsFeeIsBookedApartFromItsPrincipal)
+{
+    // The fee was burned from the trading funds' XCH once the send
+    // confirmed; a fence event can take the principal (it is at the
+    // address), never the fee. So they are two events.
+    const OptionsTopUpParts parts = split_topup(classify_options_topup(xch_top_up(), kUsdc));
+    EXPECT_EQ(parts.principal.event_id, std::string{"options_topup:"} + kTxXch) << "as before";
+    ASSERT_EQ(parts.principal.legs.size(), 1u);
+    EXPECT_EQ(parts.principal.legs[0].leg, "options");
+    EXPECT_EQ(parts.principal.legs[0].delta_mojos, -1'500'000'000'000);
+    EXPECT_EQ(topup_amount(parts.principal), std::optional<std::uint64_t>{1'500'000'000'000})
+        << "its coin is still looked for by what was sent";
+    ASSERT_TRUE(parts.fee);
+    EXPECT_EQ(parts.fee->event_id, std::string{"options_topup_fee:"} + kTxXch);
+    EXPECT_EQ(parts.fee->event_type, "options_withdrawal");
+    ASSERT_EQ(parts.fee->legs.size(), 1u);
+    EXPECT_EQ(parts.fee->legs[0].leg, "fee");
+    EXPECT_EQ(parts.fee->legs[0].asset_id, "xch");
+    EXPECT_EQ(parts.fee->legs[0].delta_mojos, -10'000'000);
+    EXPECT_EQ(parts.fee->floor_iso, parts.principal.floor_iso);
+    EXPECT_EQ(parts.fee->status, parts.principal.status);
+    EXPECT_NE(parts.fee->reference, parts.principal.reference);
+    // The fee's id is not a top-up's: the transaction is read from the
+    // principal alone.
+    EXPECT_NE(parts.fee->event_id.rfind("options_topup:", 0), 0u);
+
+    // The quote asset's top-up pays its fee in XCH too.
+    const OptionsTopUpParts quote = split_topup(classify_options_topup(quote_top_up(), kUsdc));
+    ASSERT_TRUE(quote.fee);
+    EXPECT_EQ(quote.principal.legs[0].asset_id, kUsdc);
+    EXPECT_EQ(quote.fee->legs[0].asset_id, "xch");
+
+    // No fee, no fee event.
+    const OptionsTopUpParts free_send = split_topup(classify_options_topup(
+        with_detail(std::string{R"({"amount": 5, "asset": "XCH", "transaction": ")"} + kTxXch + R"("})"),
+        kUsdc));
+    EXPECT_FALSE(free_send.fee);
+    EXPECT_EQ(free_send.principal.legs.size(), 1u);
+}
+
+TEST(OptionsTransfer, ATopUpIsInsideAFenceUpEventOnlyIfThatEventTookItsCoin)
+{
+    const std::vector<std::string> rise{"aa", "bb"};
+    // The event's own list, from this process: its coin decides.
+    EXPECT_TRUE(topup_in_rise(rise, std::optional<std::string>{"aa"}));
+    EXPECT_FALSE(topup_in_rise(rise, std::optional<std::string>{"cc"}))
+        << "sent before the fence went up, still on its way when its list was taken";
+    // Without the list (booked by an earlier process) or the coin, the send
+    // time decides: inside.
+    EXPECT_TRUE(topup_in_rise(std::nullopt, std::optional<std::string>{"cc"}));
+    EXPECT_TRUE(topup_in_rise(rise, std::nullopt));
+    EXPECT_TRUE(topup_in_rise(std::nullopt, std::nullopt));
+    EXPECT_FALSE(topup_in_rise(std::vector<std::string>{}, std::optional<std::string>{"aa"}))
+        << "an event that took nothing took no top-up";
+}
+
 TEST(OptionsTransfer, ATopUpWithoutAFeeHasOneLeg)
 {
     const OptionsFlow none = classify_options_topup(
@@ -459,6 +515,7 @@ TEST(OptionsTransfer, GoingDownATopUpIsPlacedByItsOwnCoinInTheListReturned)
     OptionsTopUpFacts f;
     f.lowering = true;
     f.recent = true;
+    f.sent_near_lowering = true;
     f.coin_known = true;
 
     // In the list the fence-down event returns: its withdrawal goes first,
@@ -469,9 +526,9 @@ TEST(OptionsTransfer, GoingDownATopUpIsPlacedByItsOwnCoinInTheListReturned)
     f.wallet_confirmed = true;
     EXPECT_EQ(place_topup(f), Place::Book);
 
-    // Not in that list, and arrived: it came after the list was taken, so
-    // the fence went down with it uncounted -- the trading funds never lost
-    // it, and the next fence-up event takes it.
+    // Not in that list, and arrived: sent shortly before the fence went down,
+    // it came after the list was taken -- the trading funds never lost it,
+    // and the next fence-up event takes it.
     f.coin_returned = false;
     EXPECT_EQ(place_topup(f), Place::After);
     f.wallet_confirmed = false;
@@ -480,11 +537,17 @@ TEST(OptionsTransfer, GoingDownATopUpIsPlacedByItsOwnCoinInTheListReturned)
     // Not in that list, and not arrived: nothing yet.
     f.book_confirmed = false;
     EXPECT_EQ(place_topup(f), Place::NotYet);
-    // An older send not in that list was listed while the fence was up and
-    // spent since (a mint): it left the trading funds then.
-    f.recent = false;
+
+    // Sent long before the fence went down, and not in its list: it was
+    // listed while the fence was up and spent since (a mint).
     f.wallet_confirmed = true;
+    f.sent_near_lowering = false;
     EXPECT_EQ(place_topup(f), Place::Book);
+    // That is the fence's moment, not the books': the same send is After
+    // however long the event then waits to be booked.
+    f.sent_near_lowering = true;
+    f.recent = false;
+    EXPECT_EQ(place_topup(f), Place::After) << "two hours after the send, the lowering is what counts";
     f.wallet_confirmed = false;
     EXPECT_EQ(place_topup(f), Place::NotYet) << "never confirmed, and not listed";
 }
@@ -840,51 +903,76 @@ TEST(OptionsTransferWiring, ATopUpIsConfirmedByItsOwnTransactionBeforeItIsBooked
     const std::string raw = read_engine_cpp();
     const std::string pass = function_body(raw, kTopUps);
     ASSERT_FALSE(pass.empty());
+    // In the books already -- this process or an earlier one -- is known
+    // before anything else: no wallet call, nothing to place or hold.
+    const std::size_t ledger = position_of(
+        pass, "if (db_->ledger_has_event(part.event_id)) { "
+              "options_booked_event_ids_.insert(part.event_id); return false; }");
     const std::size_t judged = position_of(
         pass, "accounting::judge_topup(books, flow.floor_iso, options_fence_up_stamp_);");
     const std::size_t asked = position_of(
-        pass, "co_await options_topup_proof(flow, recent || going_down, block_height)");
+        pass, "co_await options_topup_proof( parts.principal, recent || need_coin, block_height)");
+    const std::size_t fee = position_of(
+        pass, "const OptionsBooking fee_outcome = co_await book_options_flow( "
+              "ready(*parts.fee), /*fence_event=*/false, block_height, tally);");
+    const std::size_t principal_only = position_of(pass, "if (!principal_open) continue;");
+    const std::size_t deferred = position_of(pass, "if (verdict == accounting::OptionsTopUpVerdict::Deferred) {");
     const std::size_t placed = position_of(pass, "switch (accounting::place_topup(facts)) {");
     const std::size_t booked = position_of(
-        pass, "co_await book_options_flow(flow, /*fence_event=*/false, block_height, tally);");
-    ASSERT_NE(judged, npos);
-    ASSERT_NE(asked, npos);
-    ASSERT_NE(placed, npos);
-    ASSERT_NE(booked, npos);
+        pass, "co_await book_options_flow( ready(parts.principal), /*fence_event=*/false, block_height, tally);");
+    for (const std::size_t at : {ledger, judged, asked, fee, principal_only, deferred, placed, booked}) {
+        ASSERT_NE(at, npos);
+    }
+    EXPECT_LT(ledger, judged);
     EXPECT_LT(judged, asked);
-    EXPECT_LT(asked, placed);
+    // The fee is booked once the send confirmed, before -- and whatever --
+    // the principal's placement.
+    EXPECT_LT(asked, fee);
+    EXPECT_LT(fee, principal_only);
+    EXPECT_LT(principal_only, deferred);
+    EXPECT_LT(deferred, placed);
     EXPECT_LT(placed, booked);
-    EXPECT_EQ(count_of(pass, "co_await book_options_flow("), 1u);
+    EXPECT_EQ(count_of(pass, "co_await book_options_flow("), 2u) << "the fee, and the principal";
     EXPECT_EQ(count_of(pass, "accounting::place_topup("), 1u) << "one decision, unit-tested";
-    EXPECT_NE(position_of(pass, "if (verdict == accounting::OptionsTopUpVerdict::Deferred) {"), npos);
-    // One the ledger holds from an earlier process is not "inside": it booked.
-    EXPECT_NE(position_of(pass, "if (db_->ledger_has_event(flow.event_id)) { "
-                                "options_booked_event_ids_.insert(flow.event_id); } else { "
-                                "options_terminal_skip_ids_.insert(flow.event_id);"),
+    EXPECT_NE(position_of(pass, "const accounting::OptionsTopUpParts parts = accounting::split_topup(flow);"),
               npos);
     // The facts: the wallet is asked when the options book has not recorded
     // the confirmation, or when the send's coin is needed to place it; that
-    // coin is looked for by id, in the fence's list and in the list the
-    // fence-down event returns.  No amount is compared anywhere in the pass.
+    // coin is looked for by id -- in the fence's list, in the list a
+    // fence-down event returns, in the list the newest fence-up event took.
+    // No amount is compared anywhere in the pass.
     EXPECT_NE(position_of(pass, "const bool going_down = lowering != nullptr && lowering->coin_ids.has_value();"),
               npos);
-    EXPECT_NE(position_of(pass, "if (!facts.book_confirmed || going_down) {"), npos);
-    EXPECT_NE(position_of(pass, "facts.coin_listed = coin_fence_->is_fenced_coin(*proof->coin_id);"), npos);
-    EXPECT_NE(position_of(pass, "facts.coin_returned = std::find(ids.begin(), ids.end(), *proof->coin_id) "
-                                "!= ids.end();"),
+    EXPECT_NE(position_of(pass, "if (!facts.book_confirmed || need_coin) {"), npos);
+    EXPECT_NE(position_of(pass, "facts.coin_listed = coin_fence_->is_fenced_coin(*coin_id);"), npos);
+    EXPECT_NE(position_of(pass, "facts.coin_returned = std::find(ids.begin(), ids.end(), *coin_id) != ids.end();"),
+              npos);
+    EXPECT_NE(position_of(pass, "if (!check_rise || accounting::topup_in_rise(options_rise_coin_ids_, coin_id)) {"),
               npos);
     EXPECT_EQ(position_of(pass, "amount"), npos);
+    // "Shortly before the fence went down" is the fence's moment.
+    EXPECT_NE(position_of(pass, "facts.sent_near_lowering = going_down && lowering->at_unix - "
+                                "static_cast<double>(row.sent_at) <= "
+                                "static_cast<double>(accounting::kOptionsPendingSlackSeconds);"),
+              npos);
     // Hold keeps the fence-down event waiting; NotYet and a booking that
     // waits are owed to the invariant, once a heartbeat; After is neither.
     EXPECT_NE(position_of(pass, "case accounting::OptionsTopUpPlace::Hold: "), npos);
-    EXPECT_NE(position_of(pass, "owe(); waiting = true; continue; case accounting::OptionsTopUpPlace::NotYet: "
-                                "owe(); continue; case accounting::OptionsTopUpPlace::After:"),
+    EXPECT_NE(position_of(pass, "owe(parts.principal); waiting = true; continue; "
+                                "case accounting::OptionsTopUpPlace::NotYet: owe(parts.principal); continue; "
+                                "case accounting::OptionsTopUpPlace::After:"),
               npos);
-    EXPECT_NE(position_of(pass, "if (!recent || !options_owed_ids_.insert(flow.event_id).second) return;"),
+    EXPECT_NE(position_of(pass, "if (!recent || !options_owed_ids_.insert(part.event_id).second) return;"),
               npos);
     EXPECT_NE(position_of(pass, "if (outcome == OptionsBooking::Wait || outcome == OptionsBooking::Failed) "
-                                "{ owe(); waiting = true; }"),
+                                "{ owe(parts.principal); waiting = true; }"),
               npos);
+    // A refused write stops the writing, not the tolerance.
+    EXPECT_NE(position_of(pass, "if (refused) { if (principal_open) owe(parts.principal); "
+                                "if (fee_open) owe(*parts.fee); continue; }"),
+              npos);
+    EXPECT_NE(position_of(pass, "if (outcome == OptionsBooking::Failed) refused = true;"), npos);
+    EXPECT_EQ(count_of(pass, "break;"), 1u) << "the switch's: a refused write does not end the pass";
 
     const std::string proof = function_body(raw, kProof);
     ASSERT_FALSE(proof.empty());
@@ -962,8 +1050,19 @@ TEST(OptionsTransferWiring, AFlowIsJournalledBeforeAnythingElseMoves)
     // A fence event is entered at its own moment: the stamp top-ups meet.
     EXPECT_NE(position_of(book, "const std::string entry_time = fence_event ? flow.at_iso :"), npos);
     // The bridge asset's tracked quantity is the bridge scan's to move, once
-    // it has a settled balance: the peak is discarded once more then.
+    // it has a settled balance: the peak is discarded once more then, and the
+    // marker is how a restart in between still knows to.
     EXPECT_NE(position_of(book, "if (in_process) tally.bridge_reanchor = true; } else {"), npos);
+    const std::size_t stamped = position_of(book, "const bool in_process =");
+    ASSERT_NE(stamped, npos);
+    EXPECT_LT(stamped, marker);
+    EXPECT_NE(position_of(book, "if (bridge_owned && !in_process) continue;"), npos);
+    // An opening that cannot be read waits; only one that is not there
+    // decides.
+    const std::size_t unread = position_of(book, "if (opened && opening_time.empty()) {");
+    ASSERT_NE(unread, npos);
+    EXPECT_LT(unread, opening);
+    EXPECT_NE(position_of(book, "co_return OptionsBooking::Wait; } if (opening_time.empty()"), npos);
 }
 
 TEST(OptionsTransferWiring, ABookingIsTiedToBalancesReadWithTheFlowsCoinListed)
@@ -1007,6 +1106,15 @@ TEST(OptionsTransferWiring, ABookingIsTiedToBalancesReadWithTheFlowsCoinListed)
     EXPECT_LT(check, owed);
     EXPECT_NE(position_of(step, "if (caught_up) { if (peak_equity_hwm_usd_ > 0.0) {"), npos);
     EXPECT_EQ(position_of(step, "options_peak_reset_again_"), npos);
+    // Owed across a restart (the bridge asset's marker), and settled with a
+    // committed write.
+    const std::size_t restored = position_of(step, "if (options_bridge_reanchor_restored_) {");
+    ASSERT_NE(restored, npos);
+    EXPECT_LT(restored, check);
+    EXPECT_NE(position_of(step, "if (caught_up || expired) { options_bridge_reanchor_block_ = 0;"), npos);
+    EXPECT_NE(position_of(step, "options_marker_clear_pending_.insert(acc.bridge_asset_id); "
+                                "(void)persist_inventory_state();"),
+              npos);
 }
 
 TEST(OptionsTransferWiring, APassThatStopsAtAFenceEventStillCarriesEveryLaterFlow)
@@ -1025,15 +1133,16 @@ TEST(OptionsTransferWiring, APassThatStopsAtAFenceEventStillCarriesEveryLaterFlo
     ASSERT_NE(later, npos);
     EXPECT_LT(otherwise, later);
     EXPECT_NE(position_of(step, "slack = accounting::add_held_slack(slack, held);"), npos);
-    // ... and every top-up not booked yet, within two hours of its send,
-    // except one inside an event the books already hold.
+    // ... and every top-up part not booked yet, within two hours of its
+    // send: its fee always, its principal unless inside an event the books
+    // already hold.
     const std::size_t topups = position_of(
-        step, "|| !accounting::topup_slack_applies(row.sent_at, now_unix) "
-              "|| accounting::judge_topup(books, flow.floor_iso, options_fence_up_stamp_) "
-              "== accounting::OptionsTopUpVerdict::Inside "
-              "|| !options_owed_ids_.insert(flow.event_id).second) { continue; }");
+        step, "|| !accounting::topup_slack_applies(row.sent_at, now_unix)) { continue; } "
+              "const auto parts = accounting::split_topup(flow);");
     ASSERT_NE(topups, npos);
     EXPECT_LT(later, topups);
+    EXPECT_NE(position_of(step, "if (!inside) owe_part(parts.principal); if (parts.fee) owe_part(*parts.fee);"),
+              npos);
 }
 
 TEST(OptionsTransferWiring, TheMarkerOutlivesAStopAndGoesOnlyOnceTheTrackerIsWritten)
@@ -1044,12 +1153,22 @@ TEST(OptionsTransferWiring, TheMarkerOutlivesAStopAndGoesOnlyOnceTheTrackerIsWri
     // any heartbeat can reconcile it.
     const std::size_t restored = engine.find(squeeze("db_->load_inventory_state();"));
     const std::size_t markers = engine.find(squeeze(
-        "if (const auto pending = db_->capital_reconcile_pending()) { "
-        "for (const auto& asset_id : *pending) { options_capital_assets_.insert(asset_id); "
-        "inventory_reconcile_capital_[asset_id] = true; }"));
+        "if (const auto pending = db_->capital_reconcile_pending()) {"));
     ASSERT_NE(restored, npos);
     ASSERT_NE(markers, npos);
     EXPECT_LT(restored, markers);
+    // The bridge scan's own asset is a re-anchor owed; any other, Step 11's
+    // reconcile marked as capital.
+    const std::size_t bridge = engine.find(squeeze(
+        "if (asset_id == acc.bridge_asset_id && acc.ledger_enabled && acc.bridge_ingest_enabled) {"), markers);
+    const std::size_t owed = engine.find(squeeze("options_bridge_reanchor_restored_ = true; continue; }"), markers);
+    const std::size_t others = engine.find(squeeze(
+        "options_capital_assets_.insert(asset_id); inventory_reconcile_capital_[asset_id] = true; }"), markers);
+    ASSERT_NE(bridge, npos);
+    ASSERT_NE(owed, npos);
+    ASSERT_NE(others, npos);
+    EXPECT_LT(bridge, owed);
+    EXPECT_LT(owed, others);
     EXPECT_EQ(count_of(engine, "db_->capital_reconcile_pending()"), 1u);
 
     // Step 11's wallet reconcile re-anchors for such an asset, as it does

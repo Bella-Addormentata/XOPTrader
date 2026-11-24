@@ -3315,7 +3315,16 @@ asio::awaitable<void> Engine::poll_loop_coro()
     // wallet already account for both.
     if (db_) {
         if (const auto pending = db_->capital_reconcile_pending()) {
+            const auto& acc = config_.accounting;
             for (const auto& asset_id : *pending) {
+                if (asset_id == acc.bridge_asset_id && acc.ledger_enabled
+                    && acc.bridge_ingest_enabled) {
+                    // The bridge scan's own asset: Step 11 never reconciles it.
+                    // What is owed is the re-anchor once that scan has a
+                    // settled balance with the flow (step_ingest_options_transfers).
+                    options_bridge_reanchor_restored_ = true;
+                    continue;
+                }
                 options_capital_assets_.insert(asset_id);
                 inventory_reconcile_capital_[asset_id] = true;
             }
@@ -24540,6 +24549,7 @@ bool Engine::load_options_books()
     // must not.
     if (!newest || !newest_up) return false;
     options_last_fence_event_id_ = newest->event_id;
+    options_fence_up_event_id_   = newest_up->event_id;
     options_fence_up_stamp_ =
         accounting::fence_up_stamp(newest_up->event_id, newest_up->entry_time);
     return true;
@@ -24605,8 +24615,17 @@ asio::awaitable<Engine::OptionsBooking> Engine::book_options_flow(
         const bool capital_of_a_topup = !fence_event && leg.leg == accounting::kOptionsLeg;
         // No opening, no chronology: the ledger does not tie this asset at
         // all.  A flow at or before the opening is inside it.
-        const std::string opening_time = ledger_opened_assets_.count(asset) > 0
-            ? db_->ledger_opening_time(asset) : std::string{};
+        const bool opened = ledger_opened_assets_.count(asset) > 0;
+        const std::string opening_time =
+            opened ? db_->ledger_opening_time(asset) : std::string{};
+        if (opened && opening_time.empty()) {
+            // An opening that could not be read is not one that is not
+            // there: the whole flow waits, rather than lose a leg -- or the
+            // top-up -- for good.
+            spdlog::debug("[Engine] Options ingest: the {} opening could not be read -- "
+                          "{} waits to book", leg.asset_id.substr(0, 12), flow.reference);
+            co_return OptionsBooking::Wait;
+        }
         if (opening_time.empty()
             || !accounting::iso_strictly_after(flow.floor_iso, opening_time)) {
             if (capital_of_a_topup) {
@@ -24669,9 +24688,16 @@ asio::awaitable<Engine::OptionsBooking> Engine::book_options_flow(
     //       reconcile) then leaves the next process knowing that the
     //       correction it makes is this flow, not a loss.  A note with no
     //       flow behind it (the journal fails) costs one needless re-anchor.
+    const bool in_process =
+        accounting::iso_strictly_after(flow.at_iso, bridge_process_start_iso_);
     for (const auto& p : priced) {
         const std::string& asset_id = p.leg->asset_id;
-        if (asset_id == acc.bridge_asset_id && bridge_accounting_operational()) continue;
+        // The bridge asset's tracked quantity is the bridge scan's: what a
+        // restart must know of there is the re-anchor a flow of this process
+        // owes until that scan has a settled balance with it.
+        const bool bridge_owned =
+            asset_id == acc.bridge_asset_id && bridge_accounting_operational();
+        if (bridge_owned && !in_process) continue;
         if (!db_->mark_capital_reconcile_pending(asset_id, "options")) {
             spdlog::error("[Engine] Options ingest: could not note {} as pending for {} "
                           "-- retrying next heartbeat", asset_id.substr(0, 12),
@@ -24738,8 +24764,6 @@ asio::awaitable<Engine::OptionsBooking> Engine::book_options_flow(
     }
 
     // -- 2. Side effects, only for a flow journalled just now.
-    const bool in_process =
-        accounting::iso_strictly_after(flow.at_iso, bridge_process_start_iso_);
     double flow_usd = 0.0;
     for (const auto& p : priced) {
         const std::string& asset_id = p.leg->asset_id;
@@ -24851,9 +24875,16 @@ asio::awaitable<bool> Engine::book_options_topups(
         std::chrono::system_clock::now().time_since_epoch()).count();
     // A fence-down event follows, returning the coins of its own list.
     const bool going_down = lowering != nullptr && lowering->coin_ids.has_value();
+    // The list the newest fence-up event took, when this process booked it.
+    const bool rise_known = !options_rise_event_id_.empty()
+        && options_rise_event_id_ == options_fence_up_event_id_
+        && options_rise_coin_ids_.has_value();
     bool waiting = false;
+    // A ledger write was refused this pass: nothing more is written, and
+    // every later flow is still carried.
+    bool refused = false;
     for (const auto& row : rows) {
-        accounting::OptionsFlow flow = accounting::classify_options_topup(row, quote_asset);
+        const accounting::OptionsFlow flow = accounting::classify_options_topup(row, quote_asset);
         if (flow.status == accounting::OptionsFlowStatus::Invalid) {
             if (options_warned_ids_.insert("row:" + std::to_string(row.sent_event_id)).second) {
                 spdlog::warn("[Engine] Options ingest: top-up event {} of {} cannot be "
@@ -24862,72 +24893,134 @@ asio::awaitable<bool> Engine::book_options_topups(
             }
             continue;
         }
-        if (options_booked_event_ids_.count(flow.event_id) > 0
-            || options_terminal_skip_ids_.count(flow.event_id) > 0) {
-            continue;
-        }
-        const auto verdict =
-            accounting::judge_topup(books, flow.floor_iso, options_fence_up_stamp_);
-        if (verdict == accounting::OptionsTopUpVerdict::Deferred) {
-            // The books stand fence-down: its coins are trading funds, and
-            // the next fence-up event takes them.
-            continue;
-        }
-        if (verdict == accounting::OptionsTopUpVerdict::Inside) {
-            // Unless it booked before that event, in an earlier process.
-            if (db_->ledger_has_event(flow.event_id)) {
-                options_booked_event_ids_.insert(flow.event_id);
-            } else {
-                options_terminal_skip_ids_.insert(flow.event_id);
-                spdlog::info("[Engine] Options ingest: {} was sent at {}, before the "
-                             "fence went up at {} -- inside that event, not booked",
-                             flow.reference, flow.floor_iso, options_fence_up_stamp_);
+        const accounting::OptionsTopUpParts parts = accounting::split_topup(flow);
+        // Decided already, or in the books from this process or an earlier
+        // one: nothing to place, and no wallet call for it.
+        const auto open = [&](const accounting::OptionsFlow& part) {
+            if (options_terminal_skip_ids_.count(part.event_id) > 0
+                || options_booked_event_ids_.count(part.event_id) > 0) {
+                return false;
             }
-            continue;
-        }
-        // The fence was up when it went out.  Until it is booked the wallet
-        // may already be short of it: the invariant carries that, once.
+            if (db_->ledger_has_event(part.event_id)) {
+                options_booked_event_ids_.insert(part.event_id);
+                return false;
+            }
+            return true;
+        };
+        const bool principal_open = open(parts.principal);
+        const bool fee_open = parts.fee.has_value() && open(*parts.fee);
+        if (!principal_open && !fee_open) continue;
+
+        // Until a part is booked the wallet may already be short of it: the
+        // invariant carries that, once a heartbeat.
         const bool recent = accounting::topup_slack_applies(row.sent_at, now_unix);
-        const auto owe = [&] {
-            if (!recent || !options_owed_ids_.insert(flow.event_id).second) return;
-            for (const auto& leg : flow.legs) {
+        const auto owe = [&](const accounting::OptionsFlow& part) {
+            if (!recent || !options_owed_ids_.insert(part.event_id).second) return;
+            for (const auto& leg : part.legs) {
                 Mojo& slack = options_pending_slack_[leg.asset_id];
                 slack = accounting::add_slack(slack, -leg.delta_mojos);
             }
         };
+        if (refused) {
+            if (principal_open) owe(parts.principal);
+            if (fee_open) owe(*parts.fee);
+            continue;
+        }
 
+        const auto verdict =
+            accounting::judge_topup(books, flow.floor_iso, options_fence_up_stamp_);
         // Where it stands.  The options book writes its confirmation down
         // minutes late; the wallet's own record of THIS transaction says at
         // once whether it confirmed, and names the coin it created.  That
-        // coin, by id, is what decides (accounting::place_topup).
+        // coin, by id, is what places it: against the list a fence-down event
+        // returns, and against the list the newest fence-up event took.
+        const bool check_rise = principal_open && rise_known
+            && verdict == accounting::OptionsTopUpVerdict::Inside;
+        const bool need_coin = principal_open && (going_down || check_rise);
         accounting::OptionsTopUpFacts facts;
         facts.recent         = recent;
         facts.book_confirmed = flow.status == accounting::OptionsFlowStatus::Ready;
         facts.lowering       = going_down;
-        if (!facts.book_confirmed || going_down) {
-            if (const auto proof =
-                    co_await options_topup_proof(flow, recent || going_down, block_height)) {
+        facts.sent_near_lowering = going_down
+            && lowering->at_unix - static_cast<double>(row.sent_at)
+                   <= static_cast<double>(accounting::kOptionsPendingSlackSeconds);
+        std::optional<std::string> coin_id;
+        if (!facts.book_confirmed || need_coin) {
+            if (const auto proof = co_await options_topup_proof(
+                    parts.principal, recent || need_coin, block_height)) {
                 facts.wallet_confirmed = proof->confirmed;
-                if (proof->coin_id) {
+                coin_id = proof->coin_id;
+                if (coin_id) {
                     facts.coin_known  = true;
-                    facts.coin_listed = coin_fence_->is_fenced_coin(*proof->coin_id);
+                    facts.coin_listed = coin_fence_->is_fenced_coin(*coin_id);
                     if (going_down) {
                         const auto& ids = *lowering->coin_ids;
                         facts.coin_returned =
-                            std::find(ids.begin(), ids.end(), *proof->coin_id) != ids.end();
+                            std::find(ids.begin(), ids.end(), *coin_id) != ids.end();
                     }
                 }
             }
+        }
+        const auto ready = [&](accounting::OptionsFlow part) {
+            if (part.status != accounting::OptionsFlowStatus::Ready) {
+                part.status = accounting::OptionsFlowStatus::Ready;
+                part.at_iso = PnLTracker::timestamp_to_iso(std::chrono::system_clock::now());
+            }
+            return part;
+        };
+
+        // The fee left the trading funds' XCH once the send confirmed,
+        // wherever the principal goes: booked on its own.
+        if (fee_open) {
+            const bool confirmed = facts.book_confirmed || facts.wallet_confirmed
+                || (facts.coin_known && (facts.coin_listed || facts.coin_returned));
+            if (!confirmed) {
+                owe(*parts.fee);
+            } else {
+                const OptionsBooking fee_outcome = co_await book_options_flow(
+                    ready(*parts.fee), /*fence_event=*/false, block_height, tally);
+                if (fee_outcome == OptionsBooking::Wait || fee_outcome == OptionsBooking::Failed) {
+                    owe(*parts.fee);
+                }
+                if (fee_outcome == OptionsBooking::Failed) {
+                    refused = true;
+                    if (principal_open) owe(parts.principal);
+                    continue;
+                }
+            }
+        }
+        if (!principal_open) continue;
+
+        if (verdict == accounting::OptionsTopUpVerdict::Deferred) {
+            // The books stand fence-down: its coin is trading funds, and the
+            // next fence-up event takes it.
+            continue;
+        }
+        if (verdict == accounting::OptionsTopUpVerdict::Inside) {
+            if (check_rise && !coin_id && recent) {
+                // Whether that event took it is its coin's to say: next time.
+                owe(parts.principal);
+                continue;
+            }
+            if (!check_rise || accounting::topup_in_rise(options_rise_coin_ids_, coin_id)) {
+                options_terminal_skip_ids_.insert(parts.principal.event_id);
+                spdlog::info("[Engine] Options ingest: {} was sent at {}, before the "
+                             "fence went up at {} -- inside that event, not booked",
+                             flow.reference, flow.floor_iso, options_fence_up_stamp_);
+                continue;
+            }
+            // Sent before the fence went up and not in what it took: it was
+            // still on its way, and left the trading funds when it arrived.
         }
         switch (accounting::place_topup(facts)) {
         case accounting::OptionsTopUpPlace::Hold:
             // Going down, with no telling which side of the event it belongs
             // on: the event waits for it while it can still be on its way.
-            owe();
+            owe(parts.principal);
             waiting = true;
             continue;
         case accounting::OptionsTopUpPlace::NotYet:
-            owe();
+            owe(parts.principal);
             continue;
         case accounting::OptionsTopUpPlace::After:
             // The trading funds never lost it: the next fence-up event takes it.
@@ -24935,17 +25028,13 @@ asio::awaitable<bool> Engine::book_options_topups(
         case accounting::OptionsTopUpPlace::Book:
             break;
         }
-        if (flow.status != accounting::OptionsFlowStatus::Ready) {
-            flow.status = accounting::OptionsFlowStatus::Ready;
-            flow.at_iso = PnLTracker::timestamp_to_iso(std::chrono::system_clock::now());
-        }
-        const OptionsBooking outcome =
-            co_await book_options_flow(flow, /*fence_event=*/false, block_height, tally);
+        const OptionsBooking outcome = co_await book_options_flow(
+            ready(parts.principal), /*fence_event=*/false, block_height, tally);
         if (outcome == OptionsBooking::Wait || outcome == OptionsBooking::Failed) {
-            owe();
+            owe(parts.principal);
             waiting = true;
         }
-        if (outcome == OptionsBooking::Failed) break;
+        if (outcome == OptionsBooking::Failed) refused = true;
     }
     co_return waiting;
 }
@@ -24969,6 +25058,15 @@ asio::awaitable<void> Engine::step_ingest_options_transfers(BlockHeight block_he
     // has re-anchored at since.  In the first heartbeat after the booking in
     // which the tracker holds a settled snapshot of this heartbeat, the peak
     // is discarded once more, before Step 13 anchors it again.
+    if (options_bridge_reanchor_restored_) {
+        // The last process booked a bridge-asset flow and stopped before the
+        // bridge scan had a settled balance with it: the re-anchor it owed is
+        // owed from this heartbeat.
+        options_bridge_reanchor_restored_ = false;
+        if (options_bridge_reanchor_block_ == 0 && block_height > 0) {
+            options_bridge_reanchor_block_ = block_height - 1;
+        }
+    }
     if (options_bridge_reanchor_block_ != 0) {
         const AssetId bridge{acc.bridge_asset_id};
         const auto bit = cached_wallet_balances_.find(bridge);
@@ -24977,8 +25075,7 @@ asio::awaitable<void> Engine::step_ingest_options_transfers(BlockHeight block_he
             && bit->second.as_of_block == block_height && bit->second.fields_validated
             && bit->second.pending_change == 0
             && inventory_->net_inventory(bridge) == bit->second.confirmed;
-        const bool expired = !bridge_accounting_operational()
-            || block_height < options_bridge_reanchor_block_
+        const bool expired = block_height < options_bridge_reanchor_block_
             || block_height - options_bridge_reanchor_block_ >= config_.risk.loss_window_blocks;
         if (caught_up) {
             if (peak_equity_hwm_usd_ > 0.0) {
@@ -24988,12 +25085,16 @@ asio::awaitable<void> Engine::step_ingest_options_transfers(BlockHeight block_he
                              bridge.substr(0, 12), peak_equity_hwm_usd_);
                 peak_equity_hwm_usd_ = 0.0;
             }
-            options_bridge_reanchor_block_ = 0;
         } else if (expired) {
             spdlog::warn("[Engine] Options ingest: the bridge scan did not take the last {} "
                          "options flow into a settled balance within the loss window -- "
                          "no further re-anchor", bridge.substr(0, 12));
+        }
+        if (caught_up || expired) {
             options_bridge_reanchor_block_ = 0;
+            // Its restart marker goes with the next committed inventory write.
+            options_marker_clear_pending_.insert(acc.bridge_asset_id);
+            (void)persist_inventory_state();
         }
     }
 
@@ -25120,6 +25221,11 @@ asio::awaitable<void> Engine::step_ingest_options_transfers(BlockHeight block_he
                                                  tally);
             if (outcome != OptionsBooking::Booked && outcome != OptionsBooking::Known) {
                 owe_event(up);
+            } else {
+                // What it took, coin by coin: a top-up sent before it is inside
+                // it only if its own coin is here (accounting::topup_in_rise).
+                options_rise_event_id_ = up.event_id;
+                options_rise_coin_ids_ = entry.holding->coin_ids;
             }
             break;
         }
@@ -25201,18 +25307,26 @@ asio::awaitable<void> Engine::step_ingest_options_transfers(BlockHeight block_he
         for (const auto& row : rows) {
             const auto flow = accounting::classify_options_topup(row, quote_asset);
             if (flow.status == accounting::OptionsFlowStatus::Invalid
-                || options_booked_event_ids_.count(flow.event_id) > 0
-                || options_terminal_skip_ids_.count(flow.event_id) > 0
-                || !accounting::topup_slack_applies(row.sent_at, now_unix)
-                || accounting::judge_topup(books, flow.floor_iso, options_fence_up_stamp_)
-                       == accounting::OptionsTopUpVerdict::Inside
-                || !options_owed_ids_.insert(flow.event_id).second) {
+                || !accounting::topup_slack_applies(row.sent_at, now_unix)) {
                 continue;
             }
-            for (const auto& leg : flow.legs) {
-                Mojo& slack = options_pending_slack_[leg.asset_id];
-                slack = accounting::add_slack(slack, -leg.delta_mojos);
-            }
+            const auto parts = accounting::split_topup(flow);
+            const bool inside =
+                accounting::judge_topup(books, flow.floor_iso, options_fence_up_stamp_)
+                == accounting::OptionsTopUpVerdict::Inside;
+            const auto owe_part = [&](const accounting::OptionsFlow& part) {
+                if (options_booked_event_ids_.count(part.event_id) > 0
+                    || options_terminal_skip_ids_.count(part.event_id) > 0
+                    || !options_owed_ids_.insert(part.event_id).second) {
+                    return;
+                }
+                for (const auto& leg : part.legs) {
+                    Mojo& slack = options_pending_slack_[leg.asset_id];
+                    slack = accounting::add_slack(slack, -leg.delta_mojos);
+                }
+            };
+            if (!inside) owe_part(parts.principal);
+            if (parts.fee) owe_part(*parts.fee);
         }
     }
 
