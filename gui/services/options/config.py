@@ -71,10 +71,13 @@ not used, and are ignored with a warning rather than refused. Without an
 ``options.target`` the fence's target comes from the limits
 (:func:`default_target`); ``target: false`` turns top-ups off.
 
-[AUTO-SIZE] ``contract_xch: auto`` (also when it is not written) sizes the
-contracts from the limits: variety first, then size -- the largest of 1, 10,
-100, ... XCH at which every call slot the grid can hold still fits inside
-``limits.max_locked_xch``, and never under 1 XCH (:func:`auto_contract_xch`).
+[LADDER] ``contract_xch: auto`` (also when it is not written) is a ladder of
+sizes offered side by side: 1, 10, 100, ... XCH (:data:`LADDER_XCH`). Every
+strike and expiry gets a contract of each size, the smallest everywhere
+first, as far as the limits allow: the whole 1 XCH grid, then 10 XCH
+contracts, then 100 (:func:`gui.services.options.quoting.plan`). Small and
+large buyers both find a contract at every strike and date. A written number
+is that one size, as before. :func:`call_ladder` says what a ladder comes to.
 """
 
 from __future__ import annotations
@@ -237,7 +240,7 @@ def _expiry(raw: Any) -> int:
 
 
 def distinct_expiries(dates: Any) -> int:
-    """[AUTO-SIZE] How many expiries a written list of dates comes to, as :func:`parse` counts.
+    """[LADDER] How many expiries a written list of dates comes to, as :func:`parse` counts.
 
     The same moment written twice, or in two UTC offsets, is one expiry. Raises
     OptionsConfigError for an entry :func:`parse` would refuse.
@@ -330,66 +333,75 @@ class Limits:
     max_fee_mojos: int
 
 
-#: [AUTO-SIZE] ``options.contract_xch: auto`` never goes under this many XCH...
-AUTO_CONTRACT_MIN_XCH = 1
-#: ...nor over this many, whatever the cap: a bound for the search.
-AUTO_CONTRACT_MAX_XCH = 1_000_000
+#: [LADDER] The sizes ``options.contract_xch: auto`` offers, in whole XCH,
+#: smallest first. Why 1 XCH at least: a contract's premium grows with its size
+#: and its fees do not, and the quote asset's smallest unit (0.001 wUSDC.b) is
+#: a coarse price step for a contract much under 1 XCH. The largest is a bound,
+#: not a goal: the limits stop the ladder long before it.
+LADDER_XCH: tuple[int, ...] = (1, 10, 100, 1_000, 10_000, 100_000, 1_000_000)
+AUTO_CONTRACT_MIN_XCH = LADDER_XCH[0]
+AUTO_CONTRACT_MAX_XCH = LADDER_XCH[-1]
 
 
-def held_call_slots(limits: Limits, call_strikes: int, expiries: int) -> int:
-    """[AUTO-SIZE] The most calls the grid can hold at once.
+def call_ladder(
+    limits: Limits, call_strikes: int, expiries: int, put_strikes: int = 0
+) -> tuple[tuple[int, int], ...]:
+    """[LADDER] What ``contract_xch: auto`` comes to for calls, on an empty book.
 
-    One slot per call strike and expiry, within ``max_contracts_per_expiry``
-    and ``max_contracts`` (a cap that is unset or unlimited does not bound
-    it). Puts share those two caps, so with puts written this is the most the
-    calls could take, and the size worked out from it errs on the small side.
+    ``(XCH a contract, calls of that size)`` for each size at least one call
+    reaches, smallest first, filled as :func:`gui.services.options.quoting.plan`
+    fills them: every call strike and expiry at 1 XCH, then at 10 XCH, and so
+    on, until ``max_locked_xch``, ``max_contracts`` or
+    ``max_contracts_per_expiry`` stops it. Puts take their share of the two
+    counts at each size before the next size starts; how much of the quote
+    asset they lock depends on the price, so ``max_locked_quote`` is not
+    counted here, and when it stops puts the calls may go further than this.
+
+    Empty when no call can be minted: no call strikes or expiries, one of the
+    three limits read here not set, or ``max_locked_xch`` under 1 XCH. With
+    ``max_locked_xch`` unlimited calls stay at 1 XCH: there is nothing to size
+    the ladder from.
     """
-    per_expiry = max(0, call_strikes)
-    if limits.max_contracts_per_expiry > 0:
-        per_expiry = min(per_expiry, limits.max_contracts_per_expiry)
-    slots = max(0, expiries) * per_expiry
-    if limits.max_contracts > 0:
-        slots = min(slots, limits.max_contracts)
-    return slots
-
-
-def auto_contract_xch(limits: Limits, call_strikes: int, expiries: int) -> int:
-    """[AUTO-SIZE] What ``options.contract_xch: auto`` stands for, in whole XCH.
-
-    Variety first, then size: the largest of 1, 10, 100, ... XCH at which
-    every call slot the grid can hold at once (:func:`held_call_slots`) still
-    fits inside ``max_locked_xch``. More strikes or dates, or a lower cap,
-    mean smaller contracts, down to 1 XCH and never under it: when even that
-    does not cover every slot, the limits decide which are written -- the
-    nearest expiry first, then the strikes nearest the money
-    (:func:`gui.services.options.quoting.plan`).
-
-    1 XCH too when ``max_locked_xch`` is not a number (unset or unlimited:
-    there is nothing to size from), and when no calls are written: a put
-    locks the quote asset, and how much of it depends on the price.
-
-    Why 1 XCH at least: a contract's premium grows with its size and its fees
-    do not, and the quote asset's smallest unit (0.001 wUSDC.b) is a coarse
-    price step for a contract much under 1 XCH.
-    """
-    slots = held_call_slots(limits, call_strikes, expiries)
-    size = AUTO_CONTRACT_MIN_XCH
-    if slots <= 0 or limits.max_locked_xch <= 0:
-        return size
-    while (
-        size * 10 <= AUTO_CONTRACT_MAX_XCH
-        and size * 10 * XCH_MOJOS * slots <= limits.max_locked_xch
-    ):
-        size *= 10
-    return size
+    if call_strikes <= 0 or expiries <= 0:
+        return ()
+    if UNSET in (limits.max_locked_xch, limits.max_contracts, limits.max_contracts_per_expiry):
+        return ()
+    held = 0
+    on_expiry = [0] * expiries
+    locked = 0
+    out: list[tuple[int, int]] = []
+    for size in LADDER_XCH:
+        if out and limits.max_locked_xch == UNLIMITED:
+            break
+        calls = 0
+        for index in range(expiries):
+            room = call_strikes + put_strikes
+            if limits.max_contracts_per_expiry != UNLIMITED:
+                room = min(room, limits.max_contracts_per_expiry - on_expiry[index])
+            if limits.max_contracts != UNLIMITED:
+                room = min(room, limits.max_contracts - held)
+            if room <= 0:
+                continue
+            here = min(call_strikes, room)
+            if limits.max_locked_xch != UNLIMITED:
+                here = min(here, (limits.max_locked_xch - locked) // (size * XCH_MOJOS))
+            taken = here + min(put_strikes, room - here)
+            calls += here
+            locked += here * size * XCH_MOJOS
+            on_expiry[index] += taken
+            held += taken
+        if calls <= 0:
+            break
+        out.append((size, calls))
+    return tuple(out)
 
 
 def _contract_size(section: dict) -> float | None:
     """``options.contract_xch`` in XCH; None for ``auto``, which not writing it also means.
 
-    [AUTO-SIZE] Left out or null is ``auto``, as an unwritten ``expiries`` is
+    [LADDER] Left out or null is ``auto``, as an unwritten ``expiries`` is
     weekly and an unwritten ``target`` comes from the limits. Anything else
-    must be a positive number.
+    must be a positive number: that one size, and no ladder.
     """
     raw = section.get("contract_xch")
     if raw is None or (isinstance(raw, str) and raw.strip().lower() == "auto"):
@@ -588,13 +600,21 @@ class OptionsConfig:
     #: [ROLLING] ``options.expiries: weekly`` (or a mapping): the expiries roll
     #: forward on their own and ``expiries`` is empty. None for a list of dates.
     expiry_rule: ExpiryRule | None = None
-    #: [AUTO-SIZE] ``options.contract_xch: auto`` (or not written):
-    #: ``contract_xch_mojos`` was worked out from the limits (auto_contract_xch).
+    #: [LADDER] ``options.contract_xch: auto`` (or not written): the sizes are
+    #: the ladder, and ``contract_xch_mojos`` is its smallest.
     contract_auto: bool = False
+    #: [LADDER] Every size on offer, in XCH mojos, smallest first. Empty means
+    #: ``contract_xch_mojos`` alone; read it through :attr:`sizes_mojos`.
+    contract_sizes_mojos: tuple[int, ...] = ()
 
     @property
     def address_prefix(self) -> str:
         return "xch" if self.network == MAINNET else "txch"
+
+    @property
+    def sizes_mojos(self) -> tuple[int, ...]:
+        """[LADDER] The contract sizes on offer, in XCH mojos, smallest first."""
+        return self.contract_sizes_mojos or (self.contract_xch_mojos,)
 
     def expiries_at(self, now: int) -> tuple[int, ...]:
         """The expiries the grid is built on at ``now``.
@@ -606,6 +626,14 @@ class OptionsConfig:
         if self.expiry_rule is None:
             return self.expiries
         return self.expiry_rule.at(now + self.stop_before_expiry_seconds)
+
+    def quotable_expiries(self, now: int) -> tuple[int, ...]:
+        """The expiries contracts are minted for at ``now``: those past the stop window."""
+        return tuple(
+            expiry
+            for expiry in self.expiries_at(now)
+            if expiry - now > self.stop_before_expiry_seconds
+        )
 
 
 def disabled() -> OptionsConfig | None:
@@ -798,8 +826,7 @@ def parse(root: Any) -> OptionsConfig | None:
     quote_decimals = int(_number(section, "quote_asset_decimals", 3))
     if not 0 <= quote_decimals <= 12:
         raise OptionsConfigError("options.quote_asset_decimals must be between 0 and 12")
-    # [AUTO-SIZE] None for `auto`: sized below, once the grid and the limits
-    # are read.
+    # [LADDER] None for `auto`: the ladder, from 1 XCH up.
     written_xch = _contract_size(section)
 
     expiries_raw = section.get("expiries")
@@ -892,16 +919,11 @@ def parse(root: Any) -> OptionsConfig | None:
         max_contracts_per_expiry=_cap(limits_raw, "max_contracts_per_expiry", 1),
         max_fee_mojos=int(_number(limits_raw, "max_fee_mojos", 0)),
     )
-    if written_xch is None:
-        # A rule's expiries can coincide (a month-end Friday that is also one
-        # of the weeklies), so this may count one too many: the smaller size.
-        grid_expiries = (
-            expiry_rule.weekly + expiry_rule.monthly if expiry_rule is not None else len(expiries)
-        )
-        contract_xch = float(auto_contract_xch(limits, len(calls), grid_expiries))
-    else:
-        contract_xch = written_xch
+    # [LADDER] What the hedge check and the target's headroom are sized by:
+    # the one size written, or the ladder's smallest.
+    contract_xch = float(AUTO_CONTRACT_MIN_XCH) if written_xch is None else written_xch
     contract_mojos = _mojos(contract_xch, XCH_MOJOS, "options.contract_xch")
+    sizes = () if written_xch is not None else tuple(size * XCH_MOJOS for size in LADDER_XCH)
     fee_auto = str(section.get("fee_mojos", 0)).strip().lower() == "auto"
     fee = 0 if fee_auto else int(_number(section, "fee_mojos", 0))
     if fee > limits.max_fee_mojos:
@@ -957,6 +979,7 @@ def parse(root: Any) -> OptionsConfig | None:
         coingecko_api_key=str(coingecko.get("api_key") or "").strip(),
         expiry_rule=expiry_rule,
         contract_auto=written_xch is None,
+        contract_sizes_mojos=sizes,
         target=_resolve_target(section, quote_unit, wallet, limits, contract_mojos, bool(puts)),
     )
 
@@ -967,19 +990,27 @@ def default_target(
     """[DEFAULTS] The fence's target when ``options.target`` is not set: the book's own limits.
 
     XCH: ``max_locked_xch`` plus one contract -- the most the grid may lock,
-    with room for fees and the next mint. Quote: two units, a cancel's seed
-    coin, plus ``max_locked_quote`` when puts are written. None when
-    ``max_locked_xch`` is not a number: nothing moves into the options
-    address without a cap the operator chose.
+    with room for fees and the next mint. [LADDER] One contract of the
+    smallest size: the larger ones are inside ``max_locked_xch`` already.
+    Quote: two units, a cancel's seed coin, plus ``max_locked_quote`` when
+    puts are written. None when ``max_locked_xch`` is not a number: nothing
+    moves into the options address without a cap the operator chose.
     """
     if limits.max_locked_xch <= 0:  # UNSET or UNLIMITED
         return None
     quote = 2 * quote_unit
     if puts and limits.max_locked_quote > 0:
         quote += limits.max_locked_quote
-    return TargetConfig(
-        xch_mojos=limits.max_locked_xch + contract_mojos, quote_mojos=quote, tolerance=0.2
-    )
+    xch = limits.max_locked_xch + contract_mojos
+    # [LADDER] Topped up once it is short by half a contract of the smallest
+    # size, or by 20%, whichever comes first. A sold call that is exercised
+    # takes its collateral with it; with the ladder's larger sizes the target is
+    # large, and 20% of it is more than a refill can do without -- the address
+    # held too little to mint the refill and too much to be topped up. Short by
+    # less than half a contract, it still holds every mint the limits allow,
+    # with half a contract to spare for fees.
+    tolerance = min(0.2, contract_mojos / 2 / xch)
+    return TargetConfig(xch_mojos=xch, quote_mojos=quote, tolerance=tolerance)
 
 
 def _resolve_target(

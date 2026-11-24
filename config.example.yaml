@@ -1694,9 +1694,11 @@ options:
   # engine's rolling-loss limit (risk.window_loss): the engine sees a top-up
   # as its balance going down.
   # Unset, with the fence on, it comes from limits below: xch is
-  # max_locked_xch plus one contract_xch, quote is 2 plus max_locked_quote when
-  # put_strikes_pct are written. With max_locked_xch unset or unlimited there
-  # is no target, so nothing moves into `address` without a cap you chose.
+  # max_locked_xch plus one contract of the smallest size (1 XCH with `auto`),
+  # quote is 2 plus max_locked_quote when put_strikes_pct are written, and the
+  # address is topped up once it is half a contract or 20% short, whichever
+  # comes first. With max_locked_xch unset or unlimited there is no target, so
+  # nothing moves into `address` without a cap you chose.
   # `target: false` turns top-ups off.
   # target:
   #   xch: 1.5          # collateral for the grid + fees
@@ -1708,15 +1710,16 @@ options:
   quote_asset_decimals: 3
 
   # The grid. One slot per expiry and strike; a slot is refilled when it sells.
-  # contract_xch is the XCH per contract. `auto` (also when left out) sizes it
-  # from limits below, variety first and then size: the largest of 1, 10, 100,
-  # ... XCH at which every call slot (call strikes x expiries, within
-  # max_contracts and max_contracts_per_expiry) still fits inside
-  # max_locked_xch, and never under 1 XCH. With the grid below (two call
-  # strikes on two Fridays) max_locked_xch: 4 gives 1 XCH contracts and 40
-  # gives 10 XCH ones. When even 1 XCH a slot does not fit, the nearest expiry
-  # and the strikes nearest the money are written first. Or write a number,
-  # e.g. 0.5.
+  # contract_xch is the XCH per contract. `auto` (also when left out) offers
+  # 1, 10, 100, ... XCH contracts side by side, so small and large buyers both
+  # find one at every strike and date: every slot gets a 1 XCH contract first,
+  # then a 10 XCH one, then 100, as far as the limits below allow (calls stop
+  # at max_locked_xch, puts at max_locked_quote). Within a size the nearest
+  # expiry and the strikes nearest the money go first. With two call strikes
+  # on two Fridays (four calls a size): max_locked_xch 4 gives four 1 XCH
+  # calls, 14 adds one 10 XCH call, 44 four of them. max_contracts and
+  # max_contracts_per_expiry count every size, so two sizes of those calls
+  # need 8 and 4. Or write a number, e.g. 0.5: that one size only.
   contract_xch: auto
   # weekly: the next two Fridays at 08:00 UTC, rolling forward on their own
   # (the crypto options market's time; xchoptions.com has no standard dates).
@@ -1825,7 +1828,7 @@ options:
     max_spread_pct: 10
     require_book: true
     # [OPTIONAL] The size the Dexie book must be able to fill. Left out, one
-    # contract (contract_xch, also when that is auto).
+    # contract of the smallest size (1 XCH with contract_xch: auto).
     # hedge_size_xch: 20
 
   # Reading the chain. The wallet does not track option coins, so the book

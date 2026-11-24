@@ -13,13 +13,15 @@ would then refuse.
 
 Defaults, as the book reads them (0.10.53): sharing the trading wallet takes
 its host, port, certificates and key from the Connection tab, the fence
-follows the book, and the target comes from the limits. [AUTO-SIZE] So does
-the contract size, unless a number is written (``contract_xch: auto``).
+follows the book, and the target comes from the limits. [LADDER] So do the
+contract sizes, unless a number is written (``contract_xch: auto``): 1, 10,
+100, ... XCH side by side, the smallest everywhere first.
 """
 
 from __future__ import annotations
 
 import copy
+import dataclasses
 import datetime
 import math
 from collections.abc import Callable
@@ -59,8 +61,8 @@ EXPIRY_MODES: tuple[str, ...] = (
     "None: no new contracts",
 )
 _EXPIRY_ROLLING, _EXPIRY_FIXED, _EXPIRY_NONE = range(3)
-#: [AUTO-SIZE] Labels for options.contract_xch: ``auto`` (worked out from the
-#: limits), or a number.
+#: [LADDER] Labels for options.contract_xch: ``auto`` (1, 10, 100, ... XCH side
+#: by side, as far as the limits allow), or a number (that one size).
 SIZE_MODES: tuple[str, ...] = ("Automatic, from my limits", "Fixed")
 _SIZE_AUTO, _SIZE_FIXED = range(2)
 
@@ -160,6 +162,16 @@ def _rule_counts(value: Any) -> tuple[int, int] | None:
     return None
 
 
+def _same_number(first: Any, second: Any) -> bool:
+    """Whether two config values are the same number (0.5 and "0.5" are)."""
+    if first is None or second is None or isinstance(first, bool) or isinstance(second, bool):
+        return False
+    try:
+        return math.isclose(float(first), float(second))
+    except (TypeError, ValueError):
+        return False
+
+
 def _limit_text(value: Any) -> str:
     if value is None or value == "":
         return ""
@@ -191,6 +203,10 @@ class OptionsSettingsSection:
         #: number back as it was (the book's parser judges a malformed one),
         #: never the box's rounding or fallback.
         self._loaded_numbers: dict[str, Any] = {}
+        #: [LADDER] The written contract size ``market.hedge_size_xch`` was set
+        #: to match when loaded, or None: a save that changes the size takes
+        #: that Dexie check back to its default with it.
+        self._hedge_follows: Any = None
         #: The number boxes edited since the last load.
         self._touched: set[str] = set()
         self.widget = self._build()
@@ -284,8 +300,9 @@ class OptionsSettingsSection:
         self.target_mode.setToolTip(
             "options.target: what a Live step keeps at the options address, sending from the "
             "trading funds when it falls more than the tolerance below. Used with the engine "
-            "fence. From my limits: max locked XCH plus one contract, and 2 of the quote asset "
-            "(plus max locked quote with puts); with no XCH cap, nothing is topped up."
+            "fence. From my limits: max locked XCH plus one contract of the smallest size, and "
+            "2 of the quote asset (plus max locked quote with puts), topped up once half a "
+            "contract or 20% short; with no XCH cap, nothing is topped up."
         )
         target_form.addRow("Keep the address at:", self.target_mode)
         self.target_hint = QLabel("")
@@ -319,10 +336,10 @@ class OptionsSettingsSection:
         self.size_mode = QComboBox()
         self.size_mode.addItems(list(SIZE_MODES))
         self.size_mode.setToolTip(
-            "options.contract_xch. Automatic (auto): the largest of 1, 10, 100, ... XCH at "
-            "which every call slot (strikes x expiries, within Max contracts and Max per "
-            "expiry) still fits inside Max XCH locked, and never under 1 XCH. More strikes or "
-            "dates, or a lower cap, mean smaller contracts. Fixed: the size you write."
+            "options.contract_xch. Automatic (auto): contracts of 1, 10, 100, ... XCH side by "
+            "side. Every strike and expiry gets a 1 XCH contract first, then a 10 XCH one, and "
+            "so on, as far as Max XCH locked (calls), Max quote locked (puts), Max contracts and "
+            "Max per expiry allow. Fixed: the one size you write."
         )
         grid_form.addRow("Contract size:", self.size_mode)
         self.size_hint = QLabel("")
@@ -515,14 +532,12 @@ class OptionsSettingsSection:
         self.target_hint.setText(self._target_hint())
         self.limits_hint.setText(self._limits_hint())
 
-    def _auto_size(self) -> tuple[int, int, float | None]:
-        """[AUTO-SIZE] What Automatic comes to with the fields as they are.
+    def _grid(self) -> tuple[Any, int, int, int, float | None]:
+        """[LADDER] The limits and the grid the fields come to, as the book counts them.
 
-        (XCH a contract, the call slots the grid can hold, Max XCH locked or
-        None when it is not a number) -- by the book's own rule
-        (:func:`gui.services.options.config.auto_contract_xch`), so the tab
-        shows the size the book would mint with. A field the book would
-        refuse counts as unset here; Save says what is wrong with it.
+        (limits, call strikes, put strikes, expiries, Max XCH locked or None
+        when it is not a number). A field the book would refuse counts as unset
+        here; Save says what is wrong with it.
         """
         from gui.services.options import config as options_config
 
@@ -561,10 +576,12 @@ class OptionsSettingsSection:
             max_contracts_per_expiry=count("max_contracts_per_expiry"),
             max_fee_mojos=0,
         )
-        try:
-            calls = len(_number_list(self.call_strikes.text()))
-        except ValueError:
-            calls = 0
+        strikes = []
+        for field in (self.call_strikes, self.put_strikes):
+            try:
+                strikes.append(len(_number_list(field.text())))
+            except ValueError:
+                strikes.append(0)
         mode = self.expiry_mode.currentIndex()
         if mode == _EXPIRY_ROLLING:
             expiries = self.expiry_weeks.value() + self.expiry_months.value()
@@ -578,31 +595,46 @@ class OptionsSettingsSection:
                 expiries = len(set(dates))  # Save says what is wrong with it
         else:
             expiries = 0
-        size = options_config.auto_contract_xch(limits, calls, expiries)
-        return size, options_config.held_call_slots(limits, calls, expiries), xch_cap
+        return limits, strikes[0], strikes[1], expiries, xch_cap
 
     def _contract_size(self) -> float:
-        """The contract size the book would use: the box's, or what Automatic comes to."""
+        """The size headroom is counted in: the box's, or the ladder's smallest."""
         if self.size_mode.currentIndex() == _SIZE_FIXED:
             return self.contract_xch.value()
-        return float(self._auto_size()[0])
+        from gui.services.options import config as options_config
+
+        return float(options_config.AUTO_CONTRACT_MIN_XCH)
 
     def _size_hint(self) -> str:
-        """[AUTO-SIZE] What Automatic comes to, and why."""
+        """[LADDER] What Automatic comes to for calls on an empty book, and what one more needs."""
         if self.size_mode.currentIndex() == _SIZE_FIXED:
             return ""
-        size, slots, cap = self._auto_size()
+        from gui.services.options import config as options_config
+
+        limits, calls, puts, expiries, cap = self._grid()
+        tail = " Puts get the same sizes, as far as Max quote locked allows." if puts else ""
+        if calls <= 0 or expiries <= 0:
+            return "1 XCH contracts first, then 10, 100... as far as the limits allow." + tail
         if cap is None:
-            return f"{size} XCH a contract: Max XCH locked below has no number to size it from."
-        if slots <= 0:
-            return f"{size} XCH a contract: there are no call slots to size it from."
-        covered = min(slots, int(cap // size))
-        if covered < slots:
-            return (
-                f"{size} XCH a contract, the smallest it goes: Max XCH locked covers "
-                f"{covered} of the {slots} call slots, nearest expiry first."
+            return "1 XCH calls only: Max XCH locked below has no number to size more from." + tail
+        ladder = options_config.call_ladder(limits, calls, expiries, puts)
+        if not ladder:
+            return ""  # the limits hint says why nothing is minted
+        locked = sum(size * count for size, count in ladder)
+        sizes = ", then ".join(f"{count} of {size:g} XCH" for size, count in ladder)
+        text = f"Calls, smallest first: {sizes} ({locked:g} XCH locked)."
+        top, count = ladder[-1]
+        step = top if count < calls * expiries else top * 10
+        if step <= options_config.AUTO_CONTRACT_MAX_XCH:
+            wider = dataclasses.replace(
+                limits, max_locked_xch=(locked + step) * options_config.XCH_MOJOS
             )
-        return f"{size} XCH a contract: all {slots} call slots fit inside Max XCH locked."
+            more = options_config.call_ladder(wider, calls, expiries, puts)
+            if sum(n for _, n in more) > sum(n for _, n in ladder):
+                text += f" Max XCH locked {locked + step:g} adds a {step:g} XCH call."
+            else:
+                text += " Max contracts and Max per expiry leave no room for more calls."
+        return text + tail
 
     def _limits_hint(self) -> str:
         """[review] Why nothing would be minted with these limits, or ""."""
@@ -616,7 +648,7 @@ class OptionsSettingsSection:
             return "Nothing is minted until all four limits are set: a number each, or unlimited."
         cap = values["max_locked_xch"]
         if isinstance(cap, (int, float)) and cap < self._contract_size():
-            return "Max XCH locked is less than one contract: nothing is minted."
+            return "Max XCH locked is less than one contract: no call is minted."
         return ""
 
     def _target_hint(self) -> str:
@@ -689,8 +721,9 @@ class OptionsSettingsSection:
             self.target_mode.setCurrentIndex(_TARGET_LIMITS)
 
         size = section.get("contract_xch")
+        self._hedge_follows = None
         if size is None or (isinstance(size, str) and size.strip().lower() == "auto"):
-            # [AUTO-SIZE] `auto`, or not written (the book reads that as auto
+            # [LADDER] `auto`, or not written (the book reads that as auto
             # too): Automatic. The box holds what Fixed would start from, and
             # nothing loaded, so switching to Fixed writes the box's number.
             self.size_mode.setCurrentIndex(_SIZE_AUTO)
@@ -703,6 +736,11 @@ class OptionsSettingsSection:
             self.size_mode.setCurrentIndex(_SIZE_FIXED)
             _show_number(self.contract_xch, max(_number(size, 0.0), 0.0))
             self._loaded_numbers["contract_xch"] = size
+            market = section.get("market") if isinstance(section.get("market"), dict) else {}
+            if _same_number(market.get("hedge_size_xch"), size):
+                # [LADDER] The Dexie check sized to match this contract size
+                # (the 0.5 XCH live test wrote both): it goes with the size.
+                self._hedge_follows = size
         expiries = section.get("expiries")
         rule = _rule_counts(expiries)
         listed = expiries if isinstance(expiries, (list, tuple)) else []
@@ -830,6 +868,13 @@ class OptionsSettingsSection:
             "put_strikes_pct": _number_list(self.put_strikes.text()),
             "limits": {key: _limit_value(field.text()) for key, field in self.limit_fields.items()},
         }
+        if self._hedge_follows is not None and not _same_number(
+            options["contract_xch"], self._hedge_follows
+        ):
+            # [LADDER] The size changed and the Dexie check was sized to the
+            # old one: back to its default, one contract of the smallest size
+            # (finish() removes the None).
+            options["market"] = {"hedge_size_xch": None}
         mode = self.target_mode.currentIndex()
         if mode == _TARGET_OFF:
             options["target"] = False
@@ -847,12 +892,19 @@ class OptionsSettingsSection:
     def finish(options: dict[str, Any]) -> None:
         """After the merge onto config.yaml: remove what this tab leaves to the defaults.
 
-        A target from the limits and a blank limit are absences, not values;
-        a merge cannot remove a key, so they are taken out here. On a shared
-        wallet, empty connection fields are left to the Connection tab.
+        A target from the limits, a blank limit and [LADDER] a Dexie check
+        sized to a contract size given up are absences, not values; a merge
+        cannot remove a key, so they are taken out here. On a shared wallet,
+        empty connection fields are left to the Connection tab.
         """
         if options.get("target") is None:
             options.pop("target", None)
+        market = options.get("market")
+        if isinstance(market, dict) and "hedge_size_xch" in market:
+            if market["hedge_size_xch"] is None:
+                market.pop("hedge_size_xch")
+            if not market:
+                options.pop("market")
         limits = options.get("limits")
         if isinstance(limits, dict):
             for key in [key for key, value in limits.items() if value is None]:

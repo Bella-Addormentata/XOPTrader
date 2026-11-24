@@ -301,11 +301,33 @@ def _learned_rate(book_store: store.OptionStore) -> float:
         return 0.0
 
 
-def contract_size_line(cfg: config.OptionsConfig) -> str:
-    """[AUTO-SIZE] The contract size as `status` says it, so ``auto`` is never a guess."""
-    size = cfg.contract_xch_mojos / config.XCH_MOJOS
-    auto = " (auto, from the limits)" if cfg.contract_auto else ""
-    return f"contract size: {size:g} XCH{auto}"
+def contract_size_line(cfg: config.OptionsConfig, now: int | None = None) -> str:
+    """[LADDER] The contract sizes as `status` says them, so ``auto`` is never a guess.
+
+    A written size is that one size. ``auto`` is the ladder, with what it comes
+    to for calls on an empty book at these limits (:func:`config.call_ladder`).
+    """
+    if not cfg.contract_auto:
+        return f"contract size: {cfg.contract_xch_mojos / config.XCH_MOJOS:g} XCH"
+    sizes = ", ".join(f"{size / config.XCH_MOJOS:g}" for size in cfg.sizes_mojos[:3])
+    head = f"contract sizes: {sizes}... XCH side by side (auto, smallest first)"
+    limits = cfg.limits
+    caps = (limits.max_locked_xch, limits.max_locked_quote, limits.max_contracts)
+    if config.UNSET in (*caps, limits.max_contracts_per_expiry):
+        return f"{head}; a limit is not set, so nothing is minted"
+    if not cfg.call_strikes_pct:
+        return f"{head}; puts only, as far as max_locked_quote allows"
+    when = int(time.time()) if now is None else now
+    ladder = config.call_ladder(
+        cfg.limits,
+        len(cfg.call_strikes_pct),
+        len(cfg.quotable_expiries(when)),
+        len(cfg.put_strikes_pct),
+    )
+    if not ladder:
+        return f"{head}; no call fits these limits"
+    calls = ", ".join(f"{count} of {size:g} XCH" for size, count in ladder)
+    return f"{head}; calls these limits hold: {calls}"
 
 
 def _status(cfg: config.OptionsConfig) -> int:
