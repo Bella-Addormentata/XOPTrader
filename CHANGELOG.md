@@ -5,7 +5,7 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.57] — 2026-11-22 — wide-book protection, option contracts sized from your limits, distinct offer amounts, quieter alerts, and a read-only Circuit page
+## [0.10.57] — 2026-11-24 — wide-book protection, option contracts sized from your limits, distinct offer amounts, options top-ups booked as transfers, quieter alerts, and a read-only Circuit page
 
 ### A book too wide to price (#252, #254)
 
@@ -49,7 +49,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   worked out. `config.example.yaml` uses `auto` and leaves
   `hedge_size_xch` out.
 
-### Offers no longer ask for identical amounts (#255)
+### Offers no longer ask for identical amounts (#255, #256)
 
 When a taker combines several offers in one transaction, the wallet pays
 every request for an asset from one coin, and Chia rejects two identical
