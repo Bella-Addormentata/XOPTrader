@@ -29,26 +29,34 @@
 //   * record_taker_fill() -- ledger legs, the taker_fills row, revive flows --
 //     runs for a take only once the wallet reports it CONFIRMED *and* its
 //     payment to us is in our coin store at that height: one coin of exactly
-//     each received amount (receipts_paid).  The maker side has proved its
-//     fills the same way since #171 (fill_proof.hpp, prove_take_from_payments):
-//     the wallet's status is its own bookkeeping, not evidence.
+//     each received amount, in that asset's own wallet (receipts_paid).  The
+//     maker side has proved its fills the same way since #171 (fill_proof.hpp,
+//     prove_take_from_payments): the wallet's status is its own bookkeeping,
+//     not evidence.
 //   * FAILED or CANCELLED: the take never happened.  Nothing is booked.
 //   * Everything else waits: pending, unreadable, or CONFIRMED with the
-//     payment not in the store yet.  A take still waiting after
-//     kTakeSettleGiveUpBlocks stops being tracked, loudly; if it settles
-//     after that, the sweep below books it.
+//     payment not in the store yet.  The takes are read a few per heartbeat,
+//     least recently read first, so none waits behind another.  A take still
+//     waiting after kTakeSettleGiveUpBlocks stops being tracked, loudly; if it
+//     settles after that, the sweep below books it.
 //   * While a take of a Dexie offer is unsettled, that offer is not taken
 //     again.  Nor is an offer whose take request failed in a way that may
-//     have reached the wallet (rpc::request_possibly_submitted), for
-//     kUncertainTakeHoldBlocks: the wallet may still be taking it.
+//     have reached the wallet (rpc::request_possibly_submitted), or whose
+//     reply named no trade id, for kUncertainTakeHoldBlocks: the wallet may
+//     still be taking it.  What such a take could move (UncertainTake) widens
+//     the divergence control's tolerance for as long as the hold lasts, so
+//     the control does not absorb it before the sweep books it.
+//   * Both kinds of hold are written to the database (take_holds) and read
+//     back at start, before any take step runs: a restart does not forget an
+//     unsettled take or an uncertain request.
 //   * THE SWEEP.  A settled take of ours in the wallet's recent trade records
 //     that the ledger does not hold and the engine is not tracking -- one
-//     whose request timed out, or one tracked by a process that has since
-//     stopped -- is booked from the wallet's own amounts, after the same
-//     payment proof.  Only takes between kTakeSweepGraceBlocks and
-//     kTakeSweepLookbackBlocks old: the GUI's bridge top-up takes are booked
-//     by their own ingest first, and older history is a repair's business,
-//     not a heartbeat's.
+//     whose request timed out, or one taken by hand -- is booked from the
+//     wallet's own amounts, after the same payment proof.  The GUI's bridge
+//     top-up takes are left to their own ingest (by trade id, and the ledger
+//     is asked under both spellings of a take's event id).  Only takes between
+//     kTakeSweepGraceBlocks and kTakeSweepLookbackBlocks old: older history is
+//     a repair's business, not a heartbeat's.
 //
 // Pure header: no I/O, no RPC, no logging.
 // ---------------------------------------------------------------------------
@@ -61,11 +69,14 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -78,10 +89,13 @@ inline constexpr BlockHeight kTakeSettleGiveUpBlocks{960};
 
 /// How long an offer whose take request may have reached the wallet without
 /// an answer is left alone (~20 min): long enough for that take to settle or
-/// fail, after which the offer is either gone or takeable again.
+/// fail, after which the offer is either gone or takeable again.  Longer
+/// than the sweep's grace plus one sweep interval, so the tolerance it adds
+/// lasts until the sweep has booked a take that did settle.
 inline constexpr BlockHeight kUncertainTakeHoldBlocks{64};
 
-/// Pending takes read per heartbeat, oldest first: one wallet get_offer each.
+/// Pending takes read per heartbeat, least recently read first: one wallet
+/// get_offer each.
 inline constexpr std::size_t kTakeSettlePerHeartbeat{4};
 
 /// The sweep runs every this many blocks (~3 min) ...
@@ -90,9 +104,12 @@ inline constexpr BlockHeight kTakeSweepEveryBlocks{10};
 inline constexpr std::int64_t kTakeSweepWindow{50};
 /// ... confirmed at most this long ago (~1 day) ...
 inline constexpr BlockHeight kTakeSweepLookbackBlocks{4'608};
-/// ... and at least this long ago (~30 min), so a take booked by another
-/// writer (the GUI's bridge top-up ingest) is already in the ledger.
-inline constexpr BlockHeight kTakeSweepGraceBlocks{100};
+/// ... and at least this long ago (~6 min): the settle step books a take it
+/// tracks within a heartbeat or two, and the sweep is for the rest.
+inline constexpr BlockHeight kTakeSweepGraceBlocks{20};
+
+static_assert(kUncertainTakeHoldBlocks > kTakeSweepGraceBlocks + kTakeSweepEveryBlocks,
+              "an uncertain take's tolerance must outlast the sweep that books it");
 
 /// One asset and an amount of it, in its own mojos.
 using AssetAmount = std::pair<std::string, Mojo>;
@@ -108,7 +125,61 @@ struct PendingTake {
     Mojo          price_mojos{0};
     std::uint64_t fee_mojos{0};
     BlockHeight   submitted_block{0};
+    BlockHeight   last_checked_block{0};  ///< the settle step's last read (0: none)
 };
+
+/// A take request that may have reached the wallet without an answer, or
+/// whose reply named no trade id: the offer is held back, and what the take
+/// could move widens the divergence control's tolerance, until `at` plus
+/// kUncertainTakeHoldBlocks.
+struct UncertainTake {
+    BlockHeight              at{0};
+    std::vector<AssetAmount> exposure;   ///< absolute mojos per asset, fee on xch included
+};
+
+/// What a take site is about to take: enough to hold the offer back, and to
+/// say what the take could move, should the request go unanswered.
+struct TakeIntent {
+    std::string   strategy;
+    std::string   pair_name;
+    bool          we_bought_base{false};
+    Mojo          base_mojos{0};
+    Mojo          price_mojos{0};
+    std::uint64_t fee_mojos{0};
+};
+
+/// Add a take's network fee to what it could move, on xch, saturating.
+inline void add_fee_exposure(UncertainTake& hold, std::uint64_t fee_mojos)
+{
+    if (fee_mojos == 0U) return;
+    constexpr auto kMost = static_cast<std::uint64_t>(std::numeric_limits<Mojo>::max());
+    hold.exposure.emplace_back("xch", static_cast<Mojo>(std::min(fee_mojos, kMost)));
+}
+
+/// Is an uncertain hold made at `at` still in force at `now`?
+[[nodiscard]] constexpr bool uncertain_hold_live(BlockHeight at, BlockHeight now) noexcept
+{
+    return now >= at && now - at < kUncertainTakeHoldBlocks;
+}
+
+/// Per asset, what the live uncertain holds could have moved: the
+/// divergence control's extra tolerance.  Saturating.
+[[nodiscard]] inline std::unordered_map<std::string, Mojo> uncertain_take_slack(
+    const std::unordered_map<std::string, UncertainTake>& uncertain, BlockHeight now)
+{
+    std::unordered_map<std::string, Mojo> out;
+    for (const auto& [offer_id, hold] : uncertain) {
+        (void)offer_id;
+        if (!uncertain_hold_live(hold.at, now)) continue;
+        for (const auto& [asset, mojos] : hold.exposure) {
+            if (mojos <= 0) continue;
+            Mojo& slot = out[asset];
+            slot = (slot > std::numeric_limits<Mojo>::max() - mojos)
+                ? std::numeric_limits<Mojo>::max() : slot + mojos;
+        }
+    }
+    return out;
+}
 
 /// What to do with a tracked take this heartbeat.
 enum class TakeVerdict : std::uint8_t {
@@ -232,32 +303,60 @@ struct WalletTake {
     return out;
 }
 
+/// The wallet id a flat wallet coin record belongs to
+/// (`wallet_identifier.id`), or nullopt when it does not say.
+[[nodiscard]] inline std::optional<std::int64_t> coin_record_wallet_id(const nlohmann::json& record)
+{
+    if (!record.is_object()) return std::nullopt;
+    const auto ident = record.find("wallet_identifier");
+    if (ident == record.end() || !ident->is_object()) return std::nullopt;
+    const auto id = ident->find("id");
+    if (id == ident->end() || !id->is_number_integer()) return std::nullopt;
+    return id->get<std::int64_t>();
+}
+
 /// Did the take pay us?  Every received amount must be matched by its own
-/// coin record -- the wallet's flat get_coin_records rows -- of exactly that
-/// amount, created at `height`.  One record never vouches for two receipts.
-/// Fail closed: no receipts, no height, or any record that cannot be read
-/// proves nothing.
-[[nodiscard]] inline bool receipts_paid(const std::vector<AssetAmount>&    received,
-                                        const std::vector<nlohmann::json>& records,
-                                        std::uint64_t                      height)
+/// coin record -- the wallet's flat get_coin_records rows, which span every
+/// wallet -- of exactly that amount, created at `height`, IN THAT ASSET'S
+/// WALLET (`wallet_ids`: normalised asset id -> wallet id).  A 1,000-mojo DBX
+/// coin never pays a 1,000-mojo BYC receipt, and one record never vouches for
+/// two receipts.  Fail closed: no receipts, no height, an asset with no
+/// wallet, or any record that cannot be read proves nothing.
+[[nodiscard]] inline bool receipts_paid(const std::vector<AssetAmount>&                 received,
+                                        const std::vector<nlohmann::json>&              records,
+                                        std::uint64_t                                   height,
+                                        const std::unordered_map<std::string, std::int64_t>& wallet_ids)
 {
     if (received.empty() || height == 0U) return false;
-    std::vector<std::uint64_t> coins;
+    std::vector<std::pair<std::int64_t, std::uint64_t>> coins;   // (wallet id, amount)
     coins.reserve(records.size());
     for (const auto& record : records) {
         const auto ref     = parse_coin_ref(record);
         const auto created = coin_record_confirmed_height(record);
-        if (!ref || !created) return false;
-        if (*created == height) coins.push_back(ref->amount);
+        const auto wallet  = coin_record_wallet_id(record);
+        if (!ref || !created || !wallet) return false;
+        if (*created == height) coins.emplace_back(*wallet, ref->amount);
     }
     for (const auto& r : received) {
         if (r.second <= 0) return false;
-        const auto want = static_cast<std::uint64_t>(r.second);
-        const auto it   = std::find(coins.begin(), coins.end(), want);
+        const auto wid = wallet_ids.find(r.first);
+        if (wid == wallet_ids.end() || wid->second <= 0) return false;
+        const std::pair<std::int64_t, std::uint64_t> want{wid->second,
+                                                          static_cast<std::uint64_t>(r.second)};
+        const auto it = std::find(coins.begin(), coins.end(), want);
         if (it == coins.end()) return false;
         coins.erase(it);
     }
     return true;
+}
+
+/// Both spellings a take's ledger event id has: the engine writes
+/// "take:" + the wallet's id ("0x..."), the GUI's top-up ingest "take:" +
+/// the bare lowercase id (accounting/topup_take.hpp).  Ask the ledger both.
+[[nodiscard]] inline std::array<std::string, 2> take_event_ids(std::string_view trade_id)
+{
+    const std::string bare = normalize_id(trade_id);
+    return {"take:0x" + bare, "take:" + bare};
 }
 
 /// A settled take as the books want it on one pair.
@@ -309,15 +408,14 @@ struct TakeBooking {
 }
 
 /// May the Dexie offer `offer_id` be taken at `now`?  Not while a take of it
-/// is unsettled (`pending`, keyed by trade id), and not for
-/// kUncertainTakeHoldBlocks after a take request for it that may have reached
-/// the wallet unanswered (`uncertain`, offer id -> height of that request).
-/// An empty offer id is never refused here: there is nothing to match.
+/// is unsettled (`pending`, keyed by trade id), and not while an uncertain
+/// hold on it is live (`uncertain`, keyed by offer id).  An empty offer id is
+/// never refused here: there is nothing to match.
 [[nodiscard]] inline bool take_refused(
-    const std::unordered_map<std::string, PendingTake>& pending,
-    const std::unordered_map<std::string, BlockHeight>& uncertain,
-    const std::string&                                  offer_id,
-    BlockHeight                                         now)
+    const std::unordered_map<std::string, PendingTake>&   pending,
+    const std::unordered_map<std::string, UncertainTake>& uncertain,
+    const std::string&                                    offer_id,
+    BlockHeight                                           now)
 {
     if (offer_id.empty()) return false;
     for (const auto& [trade_id, take] : pending) {
@@ -325,25 +423,26 @@ struct TakeBooking {
         if (take.counterparty_offer_id == offer_id) return true;
     }
     const auto it = uncertain.find(offer_id);
-    if (it == uncertain.end()) return false;
-    return now >= it->second && now - it->second < kUncertainTakeHoldBlocks;
+    return it != uncertain.end() && uncertain_hold_live(it->second.at, now);
 }
 
-/// Trade ids of the tracked takes, oldest submission first (ties by id, so
-/// the order is stable), at most `limit` of them.
+/// Trade ids of the tracked takes to read this heartbeat, at most `limit`:
+/// least recently read first, then oldest submission, then id -- so every
+/// take is read within a bounded number of heartbeats, whatever the others
+/// do (a never-read take, 0, comes first).
 [[nodiscard]] inline std::vector<std::string> takes_to_settle(
     const std::unordered_map<std::string, PendingTake>& pending, std::size_t limit)
 {
-    std::vector<std::pair<BlockHeight, std::string>> order;
+    std::vector<std::tuple<BlockHeight, BlockHeight, std::string>> order;
     order.reserve(pending.size());
     for (const auto& [trade_id, take] : pending) {
-        order.emplace_back(take.submitted_block, trade_id);
+        order.emplace_back(take.last_checked_block, take.submitted_block, trade_id);
     }
     std::sort(order.begin(), order.end());
     std::vector<std::string> out;
     for (const auto& entry : order) {
         if (out.size() >= limit) break;
-        out.push_back(entry.second);
+        out.push_back(std::get<2>(entry));
     }
     return out;
 }

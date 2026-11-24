@@ -77,6 +77,7 @@ XCH = "xch"
 BYC = "ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac"
 DBX = "db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20"
 FEE_MATCH_TOLERANCE = 10_000_000_000      # 0.01 XCH: measured fees vs the remainder
+FEE_PER_HEIGHT_MAX = 1_000_000_000        # 0.001 XCH: the most one block's fees may be
 GIVE = 50                                 # blocks a payment coin may trail its trade
 MOJOS_PER_XCH = 10 ** 12
 
@@ -305,7 +306,9 @@ def proven_trades(trades: list, coins: dict, booked: dict) -> dict:
             for asset, at, amount in claims:
                 pool.free[(asset, at, amount)] += 1
             continue
-        real[norm(t["trade_id"])] = t
+        # The block the payment landed in, which is the block of the spend:
+        # the wallet's confirmed_at_index can lag it by a block.
+        real[norm(t["trade_id"])] = dict(t, settled_at=max(at for _, at, _ in claims))
     return real
 
 
@@ -465,6 +468,7 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
                 reward_px.append((int(r[8] or 0), float(m.group(1))))
     reward_px.sort()
     leftovers = {}
+    confirmed_ids = {norm(t["trade_id"]) for t in trades if t.get("status") == "CONFIRMED"}
     for asset, cs in coins.items():
         if asset == XCH:
             continue    # XCH: no reward stream; options flows are D, the rest is F
@@ -485,12 +489,16 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
                         left[k] -= 1
                         break
         for r in led:      # booked receipts a stale wallet status hides (PENDING_CANCEL)
-            if r[2] in ("fill", "take") and norm(r[5]) == asset and r[6] > 0:
-                h0 = int(r[8] or 0)
-                for k in ((h0 + d, r[6]) for d in range(-GIVE, GIVE + 1)):
-                    if left[k] > 0:
-                        left[k] -= 1
-                        break
+            if r[2] not in ("fill", "take") or norm(r[5]) != asset or r[6] <= 0:
+                continue
+            hexes = re.findall(r"[0-9a-fA-F]{64}", r[3] or "")
+            if hexes and hexes[0].lower() in confirmed_ids:
+                continue   # its receipt came off above, with its wallet record
+            h0 = int(r[8] or 0)
+            for k in ((h0 + d, r[6]) for d in range(-GIVE, GIVE + 1)):
+                if left[k] > 0:
+                    left[k] -= 1
+                    break
         if asset != DBX:
             leftovers[asset] = sorted(k for k, n in left.items() for _ in range(max(n, 0)))
             continue
@@ -520,13 +528,27 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
     for c in xch_coins:
         kids[c["parent"]] += c["amount"]
     spent = [c for c in xch_coins if c["ph"] != oph and c["spent"] > retie_h]
-    left_wallet = sum(c["amount"] - kids.get(c["id"], 0) for c in spent)
+    left_by_height = collections.Counter()
+    for c in spent:
+        left_by_height[c["spent"]] += c["amount"] - kids.get(c["id"], 0)
+    left_wallet = sum(left_by_height.values())
     end_h = max((c["spent"] for c in spent), default=retie_h)
     paid_xch = 0
     for t in real.values():
         if int(t["confirmed_at_index"]) > retie_h:
             _, paid = receive_and_pay(t)
             paid_xch += paid.get(XCH, 0)
+            left_by_height[int(t["settled_at"])] -= paid.get(XCH, 0)
+    # A network fee is small.  XCH that left a trading coin at one height,
+    # beyond the XCH legs of the trades settled there, by more than
+    # FEE_PER_HEIGHT_MAX is a payment to someone, not a fee: refuse to call
+    # it one.
+    not_fees = {h: v for h, v in left_by_height.items() if v > FEE_PER_HEIGHT_MAX}
+    if not_fees:
+        listed = ", ".join(f"block {h}: {v / MOJOS_PER_XCH:.6f} XCH"
+                           for h, v in sorted(not_fees.items())[:20])
+        raise SystemExit(f"{len(not_fees)} XCH outflow(s) are not trades and too large to be "
+                         f"network fees -- explain them before repairing: {listed}")
     # Fee legs of events reversed already (the 2026-09 phantom fills) or here
     # were never paid.
     reversed_events = ({e["event_id"] for e in entries if e["event_type"] == "reversal"}
@@ -584,16 +606,49 @@ def report(plan: dict) -> dict:
 
 
 # ---------------------------------------------------------------- apply/check
+WRITER_EXES = ("xop_trader.exe", "xop_trader_gui.exe")
+# Command-line marks of a GUI run from source and of the options runner.  Not
+# "xop_trader": this script's own --db argument names the database.
+WRITER_COMMANDS = ("gui.main", "gui\\main", "gui/main", "gui.services.options")
+
+
+def writers_running(processes: list) -> list:
+    """The engine, the GUI (installed, or run from source as python gui.main)
+    and the options book's own runner, among (name, command line) pairs."""
+    found = []
+    for name, command in processes:
+        exe = (name or "").lower()
+        cmd = (command or "").lower()
+        if exe in WRITER_EXES:
+            found.append(exe)
+        elif exe in ("python.exe", "pythonw.exe") and any(w in cmd for w in WRITER_COMMANDS):
+            found.append(f"{exe}: {command}")
+    return found
+
+
 def require_stopped() -> None:
+    """Refuse unless every writer of the database and the wallet is stopped.
+    Fails closed: a process list that cannot be read refuses too."""
     if os.name != "nt":
-        return
+        raise SystemExit("--apply runs on the trading PC (Windows) only")
     root = pathlib.Path(os.environ.get("SystemRoot", r"C:\Windows"))
-    tasklist = root / "System32" / "tasklist.exe"
-    out = subprocess.run([str(tasklist)], capture_output=True, text=True,  # noqa: S603
-                         check=True).stdout.lower()
-    running = [p for p in ("xop_trader.exe", "xop_trader_gui.exe") if p in out]
+    shell = root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    query = ("Get-CimInstance Win32_Process | Select-Object ProcessId, Name, CommandLine | "
+             "ConvertTo-Json -Compress")
+    try:
+        out = subprocess.run([str(shell), "-NoProfile", "-Command", query],  # noqa: S603
+                             capture_output=True, text=True, check=True, timeout=60).stdout
+        rows = json.loads(out)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise SystemExit(f"the process list could not be read ({exc}); not applying") from exc
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not rows:
+        raise SystemExit("the process list came back empty; not applying")
+    running = writers_running([(r.get("Name"), r.get("CommandLine")) for r in rows
+                               if r.get("ProcessId") != os.getpid()])
     if running:
-        raise SystemExit(f"stop these first: {', '.join(running)}")
+        raise SystemExit("stop these first: " + "; ".join(running))
 
 
 def backup(db_path: pathlib.Path) -> pathlib.Path:

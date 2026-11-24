@@ -376,6 +376,29 @@ struct DbTakerFill {
 };
 
 // ---------------------------------------------------------------------------
+// [TAKE-SETTLE 2026-11-24] DbTakeHold -- a take the engine is holding: one
+// the wallet accepted that has not settled ("pending", keyed "take:<trade
+// id>"), or a take request that may have reached the wallet unanswered
+// ("uncertain", keyed "uncertain:<offer id>", no trade id).  Written when the
+// hold starts and deleted when it ends, so a restart restores both before
+// any take step runs (execution/take_settlement.hpp).
+// ---------------------------------------------------------------------------
+
+struct DbTakeHold {
+    std::string   hold_key;               ///< "take:<trade id>" | "uncertain:<offer id>"
+    std::string   kind;                   ///< "pending" | "uncertain"
+    std::string   offer_id;               ///< The Dexie offer taken.
+    std::string   trade_id;               ///< "" for an uncertain request.
+    std::string   strategy;
+    std::string   pair_name;
+    bool          we_bought_base{false};
+    Mojo          base_mojos{0};
+    Mojo          price_mojos{0};
+    std::uint64_t fee_mojos{0};
+    BlockHeight   block_height{0};        ///< Submitted at (pending) / requested at (uncertain).
+};
+
+// ---------------------------------------------------------------------------
 // [PACE 2026-09-13] DbPaceFillRow -- one raw fill for the pace controller's
 // progress accounting: a maker row (trade_log) or a taker row (taker_fills).
 // No arithmetic happens in SQL: price x size reaches ~1e24, past int64.
@@ -718,6 +741,17 @@ public:
     /// holds reaching the tracker -- a capital event (it re-anchors the
     /// drawdown peak), with no second Net Deposits entry.
     [[nodiscard]] std::optional<std::vector<std::string>> capital_reconcile_pending() const;
+
+    /// [TAKE-SETTLE] Write (or rewrite) one take hold.  Never throws.
+    /// @return false when it could not be written.
+    bool save_take_hold(const DbTakeHold& hold) noexcept;
+
+    /// [TAKE-SETTLE] The hold ended: drop it.  Never throws.
+    bool delete_take_hold(const std::string& hold_key) noexcept;
+
+    /// [TAKE-SETTLE] Every hold, or std::nullopt when the table could not be
+    /// read.
+    [[nodiscard]] std::optional<std::vector<DbTakeHold>> take_holds() const;
 
     /// The entry_time of this asset's 'opening' leg (ISO-8601 UTC), or ""
     /// when none exists / the query fails.  [S19] The bridge ingester

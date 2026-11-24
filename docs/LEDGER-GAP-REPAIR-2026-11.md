@@ -88,15 +88,23 @@ the options address. The script reports both.
   fee legs of events already reversed), is 0.339999 XCH. It is the network
   fees of cancels and coin splits (§8 known gap), posted as one `fee` row. It
   keeps growing while the engine cancels, so it is measured when the script
-  runs. The dry run also checks what is left of the XCH gap after A to F:
-  0.000000 XCH. `--apply` refuses if that is more than 0.01 XCH.
+  runs. Each block's outflow is checked first, after the XCH paid by the
+  trades that settled in that block (at the block their payment landed in).
+  More than 0.001 XCH left over in any one block is a payment, not a fee, and
+  the script refuses until it is explained. The dry run also checks what is
+  left of the XCH gap after A to F: 0.000000 XCH. `--apply` refuses if that
+  is more than 0.01 XCH.
 
 ## Runbook
 
 All commands run from `C:\GitHub\XOPTrader`, with the Chia wallet running and synced.
 
 1. Merge and publish the release with the take fix. Do not install it yet.
-2. Stop the GUI. That stops the engine and the options book.
+2. Stop the GUI. That stops the engine and the options book. Stop the
+   options runner too if it runs in a terminal. `--apply` refuses while
+   `xop_trader.exe` or `xop_trader_gui.exe` runs, or a Python process runs
+   `gui.main` or `gui.services.options`. It also refuses if it cannot read
+   the process list.
 3. Dry run, and read the summary. "XCH left after every item" must be
    within ±0.01. A fill taken while the engine was stopped shows up there;
    if so, wait for it to be booked.

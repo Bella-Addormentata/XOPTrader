@@ -214,6 +214,24 @@ CREATE TABLE IF NOT EXISTS capital_reconcile_pending (
 );
 )SQL";
 
+// [TAKE-SETTLE 2026-11-24] The takes the engine is holding (DbTakeHold).
+constexpr const char* kCreateTakeHolds = R"SQL(
+CREATE TABLE IF NOT EXISTS take_holds (
+    hold_key        TEXT    PRIMARY KEY,
+    kind            TEXT    NOT NULL,
+    offer_id        TEXT    NOT NULL,
+    trade_id        TEXT    NOT NULL,
+    strategy        TEXT    NOT NULL,
+    pair_name       TEXT    NOT NULL,
+    we_bought_base  INTEGER NOT NULL,
+    base_mojos      INTEGER NOT NULL,
+    price_mojos     INTEGER NOT NULL,
+    fee_mojos       INTEGER NOT NULL,
+    block_height    INTEGER NOT NULL,
+    created_at      TEXT    DEFAULT CURRENT_TIMESTAMP
+);
+)SQL";
+
 constexpr const char* kCreateArbEdgeLog = R"SQL(
 CREATE TABLE IF NOT EXISTS arb_edge_log (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1854,6 +1872,119 @@ std::optional<std::vector<std::string>> Database::capital_reconcile_pending() co
     return assets;
 }
 
+bool Database::save_take_hold(const DbTakeHold& hold) noexcept
+{
+    static constexpr const char* kUpsert = R"SQL(
+        INSERT OR REPLACE INTO take_holds
+            (hold_key, kind, offer_id, trade_id, strategy, pair_name,
+             we_bought_base, base_mojos, price_mojos, fee_mojos, block_height)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    try {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, kUpsert, -1, &stmt, nullptr) != SQLITE_OK) {
+            spdlog::error("[Database] save_take_hold prepare failed: {}", sqlite3_errmsg(db_));
+            sqlite3_finalize(stmt);
+            return false;
+        }
+        sqlite3_bind_text(stmt, 1, hold.hold_key.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, hold.kind.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, hold.offer_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, hold.trade_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 5, hold.strategy.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 6, hold.pair_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 7, hold.we_bought_base ? 1 : 0);
+        sqlite3_bind_int64(stmt, 8, hold.base_mojos);
+        sqlite3_bind_int64(stmt, 9, hold.price_mojos);
+        sqlite3_bind_int64(stmt, 10, static_cast<sqlite3_int64>(
+            std::min<std::uint64_t>(hold.fee_mojos,
+                                    static_cast<std::uint64_t>(std::numeric_limits<sqlite3_int64>::max()))));
+        sqlite3_bind_int64(stmt, 11, static_cast<sqlite3_int64>(hold.block_height));
+        const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+        if (!ok) {
+            spdlog::error("[Database] save_take_hold failed for {}: {}", hold.hold_key,
+                          sqlite3_errmsg(db_));
+        }
+        sqlite3_finalize(stmt);
+        return ok;
+    } catch (...) {
+        spdlog::error("[Database] save_take_hold: unexpected exception");
+        return false;
+    }
+}
+
+bool Database::delete_take_hold(const std::string& hold_key) noexcept
+{
+    static constexpr const char* kDelete = R"SQL(
+        DELETE FROM take_holds WHERE hold_key = ?1;
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    try {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, kDelete, -1, &stmt, nullptr) != SQLITE_OK) {
+            spdlog::error("[Database] delete_take_hold prepare failed: {}", sqlite3_errmsg(db_));
+            sqlite3_finalize(stmt);
+            return false;
+        }
+        sqlite3_bind_text(stmt, 1, hold_key.c_str(), -1, SQLITE_TRANSIENT);
+        const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+        if (!ok) {
+            spdlog::error("[Database] delete_take_hold failed for {}: {}", hold_key,
+                          sqlite3_errmsg(db_));
+        }
+        sqlite3_finalize(stmt);
+        return ok;
+    } catch (...) {
+        spdlog::error("[Database] delete_take_hold: unexpected exception");
+        return false;
+    }
+}
+
+std::optional<std::vector<DbTakeHold>> Database::take_holds() const
+{
+    static constexpr const char* kSelect = R"SQL(
+        SELECT hold_key, kind, offer_id, trade_id, strategy, pair_name,
+               we_bought_base, base_mojos, price_mojos, fee_mojos, block_height
+        FROM take_holds ORDER BY block_height, hold_key;
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, kSelect, -1, &stmt, nullptr) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return std::nullopt;
+    }
+    const auto text = [&](int col) {
+        const char* v = reinterpret_cast<const char*>(sqlite3_column_text(stmt, col));
+        return v != nullptr ? std::string(v) : std::string{};
+    };
+    std::vector<DbTakeHold> holds;
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        DbTakeHold h;
+        h.hold_key       = text(0);
+        h.kind           = text(1);
+        h.offer_id       = text(2);
+        h.trade_id       = text(3);
+        h.strategy       = text(4);
+        h.pair_name      = text(5);
+        h.we_bought_base = sqlite3_column_int(stmt, 6) != 0;
+        h.base_mojos     = sqlite3_column_int64(stmt, 7);
+        h.price_mojos    = sqlite3_column_int64(stmt, 8);
+        const sqlite3_int64 fee = sqlite3_column_int64(stmt, 9);
+        h.fee_mojos      = fee > 0 ? static_cast<std::uint64_t>(fee) : 0U;
+        const sqlite3_int64 height = sqlite3_column_int64(stmt, 10);
+        h.block_height   = height > 0 ? static_cast<BlockHeight>(height) : BlockHeight{0};
+        holds.push_back(std::move(h));
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return std::nullopt;
+    return holds;
+}
+
 std::string Database::ledger_opening_time(const AssetId& asset_id) const
 {
     static constexpr const char* kSelect = R"SQL(
@@ -2234,6 +2365,7 @@ void Database::run_migrations()
         kCreateLedgerEntries,
         kIndexLedgerAsset,
         kCreateCapitalReconcilePending,
+        kCreateTakeHolds,
         kCreateArbEdgeLog,
         kIndexArbEdgeDirTime,
         kCreateTakerFills,

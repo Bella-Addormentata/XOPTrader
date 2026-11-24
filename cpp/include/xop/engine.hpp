@@ -1547,9 +1547,12 @@ private:
     /// [TAKE-SETTLE 2026-11-24] Takes the wallet accepted that are not booked
     /// yet, by trade id (execution/take_settlement.hpp).
     std::unordered_map<std::string, execution::PendingTake> pending_takes_;
-    /// Dexie offer id -> height of a take request for it that may have
-    /// reached the wallet without an answer.
-    std::unordered_map<std::string, BlockHeight> uncertain_take_offers_;
+    /// Dexie offer id -> a take request for it that may have reached the
+    /// wallet without an answer, or whose reply named no trade id.
+    std::unordered_map<std::string, execution::UncertainTake> uncertain_take_offers_;
+    /// Settled takes the sweep has booked (or found inside an asset's
+    /// opening) in this process, by normalised trade id.
+    std::unordered_set<std::string> take_sweep_done_;
     /// Height the missed-take sweep last ran at (0: not yet).
     BlockHeight last_take_sweep_block_{0};
     /// Settled takes the sweep could not book (no configured pair), warned once.
@@ -1918,15 +1921,44 @@ private:
 
     /// [TAKE-SETTLE 2026-11-24] The one door to the wallet's take_offer.
     /// Refuses -- {"success": false, "error": ...}, and no RPC -- a take of a
-    /// Dexie offer an unsettled take of ours already holds, or whose last
-    /// take request may have reached the wallet unanswered.  A request that
-    /// fails that way (rpc::request_possibly_submitted) is noted against the
-    /// offer for execution::kUncertainTakeHoldBlocks and rethrown.
+    /// Dexie offer an unsettled take of ours already holds, or one under an
+    /// uncertain hold.  A request that fails in a way that may have reached
+    /// the wallet (rpc::request_possibly_submitted) puts the offer under an
+    /// uncertain hold (hold_uncertain_take) and is rethrown.  `intent`
+    /// carries the take's fee and what it could move.
     asio::awaitable<nlohmann::json> take_offer_guarded(
-        const std::string& counterparty_offer_id,
-        const std::string& offer_text,
-        std::uint64_t      fee,
-        BlockHeight        block_height);
+        const std::string&           counterparty_offer_id,
+        const std::string&           offer_text,
+        BlockHeight                  block_height,
+        const execution::TakeIntent& intent);
+
+    /// [TAKE-SETTLE 2026-11-24] What a take on `pair_name` could move, per
+    /// asset (base, quote, and the fee on xch), held from `at`.
+    [[nodiscard]] execution::UncertainTake take_exposure(const std::string& pair_name,
+                                                         bool we_bought_base,
+                                                         Mojo base_mojos,
+                                                         Mojo price_mojos,
+                                                         std::uint64_t fee_mojos,
+                                                         BlockHeight at) const;
+
+    /// [TAKE-SETTLE 2026-11-24] Hold Dexie offer `offer_id` back for
+    /// execution::kUncertainTakeHoldBlocks from `at`, widening the divergence
+    /// control's tolerance by what the take could move, and write the hold to
+    /// take_holds so a restart keeps it.
+    void hold_uncertain_take(const std::string& offer_id,
+                             const execution::TakeIntent& intent,
+                             BlockHeight at) noexcept;
+
+    /// [TAKE-SETTLE 2026-11-24] Read take_holds back at start, before any
+    /// take step runs: the takes the last process left unsettled, and its
+    /// uncertain requests.
+    void restore_take_holds() noexcept;
+
+    /// [TAKE-SETTLE 2026-11-24] Each received asset's wallet id, for the
+    /// payment proof (execution::receipts_paid); an unresolved asset is left
+    /// out, which fails the proof.
+    [[nodiscard]] std::unordered_map<std::string, std::int64_t> receipt_wallet_ids(
+        const std::vector<execution::AssetAmount>& received) const;
 
     /// [TAKE-SETTLE 2026-11-24] Book the tracked takes that settled; drop the
     /// ones that failed or were cancelled.  At most

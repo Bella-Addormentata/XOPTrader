@@ -128,18 +128,26 @@ the ledger held 44.54 XCH that never moved.
 
 - **Booked on settlement.**  A take's legs are posted only once the wallet
   reports its trade CONFIRMED and the coin it pays us -- exactly each amount
-  the maker offered -- is in our coin store at that height.  The legs are the
-  wallet's own amounts, at the height the take settled.
+  the maker offered, in that asset's own wallet -- is in our coin store at
+  that height.  The legs are the wallet's own amounts, at the height the take
+  settled; a leg at or below its asset's opening block is suppressed, as for
+  a fill.
 - **A take that fails books nothing.**  FAILED or CANCELLED in the wallet: no
   legs, no `taker_fills` row.
 - **One take of an offer at a time.**  While a take of a Dexie offer is
   unsettled the engine does not take that offer again, and a take request that
-  may have reached the wallet unanswered is never re-sent.
+  may have reached the wallet unanswered is never re-sent.  Both holds are kept
+  in `take_holds` across restarts.  While an unanswered request is held, the
+  divergence control's tolerance includes what that take could move, so a
+  take the sweep is about to book is not absorbed by an auto-adjust first.
 - **The sweep.**  A settled take of ours that the ledger does not hold and the
   engine is not tracking -- a request that timed out, a take of a process that
   has since stopped -- is booked from the wallet's record of it after the same
   proof, under strategy `wallet_sweep`, with fee 0 (the wallet's record does
-  not state our fee).  It looks back one day; older history is a repair's.
+  not state our fee).  It leaves the GUI's bridge top-up takes to their own
+  ingest, asks the ledger under both spellings of a take's event id
+  (`take:0x<id>` and the top-up ingest's `take:<id>`), and looks back one day;
+  older history is a repair's.
 
 Rules and measurements: `cpp/include/xop/execution/take_settlement.hpp`.
 

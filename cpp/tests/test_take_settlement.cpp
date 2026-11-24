@@ -14,6 +14,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <limits>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -49,8 +51,8 @@ nlohmann::json take_record(const std::string& status = "CONFIRMED",
     };
 }
 
-// A flat wallet coin record (get_coin_records).
-nlohmann::json coin(std::uint64_t amount, std::uint64_t height)
+// A flat wallet coin record (get_coin_records), in wallet `wallet_id`.
+nlohmann::json coin(std::uint64_t amount, std::uint64_t height, std::int64_t wallet_id = 1)
 {
     return {
         {"amount", amount},
@@ -58,8 +60,13 @@ nlohmann::json coin(std::uint64_t amount, std::uint64_t height)
         {"spent_height", 0},
         {"parent_coin_info", "0x" + std::string(64, 'a')},
         {"puzzle_hash", "0x" + std::string(64, 'b')},
+        {"wallet_identifier", {{"id", wallet_id}, {"type", wallet_id == 1 ? 0 : 6}}},
     };
 }
+
+// The live wallet ids: 1 XCH, 2 wUSDC.b, 4 BYC, 8 DBX.
+const std::unordered_map<std::string, std::int64_t> kWallets{
+    {"xch", 1}, {kUsdc, 2}, {kByc, 4}, {kDbx, 8}};
 
 PendingTake pending(const std::string& trade_id, const std::string& offer_id,
                     BlockHeight submitted)
@@ -186,27 +193,55 @@ TEST(TakeSettlement, ASideThatReadsShortDoesNotBookShort) {
 
 TEST(TakeSettlement, ThePaymentMustBeInTheStoreAtTheTakesHeight) {
     const std::vector<AssetAmount> received{{"xch", 5'000'000'000'000}};
-    EXPECT_TRUE(receipts_paid(received, {coin(5'000'000'000'000, 9'600'225)}, 9'600'225));
+    EXPECT_TRUE(receipts_paid(received, {coin(5'000'000'000'000, 9'600'225)}, 9'600'225,
+                              kWallets));
     // The 2026-11-20 phantoms: nothing of that amount arrived.
-    EXPECT_FALSE(receipts_paid(received, {}, 9'600'225));
-    EXPECT_FALSE(receipts_paid(received, {coin(5'000'000'000'000, 9'600'226)}, 9'600'225));
-    EXPECT_FALSE(receipts_paid(received, {coin(4'999'999'999'999, 9'600'225)}, 9'600'225));
+    EXPECT_FALSE(receipts_paid(received, {}, 9'600'225, kWallets));
+    EXPECT_FALSE(receipts_paid(received, {coin(5'000'000'000'000, 9'600'226)}, 9'600'225,
+                               kWallets));
+    EXPECT_FALSE(receipts_paid(received, {coin(4'999'999'999'999, 9'600'225)}, 9'600'225,
+                               kWallets));
     EXPECT_EQ(receipt_amounts(received), (std::vector<std::uint64_t>{5'000'000'000'000}));
 }
 
+TEST(TakeSettlement, ThePaymentMustBeInTheReceivedAssetsOwnWallet) {
+    // [review #262] get_coin_records spans every wallet: a 1,000-mojo DBX
+    // coin must not pay a 1,000-mojo BYC receipt.
+    const std::vector<AssetAmount> byc{{kByc, 1'000}};
+    EXPECT_FALSE(receipts_paid(byc, {coin(1'000, 50, /*wallet_id=*/8)}, 50, kWallets));
+    EXPECT_TRUE(receipts_paid(byc, {coin(1'000, 50, /*wallet_id=*/4)}, 50, kWallets));
+    // An asset the engine cannot place in a wallet proves nothing.
+    EXPECT_FALSE(receipts_paid(byc, {coin(1'000, 50, 4)}, 50, {{"xch", 1}}));
+    // A record that does not say its wallet proves nothing either.
+    auto anonymous = coin(1'000, 50, 4);
+    anonymous.erase("wallet_identifier");
+    EXPECT_FALSE(receipts_paid(byc, {anonymous}, 50, kWallets));
+    EXPECT_EQ(coin_record_wallet_id(coin(1, 1, 8)), std::optional<std::int64_t>{8});
+}
+
 TEST(TakeSettlement, OneCoinNeverVouchesForTwoReceipts) {
-    const std::vector<AssetAmount> twice{{"xch", 1'000}, {kByc, 1'000}};
-    EXPECT_FALSE(receipts_paid(twice, {coin(1'000, 50)}, 50));
-    EXPECT_TRUE(receipts_paid(twice, {coin(1'000, 50), coin(1'000, 50)}, 50));
+    const std::vector<AssetAmount> twice{{kDbx, 1'000}, {kByc, 1'000}};
+    EXPECT_FALSE(receipts_paid(twice, {coin(1'000, 50, 8)}, 50, kWallets));
+    // Two coins of ONE asset do not pay receipts in two assets.
+    EXPECT_FALSE(receipts_paid(twice, {coin(1'000, 50, 8), coin(1'000, 50, 8)}, 50, kWallets));
+    EXPECT_TRUE(receipts_paid(twice, {coin(1'000, 50, 8), coin(1'000, 50, 4)}, 50, kWallets));
 }
 
 TEST(TakeSettlement, AnUnreadableAnswerProvesNothing) {
     const std::vector<AssetAmount> received{{"xch", 1'000}};
     auto bad = coin(1'000, 50);
     bad.erase("parent_coin_info");
-    EXPECT_FALSE(receipts_paid(received, {coin(1'000, 50), bad}, 50));
-    EXPECT_FALSE(receipts_paid({}, {coin(1'000, 50)}, 50));
-    EXPECT_FALSE(receipts_paid(received, {coin(1'000, 50)}, 0));
+    EXPECT_FALSE(receipts_paid(received, {coin(1'000, 50), bad}, 50, kWallets));
+    EXPECT_FALSE(receipts_paid({}, {coin(1'000, 50)}, 50, kWallets));
+    EXPECT_FALSE(receipts_paid(received, {coin(1'000, 50)}, 0, kWallets));
+}
+
+TEST(TakeSettlement, ATakesEventIdHasTwoSpellings) {
+    // The engine books "take:0x<id>", the GUI's top-up ingest "take:<id>".
+    const auto ids = take_event_ids("0xABCdef");
+    EXPECT_EQ(ids[0], "take:0xabcdef");
+    EXPECT_EQ(ids[1], "take:abcdef");
+    EXPECT_EQ(take_event_ids("abcdef"), ids);
 }
 
 // ============================================================================
@@ -253,7 +288,7 @@ TEST(TakeSettlement, AnOfferWithAnUnsettledTakeIsNotTakenAgain) {
     // 08:05:10 it took it again (f8a59d4b, FAILED) and booked both.
     std::unordered_map<std::string, PendingTake> takes;
     takes.emplace("0x3d58e29d", pending("0x3d58e29d", "AkA6GJrWFG", 9'600'106));
-    const std::unordered_map<std::string, BlockHeight> none;
+    const std::unordered_map<std::string, UncertainTake> none;
     EXPECT_TRUE(take_refused(takes, none, "AkA6GJrWFG", 9'600'108));
     EXPECT_FALSE(take_refused(takes, none, "FnrurLSVNv", 9'600'108));
     EXPECT_FALSE(take_refused(takes, none, "", 9'600'108));
@@ -261,7 +296,8 @@ TEST(TakeSettlement, AnOfferWithAnUnsettledTakeIsNotTakenAgain) {
 
 TEST(TakeSettlement, AnUncertainRequestHoldsTheOfferForAWhile) {
     const std::unordered_map<std::string, PendingTake> none;
-    const std::unordered_map<std::string, BlockHeight> uncertain{{"nMDyHor9J8", 9'600'463}};
+    const std::unordered_map<std::string, UncertainTake> uncertain{
+        {"nMDyHor9J8", UncertainTake{9'600'463, {}}}};
     EXPECT_TRUE(take_refused(none, uncertain, "nMDyHor9J8", 9'600'463));
     EXPECT_TRUE(take_refused(none, uncertain, "nMDyHor9J8",
                              9'600'463 + kUncertainTakeHoldBlocks - 1));
@@ -269,6 +305,26 @@ TEST(TakeSettlement, AnUncertainRequestHoldsTheOfferForAWhile) {
                               9'600'463 + kUncertainTakeHoldBlocks));
     EXPECT_FALSE(take_refused(none, uncertain, "nMDyHor9J8", 9'600'000));   // went back
     EXPECT_FALSE(take_refused(none, uncertain, "Dq3TqEWpW5", 9'600'463));
+}
+
+TEST(TakeSettlement, AnUncertainTakeIsToleranceUntilTheSweepCanBookIt) {
+    // [review #262] What it could move widens the divergence control's
+    // tolerance for the whole hold, which outlasts the sweep's grace.
+    UncertainTake hold{9'600'463, {{"xch", 5'000'000'000'000}, {kDbx, 423'000}}};
+    add_fee_exposure(hold, 330'000);
+    add_fee_exposure(hold, 0);
+    const std::unordered_map<std::string, UncertainTake> uncertain{
+        {"nMDyHor9J8", hold}, {"5Uoyw6hrnJ", UncertainTake{9'600'463, {{"xch", 7}}}}};
+    const auto slack = uncertain_take_slack(uncertain, 9'600'463 + kTakeSweepGraceBlocks
+                                                           + kTakeSweepEveryBlocks);
+    EXPECT_EQ(slack.at("xch"), 5'000'000'000'000 + 330'000 + 7);
+    EXPECT_EQ(slack.at(kDbx), 423'000);
+    EXPECT_TRUE(uncertain_take_slack(uncertain, 9'600'463 + kUncertainTakeHoldBlocks).empty());
+    // Saturating, never wrapping.
+    const std::unordered_map<std::string, UncertainTake> huge{
+        {"a", UncertainTake{1, {{"xch", std::numeric_limits<Mojo>::max()}}}},
+        {"b", UncertainTake{1, {{"xch", 5}}}}};
+    EXPECT_EQ(uncertain_take_slack(huge, 1).at("xch"), std::numeric_limits<Mojo>::max());
 }
 
 TEST(TakeSettlement, TakesSettleOldestFirstAndAFewAtATime) {
@@ -282,7 +338,22 @@ TEST(TakeSettlement, TakesSettleOldestFirstAndAFewAtATime) {
     EXPECT_TRUE(takes_to_settle({}, 4).empty());
 }
 
+TEST(TakeSettlement, NoTakeWaitsBehindOthersThatStayPending) {
+    // [review #262] Oldest-first alone let four old pending takes starve a
+    // fifth that had settled.  The least recently read go first.
+    std::unordered_map<std::string, PendingTake> takes;
+    for (const char* id : {"0x1", "0x2", "0x3", "0x4"}) {
+        takes.emplace(id, pending(id, id, 10));
+    }
+    takes.emplace("0x5", pending("0x5", "5", 20));
+    const auto first = takes_to_settle(takes, 4);
+    EXPECT_EQ(first, (std::vector<std::string>{"0x1", "0x2", "0x3", "0x4"}));
+    for (const auto& id : first) takes.at(id).last_checked_block = 100;
+    EXPECT_EQ(takes_to_settle(takes, 4).front(), "0x5");
+}
+
 TEST(TakeSettlement, TheSweepLooksBetweenItsGraceAndItsLookback) {
+    static_assert(kUncertainTakeHoldBlocks > kTakeSweepGraceBlocks + kTakeSweepEveryBlocks);
     constexpr BlockHeight kNow = 9'620'000;
     EXPECT_FALSE(in_sweep_window(kNow, kNow));                              // too fresh
     EXPECT_FALSE(in_sweep_window(kNow - kTakeSweepGraceBlocks + 1, kNow));
@@ -342,9 +413,9 @@ TEST(TakeSettlementWiring, EveryTakeGoesThroughTheGuardedDoor) {
     const std::string guard = function_body(
         raw, "asio::awaitable<nlohmann::json> Engine::take_offer_guarded(");
     ASSERT_FALSE(guard.empty());
-    EXPECT_EQ(count_of(guard, "wallet_->take_offer(offer_text, fee)"), 1u);
+    EXPECT_EQ(count_of(guard, "wallet_->take_offer(offer_text, intent.fee_mojos)"), 1u);
     EXPECT_LT(position_of(guard, "execution::take_refused(pending_takes_, uncertain_take_offers_,"),
-              position_of(guard, "wallet_->take_offer(offer_text, fee)"));
+              position_of(guard, "wallet_->take_offer(offer_text, intent.fee_mojos)"));
     EXPECT_NE(position_of(guard, "rpc::request_possibly_submitted(e.curl_code(), e.http_code())"),
               std::string::npos);
     // Each site passes the Dexie offer it is taking.
@@ -378,16 +449,60 @@ TEST(TakeSettlementWiring, BookingNeedsThePaymentProof) {
         const std::string body = function_body(raw, signature);
         ASSERT_FALSE(body.empty()) << signature;
         const std::size_t proof = position_of(
-            body, "execution::receipts_paid(take->received, coins, take->height)");
+            body, "execution::receipts_paid(take->received, coins, take->height,");
         ASSERT_NE(proof, std::string::npos) << signature;
         EXPECT_LT(proof, position_of(body, "record_taker_fill(")) << signature;
     }
-    // The sweep skips what the ledger holds and what is being tracked.
+    // The sweep skips what the ledger holds under either spelling, what is
+    // being tracked, the GUI's top-ups, and what it already did.
     const std::string sweep = function_body(
         raw, "asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)");
-    EXPECT_EQ(count_of(sweep, "db_->ledger_has_event(\"take:\"+take->trade_id)"), 2u);
-    EXPECT_NE(position_of(sweep, "tracked.count(execution::normalize_id(take->trade_id))"),
+    EXPECT_NE(position_of(sweep, "for (const auto& id : execution::take_event_ids(trade_id))"),
+              std::string::npos);
+    EXPECT_EQ(count_of(sweep, "in_ledger(take->trade_id)"), 2u);
+    EXPECT_NE(position_of(sweep, "tracked.count(id) > 0 || topups.count(id) > 0 "
+                                 "|| take_sweep_done_.count(id) > 0"), std::string::npos);
+    EXPECT_NE(position_of(sweep, "for (const auto& row : read_topup_take_rows(store))"),
               std::string::npos);
     EXPECT_NE(position_of(sweep, "execution::in_sweep_window(take->height, block_height)"),
+              std::string::npos);
+    // Both proofs match each receipt in its own wallet.
+    EXPECT_EQ(count_of(raw.empty() ? std::string{} : squeeze(raw),
+                       "receipt_wallet_ids(take->received)"), 2u);
+}
+
+TEST(TakeSettlementWiring, HoldsAreWrittenReadBackAndKeptWhileUncertain) {
+    const std::string raw = read_engine_cpp();
+    const std::string all = squeeze(raw);
+    // An unanswered request, and a reply with no trade id, both hold the offer.
+    const std::string guard = function_body(
+        raw, "asio::awaitable<nlohmann::json> Engine::take_offer_guarded(");
+    EXPECT_NE(position_of(guard, "hold_uncertain_take(counterparty_offer_id, intent, block_height);"),
+              std::string::npos);
+    const std::string track = function_body(raw, "void Engine::track_pending_take(");
+    EXPECT_NE(position_of(track, "hold_uncertain_take(counterparty_offer_id, intent, block_height);"),
+              std::string::npos);
+    EXPECT_NE(position_of(track, "db_->save_take_hold(row)"), std::string::npos);
+    // Every way a hold ends deletes it.
+    const std::string settle = function_body(
+        raw, "asio::awaitable<void> Engine::step_settle_pending_takes(BlockHeight block_height)");
+    EXPECT_NE(position_of(settle, "db_->delete_take_hold(\"uncertain:\" + it->first);"),
+              std::string::npos);
+    EXPECT_NE(position_of(settle, "db_->delete_take_hold(\"take:\" + p.trade_id);"),
+              std::string::npos);
+    EXPECT_NE(position_of(settle, "polled->second.last_checked_block = block_height;"),
+              std::string::npos);
+    // Read back at start.
+    EXPECT_EQ(count_of(all, "restore_take_holds();"), 1u);
+    // The invariant widens its tolerance by the live uncertain holds.
+    const std::string invariant = function_body(
+        raw, "void Engine::step_check_ledger_invariant(BlockHeight block_height)");
+    EXPECT_NE(position_of(invariant, "execution::uncertain_take_slack(uncertain_take_offers_, "
+                                     "block_height);"), std::string::npos);
+    EXPECT_EQ(count_of(invariant, "exposure + fee_slack + held_slack"), 2u);
+    EXPECT_EQ(count_of(invariant, "exposure + fee_slack + inflight_slack"), 0u);
+    // A take inside an asset's opening books no leg (the fill path's rule).
+    const std::string record = function_body(raw, "void Engine::record_taker_fill(");
+    EXPECT_NE(position_of(record, "block_height > 0 && block_height <= git->second"),
               std::string::npos);
 }

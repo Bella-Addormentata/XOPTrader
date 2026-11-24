@@ -22,13 +22,17 @@ listing an offer while our first take of it waits to be mined.
   pays us is in the wallet, at the wallet's own amounts and height. A take
   that failed or was cancelled books nothing.
 - **One take of an offer at a time.** An offer with an unsettled take of
-  ours is not taken again.
+  ours is not taken again. Unsettled takes are written to the database and
+  read back at start, so a restart does not forget them.
 - **A take request is never re-sent.** After a timeout the wallet may still
   be taking the offer, so the engine leaves that offer alone for about 20
-  minutes instead of sending a second copy.
+  minutes instead of sending a second copy. Meanwhile the ledger check
+  allows for what that take could move, so the check does not book it as
+  an unexplained difference first.
 - **Missed takes are swept in.** Every few minutes the engine looks at the
   wallet's takes of the last day and books any settled one it does not hold,
-  from the wallet's own record of it.
+  from the wallet's own record of it. The GUI's bridge top-up takes are left
+  to their own booking.
 
 ### Dexie rewards: bigger coins and bigger bursts are booked
 

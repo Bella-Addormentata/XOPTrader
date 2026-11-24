@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -529,6 +530,66 @@ TEST(DatabaseTest, InventoryStateRoundTripsAcrossReopen) {
     EXPECT_EQ(cat->total_quantity, 25'000LL);
     EXPECT_DOUBLE_EQ(cat->total_cost, 25'000.0);
     EXPECT_TRUE(cat->basis_is_seed_sentinel);
+}
+
+// [TAKE-SETTLE 2026-11-24] Take holds survive a restart and end when deleted.
+TEST(DatabaseTest, TakeHoldsRoundTripAcrossReopen) {
+    TempDbPath temp("take_holds_roundtrip");
+    {
+        xop::Database db(temp.path().string());
+        const auto none = db.take_holds();
+        ASSERT_TRUE(none.has_value());
+        EXPECT_TRUE(none->empty());
+
+        xop::DbTakeHold pending;
+        pending.hold_key       = "take:0x3d58e29d";
+        pending.kind           = "pending";
+        pending.offer_id       = "AkA6GJrWFG";
+        pending.trade_id       = "0x3d58e29d";
+        pending.strategy       = "crossed_book";
+        pending.pair_name      = "XCH/DBX";
+        pending.we_bought_base = true;
+        pending.base_mojos     = 5'000'000'000'000LL;
+        pending.price_mojos    = 81'200'000'000'000LL;
+        pending.fee_mojos      = 15'000'000;
+        pending.block_height   = 9'600'106;
+        EXPECT_TRUE(db.save_take_hold(pending));
+
+        xop::DbTakeHold uncertain = pending;
+        uncertain.hold_key = "uncertain:nMDyHor9J8";
+        uncertain.kind     = "uncertain";
+        uncertain.offer_id = "nMDyHor9J8";
+        uncertain.trade_id = "";
+        uncertain.fee_mojos = std::numeric_limits<std::uint64_t>::max();   // clamped, not wrapped
+        EXPECT_TRUE(db.save_take_hold(uncertain));
+        uncertain.block_height = 9'600'463;          // rewritten, not doubled
+        EXPECT_TRUE(db.save_take_hold(uncertain));
+    }
+    xop::Database db(temp.path().string());
+    auto holds = db.take_holds();
+    ASSERT_TRUE(holds.has_value());
+    ASSERT_EQ(holds->size(), 2u);
+    const xop::DbTakeHold& first = holds->front();   // ordered by block height
+    EXPECT_EQ(first.hold_key, "take:0x3d58e29d");
+    EXPECT_EQ(first.kind, "pending");
+    EXPECT_EQ(first.offer_id, "AkA6GJrWFG");
+    EXPECT_EQ(first.trade_id, "0x3d58e29d");
+    EXPECT_EQ(first.strategy, "crossed_book");
+    EXPECT_TRUE(first.we_bought_base);
+    EXPECT_EQ(first.base_mojos, 5'000'000'000'000LL);
+    EXPECT_EQ(first.price_mojos, 81'200'000'000'000LL);
+    EXPECT_EQ(first.fee_mojos, 15'000'000u);
+    EXPECT_EQ(first.block_height, 9'600'106u);
+    EXPECT_EQ(holds->back().block_height, 9'600'463u);
+    EXPECT_EQ(holds->back().fee_mojos,
+              static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()));
+
+    EXPECT_TRUE(db.delete_take_hold("take:0x3d58e29d"));
+    EXPECT_TRUE(db.delete_take_hold("take:never-held"));
+    holds = db.take_holds();
+    ASSERT_TRUE(holds.has_value());
+    ASSERT_EQ(holds->size(), 1u);
+    EXPECT_EQ(holds->front().hold_key, "uncertain:nMDyHor9J8");
 }
 
 TEST(DatabaseTest, InventoryStateUpsertReplacesPriorSnapshot) {
