@@ -1055,6 +1055,36 @@ def test_a_market_section_that_is_not_a_mapping_is_refused_until_corrected(panel
     assert _saved_options(cfg_path)["market"] == {"peg_tolerance_pct": 2}
 
 
+def test_a_market_made_malformed_in_the_editor_is_refused_not_swapped_for_the_file_s(
+    panel, tmp_path, monkeypatch
+):
+    """[review #263] Loaded from the editor, a market section that is not a mapping showed
+    the default in the field, while a save merged onto the file on disk kept that file's
+    market, its strict 0 too, unseen. It is sent as loaded, for the book's parser to
+    refuse, until a tolerance is typed."""
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+    )
+    cfg_path = _shared_book(tmp_path, market={"peg_tolerance_pct": 0})
+    before = cfg_path.read_text(encoding="utf-8")
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+
+    root = yaml.safe_load(panel._yaml_editor.toPlainText())
+    root["options"]["market"] = ["peg_tolerance_pct", 0]
+    panel._yaml_editor.setPlainText(yaml.safe_dump(root, sort_keys=False))
+    panel._on_load_from_editor()
+
+    assert tab.peg_tolerance.text() == ""
+    assert panel.save_config(str(cfg_path)) is False
+    assert any("options.market must be a mapping" in said for said in _SAID), _SAID
+    assert cfg_path.read_text(encoding="utf-8") == before
+
+    tab.peg_tolerance.setText("2")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["market"]["peg_tolerance_pct"] == 2
+
+
 def test_the_first_edit_of_a_number_box_is_sent_as_edited(panel, tmp_path):
     """[review #263] The page's change notification collects the tab on every edit: the
     box must count as edited by then, or the first edit goes out as the number loaded."""

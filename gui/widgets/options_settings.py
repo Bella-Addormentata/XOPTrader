@@ -252,8 +252,10 @@ class OptionsSettingsSection:
         self._touched: set[str] = set()
         #: [PEG] market.peg_tolerance_pct as loaded, and the field's text for it.
         self._loaded_tolerance: tuple[Any, str] = (None, "")
-        #: [review #263] options.market loaded as something other than a mapping.
+        #: [review #263] options.market loaded as something other than a mapping,
+        #: and that value as loaded.
         self._market_malformed = False
+        self._loaded_market: Any = None
         self.widget = self._build()
 
     # -- building ----------------------------------------------------------------
@@ -836,6 +838,7 @@ class OptionsSettingsSection:
         # is not a mapping is kept for the book's parser to refuse on Save
         # until the field is edited.
         self._market_malformed = raw_market is not None and not isinstance(raw_market, dict)
+        self._loaded_market = copy.deepcopy(raw_market) if self._market_malformed else None
         tolerance = market.get("peg_tolerance_pct")
         self.peg_tolerance.setText(_limit_text(tolerance))
         self._loaded_tolerance = (tolerance, self.peg_tolerance.text())
@@ -1017,6 +1020,12 @@ class OptionsSettingsSection:
             market["hedge_size_xch"] = None
         if market:
             options["market"] = market
+        elif self._market_malformed:
+            # [review #263] Sent back as loaded, for the book's parser to
+            # refuse: after Load from Editor a save merges onto the file on
+            # disk, whose market would otherwise stand in for the editor's
+            # unseen, under a field showing the default.
+            options["market"] = copy.deepcopy(self._loaded_market)
         mode = self.target_mode.currentIndex()
         if mode == _TARGET_OFF:
             options["target"] = False
