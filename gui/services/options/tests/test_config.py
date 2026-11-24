@@ -506,6 +506,24 @@ def test_puts_take_their_share_of_the_counts() -> None:
     assert config.call_ladder(_caps(44, 10, 5), 2, 2, put_strikes=2) == ((1, 4), (10, 2))
 
 
+def test_the_ladder_says_when_puts_share_the_counts() -> None:
+    """[review #261] Calls are counted first, but the planner mints the strikes nearest
+    the money first, calls or puts: where the counts cannot hold both, Settings and
+    `status` say so."""
+    assert not config.ladder_counts_shared(_caps(44, 16, 8), 2, 2, put_strikes=2)
+    assert not config.ladder_counts_shared(_caps(44, 8, 4), 2, 2, put_strikes=2), (
+        "the 1 XCH grid fits whole, and nothing is left for 10 XCH"
+    )
+    assert config.ladder_counts_shared(_caps(44, 10, 5), 2, 2, put_strikes=2)
+    assert not config.ladder_counts_shared(_caps(44, 10, 5), 2, 2), "no puts"
+    # One call strike and one put strike, room for one contract: counted as the call.
+    assert config.call_ladder(_caps(10, 1, 1), 1, 1, put_strikes=1) == ((1, 1),)
+    assert config.ladder_counts_shared(_caps(10, 1, 1), 1, 1, put_strikes=1)
+    # The XCH cap, not the counts, stops the 10 XCH calls: nothing is shared.
+    assert config.call_ladder(_caps(4, 16, 8), 2, 2, put_strikes=2) == ((1, 4),)
+    assert not config.ladder_counts_shared(_caps(4, 16, 8), 2, 2, put_strikes=2)
+
+
 def test_puts_with_an_unlimited_cap_take_room_only_at_the_smallest_size() -> None:
     """[review #261] The planner keeps a side with an unlimited cap at 1 XCH, so those
     puts leave Max contracts and Max per expiry to the larger calls."""

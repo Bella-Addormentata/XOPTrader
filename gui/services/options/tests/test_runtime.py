@@ -875,6 +875,15 @@ def test_status_prints_the_book(tmp_path, monkeypatch, capsys) -> None:
     assert cli.contract_size_line(ladder, now=world.now()) == (
         f"{head}; calls these limits hold: 4 of 1 XCH, 1 of 10 XCH"
     )
+    shared = dataclasses.replace(
+        ladder,
+        put_strikes_pct=(90, 80),
+        limits=dataclasses.replace(ladder.limits, max_contracts=6, max_contracts_per_expiry=3),
+    )
+    assert cli.contract_size_line(shared, now=world.now()) == (
+        f"{head}; calls these limits hold: 4 of 1 XCH"
+        " (puts share the counts, and the strikes nearest the money go first)"
+    )
     unset = dataclasses.replace(ladder, limits=cfg.limits)
     assert cli.contract_size_line(unset, now=world.now()) == (
         f"{head}; a limit is not set, so nothing is minted"

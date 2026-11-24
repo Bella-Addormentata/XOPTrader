@@ -644,9 +644,11 @@ def test_the_ladder_hint_follows_the_limits_and_the_grid(panel, tmp_path):
         assert "has no number to size more from" in tab.size_hint.text()
 
     cap.setText("40")
-    tab.put_strikes.setText("90, 80")
+    tab.put_strikes.setText("90, 80")  # five strikes a Friday, room for six
     assert tab.size_hint.text().endswith(
-        "Puts get the same sizes, as far as Max quote locked allows."
+        "Puts get the same sizes, as far as Max quote locked allows. Where puts and calls "
+        "share Max contracts and Max per expiry, the strikes nearest the money go first, so "
+        "puts may take some of the room shown for calls."
     )
     tab.call_strikes.setText("")
     assert tab.size_hint.text().startswith("1 XCH contracts first, then 10, 100...")
@@ -683,6 +685,25 @@ def test_puts_with_an_unlimited_cap_leave_room_for_larger_calls(panel, tmp_path)
         "Calls, smallest first: 4 of 1 XCH, then 4 of 10 XCH (44 XCH locked). "
         "Max XCH locked 144 adds a 100 XCH call. "
         "Puts stay at 1 XCH: Max quote locked has no number to size them from."
+    )
+
+
+def test_the_hint_says_when_puts_share_the_counts_with_calls(panel, tmp_path):
+    """[review #261] The hint counts the calls first; the book mints the strikes nearest
+    the money first, calls or puts, so where the counts cannot hold both it says so."""
+    limits = {
+        "max_locked_xch": 44,
+        "max_locked_quote": 100,
+        "max_contracts": 10,
+        "max_contracts_per_expiry": 5,
+    }
+    panel.load_config(str(_auto_book(tmp_path, put_strikes_pct=[90, 80], limits=limits)))
+    assert panel._options_section.size_hint.text() == (
+        "Calls, smallest first: 4 of 1 XCH, then 2 of 10 XCH (24 XCH locked). "
+        "Max contracts and Max per expiry leave no room for more calls. "
+        "Puts get the same sizes, as far as Max quote locked allows. "
+        "Where puts and calls share Max contracts and Max per expiry, the strikes nearest "
+        "the money go first, so puts may take some of the room shown for calls."
     )
 
 

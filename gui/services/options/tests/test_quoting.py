@@ -405,6 +405,27 @@ def test_the_settings_preview_matches_what_the_planner_mints(limits, puts) -> No
     assert dict(preview) == minted
 
 
+def test_puts_nearer_the_money_take_count_room_before_calls() -> None:
+    """[review #261] The planner goes nearest the money first, calls or puts. The
+    preview counts the calls first, so it says when the two share the counts."""
+    cfg = _config(
+        contract_xch="auto",
+        expiries=[NEAR],
+        call_strikes_pct=[120],
+        put_strikes_pct=[100],
+        limits={
+            "max_locked_xch": 10,
+            "max_locked_quote": 10,
+            "max_contracts": 1,
+            "max_contracts_per_expiry": 1,
+        },
+    )
+    plan = quoting.plan(cfg, _market(), [], NOW)
+    assert [(item.side, item.size_mojos // XCH) for item in plan.mint] == [("put", 1)]
+    assert config.call_ladder(cfg.limits, 1, 1, put_strikes=1) == ((1, 1),)
+    assert config.ladder_counts_shared(cfg.limits, 1, 1, put_strikes=1)
+
+
 def test_one_slot_holds_a_contract_of_each_size() -> None:
     cfg = _ladder(max_locked_xch=44)
     small, *_ = quoting.plan(cfg, _market(), [], NOW).mint

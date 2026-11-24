@@ -672,6 +672,13 @@ class OptionsSettingsSection:
                 text += f" Max XCH locked {locked + step:g} adds a {step:g} XCH call."
             else:
                 text += " Max contracts and Max per expiry leave no room for more calls."
+        if options_config.ladder_counts_shared(limits, calls, expiries, puts):
+            # [review #261] The planner mints the strikes nearest the money
+            # first, calls or puts: the calls above are counted first.
+            tail += (
+                " Where puts and calls share Max contracts and Max per expiry, the strikes"
+                " nearest the money go first, so puts may take some of the room shown for calls."
+            )
         return text + tail
 
     def _limits_hint(self) -> str:

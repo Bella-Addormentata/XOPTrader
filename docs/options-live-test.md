@@ -26,7 +26,10 @@ The straightforward set-up, with the app alone:
    locked 4 gives four 1 XCH calls, 14 adds one 10 XCH call, 44 four of them.
    Max contracts and Max per expiry count every size, so those two sizes need
    8 and 4 (16 and 8 with two put strikes as well). The tab shows what the
-   ladder comes to for calls, and what one more call needs. In config.yaml
+   ladder comes to for calls, and what one more call needs. It counts the
+   calls first: where puts share Max contracts and Max per expiry with them,
+   the strikes nearest the money go first, so puts may take some of that
+   room, and the tab says so. In config.yaml
    this is `contract_xch: auto`; Fixed writes one number, that one size only.
    A sold contract is refilled at its own size, smallest sizes first, once its
    collateral fits under the limits again; a larger one is never cancelled to

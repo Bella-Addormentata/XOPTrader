@@ -305,7 +305,8 @@ def contract_size_line(cfg: config.OptionsConfig, now: int | None = None) -> str
     """[LADDER] The contract sizes as `status` says them, so ``auto`` is never a guess.
 
     A written size is that one size. ``auto`` is the ladder, with what it comes
-    to for calls on an empty book at these limits (:func:`config.call_ladder`).
+    to for calls on an empty book at these limits (:func:`config.call_ladder`),
+    and a word when puts share the counts with those calls.
     """
     if not cfg.contract_auto:
         return f"contract size: {cfg.contract_xch_mojos / config.XCH_MOJOS:g} XCH"
@@ -318,15 +319,19 @@ def contract_size_line(cfg: config.OptionsConfig, now: int | None = None) -> str
     if not cfg.call_strikes_pct:
         return f"{head}; puts only, as far as max_locked_quote allows"
     when = int(time.time()) if now is None else now
-    ladder = config.call_ladder(
+    grid = (
         cfg.limits,
         len(cfg.call_strikes_pct),
         len(cfg.quotable_expiries(when)),
         len(cfg.put_strikes_pct),
     )
+    ladder = config.call_ladder(*grid)
     if not ladder:
         return f"{head}; no call fits these limits"
     calls = ", ".join(f"{count} of {size:g} XCH" for size, count in ladder)
+    if config.ladder_counts_shared(*grid):
+        # [review #261] Counted calls first; the book goes nearest the money first.
+        calls += " (puts share the counts, and the strikes nearest the money go first)"
     return f"{head}; calls these limits hold: {calls}"
 
 

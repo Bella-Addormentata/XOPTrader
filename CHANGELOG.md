@@ -47,9 +47,12 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Settings > Options** shows what the ladder comes to for calls with the
   limits as they are, and what one more call needs, for example "Calls,
   smallest first: 4 of 1 XCH, then 1 of 10 XCH (14 XCH locked). Max XCH
-  locked 24 adds a 10 XCH call." Changing the contract size there also
-  takes a `market.hedge_size_xch` that was set to match the old size (the
-  live test's 0.5 XCH) back to its default.
+  locked 24 adds a 10 XCH call." It counts the calls first, so where puts
+  share Max contracts and Max per expiry with them it says that the strikes
+  nearest the money go first and puts may take some of that room; `status`
+  says the same. Changing the contract size there also takes a
+  `market.hedge_size_xch` that was set to match the old size (the live
+  test's 0.5 XCH) back to its default.
 - Log lines and the `status` command name each contract's size, since one
   slot now holds a contract of each.
 

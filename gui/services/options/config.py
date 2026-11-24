@@ -357,27 +357,57 @@ def call_ladder(
     only when ``max_locked_quote`` is unlimited, as the planner mints them.
     How much of the quote asset they lock depends on the price, so a number
     in ``max_locked_quote`` is not counted here: when it stops puts, the
-    calls may go further than this.
+    calls may go further than this. Within an expiry the calls are counted
+    first; the planner takes the strikes nearest the money first, calls or
+    puts, so where the counts cannot hold both (:func:`ladder_counts_shared`)
+    puts may take some of that room.
 
     Empty when no call can be minted: no call strikes or expiries, one of the
     three limits read here not set, or ``max_locked_xch`` under 1 XCH. With
     ``max_locked_xch`` unlimited calls stay at 1 XCH: there is nothing to size
     the ladder from.
     """
+    return tuple(
+        (size, calls)
+        for size, calls, _ in _ladder_steps(limits, call_strikes, expiries, put_strikes)
+    )
+
+
+def ladder_counts_shared(
+    limits: Limits, call_strikes: int, expiries: int, put_strikes: int = 0
+) -> bool:
+    """[review #261] Whether :func:`call_ladder`'s calls compete with puts for the counts.
+
+    True when, at some size and expiry, ``max_contracts`` or
+    ``max_contracts_per_expiry`` cannot hold every call the XCH cap allows
+    there and every put beside them. The planner then mints the strikes
+    nearest the money first, calls or puts, so the split between them depends
+    on the strikes and the price: Settings and ``status`` say so.
+    """
+    return any(
+        shared for *_, shared in _ladder_steps(limits, call_strikes, expiries, put_strikes)
+    )
+
+
+def _ladder_steps(
+    limits: Limits, call_strikes: int, expiries: int, put_strikes: int
+) -> list[tuple[int, int, bool]]:
+    """``(XCH a contract, calls of that size, counts shared)`` for :func:`call_ladder`."""
     if call_strikes <= 0 or expiries <= 0:
-        return ()
+        return []
     if UNSET in (limits.max_locked_xch, limits.max_contracts, limits.max_contracts_per_expiry):
-        return ()
+        return []
     held = 0
     on_expiry = [0] * expiries
     locked = 0
-    out: list[tuple[int, int]] = []
+    out: list[tuple[int, int, bool]] = []
     for size in LADDER_XCH:
         if out and limits.max_locked_xch == UNLIMITED:
             break
         # With nothing to size them from, puts stay at the smallest size.
         puts = 0 if out and limits.max_locked_quote == UNLIMITED else put_strikes
         calls = 0
+        shared = False
         for index in range(expiries):
             room = call_strikes + puts
             if limits.max_contracts_per_expiry != UNLIMITED:
@@ -386,9 +416,11 @@ def call_ladder(
                 room = min(room, limits.max_contracts - held)
             if room <= 0:
                 continue
-            here = min(call_strikes, room)
+            fit = call_strikes  # the calls the XCH cap allows here
             if limits.max_locked_xch != UNLIMITED:
-                here = min(here, (limits.max_locked_xch - locked) // (size * XCH_MOJOS))
+                fit = min(fit, (limits.max_locked_xch - locked) // (size * XCH_MOJOS))
+            here = min(fit, room)
+            shared = shared or (puts > 0 and fit > 0 and room < fit + puts)
             taken = here + min(puts, room - here)
             calls += here
             locked += here * size * XCH_MOJOS
@@ -396,8 +428,8 @@ def call_ladder(
             held += taken
         if calls <= 0:
             break
-        out.append((size, calls))
-    return tuple(out)
+        out.append((size, calls, shared))
+    return out
 
 
 def _contract_size(section: dict) -> float | None:
