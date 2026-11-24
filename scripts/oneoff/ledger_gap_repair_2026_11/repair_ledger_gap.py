@@ -749,9 +749,11 @@ def apply(db_path: pathlib.Path, plan: dict) -> None:
                 raise SystemExit(f"row not written (already there?): {e['event_id']} "
                                  f"{e['leg']} {e['asset_id']}")
         cols = [c[1] for c in con.execute("PRAGMA table_info(taker_fills)")]
+        # A trade id as either spelling, "0x<id>" or "<id>", in any case: a
+        # row written the other way must not stay behind in the history.
+        spelled = "SELECT * FROM taker_fills WHERE lower(trade_id) IN (?, ?)"
         for eid, tid, status in plan["phantoms"]:
-            rows = con.execute("SELECT * FROM taker_fills WHERE lower(trade_id) = ?",
-                               ("0x" + tid,)).fetchall()
+            rows = con.execute(spelled, ("0x" + tid, tid)).fetchall()
             for row in rows:
                 archived = dict(zip(cols, row, strict=True))
                 con.execute(
@@ -763,8 +765,13 @@ def apply(db_path: pathlib.Path, plan: dict) -> None:
                      f"never settled; reversal:{eid}; archived taker_fills row: "
                      f"{json.dumps(archived)}; {TAG}",
                      archived.get("block_height"), archived.get("fee_mojos")))
-            con.execute("DELETE FROM taker_fills WHERE lower(trade_id) = ?", ("0x" + tid,))
+            con.execute("DELETE FROM taker_fills WHERE lower(trade_id) IN (?, ?)",
+                        ("0x" + tid, tid))
         for t in plan["taker_rows"]:
+            bare = norm(t["trade_id"])
+            if con.execute(spelled, ("0x" + bare, bare)).fetchall():
+                raise SystemExit(f"taker_fills already holds {t['trade_id']} (in some spelling) "
+                                 "-- nothing written; run the dry run again")
             cur = con.execute(TAKER_INSERT, tuple(t[c] for c in TAKER_COLUMNS))
             if cur.rowcount != 1:
                 raise SystemExit(f"taker_fills row not written (already there?): {t['trade_id']}")
