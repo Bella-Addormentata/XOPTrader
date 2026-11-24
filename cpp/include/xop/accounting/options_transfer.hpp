@@ -38,10 +38,13 @@
 //     accepted, and one of kind topup_confirmed when the book next sees the
 //     wallet report it confirmed -- minutes later.  The engine reads that
 //     table READ-ONLY, as it reads the GUI's warp jobs, for WHICH top-ups
-//     there are.  WHETHER one has confirmed it asks the wallet itself, by
-//     the top-up's own transaction (read_topup_transaction), so it is booked
-//     in the heartbeat after it confirms; the book's row is the fallback
-//     for a transaction the wallet no longer knows.
+//     there are.  WHETHER one has arrived it asks the wallet itself, by the
+//     top-up's own transaction (read_topup_transaction): that record says
+//     whether it confirmed and which coin it created, and that coin in the
+//     fence's list is arrival too.  The engine's balance is the wallet's
+//     less that list, so it falls by a top-up when the list takes its coin
+//     in, and that is the heartbeat it is booked in.  The book's row is the
+//     fallback for a transaction the wallet no longer knows.
 //   * The fence going down or up (`engine_fence: auto`).  Down, the
 //     sub-account's coins are trading funds again: a deposit of what it
 //     held.  Up, they leave: a withdrawal of what it holds.

@@ -24543,6 +24543,12 @@ asio::awaitable<bool> Engine::options_wallet_snapshot(const AssetId& asset,
     if (options_snapshot_block_ != block_height) {
         options_snapshot_block_ = block_height;
         options_snapshot_assets_.clear();
+        // The balance is the wallet's less the fence's list.  A coin that
+        // has just reached the options address must be in that list, or the
+        // snapshot is the wallet from before the flow.  Never throws: a
+        // failed refresh leaves the fence unknown, and the read below
+        // refuses.
+        if (coin_fence_ && coin_fence_->enabled()) co_await coin_fence_->refresh_now();
     }
     if (options_snapshot_assets_.count(asset) > 0) co_return true;
     if (!co_await secondary_wallet_synced(block_height)) co_return false;
@@ -24729,7 +24735,12 @@ asio::awaitable<Engine::OptionsBooking> Engine::book_options_flow(
 
         if (asset_id == acc.bridge_asset_id && bridge_accounting_operational()) {
             // The bridge scan ties this asset's tracked quantity to the
-            // wallet every heartbeat: the single writer, and it has the flow.
+            // wallet every heartbeat: the single writer.  It has the flow
+            // already, or -- when it read its balance before the fence's
+            // list had the flow's coin -- takes it in the next heartbeat,
+            // after the peak discarded below was anchored again: the peak
+            // is then discarded once more.
+            if (in_process) tally.reset_again = true;
         } else {
             const Mojo tracked = inventory_->net_inventory(asset);
             const auto it_abs = inventory_absolute_write_iso_.find(asset_id);
@@ -24881,6 +24892,12 @@ asio::awaitable<bool> Engine::book_options_topups(
                 coin_id = proof->coin_id;
             }
         }
+        // The fence lists its own coin at the options address: it has
+        // arrived, whatever the wallet's record says yet.  The engine's
+        // balances fall with that list, so this is the heartbeat to book it.
+        if (!confirmed && coin_id && coin_fence_->is_fenced_coin(*coin_id)) {
+            confirmed = true;
+        }
         if (!confirmed) {
             owe();
             continue;
@@ -24923,6 +24940,20 @@ asio::awaitable<void> Engine::step_ingest_options_transfers(BlockHeight block_he
     std::unordered_map<std::string, Mojo> owed_before;
     owed_before.swap(options_pending_slack_);
     options_owed_ids_.clear();
+
+    // A bridge-asset flow booked in an earlier heartbeat may have reached
+    // equity only in this one (book_options_flow): the peak anchored in
+    // between is from before it.
+    if (options_peak_reset_again_ != 0 && block_height >= options_peak_reset_again_) {
+        options_peak_reset_again_ = 0;
+        if (peak_equity_hwm_usd_ > 0.0) {
+            spdlog::info("[Engine] Options ingest: drawdown peak {:.2f} discarded once "
+                         "more -- the bridge scan may have taken the last options flow "
+                         "into equity after the peak was anchored again",
+                         peak_equity_hwm_usd_);
+            peak_equity_hwm_usd_ = 0.0;
+        }
+    }
 
     const auto& acc = config_.accounting;
     const auto& oc  = config_.options_fence;
@@ -25121,6 +25152,9 @@ asio::awaitable<void> Engine::step_ingest_options_transfers(BlockHeight block_he
     }
     for (const auto& asset_id : tally.rebase_assets) {
         pnl_window_rebase_assets_[asset_id] = block_height;
+    }
+    if (tally.reset_again) {
+        options_peak_reset_again_ = block_height + 1;
     }
     if (tally.inv_changed) {
         persist_inventory_state();

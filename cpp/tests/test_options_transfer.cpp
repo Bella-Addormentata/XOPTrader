@@ -772,6 +772,11 @@ TEST(OptionsTransferWiring, ATopUpIsConfirmedByItsOwnTransactionBeforeItIsBooked
     const std::size_t asked = position_of(
         pass, "co_await options_topup_proof(flow, recent || placing, block_height)");
     const std::size_t unconfirmed = position_of(pass, "if (!confirmed) { owe(); continue; }");
+    // Its own coin in the fence's list is arrival too: the engine's balances
+    // fall with that list, not with the wallet's record of the send.
+    const std::size_t listed = position_of(
+        pass, "if (!confirmed && coin_id && coin_fence_->is_fenced_coin(*coin_id)) { confirmed = true; }");
+    ASSERT_NE(listed, npos);
     const std::size_t placed = position_of(
         pass, "if (!accounting::topup_arrived_before_lowering(coin_returned, row.confirmed_at, "
               "lowering->at_unix)) { continue;");
@@ -783,7 +788,8 @@ TEST(OptionsTransferWiring, ATopUpIsConfirmedByItsOwnTransactionBeforeItIsBooked
     ASSERT_NE(placed, npos);
     ASSERT_NE(booked, npos);
     EXPECT_LT(judged, asked);
-    EXPECT_LT(asked, unconfirmed);
+    EXPECT_LT(asked, listed);
+    EXPECT_LT(listed, unconfirmed);
     EXPECT_LT(unconfirmed, placed);
     EXPECT_LT(placed, booked);
     EXPECT_EQ(count_of(pass, "co_await book_options_flow("), 1u);
@@ -884,6 +890,40 @@ TEST(OptionsTransferWiring, AFlowIsJournalledBeforeAnythingElseMoves)
               npos);
     // A fence event is entered at its own moment: the stamp top-ups meet.
     EXPECT_NE(position_of(book, "const std::string entry_time = fence_event ? flow.at_iso :"), npos);
+    // The bridge asset's tracked quantity is the bridge scan's to move, which
+    // may be a heartbeat later: the peak is discarded once more then.
+    EXPECT_NE(position_of(book, "if (in_process) tally.reset_again = true; } else {"), npos);
+}
+
+TEST(OptionsTransferWiring, ABookingIsTiedToBalancesReadWithTheFlowsCoinListed)
+{
+    const std::string raw = read_engine_cpp();
+    // The snapshot a booking is tied to is read after the fence's list is
+    // refreshed: the balance is the wallet's less that list.
+    const std::string snapshot = function_body(
+        raw, "asio::awaitable<bool> Engine::options_wallet_snapshot(");
+    ASSERT_FALSE(snapshot.empty());
+    const std::size_t refreshed = position_of(
+        snapshot, "if (coin_fence_ && coin_fence_->enabled()) co_await coin_fence_->refresh_now();");
+    const std::size_t read = position_of(snapshot, "co_await fetch_bridge_balance(asset, block_height, &validated);");
+    ASSERT_NE(refreshed, npos);
+    ASSERT_NE(read, npos);
+    EXPECT_LT(refreshed, read);
+    EXPECT_EQ(count_of(snapshot, "refresh_now()"), 1u) << "once a heartbeat, with the cache it clears";
+
+    // A bridge-asset flow may reach equity a heartbeat after its booking
+    // discarded the peak: it is discarded once more from the next heartbeat.
+    const std::string step = function_body(raw, kStep);
+    const std::size_t again = position_of(
+        step, "if (options_peak_reset_again_ != 0 && block_height >= options_peak_reset_again_) { "
+              "options_peak_reset_again_ = 0;");
+    const std::size_t first_return = position_of(step, "co_return;");
+    const std::size_t owed = position_of(
+        step, "if (tally.reset_again) { options_peak_reset_again_ = block_height + 1; }");
+    ASSERT_NE(again, npos);
+    ASSERT_NE(owed, npos);
+    EXPECT_LT(again, first_return) << "also in a pass that then stands down";
+    EXPECT_LT(again, owed);
 }
 
 TEST(OptionsTransferWiring, TheMarkerOutlivesAStopAndGoesOnlyOnceTheTrackerIsWritten)
