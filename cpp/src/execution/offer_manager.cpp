@@ -4367,26 +4367,14 @@ OrphanEvaluation OfferManager::evaluate_orphan(
     }
     const auto& summary = trade_record["summary"];
 
-    // Parse offered and requested asset->amount maps.
-    // Chia wallet format: { "asset_id_hex_or_xch": amount_int, ... }
-    std::unordered_map<std::string, Mojo> offered;    // we give
-    std::unordered_map<std::string, Mojo> requested;  // we get
-
-    auto parse_side = [](const json& obj,
-                         std::unordered_map<std::string, Mojo>& out) {
-        if (!obj.is_object()) return;
-        for (auto& [asset_id, amount_val] : obj.items()) {
-            if (amount_val.is_number_integer()) {
-                out[asset_id] = amount_val.get<Mojo>();
-            } else if (amount_val.is_number_unsigned()) {
-                out[asset_id] = static_cast<Mojo>(
-                    amount_val.get<std::uint64_t>());
-            }
-        }
-    };
-
-    if (summary.contains("offered"))   parse_side(summary["offered"],   offered);
-    if (summary.contains("requested")) parse_side(summary["requested"], requested);
+    // Parse offered and requested asset->amount maps.  [ORPHAN-AMOUNTS
+    // 2026-11-24] Through summary_side, as the other two readers: the wallet
+    // writes the amounts as text, and a numbers-only parse read every orphan
+    // as empty.
+    const std::unordered_map<std::string, Mojo> offered =
+        summary_side(summary, "offered");    // we give
+    const std::unordered_map<std::string, Mojo> requested =
+        summary_side(summary, "requested");  // we get
 
     if (offered.empty() || requested.empty()) {
         eval.disposition = OrphanDisposition::Unknown;
@@ -6168,32 +6156,10 @@ std::optional<PendingOffer> OfferManager::try_parse_wallet_offer(
     const std::string trade_id = trade_record["trade_id"].get<std::string>();
     const auto& summary = trade_record["summary"];
 
-    // Parse offered and requested asset -> amount maps.
-    std::unordered_map<std::string, Mojo> offered;
-    std::unordered_map<std::string, Mojo> requested;
-
-    auto parse_side = [](const json& obj,
-                         std::unordered_map<std::string, Mojo>& out) {
-        if (!obj.is_object()) return;
-        for (auto& [asset_id, amount_val] : obj.items()) {
-            if (amount_val.is_number_integer()) {
-                out[asset_id] = amount_val.get<Mojo>();
-            } else if (amount_val.is_number_unsigned()) {
-                out[asset_id] = static_cast<Mojo>(
-                    amount_val.get<std::uint64_t>());
-            } else if (amount_val.is_string()) {
-                try {
-                    out[asset_id] = static_cast<Mojo>(
-                        std::stoll(amount_val.get<std::string>()));
-                } catch (...) {}
-            }
-        }
-    };
-
-    if (summary.contains("offered"))
-        parse_side(summary["offered"], offered);
-    if (summary.contains("requested"))
-        parse_side(summary["requested"], requested);
+    // Parse offered and requested asset -> amount maps (summary_side: numbers
+    // or the wallet's text).
+    const std::unordered_map<std::string, Mojo> offered = summary_side(summary, "offered");
+    const std::unordered_map<std::string, Mojo> requested = summary_side(summary, "requested");
 
     if (offered.empty() || requested.empty()) return std::nullopt;
 
@@ -6296,32 +6262,11 @@ std::optional<SettledFill> OfferManager::parse_settled_fill(
 
     // Parse offered / requested asset -> raw-mojo maps.  Tolerates the
     // integer, unsigned, and string encodings observed across Chia wallet
-    // versions (same tolerance as try_parse_wallet_offer above).
-    std::unordered_map<std::string, Mojo> offered;    // we gave
-    std::unordered_map<std::string, Mojo> requested;  // we got
-
-    auto parse_side_map = [](const json& obj,
-                             std::unordered_map<std::string, Mojo>& out) {
-        if (!obj.is_object()) return;
-        for (auto& [asset_id, amount_val] : obj.items()) {
-            if (amount_val.is_number_integer()) {
-                out[asset_id] = amount_val.get<Mojo>();
-            } else if (amount_val.is_number_unsigned()) {
-                out[asset_id] = static_cast<Mojo>(
-                    amount_val.get<std::uint64_t>());
-            } else if (amount_val.is_string()) {
-                try {
-                    out[asset_id] = static_cast<Mojo>(
-                        std::stoll(amount_val.get<std::string>()));
-                } catch (...) {}
-            }
-        }
-    };
-
-    if (summary.contains("offered"))
-        parse_side_map(summary["offered"], offered);
-    if (summary.contains("requested"))
-        parse_side_map(summary["requested"], requested);
+    // versions: summary_side, which every reader of a summary shares.
+    const std::unordered_map<std::string, Mojo> offered =
+        summary_side(summary, "offered");    // we gave
+    const std::unordered_map<std::string, Mojo> requested =
+        summary_side(summary, "requested");  // we got
 
     if (offered.empty() || requested.empty()) return std::nullopt;
 
