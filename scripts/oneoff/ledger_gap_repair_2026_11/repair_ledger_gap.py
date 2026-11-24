@@ -78,6 +78,7 @@ BYC = "ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac"
 DBX = "db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20"
 FEE_MATCH_TOLERANCE = 10_000_000_000      # 0.01 XCH: measured fees vs the remainder
 FEE_PER_HEIGHT_MAX = 1_000_000_000        # 0.001 XCH: the most one block's fees may be
+REWARD_MAX_MOJOS = 20_000                 # accounting.reward_max_mojos_per_coin's default
 GIVE = 50                                 # blocks a payment coin may trail its trade
 MOJOS_PER_XCH = 10 ** 12
 
@@ -362,7 +363,7 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
     # C. settled trades never booked, since the re-tie ----------------------
     missed = []
     for tid, t in real.items():
-        h = int(t["confirmed_at_index"])
+        h = int(t["settled_at"])   # the block its payment landed in
         if h <= retie_h or tid in booked:
             continue
         recv, paid = receive_and_pay(t)
@@ -508,7 +509,11 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
         for tx in wallet.incoming_txs(ids[asset], since):
             names[(tx["height"], tx["amount"])].append(tx["name"])
         booked_names = {norm(r[3].split(":", 1)[1]) for r in led if r[2] == "reward"}
+        too_big = []
         for (h, amount), n in sorted(left.items()):
+            if amount > REWARD_MAX_MOJOS:   # not a reward by the engine's own rule
+                too_big += [(h, amount)] * max(n, 0)
+                continue
             for _ in range(n):
                 free = [x for x in names.get((h, amount), []) if x not in booked_names]
                 if not free:
@@ -522,6 +527,7 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
                 post("E", "reward", "reward:0x" + name, "reward", asset, amount, "", h,
                      f"dexie liquidity reward; fmv_usd={usd:.10f}; px_usd_per_unit={px:.10f}; "
                      f"wallet_tx=0x{name}; booked late by the repair")
+        leftovers[asset] = too_big
 
     # F. XCH network fees paid outside fills and takes ----------------------
     kids = collections.defaultdict(int)

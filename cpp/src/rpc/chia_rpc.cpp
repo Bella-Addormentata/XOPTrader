@@ -1288,6 +1288,31 @@ ChiaWalletRPC::get_coin_records_at_height(std::uint64_t                     heig
 }
 
 asio::awaitable<std::vector<json>>
+ChiaWalletRPC::get_coin_records_in_range(std::uint64_t                     start,
+                                         std::uint64_t                     stop,
+                                         const std::vector<std::uint64_t>& amounts)
+{
+    // As get_coin_records_at_height: amount_filter mode 1 is include,
+    // confirmed_range is inclusive at both ends, and no limit is sent.
+    const json payload = {
+        {"confirmed_range", {{"start", start}, {"stop", stop}}},
+        {"amount_filter",   {{"values", amounts}, {"mode", 1}}}
+    };
+    const json resp = co_await rpc_post("get_coin_records", payload);
+
+    const auto listed = resp.find("coin_records");
+    if (listed == resp.end() || !listed->is_array()) {
+        throw ChiaRPCError("get_coin_records: response has no coin_records list");
+    }
+    std::vector<json> records;
+    records.reserve(listed->size());
+    for (const auto& rec : *listed) {
+        records.push_back(rec);
+    }
+    co_return records;
+}
+
+asio::awaitable<std::vector<json>>
 ChiaWalletRPC::get_recent_takes(std::int64_t count)
 {
     // No sort_key: the wallet's default CONFIRMED_AT_HEIGHT order, newest

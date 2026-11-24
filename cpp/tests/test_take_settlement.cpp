@@ -236,6 +236,50 @@ TEST(TakeSettlement, AnUnreadableAnswerProvesNothing) {
     EXPECT_FALSE(receipts_paid(received, {coin(1'000, 50)}, 0, kWallets));
 }
 
+TEST(TakeSettlement, APaymentABlockLateStillSettlesTheTakeAtItsOwnBlock) {
+    // [review #262] confirmed_at_index has been seen one block before the
+    // payment (2026-09-04, paid at H+1).  Within kReceiptGiveBlocks the take
+    // settles, at the block the payment landed in.
+    const std::vector<AssetAmount> received{{kByc, 1'630}};
+    EXPECT_EQ(receipts_settled_at(received, {coin(1'630, 9'245'442, 4)}, 9'245'441, kWallets,
+                                  kReceiptGiveBlocks),
+              std::optional<std::uint64_t>{9'245'442});
+    // Exactly at the index it settles there; past the give it does not.
+    EXPECT_EQ(receipts_settled_at(received, {coin(1'630, 9'245'441, 4)}, 9'245'441, kWallets,
+                                  kReceiptGiveBlocks),
+              std::optional<std::uint64_t>{9'245'441});
+    EXPECT_FALSE(receipts_settled_at(received, {coin(1'630, 9'245'441 + kReceiptGiveBlocks + 1, 4)},
+                                     9'245'441, kWallets, kReceiptGiveBlocks).has_value());
+    // Never before the index.
+    EXPECT_FALSE(receipts_settled_at(received, {coin(1'630, 9'245'440, 4)}, 9'245'441, kWallets,
+                                     kReceiptGiveBlocks).has_value());
+    // With no give it is the exact-height proof.
+    EXPECT_FALSE(receipts_paid(received, {coin(1'630, 9'245'442, 4)}, 9'245'441, kWallets));
+    // Two receipts: the take settled when the later one landed; the earliest
+    // matching coin is taken for each.
+    const std::vector<AssetAmount> two{{kByc, 1'000}, {kDbx, 2'000}};
+    EXPECT_EQ(receipts_settled_at(two, {coin(1'000, 51, 4), coin(1'000, 50, 4), coin(2'000, 51, 8)},
+                                  50, kWallets, kReceiptGiveBlocks),
+              std::optional<std::uint64_t>{51});
+}
+
+TEST(TakeSettlement, ATrackedTakeIsToleranceUntilItIsBookedOrDropped) {
+    // [review #262] A settled take can wait a few heartbeats to be read.
+    std::unordered_map<std::string, PendingTake> takes;
+    auto p = pending("0x3d58e29d", "AkA6GJrWFG", 9'600'106);
+    p.exposure = {{"xch", 5'000'000'000'000}, {kDbx, 406'000}, {"xch", 330'000}};
+    takes.emplace(p.trade_id, p);
+    const std::unordered_map<std::string, UncertainTake> uncertain{
+        {"nMDyHor9J8", UncertainTake{9'600'463, {{kDbx, 423'000}}}}};
+    // Long after the uncertain hold lapsed, the tracked take still counts.
+    const auto later = take_hold_slack(takes, uncertain, 9'600'463 + kUncertainTakeHoldBlocks);
+    EXPECT_EQ(later.at("xch"), 5'000'000'330'000);
+    EXPECT_EQ(later.at(kDbx), 406'000);
+    const auto now = take_hold_slack(takes, uncertain, 9'600'463);
+    EXPECT_EQ(now.at(kDbx), 406'000 + 423'000);
+    EXPECT_TRUE(take_hold_slack({}, {}, 9'600'463).empty());
+}
+
 TEST(TakeSettlement, ATakesEventIdHasTwoSpellings) {
     // The engine books "take:0x<id>", the GUI's top-up ingest "take:<id>".
     const auto ids = take_event_ids("0xABCdef");
@@ -449,7 +493,8 @@ TEST(TakeSettlementWiring, BookingNeedsThePaymentProof) {
         const std::string body = function_body(raw, signature);
         ASSERT_FALSE(body.empty()) << signature;
         const std::size_t proof = position_of(
-            body, "execution::receipts_paid(take->received, coins, take->height,");
+            body, "settled_at = execution::receipts_settled_at( take->received, coins, take->height, "
+                  "receipt_wallet_ids(take->received), execution::kReceiptGiveBlocks);");
         ASSERT_NE(proof, std::string::npos) << signature;
         EXPECT_LT(proof, position_of(body, "record_taker_fill(")) << signature;
     }
@@ -466,9 +511,48 @@ TEST(TakeSettlementWiring, BookingNeedsThePaymentProof) {
               std::string::npos);
     EXPECT_NE(position_of(sweep, "execution::in_sweep_window(take->height, block_height)"),
               std::string::npos);
-    // Both proofs match each receipt in its own wallet.
-    EXPECT_EQ(count_of(raw.empty() ? std::string{} : squeeze(raw),
-                       "receipt_wallet_ids(take->received)"), 2u);
+    // Both proofs match each receipt in its own wallet, over the give, and
+    // both book at the block the payment landed in.
+    const std::string all = squeeze(raw);
+    EXPECT_EQ(count_of(all, "receipt_wallet_ids(take->received)"), 2u);
+    EXPECT_EQ(count_of(all, "co_await wallet_->get_coin_records_in_range( take->height, "
+                            "take->height + execution::kReceiptGiveBlocks,"), 2u);
+    EXPECT_EQ(count_of(all, "static_cast<BlockHeight>(*settled_at)"), 2u);
+    EXPECT_EQ(count_of(all, "get_coin_records_at_height(take->height"), 0u);
+}
+
+TEST(TakeSettlementWiring, TheHoldIsWrittenBeforeTheTakeIsSent) {
+    const std::string raw = read_engine_cpp();
+    const std::string guard = function_body(
+        raw, "asio::awaitable<nlohmann::json> Engine::take_offer_guarded(");
+    ASSERT_FALSE(guard.empty());
+    const std::size_t held = position_of(
+        guard, "if (!hold_uncertain_take(counterparty_offer_id, intent, block_height)) {");
+    const std::size_t sent = position_of(guard, "wallet_->take_offer(offer_text, intent.fee_mojos)");
+    ASSERT_NE(held, std::string::npos);
+    ASSERT_NE(sent, std::string::npos);
+    EXPECT_LT(held, sent);
+    // A definite refusal releases it; a possibly-submitted failure keeps it.
+    const std::size_t refused = position_of(guard, "catch (const rpc::ChiaRPCApplicationError&)");
+    const std::size_t transport = position_of(guard, "catch (const rpc::ChiaRPCTransportError& e)");
+    ASSERT_NE(refused, std::string::npos);
+    ASSERT_NE(transport, std::string::npos);
+    EXPECT_LT(guard.find(squeeze("release_uncertain_take(counterparty_offer_id);"), refused),
+              transport);
+    EXPECT_NE(position_of(guard, "if (!rpc::request_possibly_submitted(e.curl_code(), "
+                                 "e.http_code())) { release_uncertain_take(counterparty_offer_id);"),
+              std::string::npos);
+    // Tracking a take releases the request's hold once the pending row is in.
+    const std::string track = function_body(raw, "void Engine::track_pending_take(");
+    EXPECT_NE(position_of(track, "if (written) release_uncertain_take(counterparty_offer_id);"),
+              std::string::npos);
+    // A settled take whose record does not map onto its pair stays tracked.
+    const std::string settle = function_body(
+        raw, "asio::awaitable<void> Engine::step_settle_pending_takes(BlockHeight block_height)");
+    const std::size_t unmapped = position_of(settle, "if (!legs || !price) {");
+    const std::size_t erased = position_of(settle, "pending_takes_.erase(it);");
+    ASSERT_NE(unmapped, std::string::npos);
+    EXPECT_LT(unmapped, erased);
 }
 
 TEST(TakeSettlementWiring, HoldsAreWrittenReadBackAndKeptWhileUncertain) {
@@ -477,11 +561,11 @@ TEST(TakeSettlementWiring, HoldsAreWrittenReadBackAndKeptWhileUncertain) {
     // An unanswered request, and a reply with no trade id, both hold the offer.
     const std::string guard = function_body(
         raw, "asio::awaitable<nlohmann::json> Engine::take_offer_guarded(");
-    EXPECT_NE(position_of(guard, "hold_uncertain_take(counterparty_offer_id, intent, block_height);"),
+    EXPECT_NE(position_of(guard, "hold_uncertain_take(counterparty_offer_id, intent, block_height)"),
               std::string::npos);
     const std::string track = function_body(raw, "void Engine::track_pending_take(");
-    EXPECT_NE(position_of(track, "hold_uncertain_take(counterparty_offer_id, intent, block_height);"),
-              std::string::npos);
+    EXPECT_NE(position_of(track, "(void)hold_uncertain_take(counterparty_offer_id, intent, "
+                                 "block_height);"), std::string::npos);
     EXPECT_NE(position_of(track, "db_->save_take_hold(row)"), std::string::npos);
     // Every way a hold ends deletes it.
     const std::string settle = function_body(
@@ -497,8 +581,8 @@ TEST(TakeSettlementWiring, HoldsAreWrittenReadBackAndKeptWhileUncertain) {
     // The invariant widens its tolerance by the live uncertain holds.
     const std::string invariant = function_body(
         raw, "void Engine::step_check_ledger_invariant(BlockHeight block_height)");
-    EXPECT_NE(position_of(invariant, "execution::uncertain_take_slack(uncertain_take_offers_, "
-                                     "block_height);"), std::string::npos);
+    EXPECT_NE(position_of(invariant, "execution::take_hold_slack(pending_takes_, "
+                                     "uncertain_take_offers_, block_height);"), std::string::npos);
     EXPECT_EQ(count_of(invariant, "exposure + fee_slack + held_slack"), 2u);
     EXPECT_EQ(count_of(invariant, "exposure + fee_slack + inflight_slack"), 0u);
     // A take inside an asset's opening books no leg (the fill path's rule).

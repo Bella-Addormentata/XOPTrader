@@ -22743,37 +22743,39 @@ execution::UncertainTake Engine::take_exposure(const std::string& pair_name,
     return hold;
 }
 
-void Engine::hold_uncertain_take(const std::string& offer_id,
+bool Engine::hold_uncertain_take(const std::string& offer_id,
                                  const execution::TakeIntent& intent,
                                  BlockHeight at) noexcept
 {
-    if (offer_id.empty()) return;
+    if (offer_id.empty()) return true;   // nothing to hold back, nothing to restore
     try {
         uncertain_take_offers_.insert_or_assign(
             offer_id, take_exposure(intent.pair_name, intent.we_bought_base, intent.base_mojos,
                                     intent.price_mojos, intent.fee_mojos, at));
-        if (db_) {
-            DbTakeHold row;
-            row.hold_key       = "uncertain:" + offer_id;
-            row.kind           = "uncertain";
-            row.offer_id       = offer_id;
-            row.strategy       = intent.strategy;
-            row.pair_name      = intent.pair_name;
-            row.we_bought_base = intent.we_bought_base;
-            row.base_mojos     = intent.base_mojos;
-            row.price_mojos    = intent.price_mojos;
-            row.fee_mojos      = intent.fee_mojos;
-            row.block_height   = at;
-            if (!db_->save_take_hold(row)) {
-                spdlog::warn("[Engine] [TAKE-SETTLE] the hold on offer {} could not be "
-                             "written -- a restart within {} blocks would forget it",
-                             offer_id.substr(0, std::min<std::size_t>(12, offer_id.size())),
-                             execution::kUncertainTakeHoldBlocks);
-            }
-        }
+        if (!db_) return true;
+        DbTakeHold row;
+        row.hold_key       = "uncertain:" + offer_id;
+        row.kind           = "uncertain";
+        row.offer_id       = offer_id;
+        row.strategy       = intent.strategy;
+        row.pair_name      = intent.pair_name;
+        row.we_bought_base = intent.we_bought_base;
+        row.base_mojos     = intent.base_mojos;
+        row.price_mojos    = intent.price_mojos;
+        row.fee_mojos      = intent.fee_mojos;
+        row.block_height   = at;
+        return db_->save_take_hold(row);
     } catch (const std::exception& e) {
         spdlog::error("[Engine] [TAKE-SETTLE] could not hold offer {}: {}", offer_id, e.what());
+        return false;
     }
+}
+
+void Engine::release_uncertain_take(const std::string& offer_id) noexcept
+{
+    if (offer_id.empty()) return;
+    uncertain_take_offers_.erase(offer_id);
+    if (db_) db_->delete_take_hold("uncertain:" + offer_id);
 }
 
 void Engine::restore_take_holds() noexcept
@@ -22790,13 +22792,6 @@ void Engine::restore_take_holds() noexcept
         std::size_t pending = 0;
         std::size_t uncertain = 0;
         for (const auto& h : *holds) {
-            execution::TakeIntent intent;
-            intent.strategy       = h.strategy;
-            intent.pair_name      = h.pair_name;
-            intent.we_bought_base = h.we_bought_base;
-            intent.base_mojos     = h.base_mojos;
-            intent.price_mojos    = h.price_mojos;
-            intent.fee_mojos      = h.fee_mojos;
             if (h.kind == "pending" && !h.trade_id.empty()) {
                 execution::PendingTake take;
                 take.strategy              = h.strategy;
@@ -22808,6 +22803,8 @@ void Engine::restore_take_holds() noexcept
                 take.price_mojos           = h.price_mojos;
                 take.fee_mojos             = h.fee_mojos;
                 take.submitted_block       = h.block_height;
+                take.exposure = take_exposure(h.pair_name, h.we_bought_base, h.base_mojos,
+                                              h.price_mojos, h.fee_mojos, h.block_height).exposure;
                 pending_takes_.insert_or_assign(h.trade_id, std::move(take));
                 ++pending;
             } else if (h.kind == "uncertain" && !h.offer_id.empty()) {
@@ -22839,8 +22836,9 @@ void Engine::track_pending_take(const std::string& strategy,
 {
     try {
         if (trade_id.empty() || trade_id == "unknown") {
-            // Nothing to read back, so nothing to settle: hold the offer as
-            // for an unanswered request, and let the sweep book the take.
+            // Nothing to read back, so nothing to settle: keep the offer under
+            // the hold take_offer_guarded wrote before sending, from now, and
+            // let the sweep book the take.
             execution::TakeIntent intent;
             intent.strategy       = strategy;
             intent.pair_name      = pc.name;
@@ -22848,7 +22846,7 @@ void Engine::track_pending_take(const std::string& strategy,
             intent.base_mojos     = base_mojos;
             intent.price_mojos    = price_mojos;
             intent.fee_mojos      = fee_mojos;
-            hold_uncertain_take(counterparty_offer_id, intent, block_height);
+            (void)hold_uncertain_take(counterparty_offer_id, intent, block_height);
             spdlog::warn("[Engine] [TAKE-SETTLE] {} take on {}: the wallet's "
                          "reply names no trade id -- offer {} is held back for {} "
                          "blocks, and the missed-take sweep books the take if it "
@@ -22868,7 +22866,10 @@ void Engine::track_pending_take(const std::string& strategy,
         take.price_mojos           = price_mojos;
         take.fee_mojos             = fee_mojos;
         take.submitted_block       = block_height;
+        take.exposure = take_exposure(pc.name, we_bought_base, base_mojos, price_mojos,
+                                      fee_mojos, block_height).exposure;
         pending_takes_.insert_or_assign(trade_id, std::move(take));
+        bool written = true;
         if (db_) {
             DbTakeHold row;
             row.hold_key       = "take:" + trade_id;
@@ -22882,12 +22883,16 @@ void Engine::track_pending_take(const std::string& strategy,
             row.price_mojos    = price_mojos;
             row.fee_mojos      = fee_mojos;
             row.block_height   = block_height;
-            if (!db_->save_take_hold(row)) {
+            written = db_->save_take_hold(row);
+            if (!written) {
                 spdlog::warn("[Engine] [TAKE-SETTLE] take {} could not be written to "
-                             "take_holds -- a restart before it settles leaves it to "
-                             "the missed-take sweep", trade_id);
+                             "take_holds -- the hold written before it was sent stays, "
+                             "so a restart still holds the offer back", trade_id);
             }
         }
+        // The take is tracked now: the hold that covered the request is not
+        // needed -- unless the pending row could not take its place.
+        if (written) release_uncertain_take(counterparty_offer_id);
         spdlog::info("[Engine] [TAKE-SETTLE] {} take {} on {} submitted at "
                      "block {} -- booked once the wallet shows it settled "
                      "({} unsettled)",
@@ -22917,25 +22922,45 @@ asio::awaitable<nlohmann::json> Engine::take_offer_guarded(
             {"success", false},
             {"error", "an earlier take of this offer has not settled yet"}};
     }
+    // The hold is written BEFORE the request leaves: a process that stops
+    // while the wallet is taking the offer leaves the next one this hold, so
+    // the offer is not taken again.  No hold, no take.
+    if (!hold_uncertain_take(counterparty_offer_id, intent, block_height)) {
+        release_uncertain_take(counterparty_offer_id);
+        spdlog::error("[Engine] [TAKE-SETTLE] the hold on offer {} could not be "
+                      "written -- not sending the take",
+                      counterparty_offer_id.substr(
+                          0, std::min<std::size_t>(12, counterparty_offer_id.size())));
+        co_return nlohmann::json{
+            {"success", false},
+            {"error", "the take could not be recorded before it was sent"}};
+    }
     try {
+        // Success: the site's track_pending_take turns this hold into a
+        // pending one.
         co_return co_await wallet_->take_offer(offer_text, intent.fee_mojos);
+    } catch (const rpc::ChiaRPCApplicationError&) {
+        // The wallet answered no: nothing was taken.
+        release_uncertain_take(counterparty_offer_id);
+        throw;
     } catch (const rpc::ChiaRPCTransportError& e) {
-        // A timeout, a dropped reply or a 5xx may have reached the wallet,
-        // which may be taking the offer now: leave it alone for a while
-        // (take_offer is never re-sent; rpc_retry_policy.hpp).
-        if (!counterparty_offer_id.empty()
-            && rpc::request_possibly_submitted(e.curl_code(), e.http_code())) {
-            hold_uncertain_take(counterparty_offer_id, intent, block_height);
-            spdlog::warn("[Engine] [TAKE-SETTLE] the take request for offer {} "
-                         "may have reached the wallet without an answer -- not "
-                         "taking it again for {} blocks; the missed-take sweep "
-                         "books the take if it settled",
-                         counterparty_offer_id.substr(
-                             0, std::min<std::size_t>(12, counterparty_offer_id.size())),
-                         execution::kUncertainTakeHoldBlocks);
+        if (!rpc::request_possibly_submitted(e.curl_code(), e.http_code())) {
+            release_uncertain_take(counterparty_offer_id);   // never reached the wallet
+            throw;
         }
+        // A timeout, a dropped reply or a 5xx may have reached the wallet,
+        // which may be taking the offer now: the hold stays (take_offer is
+        // never re-sent; rpc_retry_policy.hpp).
+        spdlog::warn("[Engine] [TAKE-SETTLE] the take request for offer {} "
+                     "may have reached the wallet without an answer -- not "
+                     "taking it again for {} blocks; the missed-take sweep "
+                     "books the take if it settled",
+                     counterparty_offer_id.substr(
+                         0, std::min<std::size_t>(12, counterparty_offer_id.size())),
+                     execution::kUncertainTakeHoldBlocks);
         throw;
     }
+    // Any other failure leaves the hold in place: it may have been sent.
 }
 
 asio::awaitable<void> Engine::step_settle_pending_takes(BlockHeight block_height)
@@ -22970,13 +22995,15 @@ asio::awaitable<void> Engine::step_settle_pending_takes(BlockHeight block_height
         const execution::WalletCancelState state =
             execution::wallet_cancel_state_from_record(record);
         const auto take = execution::read_wallet_take(record);
-        bool paid = false;
+        std::optional<std::uint64_t> settled_at;
         if (take) {
             try {
-                const auto coins = co_await wallet_->get_coin_records_at_height(
-                    take->height, execution::receipt_amounts(take->received));
-                paid = execution::receipts_paid(take->received, coins, take->height,
-                                                receipt_wallet_ids(take->received));
+                const auto coins = co_await wallet_->get_coin_records_in_range(
+                    take->height, take->height + execution::kReceiptGiveBlocks,
+                    execution::receipt_amounts(take->received));
+                settled_at = execution::receipts_settled_at(
+                    take->received, coins, take->height, receipt_wallet_ids(take->received),
+                    execution::kReceiptGiveBlocks);
             } catch (const std::exception& e) {
                 spdlog::debug("[Engine] [TAKE-SETTLE] payment read failed for take "
                               "{}: {} -- read again later", short_id, e.what());
@@ -22988,8 +23015,47 @@ asio::awaitable<void> Engine::step_settle_pending_takes(BlockHeight block_height
         const auto it = pending_takes_.find(trade_id);
         if (it == pending_takes_.end()) continue;
         const execution::TakeVerdict verdict = execution::judge_take(
-            state, paid && take.has_value(), it->second.submitted_block, block_height);
+            state, settled_at.has_value() && take.has_value(), it->second.submitted_block,
+            block_height);
         if (verdict == execution::TakeVerdict::Wait) continue;
+
+        if (verdict == execution::TakeVerdict::Book) {
+            // The wallet's own legs, read as this pair's, or nothing: a take
+            // whose record does not map onto its pair as configured now is
+            // kept tracked rather than booked from estimates.
+            const PairConfig* pc = find_pair_config(it->second.pair_name);
+            const auto legs = pc != nullptr
+                ? execution::take_booking_for_pair(*take, pc->base_asset_id, pc->quote_asset_id)
+                : std::nullopt;
+            const auto price = legs
+                ? execution::price_from_legs(legs->base_mojos, legs->quote_mojos,
+                                             pc->base_mojos_per_unit, pc->quote_mojos_per_unit)
+                : std::nullopt;
+            if (!legs || !price) {
+                if (take_unmapped_warned_.insert(trade_id).second) {
+                    spdlog::error("[Engine] [TAKE-SETTLE] {} take {} settled, but its "
+                                  "wallet record does not read as two legs of {} as "
+                                  "configured now -- kept tracked, not booked",
+                                  it->second.strategy, short_id, it->second.pair_name);
+                }
+                continue;
+            }
+            const execution::PendingTake p = it->second;
+            pending_takes_.erase(it);
+            if (db_) db_->delete_take_hold("take:" + p.trade_id);
+            if (legs->we_bought_base != p.we_bought_base || legs->base_mojos != p.base_mojos) {
+                spdlog::warn("[Engine] [TAKE-SETTLE] {} take {}: the wallet settled {} "
+                             "base={} where the take site expected {} base={} -- "
+                             "booking the wallet's numbers",
+                             p.strategy, short_id,
+                             legs->we_bought_base ? "BUY" : "SELL", legs->base_mojos,
+                             p.we_bought_base ? "BUY" : "SELL", p.base_mojos);
+            }
+            record_taker_fill(p.strategy, p.trade_id, p.counterparty_offer_id, *pc,
+                              legs->we_bought_base, legs->base_mojos, *price, p.fee_mojos,
+                              static_cast<BlockHeight>(*settled_at), legs->quote_mojos);
+            continue;
+        }
 
         const execution::PendingTake p = it->second;
         pending_takes_.erase(it);
@@ -23001,53 +23067,13 @@ asio::awaitable<void> Engine::step_settle_pending_takes(BlockHeight block_height
                          p.strategy, short_id, p.pair_name,
                          state == execution::WalletCancelState::Failed ? "FAILED"
                                                                        : "CANCELLED");
-            continue;
-        }
-        if (verdict == execution::TakeVerdict::GiveUp || !take) {
+        } else {
             spdlog::error("[Engine] [TAKE-SETTLE] {} take {} on {} is still "
                           "unsettled {} blocks after it was submitted -- no "
                           "longer tracked; the missed-take sweep books it if it "
                           "settles", p.strategy, short_id, p.pair_name,
                           block_height - p.submitted_block);
-            continue;
         }
-
-        // Book.  The wallet's own legs when they read as this pair's, else
-        // the numbers the take site priced it at.
-        const PairConfig* pc = find_pair_config(p.pair_name);
-        if (pc == nullptr) {
-            spdlog::error("[Engine] [TAKE-SETTLE] {} take {} settled on {}, a pair "
-                          "no longer configured -- not booked",
-                          p.strategy, short_id, p.pair_name);
-            continue;
-        }
-        bool we_bought_base = p.we_bought_base;
-        Mojo base_mojos     = p.base_mojos;
-        Mojo price_mojos    = p.price_mojos;
-        std::optional<Mojo> exact_quote;
-        if (const auto legs = execution::take_booking_for_pair(
-                *take, pc->base_asset_id, pc->quote_asset_id)) {
-            if (const auto price = execution::price_from_legs(
-                    legs->base_mojos, legs->quote_mojos,
-                    pc->base_mojos_per_unit, pc->quote_mojos_per_unit)) {
-                if (legs->we_bought_base != p.we_bought_base
-                    || legs->base_mojos != p.base_mojos) {
-                    spdlog::warn("[Engine] [TAKE-SETTLE] {} take {}: the wallet "
-                                 "settled {} base={} where the take site expected "
-                                 "{} base={} -- booking the wallet's numbers",
-                                 p.strategy, short_id,
-                                 legs->we_bought_base ? "BUY" : "SELL", legs->base_mojos,
-                                 p.we_bought_base ? "BUY" : "SELL", p.base_mojos);
-                }
-                we_bought_base = legs->we_bought_base;
-                base_mojos     = legs->base_mojos;
-                price_mojos    = *price;
-                exact_quote    = legs->quote_mojos;
-            }
-        }
-        record_taker_fill(p.strategy, p.trade_id, p.counterparty_offer_id, *pc,
-                          we_bought_base, base_mojos, price_mojos, p.fee_mojos,
-                          take->height, exact_quote);
     }
 }
 
@@ -23133,18 +23159,20 @@ asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)
             continue;
         }
 
-        bool paid = false;
+        std::optional<std::uint64_t> settled_at;
         try {
-            const auto coins = co_await wallet_->get_coin_records_at_height(
-                take->height, execution::receipt_amounts(take->received));
-            paid = execution::receipts_paid(take->received, coins, take->height,
-                                            receipt_wallet_ids(take->received));
+            const auto coins = co_await wallet_->get_coin_records_in_range(
+                take->height, take->height + execution::kReceiptGiveBlocks,
+                execution::receipt_amounts(take->received));
+            settled_at = execution::receipts_settled_at(
+                take->received, coins, take->height, receipt_wallet_ids(take->received),
+                execution::kReceiptGiveBlocks);
         } catch (const std::exception& e) {
             spdlog::debug("[Engine] [TAKE-SETTLE] sweep: payment read failed for "
                           "take {}: {} -- next sweep", short_id, e.what());
             continue;
         }
-        if (!paid) continue;   // no proof, no booking; the next sweep looks again
+        if (!settled_at) continue;   // no proof, no booking; the next sweep looks again
 
         const auto price = execution::price_from_legs(
             legs->base_mojos, legs->quote_mojos,
@@ -23157,13 +23185,14 @@ asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)
                      "engine never recorded -- {} {} base={} quote={} at block {} "
                      "(its fee is not in the wallet's record; booked as 0)",
                      short_id, pc->name, legs->we_bought_base ? "BUY" : "SELL",
-                     legs->base_mojos, legs->quote_mojos, take->height);
+                     legs->base_mojos, legs->quote_mojos, *settled_at);
         // Once per process whatever the outcome: a leg suppressed because the
         // take is inside an asset's opening leaves no event to find next time.
         take_sweep_done_.insert(id);
         record_taker_fill("wallet_sweep", "0x" + id, std::string{}, *pc,
                           legs->we_bought_base, legs->base_mojos, *price,
-                          /*fee_mojos=*/0, take->height, legs->quote_mojos);
+                          /*fee_mojos=*/0, static_cast<BlockHeight>(*settled_at),
+                          legs->quote_mojos);
     }
 }
 
@@ -23284,9 +23313,26 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
         txs.insert(txs.end(), rows.begin(), rows.end());
         const BlockHeight oldest = rows.empty() ? BlockHeight{0}
             : static_cast<BlockHeight>(rows.back().value("confirmed_at_height", 0));
+        // [review #262] A page that still holds an unbooked receipt may be
+        // the head of a burst longer than a page: read on now, rather than
+        // leave its tail for the next deep scan and the invariant to absorb.
+        bool page_has_new_reward = false;
+        for (const auto& t : rows) {
+            const Mojo amount = static_cast<Mojo>(t.value("amount", 0));
+            const BlockHeight height = static_cast<BlockHeight>(t.value("confirmed_at_height", 0));
+            const std::string tx_name = t.value("name", std::string{});
+            if (!tx_name.empty()
+                && accounting::is_reward_inflow(t.value("type", -1), amount, height,
+                                                genesis_block, acc.reward_max_mojos_per_coin,
+                                                /*has_matching_outgoing=*/false)
+                && !db_->ledger_has_event("reward:" + tx_name)) {
+                page_has_new_reward = true;
+                break;
+            }
+        }
         if (!accounting::reward_scan_reads_on(
-                deep_scan, page + 1, static_cast<std::int64_t>(rows.size()),
-                oldest, block_height)) {
+                deep_scan, page_has_new_reward, page + 1,
+                static_cast<std::int64_t>(rows.size()), oldest, block_height)) {
             break;
         }
     }
@@ -25938,7 +25984,7 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
     if (ledger.empty()) return;
 
     const auto take_slack =
-        execution::uncertain_take_slack(uncertain_take_offers_, block_height);
+        execution::take_hold_slack(pending_takes_, uncertain_take_offers_, block_height);
     for (const auto& [asset, cached] : cached_wallet_balances_) {
         // -- Gates.  A stale snapshot is genuinely unusable, so skip it.
         if (cached.as_of_block == 0
@@ -25997,10 +26043,12 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
         const Mojo inflight_slack = accounting::add_slack(
             std::abs(cached.pending_change),
             options_owed != options_pending_slack_.end() ? options_owed->second : 0);
-        // [TAKE-SETTLE 2026-11-24] So does what a take request that may have
-        // reached the wallet unanswered could have moved, while its hold
-        // lasts: the missed-take sweep books it if it settled, and this
-        // control must not absorb it first.
+        // [TAKE-SETTLE 2026-11-24] So does what the takes the engine holds
+        // could have moved: a tracked take until it is booked or dropped (it
+        // may wait a few heartbeats to be read once settled), and a take
+        // request that may have reached the wallet unanswered while its hold
+        // lasts (the sweep books it if it settled).  This control must not
+        // absorb either first.
         const auto take_owed = take_slack.find(execution::normalize_id(asset));
         const Mojo held_slack = accounting::add_slack(
             inflight_slack, take_owed != take_slack.end() ? take_owed->second : 0);

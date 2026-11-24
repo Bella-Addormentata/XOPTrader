@@ -173,20 +173,23 @@ inline constexpr BlockHeight kRewardDeepScanEveryBlocks{30};
 
 /// Should the reward scan read the page after the one it just read?
 ///
-/// Only on a deep-scan heartbeat; only while the page just read was full (a
-/// short page is the wallet's last); only while that page's oldest row is
-/// unconfirmed (0) or still young enough to book (reward_receipt_is_recent --
-/// past that, nothing further back can be booked anyway); and never past
-/// kRewardScanMaxPages.  The wallet orders unconfirmed rows first, then
-/// confirmed rows newest first (ChiaWalletRPC::get_transactions), so a page's
-/// last row is its oldest.
+/// On a deep-scan heartbeat, or at once when the page just read still holds
+/// an unbooked receipt (`page_has_new_reward`: a burst longer than a page,
+/// whose tail must not wait for the next deep scan while the invariant may
+/// absorb it); only while that page was full (a short page is the wallet's
+/// last); only while its oldest row is unconfirmed (0) or still young enough
+/// to book (reward_receipt_is_recent -- past that, nothing further back can
+/// be booked anyway); and never past kRewardScanMaxPages.  The wallet orders
+/// unconfirmed rows first, then confirmed rows newest first
+/// (ChiaWalletRPC::get_transactions), so a page's last row is its oldest.
 [[nodiscard]] constexpr bool reward_scan_reads_on(bool         deep,
+                                                  bool         page_has_new_reward,
                                                   std::int64_t pages_read,
                                                   std::int64_t rows_in_page,
                                                   BlockHeight  oldest_in_page,
                                                   BlockHeight  current_height) noexcept
 {
-    if (!deep) return false;
+    if (!deep && !page_has_new_reward) return false;
     if (pages_read >= kRewardScanMaxPages) return false;
     if (rows_in_page < kRewardScanPageRows) return false;
     if (oldest_in_page == 0) return true;

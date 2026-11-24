@@ -1557,6 +1557,9 @@ private:
     BlockHeight last_take_sweep_block_{0};
     /// Settled takes the sweep could not book (no configured pair), warned once.
     std::unordered_set<std::string> take_sweep_warned_;
+    /// Settled takes the settle step keeps because their record does not map
+    /// onto their pair as configured now, warned once.
+    std::unordered_set<std::string> take_unmapped_warned_;
     /// [review #163 r2] The height the engine is working at NOW: the startup
     /// height while the startup reconcile runs, then each cycle's own height,
     /// stamped at the TOP of on_new_block_coro.  last_block_ cannot serve: it
@@ -1944,10 +1947,16 @@ private:
     /// [TAKE-SETTLE 2026-11-24] Hold Dexie offer `offer_id` back for
     /// execution::kUncertainTakeHoldBlocks from `at`, widening the divergence
     /// control's tolerance by what the take could move, and write the hold to
-    /// take_holds so a restart keeps it.
-    void hold_uncertain_take(const std::string& offer_id,
-                             const execution::TakeIntent& intent,
-                             BlockHeight at) noexcept;
+    /// take_holds so a restart keeps it.  take_offer_guarded holds every offer
+    /// this way BEFORE sending its take.
+    /// @return false when the hold could not be written.
+    [[nodiscard]] bool hold_uncertain_take(const std::string& offer_id,
+                                           const execution::TakeIntent& intent,
+                                           BlockHeight at) noexcept;
+
+    /// [TAKE-SETTLE 2026-11-24] Drop the uncertain hold on `offer_id`: the
+    /// wallet refused the take, or a pending hold took its place.
+    void release_uncertain_take(const std::string& offer_id) noexcept;
 
     /// [TAKE-SETTLE 2026-11-24] Read take_holds back at start, before any
     /// take step runs: the takes the last process left unsettled, and its

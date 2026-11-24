@@ -19,11 +19,14 @@ listing an offer while our first take of it waits to be mined.
 - **Booked on settlement.** Every take path (crossed book, cross-stable,
   peg arb, drift correction, XCH recovery) now only tracks a take the wallet
   accepted. It is booked once the wallet shows it settled and the coin it
-  pays us is in the wallet, at the wallet's own amounts and height. A take
-  that failed or was cancelled books nothing.
+  pays us is in the wallet, at the wallet's own amounts and at the block
+  that payment landed in. A take that failed or was cancelled books nothing.
+  Until a take is booked or dropped, the ledger check allows for what it
+  moves.
 - **One take of an offer at a time.** An offer with an unsettled take of
-  ours is not taken again. Unsettled takes are written to the database and
-  read back at start, so a restart does not forget them.
+  ours is not taken again. The hold is written to the database before the
+  take is even sent, and read back at start, so a restart does not forget
+  it.
 - **A take request is never re-sent.** After a timeout the wallet may still
   be taking the offer, so the engine leaves that offer alone for about 20
   minutes instead of sending a second copy. Meanwhile the ledger check
@@ -38,9 +41,10 @@ listing an offer while our first take of it waits to be mined.
 
 - Reward coins up to 20 DBX each are booked (was 2 DBX): November's coins
   reach 4.4 DBX and the larger ones were left out.
-- Every ten minutes the reward scan reads back past its newest 200 wallet
-  rows, so a burst of more than 200 coins is booked whole. On 2026-11-15 a
-  burst of 220 coins left 20 unbooked.
+- The reward scan reads back past its newest 200 wallet rows every ten
+  minutes, and at once whenever a full page still holds an unbooked reward,
+  so a burst of more than 200 coins is booked whole. On 2026-11-15 a burst
+  of 220 coins left 20 unbooked.
 
 ### Offers left in the wallet are read at engine start (#260)
 

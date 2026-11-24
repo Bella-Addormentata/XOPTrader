@@ -128,18 +128,21 @@ the ledger held 44.54 XCH that never moved.
 
 - **Booked on settlement.**  A take's legs are posted only once the wallet
   reports its trade CONFIRMED and the coin it pays us -- exactly each amount
-  the maker offered, in that asset's own wallet -- is in our coin store at
-  that height.  The legs are the wallet's own amounts, at the height the take
-  settled; a leg at or below its asset's opening block is suppressed, as for
-  a fill.
+  the maker offered, in that asset's own wallet -- is in our coin store, at
+  the trade's height or up to two blocks after it.  The legs are the wallet's
+  own amounts, at the block that payment landed in; a leg at or below its
+  asset's opening block is suppressed, as for a fill.  A settled take whose
+  record does not read as two legs of its pair as configured is kept tracked,
+  never booked from estimates.
 - **A take that fails books nothing.**  FAILED or CANCELLED in the wallet: no
   legs, no `taker_fills` row.
 - **One take of an offer at a time.**  While a take of a Dexie offer is
   unsettled the engine does not take that offer again, and a take request that
-  may have reached the wallet unanswered is never re-sent.  Both holds are kept
-  in `take_holds` across restarts.  While an unanswered request is held, the
-  divergence control's tolerance includes what that take could move, so a
-  take the sweep is about to book is not absorbed by an auto-adjust first.
+  may have reached the wallet unanswered is never re-sent.  The hold is written
+  to `take_holds` before the take is sent, and kept across restarts.  While a
+  take is tracked, or an unanswered request held, the divergence control's
+  tolerance includes what that take moves, so a take about to be booked is
+  not absorbed by an auto-adjust first.
 - **The sweep.**  A settled take of ours that the ledger does not hold and the
   engine is not tracking -- a request that timed out, a take of a process that
   has since stopped -- is booked from the wallet's record of it after the same

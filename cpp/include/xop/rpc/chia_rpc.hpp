@@ -827,6 +827,18 @@ public:
     asio::awaitable<std::vector<json>> get_recent_takes(std::int64_t count);
 
     /**
+     * @brief [TAKE-SETTLE 2026-11-24] Our coins confirmed from `start` to
+     * `stop` (inclusive) whose amount is one of `amounts`, from the wallet's
+     * own store -- get_coin_records_at_height over a range, for a take's
+     * payment that may land a block after the trade's confirmed_at_index.
+     * Same caveats: no sync check, so call it right after a synced answer.
+     */
+    asio::awaitable<std::vector<json>> get_coin_records_in_range(
+        std::uint64_t                     start,
+        std::uint64_t                     stop,
+        const std::vector<std::uint64_t>& amounts);
+
+    /**
      * @brief Retrieve offers with pagination.
      *
      * [WALLET-LOAD 2026-08-04] Verified against docs.chia.net offer-rpc

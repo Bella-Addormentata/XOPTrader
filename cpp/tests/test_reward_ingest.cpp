@@ -314,26 +314,32 @@ TEST(RewardIngestScanTest, DeepScanIsDueEveryThirtyBlocks) {
 // A 220-coin burst does not fit one page of 200: the deep scan reads on.
 TEST(RewardIngestScanTest, AFullPageOfRecentRowsIsFollowedOnADeepScan) {
     constexpr xop::BlockHeight kNow = 9'575'500;
-    EXPECT_TRUE(reward_scan_reads_on(true, 1, kRewardScanPageRows, 9'575'482, kNow));
+    EXPECT_TRUE(reward_scan_reads_on(true, false, 1, kRewardScanPageRows, 9'575'482, kNow));
     // Not on an ordinary heartbeat: one page each.
-    EXPECT_FALSE(reward_scan_reads_on(false, 1, kRewardScanPageRows, 9'575'482, kNow));
+    EXPECT_FALSE(reward_scan_reads_on(false, false, 1, kRewardScanPageRows, 9'575'482, kNow));
     // A short page is the wallet's last.
-    EXPECT_FALSE(reward_scan_reads_on(true, 1, kRewardScanPageRows - 1, 9'575'482, kNow));
+    EXPECT_FALSE(reward_scan_reads_on(true, false, 1, kRewardScanPageRows - 1, 9'575'482, kNow));
     // A page whose oldest row is unconfirmed says nothing about age: read on.
-    EXPECT_TRUE(reward_scan_reads_on(true, 1, kRewardScanPageRows, 0, kNow));
+    EXPECT_TRUE(reward_scan_reads_on(true, false, 1, kRewardScanPageRows, 0, kNow));
+    // [review #262] Between deep scans, a full page that still holds an
+    // unbooked receipt is followed at once: the burst's tail must not wait.
+    EXPECT_TRUE(reward_scan_reads_on(false, true, 1, kRewardScanPageRows, 9'575'482, kNow));
+    EXPECT_FALSE(reward_scan_reads_on(false, true, 1, kRewardScanPageRows - 1, 9'575'482, kNow));
+    EXPECT_FALSE(reward_scan_reads_on(false, true, kRewardScanMaxPages, kRewardScanPageRows,
+                                      9'575'482, kNow));
 }
 
 TEST(RewardIngestScanTest, TheScanStopsWhereNothingFurtherBackCouldBook) {
     constexpr xop::BlockHeight kNow = 9'616'967;
     // Past the backlog bound every older row is too stale to book.
-    EXPECT_FALSE(reward_scan_reads_on(true, 1, kRewardScanPageRows,
+    EXPECT_FALSE(reward_scan_reads_on(true, false, 1, kRewardScanPageRows,
                                       kNow - kMaxRewardBacklogBlocks - 1, kNow));
-    EXPECT_TRUE(reward_scan_reads_on(true, 1, kRewardScanPageRows,
+    EXPECT_TRUE(reward_scan_reads_on(true, false, 1, kRewardScanPageRows,
                                      kNow - kMaxRewardBacklogBlocks, kNow));
     // And never more than kRewardScanMaxPages pages.
-    EXPECT_TRUE(reward_scan_reads_on(true, kRewardScanMaxPages - 1,
+    EXPECT_TRUE(reward_scan_reads_on(true, false, kRewardScanMaxPages - 1,
                                      kRewardScanPageRows, kNow, kNow));
-    EXPECT_FALSE(reward_scan_reads_on(true, kRewardScanMaxPages,
+    EXPECT_FALSE(reward_scan_reads_on(true, false, kRewardScanMaxPages,
                                       kRewardScanPageRows, kNow, kNow));
 }
 

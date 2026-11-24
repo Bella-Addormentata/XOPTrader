@@ -82,7 +82,9 @@ the options address. The script reports both.
   200-row window, or arrived while the engine was stopped for over two days
   (2026-11-16 to 18). They are booked as `reward` rows keyed on their wallet
   transaction, valued at the `px_usd_per_unit` of the nearest reward the
-  engine did book.
+  engine did book. A DBX coin above the engine's reward ceiling (20,000
+  mojos) is not a reward by the engine's own rule. It is reported, not
+  booked.
 - **F. Fees.** The XCH that left trading coins since the re-tie, less the
   XCH legs of the trades that settled and the fees already booked (less the
   fee legs of events already reversed), is 0.339999 XCH. It is the network

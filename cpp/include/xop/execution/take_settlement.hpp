@@ -98,6 +98,11 @@ inline constexpr BlockHeight kUncertainTakeHoldBlocks{64};
 /// get_offer each.
 inline constexpr std::size_t kTakeSettlePerHeartbeat{4};
 
+/// Blocks a take's payment may land after the trade's confirmed_at_index.
+/// The spend and its payment are one block in principle; the wallet's index
+/// has been seen one block early (2026-09-04, a maker fill paid at H+1).
+inline constexpr std::uint64_t kReceiptGiveBlocks{2};
+
 /// The sweep runs every this many blocks (~3 min) ...
 inline constexpr BlockHeight kTakeSweepEveryBlocks{10};
 /// ... over this many of the wallet's newest settled takes ...
@@ -126,6 +131,10 @@ struct PendingTake {
     std::uint64_t fee_mojos{0};
     BlockHeight   submitted_block{0};
     BlockHeight   last_checked_block{0};  ///< the settle step's last read (0: none)
+    /// What the take moves once settled, per asset (fee on xch included):
+    /// the divergence control's tolerance while the take is tracked, since a
+    /// settled take may wait a few heartbeats to be read and booked.
+    std::vector<AssetAmount> exposure;
 };
 
 /// A take request that may have reached the wallet without an answer, or
@@ -162,21 +171,42 @@ inline void add_fee_exposure(UncertainTake& hold, std::uint64_t fee_mojos)
     return now >= at && now - at < kUncertainTakeHoldBlocks;
 }
 
-/// Per asset, what the live uncertain holds could have moved: the
-/// divergence control's extra tolerance.  Saturating.
+/// Add `exposure` into `out`, per asset, saturating.
+inline void add_exposure(std::unordered_map<std::string, Mojo>& out,
+                         const std::vector<AssetAmount>& exposure)
+{
+    for (const auto& [asset, mojos] : exposure) {
+        if (mojos <= 0) continue;
+        Mojo& slot = out[asset];
+        slot = (slot > std::numeric_limits<Mojo>::max() - mojos)
+            ? std::numeric_limits<Mojo>::max() : slot + mojos;
+    }
+}
+
+/// Per asset, what the live uncertain holds could have moved.  Saturating.
 [[nodiscard]] inline std::unordered_map<std::string, Mojo> uncertain_take_slack(
     const std::unordered_map<std::string, UncertainTake>& uncertain, BlockHeight now)
 {
     std::unordered_map<std::string, Mojo> out;
     for (const auto& [offer_id, hold] : uncertain) {
         (void)offer_id;
-        if (!uncertain_hold_live(hold.at, now)) continue;
-        for (const auto& [asset, mojos] : hold.exposure) {
-            if (mojos <= 0) continue;
-            Mojo& slot = out[asset];
-            slot = (slot > std::numeric_limits<Mojo>::max() - mojos)
-                ? std::numeric_limits<Mojo>::max() : slot + mojos;
-        }
+        if (uncertain_hold_live(hold.at, now)) add_exposure(out, hold.exposure);
+    }
+    return out;
+}
+
+/// The divergence control's extra tolerance from the takes the engine holds:
+/// every tracked take until it is booked or dropped, and every live uncertain
+/// hold.  Either can have moved the wallet before the ledger books it.
+[[nodiscard]] inline std::unordered_map<std::string, Mojo> take_hold_slack(
+    const std::unordered_map<std::string, PendingTake>&   pending,
+    const std::unordered_map<std::string, UncertainTake>& uncertain,
+    BlockHeight                                           now)
+{
+    auto out = uncertain_take_slack(uncertain, now);
+    for (const auto& [trade_id, take] : pending) {
+        (void)trade_id;
+        add_exposure(out, take.exposure);
     }
     return out;
 }
@@ -315,39 +345,60 @@ struct WalletTake {
     return id->get<std::int64_t>();
 }
 
-/// Did the take pay us?  Every received amount must be matched by its own
-/// coin record -- the wallet's flat get_coin_records rows, which span every
-/// wallet -- of exactly that amount, created at `height`, IN THAT ASSET'S
-/// WALLET (`wallet_ids`: normalised asset id -> wallet id).  A 1,000-mojo DBX
-/// coin never pays a 1,000-mojo BYC receipt, and one record never vouches for
-/// two receipts.  Fail closed: no receipts, no height, an asset with no
-/// wallet, or any record that cannot be read proves nothing.
-[[nodiscard]] inline bool receipts_paid(const std::vector<AssetAmount>&                 received,
-                                        const std::vector<nlohmann::json>&              records,
-                                        std::uint64_t                                   height,
-                                        const std::unordered_map<std::string, std::int64_t>& wallet_ids)
+/// When did the take pay us -- or did it?  Every received amount must be
+/// matched by its own coin record -- the wallet's flat get_coin_records rows,
+/// which span every wallet -- of exactly that amount, IN THAT ASSET'S WALLET
+/// (`wallet_ids`: normalised asset id -> wallet id), created from `height` to
+/// `height + give`.  The earliest such coin is taken for each receipt.  A
+/// 1,000-mojo DBX coin never pays a 1,000-mojo BYC receipt, and one record
+/// never vouches for two receipts.  Returns the height of the latest receipt
+/// matched -- the block the take settled in, which books it -- or nullopt.
+/// Fail closed: no receipts, no height, an asset with no wallet, or any
+/// record that cannot be read proves nothing.
+[[nodiscard]] inline std::optional<std::uint64_t> receipts_settled_at(
+    const std::vector<AssetAmount>&                      received,
+    const std::vector<nlohmann::json>&                   records,
+    std::uint64_t                                        height,
+    const std::unordered_map<std::string, std::int64_t>& wallet_ids,
+    std::uint64_t                                        give = 0)
 {
-    if (received.empty() || height == 0U) return false;
-    std::vector<std::pair<std::int64_t, std::uint64_t>> coins;   // (wallet id, amount)
+    if (received.empty() || height == 0U) return std::nullopt;
+    // (created height, wallet id, amount), earliest first.
+    std::vector<std::tuple<std::uint64_t, std::int64_t, std::uint64_t>> coins;
     coins.reserve(records.size());
     for (const auto& record : records) {
         const auto ref     = parse_coin_ref(record);
         const auto created = coin_record_confirmed_height(record);
         const auto wallet  = coin_record_wallet_id(record);
-        if (!ref || !created || !wallet) return false;
-        if (*created == height) coins.emplace_back(*wallet, ref->amount);
+        if (!ref || !created || !wallet) return std::nullopt;
+        if (*created >= height && *created - height <= give) {
+            coins.emplace_back(*created, *wallet, ref->amount);
+        }
     }
+    std::sort(coins.begin(), coins.end());
+    std::uint64_t settled = 0;
     for (const auto& r : received) {
-        if (r.second <= 0) return false;
+        if (r.second <= 0) return std::nullopt;
         const auto wid = wallet_ids.find(r.first);
-        if (wid == wallet_ids.end() || wid->second <= 0) return false;
-        const std::pair<std::int64_t, std::uint64_t> want{wid->second,
-                                                          static_cast<std::uint64_t>(r.second)};
-        const auto it = std::find(coins.begin(), coins.end(), want);
-        if (it == coins.end()) return false;
+        if (wid == wallet_ids.end() || wid->second <= 0) return std::nullopt;
+        const auto want = static_cast<std::uint64_t>(r.second);
+        const auto it = std::find_if(coins.begin(), coins.end(), [&](const auto& c) {
+            return std::get<1>(c) == wid->second && std::get<2>(c) == want;
+        });
+        if (it == coins.end()) return std::nullopt;
+        settled = std::max(settled, std::get<0>(*it));
         coins.erase(it);
     }
-    return true;
+    return settled;
+}
+
+/// Did the take pay us at exactly `height`?  receipts_settled_at with no give.
+[[nodiscard]] inline bool receipts_paid(const std::vector<AssetAmount>&                      received,
+                                        const std::vector<nlohmann::json>&                   records,
+                                        std::uint64_t                                        height,
+                                        const std::unordered_map<std::string, std::int64_t>& wallet_ids)
+{
+    return receipts_settled_at(received, records, height, wallet_ids, 0).has_value();
 }
 
 /// Both spellings a take's ledger event id has: the engine writes
