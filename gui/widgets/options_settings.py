@@ -960,12 +960,11 @@ class OptionsSettingsSection:
             "put_strikes_pct": _number_list(self.put_strikes.text()),
             "limits": {key: _limit_value(field.text()) for key, field in self.limit_fields.items()},
         }
-        market: dict[str, Any] = {}
-        tolerance = self._peg_tolerance_out()
-        if tolerance is not None:
-            # [PEG] Only once written or edited: unwritten, the book's default
-            # applies, and options.market is left as config.yaml has it.
-            market["peg_tolerance_pct"] = tolerance
+        # [PEG] None while unwritten and unedited: the book's default, which is
+        # what the box shows (finish() removes the None). Always sent, so a
+        # value deleted in the YAML editor and loaded from it goes from the
+        # file too, instead of the merge keeping it unseen [review #263].
+        market: dict[str, Any] = {"peg_tolerance_pct": self._peg_tolerance_out()}
         if self._hedge_follows is not None and not _same_number(
             options["contract_xch"], self._hedge_follows
         ):
@@ -973,8 +972,7 @@ class OptionsSettingsSection:
             # old one: back to its default, one contract of the smallest size
             # (finish() removes the None).
             market["hedge_size_xch"] = None
-        if market:
-            options["market"] = market
+        options["market"] = market
         mode = self.target_mode.currentIndex()
         if mode == _TARGET_OFF:
             options["target"] = False
@@ -992,18 +990,21 @@ class OptionsSettingsSection:
     def finish(options: dict[str, Any]) -> None:
         """After the merge onto config.yaml: remove what this tab leaves to the defaults.
 
-        A target from the limits, a blank limit and [LADDER] a Dexie check
-        sized to a contract size given up are absences, not values; a merge
-        cannot remove a key, so they are taken out here. On a shared wallet,
-        empty connection fields are left to the Connection tab.
+        A target from the limits, a blank limit, [LADDER] a Dexie check
+        sized to a contract size given up and [PEG] an off-peg tolerance left
+        to its default are absences, not values; a merge cannot remove a key,
+        so they are taken out here. On a shared wallet, empty connection
+        fields are left to the Connection tab.
         """
         if options.get("target") is None:
             options.pop("target", None)
         market = options.get("market")
-        if isinstance(market, dict) and "hedge_size_xch" in market:
-            if market["hedge_size_xch"] is None:
-                market.pop("hedge_size_xch")
-            if not market:
+        if isinstance(market, dict):
+            owned = [key for key in ("hedge_size_xch", "peg_tolerance_pct") if key in market]
+            for key in owned:
+                if market[key] is None:
+                    market.pop(key)
+            if owned and not market:
                 options.pop("market")
         limits = options.get("limits")
         if isinstance(limits, dict):

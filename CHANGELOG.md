@@ -28,6 +28,9 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   quotes with spot outside the Dexie range or a crossed book, its `market:`
   log line says by how much, so a depeg that builds up slowly shows in the
   log before it stops the book.
+- **A Dexie offer whose amount is not a number is left out of the range**, and
+  a range price that is not a positive number stops quoting whatever the
+  tolerance. JSON can carry `NaN`, which slips past every comparison.
 
 ### Options: 1, 10, 100... XCH contracts side by side (#261)
 

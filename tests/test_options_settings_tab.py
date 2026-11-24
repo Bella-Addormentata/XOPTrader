@@ -915,3 +915,28 @@ def test_an_unwritten_off_peg_tolerance_stays_the_book_s_default(panel, tmp_path
     panel._options_section.peg_tolerance.setValue(0.0)  # the strict rule, chosen
     assert panel.save_config(str(cfg_path)) is True, _SAID
     assert _saved_options(cfg_path)["market"]["peg_tolerance_pct"] == 0.0
+
+
+def test_a_tolerance_deleted_in_the_editor_goes_from_the_file(panel, tmp_path, monkeypatch):
+    """[review #263] Deleted in the YAML editor and loaded from it, the tolerance shows the
+    book's default: a save must take it out of config.yaml too, not keep the old value
+    unseen under the default the box shows."""
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+    )
+    cfg_path = _shared_book(tmp_path, market={"peg_tolerance_pct": 0})
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.peg_tolerance.value() == 0.0
+
+    root = yaml.safe_load(panel._yaml_editor.toPlainText())
+    root["options"]["market"].pop("peg_tolerance_pct")
+    panel._yaml_editor.setPlainText(yaml.safe_dump(root, sort_keys=False))
+    panel._on_load_from_editor()
+
+    assert tab.peg_tolerance.value() == 3.0, "the default"
+    assert tab.wants_writing()
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    market = _saved_options(cfg_path)["market"]
+    assert "peg_tolerance_pct" not in market
+    assert market["max_spread_pct"] == 10

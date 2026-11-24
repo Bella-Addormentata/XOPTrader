@@ -429,3 +429,38 @@ def test_a_sound_view_or_one_with_no_book_has_no_gaps() -> None:
     assert _view().gaps_pct() == (0.0, 0.0)
     assert _view(bid=None).gaps_pct() == (0.0, 0.0)
     assert _view(spot=1.13).gaps_pct() == (0.0, 0.0), "at the ask is inside"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"bid": float("nan")},
+        {"ask": float("nan")},
+        {"bid": float("inf")},
+        {"ask": float("-inf")},
+        {"bid": 0.0},
+        {"ask": -1.0},
+    ],
+)
+@pytest.mark.parametrize("tolerance", [0.0, 3.0])
+def test_a_book_price_that_is_not_a_positive_number_is_refused(overrides, tolerance) -> None:
+    """[review #263] NaN fails every comparison: the gaps of a NaN bid are no gaps at all,
+    so the view is refused before they are worked out, whatever the tolerance."""
+    view = _view(**{"spot": 1.10, "bid": 1.09, "ask": 1.10, **overrides})
+    with pytest.raises(market.MarketError) as caught:
+        _check(view, tolerance)
+    assert caught.value.reason == market.NO_DATA
+
+
+def test_a_dexie_offer_with_an_amount_that_is_not_a_number_is_left_out() -> None:
+    """[review #263] json reads NaN and Infinity, and `<= 0` lets NaN through."""
+    feeds = Feeds()
+    feeds.bids = [_offer("wUSDC.b", float("nan"), 100.0), *feeds.bids]
+    feeds.asks = [_offer("XCH", float("inf"), 100.0), *feeds.asks]
+
+    view = _source(feeds).read()
+
+    assert view.bid == pytest.approx((1.33 + 109.0) / (1.149 + 100.0))
+    assert view.ask == pytest.approx(1.13)
+    assert market.executable_price([(float("nan"), 50.0), (1.10, 50.0)], 20.0) == 1.10
+    assert market.executable_price([(1.0, float("nan")), (1.10, 50.0)], 20.0) == 1.10

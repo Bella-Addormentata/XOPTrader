@@ -137,7 +137,8 @@ def executable_price(levels: Sequence[tuple[float, float]], size: float) -> floa
     filled = 0.0
     cost = 0.0
     for price, amount in levels:
-        if price <= 0 or amount <= 0:
+        # [review #263] NaN passes a `<= 0` test: an unusable level is left out.
+        if not (math.isfinite(price) and math.isfinite(amount)) or price <= 0 or amount <= 0:
             continue
         filled += amount
         cost += price * amount
@@ -159,7 +160,8 @@ class Market:
 
         Both are 0 for a book whose bid is under its ask with spot between
         them, and for a view with no book. The range of a crossed book runs
-        from its lower price to its higher one.
+        from its lower price to its higher one. Prices are taken as finite and
+        positive: :meth:`require_usable` refuses a view whose are not.
         """
         if self.bid is None or self.ask is None:
             return 0.0, 0.0
@@ -203,6 +205,13 @@ class Market:
                     "the Dexie book cannot fill the hedge size on both sides", NO_BOOK
                 )
             return
+        if not all(math.isfinite(price) and price > 0 for price in (self.bid, self.ask)):
+            # [review #263] Every comparison below is False for NaN: the strict
+            # range test refused one only by accident, and the gaps would let
+            # it through. Fail closed, whatever the tolerance.
+            raise MarketError(
+                f"the Dexie book gave an unusable price ({self.bid}/{self.ask})", NO_DATA
+            )
         # [PEG] A stale offer is not a depeg. Dexie offers sit until taken or
         # cancelled, and small ones are not worth anyone's while to take: on
         # 2026-11-24 a ladder of 5 XCH bids, 0.3% apart from 0.9686 down,
@@ -387,7 +396,8 @@ class MarketSource:
                     give, want = float(gives[0]["amount"]), float(wants[0]["amount"])
                 except (KeyError, TypeError, ValueError, IndexError):
                     continue
-                if give <= 0 or want <= 0:
+                # [review #263] json reads NaN and Infinity; neither is an offer.
+                if not (math.isfinite(give) and math.isfinite(want)) or give <= 0 or want <= 0:
                     continue
                 if offered == "xch":
                     levels.append((want / give, give))  # sells XCH: an ask
