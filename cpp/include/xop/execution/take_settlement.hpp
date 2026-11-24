@@ -463,6 +463,18 @@ struct WalletTake {
     return out;
 }
 
+/// [review #262 r6] Does every coin record read whole -- its amount, its
+/// confirmation height, its wallet, its id?  A proof over records that do not
+/// is no evidence either way, and a take is not given up on it.
+[[nodiscard]] inline bool coin_records_read(const std::vector<nlohmann::json>& records)
+{
+    return std::all_of(records.begin(), records.end(), [](const nlohmann::json& record) {
+        return parse_coin_ref(record).has_value()
+            && coin_record_confirmed_height(record).has_value()
+            && coin_record_wallet_id(record).has_value() && coin_record_id(record).has_value();
+    });
+}
+
 /// A take's payment, proven: the block it landed in, and the coins it was.
 struct ReceiptProof {
     std::uint64_t            settled_at{0};

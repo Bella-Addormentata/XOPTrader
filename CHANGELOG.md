@@ -57,9 +57,9 @@ listing an offer while our first take of it waits to be mined.
   own, as before, and a larger lone coin, such as a deposit, is not booked
   as a reward.
 - The reward scan reads back past its newest 200 wallet rows every ten
-  minutes, and at once whenever a full page still holds an unbooked reward
-  or holds only unconfirmed rows, so a burst of more than 200 coins is
-  booked whole. On 2026-11-15 a burst of 220 coins left 20 unbooked.
+  minutes, and at once whenever a full page still holds an unbooked reward,
+  holds only unconfirmed rows, or arrived since the last such read, so a
+  burst of more than 200 coins is booked whole. On 2026-11-15 a burst of 220 coins left 20 unbooked.
 
 ### Options: 1, 10, 100... XCH contracts side by side (#261)
 

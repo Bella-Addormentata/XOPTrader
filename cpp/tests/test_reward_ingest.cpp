@@ -337,6 +337,14 @@ TEST(RewardIngestScanTest, AFullPageOfRecentRowsIsFollowedOnADeepScan) {
     EXPECT_TRUE(reward_scan_reads_on(false, false, 1, kRewardScanPageRows, 0, kNow));
     EXPECT_FALSE(reward_scan_reads_on(false, false, kRewardScanMaxPages, kRewardScanPageRows, 0,
                                       kNow));
+    // [review #262 r6] ... and past a full page whose oldest row came after
+    // the last deep scan: more than a page arrived since, unread by any scan.
+    EXPECT_TRUE(reward_scan_reads_on(false, false, 1, kRewardScanPageRows, 9'575'482, kNow,
+                                     9'575'470));
+    EXPECT_FALSE(reward_scan_reads_on(false, false, 1, kRewardScanPageRows, 9'575'482, kNow,
+                                      9'575'482));
+    EXPECT_FALSE(reward_scan_reads_on(false, false, 1, kRewardScanPageRows, 9'575'482, kNow,
+                                      9'575'490));
     // [review #262] Between deep scans, a full page that still holds an
     // unbooked receipt is followed at once: the burst's tail must not wait.
     EXPECT_TRUE(reward_scan_reads_on(false, true, 1, kRewardScanPageRows, 9'575'482, kNow));

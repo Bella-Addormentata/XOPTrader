@@ -116,17 +116,31 @@ All commands run from `C:\GitHub\XOPTrader`, with the Chia wallet running and sy
    before planning, and inside its write transaction it refuses if the
    ledger or `taker_fills` changed since the plan was read.
 3. Dry run, and read the summary. "XCH left after every item" must be
-   within ±0.01. A fill taken while the engine was stopped shows up there;
-   if so, wait for it to be booked.
+   within ±0.01. Read the lists too: "A reverses" must name exactly the 14
+   takes above, and "C books" exactly the six takes and the 2026-09-11 fill.
+   A fill or take that settled while the engine was stopped can appear in
+   C, or in the XCH remainder. If anything else appears, stop: do not start
+   the old release to let it book it, and resolve that trade first. The
+   script refuses while the wallet is not synced, before and after it reads
+   the evidence, and again before it writes.
    `.venv\Scripts\python.exe scripts\oneoff\ledger_gap_repair_2026_11\repair_ledger_gap.py --db data\xop_trader.db --config config.yaml`
 4. Apply. The output names the backup, `data\backups\xop_trader_pre_ledger_gap_repair_2026_11_<UTC>.db`.
    `... repair_ledger_gap.py --db data\xop_trader.db --config config.yaml --apply`
 5. Install the new release and start it.
 6. Check that the gap is now within dust: `... --check`
 
-**Rollback:** before the first start, copy the backup over
-`data\xop_trader.db`. After a start, reverse the repair's rows instead
-(`reversal:<event_id>`, policy §2).
+**Rollback before the first start:** with the engine and the GUI stopped,
+delete `data\xop_trader.db-wal` and `data\xop_trader.db-shm` if they are
+there, then copy the backup over `data\xop_trader.db`. A leftover WAL from
+an interrupted write must not be replayed over the restored file.
+
+**After a start** the engine has booked on top of the repair, so the backup
+is no longer the books. Undo the repair forward instead, in one transaction
+with everything stopped: a `reversal:<event_id>` row for each row tagged
+`ledger_gap_repair_2026_11` (policy §2; that includes the reward and options
+rows), the six `repair_2026_11` rows removed from `taker_fills`, and the 14
+archived `taker_fills` rows restored from `offer_closure_events`
+(`phantom_take_correction`). That needs its own reviewed script.
 
 ## Residuals
 

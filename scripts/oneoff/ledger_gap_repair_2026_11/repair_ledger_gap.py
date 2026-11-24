@@ -133,6 +133,13 @@ class Wallet:
             raise SystemExit(f"wallet {endpoint} refused: {out.get('error')}")
         return out
 
+    def synced(self) -> bool:
+        """Synced and not syncing, as the engine's Step 8 gate reads it: a coin
+        store mid-resync can lack a payment, and a missing payment authorises
+        a reversal."""
+        st = self.rpc("get_sync_status", {})
+        return st.get("synced") is True and st.get("syncing") is False
+
     def wallet_ids(self) -> dict:
         """asset id (normalised, 'xch' for the standard wallet) -> wallet id."""
         ids = {}
@@ -368,6 +375,10 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
         if not recv:
             raise SystemExit(f"{eid}: its wallet record states no amounts, so its payment "
                              "cannot be checked -- resolve it by hand")
+        unread = sorted(a for a in recv if a not in coins)
+        if unread:
+            raise SystemExit(f"{eid}: the coins of {unread} were not read, so its payment "
+                             "cannot be ruled out -- resolve it by hand")
         h0 = min(int(r[8] or 0) for r in legs)
         payable = [asset for asset, amount in recv.items()
                    if any(unclaimed.free[(asset, h, amount)] > 0
@@ -383,6 +394,13 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
                  f"settled: the wallet holds it {status} and no coin of it was paid to us")
 
     # C. settled trades never booked, since the re-tie ----------------------
+    # A leg at or below its asset's opening block is inside that opening
+    # already (the engine's rule): the trade's history row stands, the leg
+    # is not posted again.
+    opening_block = collections.Counter()
+    for r in led:
+        if r[2] == "opening":
+            opening_block[norm(r[5])] = max(opening_block[norm(r[5])], int(r[8] or 0))
     missed = []
     for tid, t in real.items():
         h = int(t["settled_at"])   # the block its payment landed in
@@ -403,6 +421,10 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
                    "at this height; fee not in the wallet's record")
         legs = {a: v for a, v in recv.items()} | {a: -v for a, v in paid.items()}
         for asset, amount in legs.items():
+            if h <= opening_block[asset]:
+                print(f"  C: 0x{tid[:12]} {asset[:8]} leg at block {h} is inside that asset's "
+                      f"opening (block {opening_block[asset]}) -- not posted")
+                continue
             post("C", et, eid, "base" if asset == base else "quote", asset, amount, name, h, why)
         if et == "take":
             created = int(t.get("created_at_time") or 0)
@@ -428,7 +450,7 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
                 if norm(r[5]) == BYC and r[0] < last_id:
                     absorbed -= r[6]     # the adjusts put back what the phantom leg took out
         for t in missed:
-            if int(t["confirmed_at_index"]) <= last_h:
+            if int(t["settled_at"]) <= last_h:
                 recv, paid = receive_and_pay(t)
                 absorbed += recv.get(BYC, 0) - paid.get(BYC, 0)
         total = sum(r[6] for r in byc_adjusts)
@@ -455,6 +477,17 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
                                        if r[2] == "options_withdrawal" and r[4] == "options"
                                        and norm(r[5]) == XCH and r[6] != 0
                                        and (r[3] or "").startswith("options_topup:"))
+    # A booked send is matched to a crossing coin by its amount: refuse when
+    # an amount crossed more often than it was booked, since which of those
+    # coins was the unbooked one -- its date, its valuation -- is unknown.
+    sent = collections.Counter(
+        c["amount"] for c in xch_coins
+        if c["ph"] == oph and byid.get(c["parent"]) is not None
+        and byid[c["parent"]]["ph"] != oph)
+    ambiguous = {a: n for a, n in sent.items() if 0 < booked_sends[a] < n}
+    if ambiguous:
+        raise SystemExit(f"options sends of the same amount are booked and unbooked: {ambiguous} "
+                         "-- book them by hand")
     for c in sorted(xch_coins, key=lambda c: c["conf"]):
         parent = byid.get(c["parent"])
         if parent is None or (c["ph"] == oph) == (parent["ph"] == oph):
@@ -570,7 +603,7 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
     end_h = max((c["spent"] for c in spent), default=retie_h)
     paid_xch = 0
     for t in real.values():
-        if int(t["confirmed_at_index"]) > retie_h:
+        if int(t["settled_at"]) > retie_h:
             _, paid = receive_and_pay(t)
             paid_xch += paid.get(XCH, 0)
             left_by_height[int(t["settled_at"])] -= paid.get(XCH, 0)
@@ -600,6 +633,9 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
     return {"entries": entries, "taker_rows": taker_rows, "snapshot": snapshot,
             "phantoms": [(e, t, s) for e, t, s, _ in phantoms],
             "missed": [norm(t["trade_id"]) for t in missed], "coins": coins, "oph": oph,
+            "booked_trades": [("fill" if t.get("is_my_offer") else "take",
+                               ("0x" if t.get("is_my_offer") else "take:0x") + norm(t["trade_id"]),
+                               int(t["settled_at"])) for t in missed],
             "led": led, "measured_fee": measured, "leftovers": leftovers}
 
 
@@ -627,6 +663,10 @@ def report(plan: dict) -> dict:
           f"{len(plan['missed'])} trades to book; {len(plan['taker_rows'])} taker_fills rows")
     for kind in sorted(by_kind):
         print(f"  {kind}: " + ", ".join(f"{a[:8]} {fmt(a, v)}" for a, v in by_kind[kind].items()))
+    for eid, _tid, status in plan["phantoms"]:
+        print(f"  A reverses {eid} ({status})")
+    for kind, eid, h in plan["booked_trades"]:
+        print(f"  C books {kind} {eid} at block {h}")
     for asset, coins_left in plan["leftovers"].items():
         if coins_left:
             total = sum(a for _, a in coins_left)
@@ -727,8 +767,10 @@ def ledger_snapshot(con: sqlite3.Connection) -> tuple:
             + con.execute("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM taker_fills").fetchone())
 
 
-def apply(db_path: pathlib.Path, plan: dict) -> None:
+def apply(db_path: pathlib.Path, plan: dict, wallet: Wallet) -> None:
     require_stopped()
+    if not wallet.synced():
+        raise SystemExit("the wallet is not synced (or is syncing) -- nothing written")
     dest = backup(db_path)
     print(f"backup: {dest}")
     now = utc_now()
@@ -819,8 +861,12 @@ def main() -> None:
         require_stopped()   # before planning: the plan is read with every writer stopped
     pairs = [(str(p.get("name")), norm(p.get("base_asset_id")), norm(p.get("quote_asset_id")))
              for p in (cfg.get("pairs") or [])]
+    if not wallet.synced():
+        raise SystemExit("the wallet is not synced (or is syncing) -- wait for it, then run again")
     db = sqlite3.connect(f"file:{args.db.as_posix()}?mode=ro", uri=True)
     plan = build_plan(db, wallet, address, pairs)
+    if not wallet.synced():
+        raise SystemExit("the wallet stopped being synced while the plan was read -- run again")
     after = report(plan)
     db.close()
     xch_left = after.get(XCH, 0)
@@ -835,7 +881,7 @@ def main() -> None:
     if args.apply:
         if abs(xch_left) > FEE_MATCH_TOLERANCE:
             raise SystemExit("refusing to apply: the XCH remainder is outside the fee tolerance")
-        apply(args.db, plan)
+        apply(args.db, plan, wallet)
 
 
 if __name__ == "__main__":

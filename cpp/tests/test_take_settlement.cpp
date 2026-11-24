@@ -476,6 +476,21 @@ TEST(TakeSettlement, AnUnresolvedTakeOfOursIsToleranceWhateverItsStatus) {
     EXPECT_FALSE(take_record_exposure(unreadable).has_value());
 }
 
+TEST(TakeSettlement, AMalformedCoinRecordIsNoEvidence) {
+    // [review #262 r6] Every record must read whole for the answer to count.
+    EXPECT_TRUE(coin_records_read({}));
+    EXPECT_TRUE(coin_records_read({coin(5'000'000'000'000, 9'600'225)}));
+    auto no_id = coin(5'000'000'000'000, 9'600'225);
+    no_id.erase("id");
+    EXPECT_FALSE(coin_records_read({coin(1, 2), no_id}));
+    auto no_wallet = coin(5'000'000'000'000, 9'600'225);
+    no_wallet.erase("wallet_identifier");
+    EXPECT_FALSE(coin_records_read({no_wallet}));
+    auto no_amount = coin(5'000'000'000'000, 9'600'225);
+    no_amount.erase("amount");
+    EXPECT_FALSE(coin_records_read({no_amount}));
+}
+
 TEST(TakeSettlement, ATakeBooksOnlyOnceItsPaymentIsDeepEnough) {
     // [review #262 r5] strategy.confirmation_depth_blocks, as for a maker fill.
     EXPECT_FALSE(take_deep_enough(9'600'225, 9'600'225, 6));
@@ -797,8 +812,11 @@ TEST(TakeSettlementWiring, Round5TheSweepAndTheSettleStepWaitForEvidence) {
               std::string::npos);
     EXPECT_NE(position_of(sweep, "sweep_take_slack_ = std::move(unresolved_slack);"),
               std::string::npos);
-    EXPECT_NE(position_of(sweep, "if (!engine_take_unresolved) take_sweep_clear_block_ = "
-                                 "block_height;"), std::string::npos);
+    EXPECT_NE(position_of(sweep, "if (!engine_take_unresolved && !pending_truncated) "
+                                 "take_sweep_clear_block_ = block_height;"), std::string::npos);
+    // [review #262 r6] Malformed coin records are no evidence to give up on.
+    EXPECT_NE(position_of(settle, "payment_read = claims_read && "
+                                  "execution::coin_records_read(coins);"), std::string::npos);
     // The GUI's unbooked takes are tolerance from the top-up ingest.
     const std::string topup = function_body(
         raw, "asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)");

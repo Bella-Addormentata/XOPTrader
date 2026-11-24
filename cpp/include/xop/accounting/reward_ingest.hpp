@@ -187,17 +187,25 @@ inline constexpr BlockHeight kRewardDeepScanEveryBlocks{30};
 /// [review #262 r5] A full page whose oldest row is unconfirmed is followed
 /// on every heartbeat, deep or not: it holds no confirmed receipt at all, so
 /// it says nothing about the confirmed rows behind it.
+///
+/// [review #262 r6] So is a full page whose oldest row came after the last
+/// deep scan (`last_deep_scan`): the rows behind it are newer than anything
+/// that scan read, and more than a page of them may hide a receipt.
 [[nodiscard]] constexpr bool reward_scan_reads_on(bool         deep,
                                                   bool         page_has_new_reward,
                                                   std::int64_t pages_read,
                                                   std::int64_t rows_in_page,
                                                   BlockHeight  oldest_in_page,
-                                                  BlockHeight  current_height) noexcept
+                                                  BlockHeight  current_height,
+                                                  BlockHeight  last_deep_scan = 0) noexcept
 {
     if (pages_read >= kRewardScanMaxPages) return false;
     if (rows_in_page < kRewardScanPageRows) return false;
     if (oldest_in_page == 0) return true;
-    if (!deep && !page_has_new_reward) return false;
+    if (!deep && !page_has_new_reward
+        && (last_deep_scan == 0 || oldest_in_page <= last_deep_scan)) {
+        return false;
+    }
     return reward_receipt_is_recent(oldest_in_page, current_height);
 }
 

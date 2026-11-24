@@ -23091,7 +23091,8 @@ asio::awaitable<void> Engine::step_settle_pending_takes(BlockHeight block_height
                     execution::receipt_amounts(take->received));
                 bool claims_read = true;
                 proof = prove_take_receipts(*take, coins, &claims_read);
-                payment_read = claims_read;
+                // [review #262 r6] Read whole: the claims, and every coin record.
+                payment_read = claims_read && execution::coin_records_read(coins);
             } catch (const std::exception& e) {
                 spdlog::debug("[Engine] [TAKE-SETTLE] payment read failed for take "
                               "{}: {} -- read again later", short_id, e.what());
@@ -23302,6 +23303,13 @@ asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)
         }
         pending_records = co_await wallet_->get_recent_takes(
             0, execution::kTakePendingWindow, /*include_completed=*/false);
+        // [review #262 r6] A full page of pending takes may hide one more:
+        // this sweep then proves nothing clear (see below).
+        if (static_cast<std::int64_t>(pending_records.size()) >= execution::kTakePendingWindow) {
+            spdlog::warn("[Engine] [TAKE-SETTLE] sweep: {} or more takes of ours are pending "
+                         "in the wallet -- uncertain holds stay until fewer are",
+                         execution::kTakePendingWindow);
+        }
     } catch (const std::exception& e) {
         spdlog::debug("[Engine] [TAKE-SETTLE] sweep: the wallet's takes could not "
                       "be read: {} -- next sweep", e.what());
@@ -23437,7 +23445,9 @@ asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)
     }
 
     sweep_take_slack_ = std::move(unresolved_slack);
-    if (!engine_take_unresolved) take_sweep_clear_block_ = block_height;
+    const bool pending_truncated =
+        static_cast<std::int64_t>(pending_records.size()) >= execution::kTakePendingWindow;
+    if (!engine_take_unresolved && !pending_truncated) take_sweep_clear_block_ = block_height;
 }
 
 Mojo Engine::live_offer_exposure(const AssetId& asset_id) const
@@ -23575,7 +23585,8 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
         }
         if (!accounting::reward_scan_reads_on(
                 deep_scan, page_has_new_reward, page + 1,
-                static_cast<std::int64_t>(rows.size()), oldest, block_height)) {
+                static_cast<std::int64_t>(rows.size()), oldest, block_height,
+                last_reward_deep_scan_block_)) {
             break;
         }
     }
