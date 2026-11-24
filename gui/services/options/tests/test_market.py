@@ -356,3 +356,136 @@ def test_if_the_wallet_cannot_list_its_offers_every_offer_counts(caplog) -> None
     assert first.ask == pytest.approx(1.10)  # as if nothing were known to be ours
     assert len(asked) == 2  # asked every read...
     assert sum("could not ask the wallet" in r.message for r in caplog.records) == 1  # ...said once
+
+
+# ---------------------------------------------------------------------------
+# [PEG] A stale Dexie offer is not a depeg
+# ---------------------------------------------------------------------------
+
+
+def _check(view: market.Market, tolerance: float) -> None:
+    view.require_usable(
+        now=1000.0,
+        max_age_seconds=600,
+        max_spread_pct=10,
+        require_book=True,
+        peg_tolerance_pct=tolerance,
+    )
+
+
+@pytest.mark.parametrize(
+    "spot, bid, ask",
+    [
+        (0.9435, 0.9594, 0.9665),  # 2026-11-24 12:29 CT: 1.66% under a stale 5 XCH bid
+        (0.9450, 0.9686, 0.9834),  # 10:37 CT: 2.44% under the stale bid before it
+        (1.1500, 1.0900, 1.1300),  # above the ask instead: 1.77%
+    ],
+)
+def test_spot_a_little_outside_the_range_is_quoted_within_the_tolerance(spot, bid, ask) -> None:
+    view = _view(spot=spot, bid=bid, ask=ask)
+    _check(view, 3.0)
+    with pytest.raises(market.MarketError) as caught:
+        _check(view, 0.0)  # the strict rule, as before the tolerance
+    assert caught.value.reason == market.OFF_PEG
+
+
+def test_spot_further_outside_than_the_tolerance_is_still_a_possible_depeg() -> None:
+    view = _view(spot=1.00, bid=1.05, ask=1.06)  # 4.76% under the bid
+    with pytest.raises(market.MarketError) as caught:
+        _check(view, 3.0)
+    assert caught.value.reason == market.OFF_PEG
+    assert str(caught.value) == (
+        "spot 1.0000 is 4.76% outside the executable range 1.0500-1.0600, more than the "
+        "3% allowed; the quote asset may be off its peg"
+    )
+
+
+def test_a_book_crossed_by_a_stale_offer_is_judged_by_the_same_tolerance() -> None:
+    # 2026-11-24 13:13-13:35 CT: the stale 0.9594 bid sat over a fresh ask.
+    view = _view(spot=0.9450, bid=0.9594, ask=0.9590)
+    assert view.gaps_pct() == (pytest.approx(0.0417, abs=1e-3), pytest.approx(1.45, abs=0.01))
+    _check(view, 3.0)
+    with pytest.raises(market.MarketError) as caught:
+        _check(view, 0.0)
+    assert caught.value.reason == market.CROSSED
+    assert str(caught.value) == "the Dexie book is crossed by 0.04% at the hedge size"
+
+    wide = _view(spot=1.00, bid=1.05, ask=1.00)  # crossed by 4.88%
+    with pytest.raises(market.MarketError) as caught:
+        _check(wide, 3.0)
+    assert caught.value.reason == market.CROSSED
+    assert "more than the 3% allowed" in str(caught.value)
+
+
+def test_a_crossed_book_still_has_to_hold_spot_within_the_tolerance() -> None:
+    view = _view(spot=0.90, bid=0.9594, ask=0.9590)  # crossed a little, spot 6.2% under
+    with pytest.raises(market.MarketError) as caught:
+        _check(view, 3.0)
+    assert caught.value.reason == market.OFF_PEG
+    assert "range 0.9590-0.9594" in str(caught.value), "the range runs low to high"
+
+
+def test_a_sound_view_or_one_with_no_book_has_no_gaps() -> None:
+    assert _view().gaps_pct() == (0.0, 0.0)
+    assert _view(bid=None).gaps_pct() == (0.0, 0.0)
+    assert _view(spot=1.13).gaps_pct() == (0.0, 0.0), "at the ask is inside"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"bid": float("nan")},
+        {"ask": float("nan")},
+        {"bid": float("inf")},
+        {"ask": float("-inf")},
+        {"bid": 0.0},
+        {"ask": -1.0},
+    ],
+)
+@pytest.mark.parametrize("tolerance", [0.0, 3.0])
+def test_a_book_price_that_is_not_a_positive_number_is_refused(overrides, tolerance) -> None:
+    """[review #263] NaN fails every comparison: the gaps of a NaN bid are no gaps at all,
+    so the view is refused before they are worked out, whatever the tolerance."""
+    view = _view(**{"spot": 1.10, "bid": 1.09, "ask": 1.10, **overrides})
+    with pytest.raises(market.MarketError) as caught:
+        _check(view, tolerance)
+    assert caught.value.reason == market.NO_DATA
+
+
+def test_a_dexie_offer_with_an_amount_that_is_not_a_number_is_left_out() -> None:
+    """[review #263] json reads NaN and Infinity, and `<= 0` lets NaN through."""
+    feeds = Feeds()
+    feeds.bids = [_offer("wUSDC.b", float("nan"), 100.0), *feeds.bids]
+    feeds.asks = [_offer("XCH", float("inf"), 100.0), *feeds.asks]
+
+    view = _source(feeds).read()
+
+    assert view.bid == pytest.approx((1.33 + 109.0) / (1.149 + 100.0))
+    assert view.ask == pytest.approx(1.13)
+    assert market.executable_price([(float("nan"), 50.0), (1.10, 50.0)], 20.0) == 1.10
+    assert market.executable_price([(1.0, float("nan")), (1.10, 50.0)], 20.0) == 1.10
+
+
+@pytest.mark.parametrize(
+    "view",
+    [
+        _view(spot=1.6, bid=1.624, ask=1.576),  # crossed by 3%: 3.0000000000000027 in floats
+        _view(spot=0.97, bid=1.0, ask=1.01),  # spot 3% under the bid, the same
+    ],
+    ids=["crossed", "outside"],
+)
+def test_a_gap_at_the_tolerance_is_within_it(view) -> None:
+    """[review #263] Floating point must not move the line: 3% is within a 3% tolerance."""
+    assert max(view.gaps_pct()) > 3.0, "the rounding the check has to absorb"
+    _check(view, 3.0)
+    with pytest.raises(market.MarketError):
+        _check(view, 2.99)
+
+
+def test_a_tolerance_of_zero_stays_strict_by_any_margin() -> None:
+    with pytest.raises(market.MarketError) as caught:
+        _check(_view(spot=1.09 * (1 - 1e-12), bid=1.09, ask=1.13), 0.0)
+    assert caught.value.reason == market.OFF_PEG
+    with pytest.raises(market.MarketError) as caught:
+        _check(_view(spot=1.10, bid=1.10 * (1 + 1e-12), ask=1.10), 0.0)
+    assert caught.value.reason == market.CROSSED

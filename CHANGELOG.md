@@ -7,6 +7,39 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Options: stale Dexie offers no longer stop the book as a depeg
+
+- **The off-peg check has a tolerance**, `options.market.peg_tolerance_pct`
+  (3% when left out or blank, also in Settings > Options > Market checks; a
+  gap at the tolerance is within it). The book
+  used to stop quoting whenever CoinGecko's XCH price sat outside the Dexie
+  bid-ask for the hedge size by any amount. Dexie offers sit until someone
+  takes them, and on 2026-11-24 a ladder of 5 XCH bids, 0.3% apart from
+  0.9686 down, stayed put while XCH fell 3.5%, leaving spot up to 2.4% under
+  its top bid. The strict rule stopped the book all afternoon, and on about a
+  fifth of its steps since 2026-11-20, with no gap over 2.5%. It was no
+  depeg: Dexie's fills straddled CoinGecko's price, asks taken above it and
+  bids below. Spot further out than the tolerance still stops quoting as a
+  possible depeg of the quote asset. `0` keeps the strict rule.
+- **A crossed Dexie book is judged the same way.** A book crossed by no more
+  than the tolerance (a stale bid over a fresh ask) is read as stale offers:
+  spot then has to sit within the tolerance of the two prices. Before, any
+  crossing stopped the book.
+- **Quotes are still priced on CoinGecko's spot**, as before. When the book
+  quotes with spot outside the Dexie range or a crossed book, its `market:`
+  log line says by how much, so a depeg that builds up slowly shows in the
+  log before it stops the book.
+- **A Dexie offer whose amount is not a number is left out of the range**, and
+  a range price that is not a positive number stops quoting whatever the
+  tolerance. JSON can carry `NaN`, which slips past every comparison.
+- **An options sub-section that is not a mapping is refused, even an empty
+  one.** `market: []` (or `false`, `0`, `''`) used to be read as an empty
+  section, its defaults, so a strict `0` tolerance could go unseen. This
+  covers `wallet`, `pricing`, `limits`, `market`, `node` and `splash`. Left
+  out or blank (null) is still empty. In Settings, a malformed `market`, from
+  the file or the Raw YAML Editor, is sent back as it is until the off-peg
+  tolerance is edited, so Save says what is wrong.
+
 ### Options: 1, 10, 100... XCH contracts side by side (#261)
 
 - **`contract_xch: auto` is now a ladder of sizes**, so small and large

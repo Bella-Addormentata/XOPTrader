@@ -859,3 +859,262 @@ def test_a_cap_too_large_to_count_does_not_break_the_preview(panel, tmp_path):
     assert tab.size_mode.currentIndex() == _SIZE_AUTO
     assert panel.save_config(str(cfg_path)) is False
     assert any("too large" in said for said in _SAID), _SAID
+
+
+def _without_peg_tolerance(cfg_path: Path) -> Path:
+    root = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    root["options"]["market"].pop("peg_tolerance_pct")
+    cfg_path.write_text(yaml.safe_dump(root, sort_keys=False), encoding="utf-8")
+    return cfg_path
+
+
+def test_the_off_peg_tolerance_is_shown_and_kept_as_written(panel, tmp_path):
+    """[PEG] config.example.yaml writes 3: shown, and written back as it was when the
+    tab is saved for something else."""
+    cfg_path = _shared_book(tmp_path)
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.peg_tolerance.text() == "3"
+    tab.limit_fields["max_contracts"].setText("3")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    market = _saved_options(cfg_path)["market"]
+    assert market["peg_tolerance_pct"] == 3 and isinstance(market["peg_tolerance_pct"], int)
+    assert market["max_spread_pct"] == 10, "the rest of the section is kept"
+
+
+def test_an_edited_off_peg_tolerance_is_saved_and_the_book_reads_it(panel, tmp_path):
+    cfg_path = _shared_book(tmp_path)
+    panel.load_config(str(cfg_path))
+    panel._options_section.peg_tolerance.setText("1.5")
+    assert panel._dirty
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+
+    assert _saved_options(cfg_path)["market"]["peg_tolerance_pct"] == 1.5
+    from gui.services.config_split import load_merged
+    from gui.services.options import config as options_config
+
+    parsed = options_config.parse(load_merged(cfg_path))  # with secrets.yaml, as the book reads
+    assert parsed is not None and parsed.market.peg_tolerance_pct == 1.5
+
+
+def test_an_unwritten_off_peg_tolerance_stays_the_book_s_default(panel, tmp_path):
+    """[PEG] Installs from before it existed have no key: the box shows the book's
+    default, and a save for something else leaves it unwritten, so a later default
+    still applies. Edited, it is written."""
+    cfg_path = _without_peg_tolerance(_shared_book(tmp_path))
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.peg_tolerance.text() == ""
+    assert "3, the default" in tab.peg_tolerance.placeholderText()
+    tab.limit_fields["max_contracts"].setText("3")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    market = _saved_options(cfg_path)["market"]
+    assert "peg_tolerance_pct" not in market
+    assert market["max_spread_pct"] == 10
+
+    panel.load_config(str(cfg_path))
+    panel._options_section.peg_tolerance.setText("0")  # the strict rule, chosen
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["market"]["peg_tolerance_pct"] == 0
+
+
+def test_a_tolerance_deleted_in_the_editor_goes_from_the_file(panel, tmp_path, monkeypatch):
+    """[review #263] Deleted in the YAML editor and loaded from it, the tolerance shows the
+    book's default: a save must take it out of config.yaml too, not keep the old value
+    unseen under the default the box shows."""
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+    )
+    cfg_path = _shared_book(tmp_path, market={"peg_tolerance_pct": 0})
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.peg_tolerance.text() == "0"
+
+    root = yaml.safe_load(panel._yaml_editor.toPlainText())
+    root["options"]["market"].pop("peg_tolerance_pct")
+    panel._yaml_editor.setPlainText(yaml.safe_dump(root, sort_keys=False))
+    panel._on_load_from_editor()
+
+    assert tab.peg_tolerance.text() == "", "blank: the default"
+    assert tab.wants_writing()
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    market = _saved_options(cfg_path)["market"]
+    assert "peg_tolerance_pct" not in market
+    assert market["max_spread_pct"] == 10
+
+
+def test_a_blank_tolerance_is_the_default_to_the_book_and_the_tab(panel, tmp_path):
+    """[review #263] `peg_tolerance_pct:` left blank (null) is read by the book as left
+    out, so the tab's showing it as the default and saving it as left out changes
+    nothing the book does."""
+    from gui.services.config_split import load_merged
+    from gui.services.options import config as options_config
+
+    cfg_path = _shared_book(tmp_path, market={"peg_tolerance_pct": None})
+    parsed = options_config.parse(load_merged(cfg_path))
+    assert parsed is not None and parsed.market.peg_tolerance_pct == 3.0
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.peg_tolerance.text() == ""
+    tab.limit_fields["max_contracts"].setText("3")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert "peg_tolerance_pct" not in _saved_options(cfg_path)["market"]
+    parsed = options_config.parse(load_merged(cfg_path))
+    assert parsed is not None and parsed.market.peg_tolerance_pct == 3.0
+
+
+@pytest.mark.parametrize("written, shown", [(0.04, "0.04"), (80, "80"), (2.5, "2.5")])
+def test_the_tolerance_field_shows_any_number_the_book_takes_as_written(
+    panel, tmp_path, written, shown
+):
+    """[review #263] A number box rounded 0.04 to 0.0 (the strict rule, on screen) and
+    clamped 80 to its maximum; the field shows what config.yaml has, and keeps it."""
+    cfg_path = _shared_book(tmp_path, market={"peg_tolerance_pct": written})
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.peg_tolerance.text() == shown
+    tab.limit_fields["max_contracts"].setText("3")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["market"]["peg_tolerance_pct"] == written
+
+
+def test_any_edit_of_the_tolerance_field_replaces_what_was_written(panel, tmp_path):
+    """[review #263] Typed over 0.04, "0" is written: a box already showing 0.0 could
+    not have been set to it. A trailing % is allowed, and blank is the default."""
+    cfg_path = _shared_book(tmp_path, market={"peg_tolerance_pct": 0.04})
+    for typed, saved in (("0", 0), ("2.5 %", 2.5), ("", None)):
+        panel.load_config(str(cfg_path))
+        panel._options_section.peg_tolerance.setText(typed)
+        assert panel.save_config(str(cfg_path)) is True, _SAID
+        market = _saved_options(cfg_path)["market"]
+        assert market.get("peg_tolerance_pct", None) == saved, typed
+    assert "peg_tolerance_pct" not in _saved_options(cfg_path)["market"]
+
+
+def test_a_tolerance_that_is_not_a_number_is_refused_by_the_book_s_parser(panel, tmp_path):
+    cfg_path = _shared_book(tmp_path)
+    panel.load_config(str(cfg_path))
+    panel._options_section.peg_tolerance.setText("wide")
+    assert panel.save_config(str(cfg_path)) is False
+    assert any("peg_tolerance_pct" in said for said in _SAID), _SAID
+    assert _saved_options(cfg_path)["market"]["peg_tolerance_pct"] == 3, "nothing written"
+
+
+@pytest.mark.parametrize("typed", ["%", " % "])
+def test_a_percent_sign_alone_is_refused_not_saved_as_the_default(panel, tmp_path, typed):
+    """[review #263] Read as blank, a lone % went in as the default, 3%: typed over a
+    written 0, it loosened the check unasked. The book's parser refuses it on Save."""
+    cfg_path = _shared_book(tmp_path, market={"peg_tolerance_pct": 0})
+    panel.load_config(str(cfg_path))
+    panel._options_section.peg_tolerance.setText(typed)
+    assert panel.save_config(str(cfg_path)) is False
+    assert any("peg_tolerance_pct" in said for said in _SAID), _SAID
+    assert _saved_options(cfg_path)["market"]["peg_tolerance_pct"] == 0, "nothing written"
+
+
+def test_typing_the_tolerance_shown_corrects_a_string_the_book_refuses(panel, tmp_path):
+    """[review #263] `peg_tolerance_pct: "3%"` is a string the book's parser refuses, shown
+    as the 3% the field itself takes. Typing in the field is an edit even when it ends at
+    the text loaded, so typing the 3% shown saves the number 3."""
+    from PySide6.QtTest import QTest
+
+    cfg_path = _shared_book(tmp_path, market={"peg_tolerance_pct": "3%"})
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.peg_tolerance.text() == "3%"
+    tab.limit_fields["max_contracts"].setText("3")
+    assert panel.save_config(str(cfg_path)) is False, "unedited, it goes to the parser as is"
+    assert any("peg_tolerance_pct" in said for said in _SAID), _SAID
+
+    tab.peg_tolerance.selectAll()
+    QTest.keyClicks(tab.peg_tolerance, "3%")
+    assert tab.peg_tolerance.text() == "3%"
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["market"]["peg_tolerance_pct"] == 3
+
+
+def test_a_tolerance_written_as_an_empty_string_is_the_default_it_shows(panel, tmp_path):
+    """[review #263] `peg_tolerance_pct: ''` shows blank, as the default, and the book
+    reads it as the default too, as it does a blank limit: Save works with the field
+    left alone, and with a number typed and cleared again."""
+    from gui.services.config_split import load_merged
+    from gui.services.options import config as options_config
+
+    cfg_path = _shared_book(tmp_path, market={"peg_tolerance_pct": ""})
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    assert tab.peg_tolerance.text() == ""
+    tab.limit_fields["max_contracts"].setText("3")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    parsed = options_config.parse(load_merged(cfg_path))
+    assert parsed is not None and parsed.market.peg_tolerance_pct == 3.0
+
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    tab.peg_tolerance.setText("1")
+    tab.peg_tolerance.setText("")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    parsed = options_config.parse(load_merged(cfg_path))
+    assert parsed is not None and parsed.market.peg_tolerance_pct == 3.0
+
+
+def test_a_market_section_that_is_not_a_mapping_is_refused_until_corrected(panel, tmp_path):
+    """[review #263] An edit elsewhere must not swap a malformed options.market for the
+    defaults unseen: the book's parser refuses it on Save, as before the field existed.
+    Typing a tolerance is the operator correcting the section."""
+    cfg_path = _shared_book(tmp_path, market=["max_spread_pct", 10])
+    before = cfg_path.read_text(encoding="utf-8")
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+    tab.limit_fields["max_contracts"].setText("3")
+    assert panel.save_config(str(cfg_path)) is False
+    assert any("options.market must be a mapping" in said for said in _SAID), _SAID
+    assert cfg_path.read_text(encoding="utf-8") == before
+
+    tab.peg_tolerance.setText("2")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["market"] == {"peg_tolerance_pct": 2}
+
+
+@pytest.mark.parametrize("malformed", [["peg_tolerance_pct", 0], [], False, 0])
+def test_a_market_made_malformed_in_the_editor_is_refused_not_swapped_for_the_file_s(
+    panel, tmp_path, monkeypatch, malformed
+):
+    """[review #263] Loaded from the editor, a market section that is not a mapping showed
+    the default in the field, while a save merged onto the file on disk kept that file's
+    market, its strict 0 too, unseen. It is sent as loaded, for the book's parser to
+    refuse, an empty one too, until a tolerance is typed."""
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+    )
+    cfg_path = _shared_book(tmp_path, market={"peg_tolerance_pct": 0})
+    before = cfg_path.read_text(encoding="utf-8")
+    panel.load_config(str(cfg_path))
+    tab = panel._options_section
+
+    root = yaml.safe_load(panel._yaml_editor.toPlainText())
+    root["options"]["market"] = malformed
+    panel._yaml_editor.setPlainText(yaml.safe_dump(root, sort_keys=False))
+    panel._on_load_from_editor()
+
+    assert tab.peg_tolerance.text() == ""
+    assert panel.save_config(str(cfg_path)) is False
+    assert any("options.market must be a mapping" in said for said in _SAID), _SAID
+    assert cfg_path.read_text(encoding="utf-8") == before
+
+    tab.peg_tolerance.setText("2")
+    assert panel.save_config(str(cfg_path)) is True, _SAID
+    assert _saved_options(cfg_path)["market"]["peg_tolerance_pct"] == 2
+
+
+def test_the_first_edit_of_a_number_box_is_sent_as_edited(panel, tmp_path):
+    """[review #263] The page's change notification collects the tab on every edit: the
+    box must count as edited by then, or the first edit goes out as the number loaded."""
+    cfg_path = _shared_book(tmp_path, target={"xch": 9, "quote": 9})
+    panel.load_config(str(cfg_path))
+    sent: list[dict] = []
+    panel.config_changed.connect(sent.append)
+
+    panel._options_section.target_xch.setValue(2.0)
+
+    assert sent and sent[-1]["options"]["target"]["xch"] == 2.0

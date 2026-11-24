@@ -1452,6 +1452,7 @@ class OptionsBook:
                 max_age_seconds=self._config.market.max_age_seconds,
                 max_spread_pct=self._config.market.max_spread_pct,
                 require_book=self._config.market.require_book,
+                peg_tolerance_pct=self._config.market.peg_tolerance_pct,
             )
         except MarketError as exc:
             # No price, no quotes. Offers already out expire on their own.
@@ -1466,6 +1467,13 @@ class OptionsBook:
             if market.bid is None or market.ask is None
             else (f"{market.bid:.4f}/{market.ask:.4f}")
         )
+        # [PEG] Quoting with stale offers in the book, inside the tolerance: said, so a
+        # depeg that builds up slowly can be seen coming in the log.
+        crossed_pct, outside_pct = market.gaps_pct()
+        if crossed_pct:
+            book += f" (crossed by {crossed_pct:.2f}%)"
+        if outside_pct:
+            book += f" (spot {outside_pct:.2f}% outside it)"
         log.info(
             "[options] market: spot %.4f sigma %.2f dexie %s",
             market.spot,
