@@ -427,6 +427,21 @@ struct FullNodePeerCensus {
     return json{{"node_type", kNodeTypeFullNode}};
 }
 
+// ---------------------------------------------------------------------------
+// get_transaction
+// ---------------------------------------------------------------------------
+
+/// Build the get_transaction payload: one transaction, by the id the wallet
+/// gave when it was sent (send_transaction / cat_spend `transaction_id`).
+/// The daemon reads the id with or without its 0x prefix; it is sent as the
+/// caller has it.  [OPTIONS-CAPITAL] The options ingest asks whether a
+/// top-up's own transaction has confirmed, exactly as the options book does
+/// (gui/services/options/runtime.py transaction_confirmed).
+[[nodiscard]] inline json make_get_transaction_request(const std::string& transaction_id)
+{
+    return json{{"transaction_id", transaction_id}};
+}
+
 }  // namespace xop::rpc
 
 #endif  // XOP_RPC_WALLET_REQUESTS_HPP

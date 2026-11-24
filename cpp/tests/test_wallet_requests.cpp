@@ -49,6 +49,7 @@ using xop::rpc::is_localhost_peer_host;
 using xop::rpc::kNodeTypeFullNode;
 using xop::rpc::make_get_connections_request;
 using xop::rpc::make_get_timestamp_for_height_request;
+using xop::rpc::make_get_transaction_request;
 using xop::rpc::make_get_transactions_request;
 using xop::rpc::parse_timestamp_for_height_response;
 
@@ -461,6 +462,19 @@ TEST(WalletRequests, ConnectionsRequestAsksForFullNodesOnly) {
     // chia/server/outbound_message.py NodeType.FULL_NODE.
     EXPECT_EQ(p["node_type"].get<int>(), 1);
     EXPECT_EQ(kNodeTypeFullNode, 1);
+}
+
+// [OPTIONS-CAPITAL] One transaction, by the id the wallet gave when it was
+// sent: how the options ingest learns that a top-up's OWN transaction has
+// confirmed (the options book asks the same question the same way,
+// gui/services/options/runtime.py transaction_confirmed).
+TEST(WalletRequests, TransactionRequestNamesTheOneTransaction) {
+    const std::string id = "0x2bbcfcaa7c11b312edf1a37cb95da12ecacfdb313b04fd5adb9a0f90f0898bf6";
+    const json p = make_get_transaction_request(id);
+    ASSERT_TRUE(p.is_object());
+    EXPECT_EQ(p.size(), 1u) << "nothing that selects coins or a wallet";
+    ASSERT_TRUE(p.contains("transaction_id"));
+    EXPECT_EQ(p["transaction_id"].get<std::string>(), id) << "as the caller has it";
 }
 
 TEST(WalletRequests, TheLocalhostSetIsChiasOwn) {

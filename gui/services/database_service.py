@@ -654,19 +654,34 @@ class _DatabaseWorker(QObject):
         # not a reason to drop the whole P&L payload, and (round 26) not a
         # reason to emit query_error on every refresh either: probe
         # sqlite_master first so the fallback stays silent.
+        # [OPTIONS-CAPITAL 2026-11-23] Capital moved to or from the options
+        # sub-account is external capital too (options_deposit /
+        # options_withdrawal), with its USD in the same note field.  Such an
+        # event can have several legs (a top-up and its fee; each asset the
+        # fence holds), so its flows are counted by event; one with nothing
+        # behind it has a single zero leg, and is not a flow.
         bridge_sql = """
-            SELECT COALESCE(note, '') AS note
+            SELECT event_type, COALESCE(event_id, '') AS event_id,
+                   COALESCE(delta_mojos, 0) AS delta_mojos,
+                   COALESCE(note, '') AS note
             FROM ledger_entries
-            WHERE event_type IN ('bridge_deposit', 'bridge_withdrawal')
+            WHERE event_type IN ('bridge_deposit', 'bridge_withdrawal',
+                                 'options_deposit', 'options_withdrawal')
         """
         net_deposits_usd = 0.0
         bridge_flows = 0
+        options_flows = 0
         rows = (self._execute_query(bridge_sql, [])
                 if self._table_exists("ledger_entries") else None)
         if rows:
             net_deposits_usd = sum(
                 _parse_bridge_flow_usd(r["note"]) for r in rows)
-            bridge_flows = len(rows)
+            bridge_flows = sum(
+                1 for r in rows if str(r["event_type"]).startswith("bridge_"))
+            options_flows = len({
+                r["event_id"] for r in rows
+                if str(r["event_type"]).startswith("options_")
+                and int(r["delta_mojos"] or 0) != 0})
 
         self.pnl_display_ready.emit({
             "lifetime_usd": lifetime_usd,
@@ -675,6 +690,7 @@ class _DatabaseWorker(QObject):
             "fills_24h": fills_24h,
             "net_deposits_usd": net_deposits_usd,
             "bridge_flows": bridge_flows,
+            "options_flows": options_flows,
             "baseline_iso": "" if baseline == _EPOCH_ISO else baseline,
         })
 

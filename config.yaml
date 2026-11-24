@@ -490,6 +490,13 @@ accounting:
   bridge_ingest_enabled: true
   bridge_jobs_db_path: data/warp_jobs.db
   bridge_asset_id: fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d
+  # [OPTIONS-CAPITAL 2026-11-23] Book what moves between the trading funds
+  # and the options sub-account (the options book's top-ups, and the fence
+  # going down or up) as options_withdrawal/options_deposit ledger events:
+  # external capital, not P&L.  Only with a fenced options book
+  # (options.wallet.engine_fence); the engine reads options.database_path
+  # READ-ONLY.
+  options_transfer_ingest_enabled: true
   floor_xch_mojos: 1000000000   # 0.001 XCH -- covers fee dust
   floor_cat_mojos: 100          # 0.1 unit  -- 100x the per-leg rounding error
   fee_slack_mojos: 200000       # ~40 offer events at 5,000 mojos

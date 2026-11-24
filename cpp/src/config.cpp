@@ -3524,6 +3524,14 @@ OptionsFenceConfig parse_options_fence(const YAML::Node& root)
     cfg.quote_asset_id = text(options, "quote_asset_id");
     const std::string network = text(options, "network");
     if (!network.empty()) cfg.network = network;
+    // [OPTIONS-CAPITAL] The book's database, blanks around it ignored as the
+    // GUI reads it; unset is the GUI's own default.
+    std::string database_path = text(options, "database_path");
+    const std::size_t db_first = database_path.find_first_not_of(" \t\r\n");
+    const std::size_t db_last  = database_path.find_last_not_of(" \t\r\n");
+    if (db_first != std::string::npos) {
+        cfg.database_path = database_path.substr(db_first, db_last - db_first + 1);
+    }
     return cfg;
 }
 
@@ -3626,6 +3634,8 @@ AccountingConfig parse_accounting(const YAML::Node& root)
     // operative values (see config.hpp for the measured calibration).
     read_bool("reward_ingest_enabled",  cfg.reward_ingest_enabled);
     read_bool("bridge_ingest_enabled",  cfg.bridge_ingest_enabled);
+    // [OPTIONS-CAPITAL 2026-11-23] Options sub-account flows as capital.
+    read_bool("options_transfer_ingest_enabled", cfg.options_transfer_ingest_enabled);
     bool explicit_jobs_db = false;
     if (node["bridge_jobs_db_path"] && node["bridge_jobs_db_path"].IsDefined()
         && !node["bridge_jobs_db_path"].IsNull()) {
@@ -5386,8 +5396,12 @@ AppConfig load_config(const std::string& path,
     // stuck-transaction guard protects a database no job is written to.
     {
         const std::filesystem::path base = std::filesystem::path(path).parent_path();
+        // [OPTIONS-CAPITAL] The options book's database too: the GUI reads a
+        // relative options.database_path beside config.yaml.
         for (std::string* p : {&cfg.accounting.bridge_jobs_db_path,
-                               &cfg.accounting.warp_jobs_db_path}) {
+                               &cfg.accounting.warp_jobs_db_path,
+                               &cfg.options_fence.database_path}) {
+            if (*p == ":memory:") continue;  // a test's store, not a file
             const std::filesystem::path db(*p);
             if (!db.empty() && db.is_relative() && !base.empty()) {
                 *p = (base / db).lexically_normal().string();

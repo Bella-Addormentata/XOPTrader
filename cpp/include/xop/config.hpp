@@ -2508,6 +2508,16 @@ struct AccountingConfig {
     /// drops silently on configs that never trade wmilliETH.b.
     bool bridge_secondary_asset_ids_explicit{false};
 
+    /// [OPTIONS-CAPITAL 2026-11-23] Book what moves between the trading funds
+    /// and the options sub-account -- the options book's top-ups, and the
+    /// sub-account's coins when `engine_fence: auto` takes the fence down or
+    /// up -- as options_withdrawal / options_deposit ledger events before
+    /// the divergence control runs, valued into Net Deposits like a bridge
+    /// flow (accounting/options_transfer.hpp).  Only with a fenced options
+    /// book (options.wallet.engine_fence on a shared wallet); the top-ups
+    /// are read from options.database_path.
+    bool options_transfer_ingest_enabled{true};
+
     // -- Stablecoin peg monitor (2026-07-30) -------------------------------
     //
     // Accounting values wUSDC.b / wUSDC / USDS at exactly $1.00 -- they are
@@ -3040,6 +3050,11 @@ struct OptionsFenceConfig {
     std::string address;              ///< options.wallet.address (bech32m).
     std::string network{"mainnet"};   ///< options.network: address prefix xch / txch.
     std::string quote_asset_id;       ///< options.quote_asset_id: its CAT wrapping is fenced too.
+    /// options.database_path, the options book's own database, anchored at
+    /// the config file's directory as the GUI anchors it (options/config.py
+    /// resolve_database_path).  The engine reads it READ-ONLY for the book's
+    /// top-ups ([OPTIONS-CAPITAL], accounting/options_transfer.hpp).
+    std::string database_path{"data/options_jobs.db"};
 };
 
 struct AppConfig {

@@ -309,10 +309,12 @@ struct DbRatioMode {
 struct DbLedgerEntry {
     std::string entry_time;         ///< ISO-8601 UTC of the event.
     std::string event_type;         ///< opening | fill | take | reward | bridge_deposit |
-                                    ///< bridge_withdrawal | adjust | reversal.
+                                    ///< bridge_withdrawal | options_deposit |
+                                    ///< options_withdrawal | adjust | reversal.
     std::string event_id;           ///< trade_id, or a synthetic unique id.
     std::string leg;                ///< base | quote | fee | opening | reward | bridge |
-                                    ///< adjust.  A 'reversal' keeps its original's leg.
+                                    ///< options | adjust.  A 'reversal' keeps its
+                                    ///< original's leg.
     AssetId     asset_id;           ///< Canonical id ("xch" or 64-hex).
     Mojo        delta_mojos{0};     ///< Signed: + inflow, - outflow.
     std::string pair_name;          ///< Context (may be empty).
@@ -616,7 +618,10 @@ public:
     /// Called by the engine after every fill / seed / reconcile so the
     /// cost basis survives restarts.  Never throws: persistence failures
     /// are logged and must not disrupt live trading.
-    void save_inventory_state(const std::vector<DbInventoryState>& records) noexcept;
+    /// @return true once the set is committed; false when it was not, and
+    ///         the previous set is what a restart reads.  [OPTIONS-CAPITAL]
+    ///         A capital flow's restart marker goes only on true.
+    bool save_inventory_state(const std::vector<DbInventoryState>& records) noexcept;
 
     /// Load all persisted inventory records.  Returns an empty vector when
     /// the table is empty (first run) or on error.
@@ -674,6 +679,45 @@ public:
     /// direction here: the caller then treats the receipt as unbooked, which
     /// can only produce a redundant log line, never a skipped booking.
     [[nodiscard]] bool ledger_has_event(const std::string& event_id) const;
+
+    /// [OPTIONS-CAPITAL] The newest leg whose event_id starts with `prefix`:
+    /// its event_id and its entry_time, both "" when there is none.
+    /// std::nullopt when the ledger could not be asked, which is not "none":
+    /// the options ingest reads where the books stand from it -- which way
+    /// the fence last went, the number of the last fence event, and when
+    /// the fence last went up (accounting/options_transfer.hpp) -- and on
+    /// "none" it adopts the state it finds.  A plain prefix compare, not
+    /// LIKE: the `_` of an event id is not a wildcard.
+    struct LedgerEventStamp {
+        std::string event_id;
+        std::string entry_time;
+    };
+    [[nodiscard]] std::optional<LedgerEventStamp> ledger_latest_event(
+        const std::string& prefix) const;
+
+    // -- Capital flows the inventory tracker may not hold yet ----------------
+
+    /// [OPTIONS-CAPITAL] Note, durably, that an external capital flow is
+    /// being journalled for `asset_id` and the inventory tracker does not
+    /// hold it yet.  Written BEFORE the flow's ledger legs, so a process
+    /// that stops between the journal and the tracker's write leaves the
+    /// next one this note (see capital_reconcile_pending()).  An asset
+    /// already noted stays as first written.  Never throws.
+    /// @return false when the note could not be written: the caller then
+    ///         must not journal the flow.
+    [[nodiscard]] bool mark_capital_reconcile_pending(const std::string& asset_id,
+                                                      const std::string& reason) noexcept;
+
+    /// [OPTIONS-CAPITAL] The tracker holds the flow and inventory_state is
+    /// written: the note is dropped.  Never throws.
+    bool clear_capital_reconcile_pending(const std::string& asset_id) noexcept;
+
+    /// [OPTIONS-CAPITAL] The assets noted, or std::nullopt when the table
+    /// could not be read.  A start restores them: the correction Step 11's
+    /// wallet reconcile makes for such an asset is a flow the ledger already
+    /// holds reaching the tracker -- a capital event (it re-anchors the
+    /// drawdown peak), with no second Net Deposits entry.
+    [[nodiscard]] std::optional<std::vector<std::string>> capital_reconcile_pending() const;
 
     /// The entry_time of this asset's 'opening' leg (ISO-8601 UTC), or ""
     /// when none exists / the query fails.  [S19] The bridge ingester

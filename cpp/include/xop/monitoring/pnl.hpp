@@ -267,13 +267,14 @@ public:
 
     // -- Net bridge deposits ([S19 2026-08-23]) ----------------------------
 
-    /// Accumulate one external bridge flow in USD, SIGNED: deposits
-    /// positive, withdrawals negative.  Kept out of every P&L figure --
-    /// external capital is not performance.  The caller journals the flow
-    /// to the ledger first (event_type 'bridge_deposit' /
-    /// 'bridge_withdrawal', signed USD in the note);
-    /// rehydrate_from_db rebuilds this accumulator from those rows, so
-    /// restarts are invariant.
+    /// Accumulate one external flow in USD, SIGNED: deposits positive,
+    /// withdrawals negative.  Kept out of every P&L figure -- external
+    /// capital is not performance.  The caller journals the flow to the
+    /// ledger first (event_type 'bridge_deposit' / 'bridge_withdrawal',
+    /// or, [OPTIONS-CAPITAL], 'options_deposit' / 'options_withdrawal'
+    /// for what moves to or from the options sub-account; signed USD in
+    /// the note); rehydrate_from_db rebuilds this accumulator from those
+    /// rows, so restarts are invariant.
     void add_net_deposit_usd(double usd);
 
     /// Cumulative net external deposits in USD (live + rehydrated).

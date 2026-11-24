@@ -729,6 +729,107 @@ TEST(DatabaseTest, LedgerHasEventAnswersBeforeAndAfterTheWrite) {
     EXPECT_TRUE(db.ledger_has_event("reward:abc123"));
 }
 
+// [OPTIONS-CAPITAL] The options ingest asks the ledger where the books stand:
+// the newest event whose id starts with a prefix.
+TEST(DatabaseTest, LedgerLatestEventIsTheNewestWithThatPrefix) {
+    TempDbPath temp("ledger_latest_event");
+    xop::Database db(temp.path().string());
+    // The ledger answers every time here: "none" is an empty stamp, and
+    // only a ledger that could not be asked is nullopt.
+    const auto latest = [&db](const char* prefix) {
+        const auto stamp = db.ledger_latest_event(prefix);
+        EXPECT_TRUE(stamp.has_value()) << prefix;
+        return stamp.value_or(xop::Database::LedgerEventStamp{});
+    };
+    EXPECT_EQ(latest("options_").event_id, "") << "nothing is journalled yet";
+    EXPECT_EQ(latest("options_").entry_time, "");
+
+    ASSERT_TRUE(db.append_ledger_entries({
+        leg("reward:abc123", "reward", "dbx", 618LL, "reward"),
+        leg("options_topup:aa11", "options", "xch", -1'500'000'000'000LL, "options_withdrawal"),
+        leg("options_topup:aa11", "fee", "xch", -10'000'000LL, "options_withdrawal"),
+        leg("optionsXtopup:zz", "options", "xch", -1LL, "options_withdrawal"),
+    }).has_value());
+    EXPECT_EQ(latest("options_").event_id, "options_topup:aa11")
+        << "the underscore is a character, not a wildcard";
+    EXPECT_EQ(latest("options_fence_").event_id, "") << "no fence event yet";
+
+    // A fence event with nothing behind it is still an event: its zero leg
+    // is how the books know which way the fence went.
+    auto up = leg("options_fence_up:1", "options", "xch", 0LL, "options_withdrawal");
+    up.entry_time = "2026-11-24T10:00:00.000Z";
+    auto down_xch = leg("options_fence_down:2", "options", "xch", 500'000'000'000LL, "options_deposit");
+    auto down_usdc = leg("options_fence_down:2", "options", "usdc", 2'000LL, "options_deposit");
+    down_xch.entry_time = down_usdc.entry_time = "2026-11-24T11:30:00.000Z";
+    ASSERT_EQ(db.append_ledger_entries({up}).value_or(999), 1u);
+    ASSERT_EQ(db.append_ledger_entries({down_xch, down_usdc}).value_or(999), 2u);
+    ASSERT_TRUE(db.append_ledger_entries({
+        leg("trade-z", "base", "xch", -1LL),
+    }).has_value());
+
+    const auto newest = latest("options_");
+    EXPECT_EQ(newest.event_id, "options_fence_down:2");
+    EXPECT_EQ(newest.entry_time, "2026-11-24T11:30:00.000Z");
+    EXPECT_EQ(latest("options_fence_").event_id, "options_fence_down:2");
+    const auto last_up = latest("options_fence_up:");
+    EXPECT_EQ(last_up.event_id, "options_fence_up:1");
+    EXPECT_EQ(last_up.entry_time, "2026-11-24T10:00:00.000Z");
+    EXPECT_EQ(latest("options_topup:").event_id, "options_topup:aa11");
+    EXPECT_EQ(latest("nothing_like_it").event_id, "");
+    EXPECT_EQ(latest("").event_id, "trade-z") << "every id starts with nothing";
+    // The zero leg moved no balance.
+    EXPECT_EQ(db.ledger_balances().at(xop::AssetId{"xch"}),
+              -1'500'000'000'000LL - 10'000'000LL - 1LL + 500'000'000'000LL - 1LL);
+}
+
+// [OPTIONS-CAPITAL] A capital flow is journalled before the inventory tracker
+// holds it.  The note written first is what a process that starts after a
+// stop in between reads: the correction it makes for that asset is the flow
+// reaching the tracker, not a loss.
+TEST(DatabaseTest, ACapitalFlowTheTrackerMayNotHoldYetIsNotedAcrossARestart) {
+    TempDbPath temp("capital_reconcile_pending");
+    const std::string usdc = "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d";
+    {
+        xop::Database db(temp.path().string());
+        const auto none = db.capital_reconcile_pending();
+        ASSERT_TRUE(none.has_value()) << "an empty table is an answer";
+        EXPECT_TRUE(none->empty());
+
+        EXPECT_TRUE(db.mark_capital_reconcile_pending("xch", "options"));
+        EXPECT_TRUE(db.mark_capital_reconcile_pending(usdc, "options"));
+        // A second flow for an asset changes nothing: one note an asset.
+        EXPECT_TRUE(db.mark_capital_reconcile_pending("xch", "options"));
+        const auto both = db.capital_reconcile_pending();
+        ASSERT_TRUE(both.has_value());
+        EXPECT_EQ(*both, (std::vector<std::string>{usdc, "xch"}));
+    }
+    // The stop: nothing but the database carries it over.
+    xop::Database db(temp.path().string());
+    const auto restored = db.capital_reconcile_pending();
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(*restored, (std::vector<std::string>{usdc, "xch"}));
+
+    // The tracker holds the XCH flow and is written: that note goes, the
+    // other stays.
+    EXPECT_TRUE(db.clear_capital_reconcile_pending("xch"));
+    EXPECT_EQ(db.capital_reconcile_pending().value_or(std::vector<std::string>{"?"}),
+              (std::vector<std::string>{usdc}));
+    // Clearing what is not there is not an error.
+    EXPECT_TRUE(db.clear_capital_reconcile_pending("xch"));
+    EXPECT_TRUE(db.clear_capital_reconcile_pending(usdc));
+    EXPECT_TRUE(db.capital_reconcile_pending().value_or(std::vector<std::string>{"?"}).empty());
+    // It never touched a balance.
+    EXPECT_TRUE(db.ledger_balances().empty());
+
+    // The inventory write a marker waits on says whether it committed.
+    xop::DbInventoryState rec;
+    rec.asset_id = "xch";
+    rec.total_quantity = 1'500'000'000'000LL;
+    rec.total_cost = 7.8;
+    EXPECT_TRUE(db.save_inventory_state({rec}));
+    EXPECT_TRUE(db.save_inventory_state({})) << "nothing to write commits nothing, and fails nothing";
+}
+
 TEST(DatabaseTest, LedgerSurvivesReopen) {
     TempDbPath temp("ledger_reopen");
     {

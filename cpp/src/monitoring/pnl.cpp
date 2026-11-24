@@ -489,10 +489,15 @@ void PnLTracker::rehydrate_from_db()
     // accounting::bridge_note.  Same restart-invariance treatment as the
     // reward block above (and the same table, so the prepare cannot fail
     // here after the reward prepare succeeded -- but check anyway).
+    // [OPTIONS-CAPITAL 2026-11-23] Options sub-account flows are external
+    // capital too, and carry their USD in the same note field
+    // (accounting/options_transfer.hpp options_note).  A fence event's zero
+    // leg has no such field and reads as $0.
     static constexpr const char* kBridgeSql = R"SQL(
         SELECT COALESCE(note, ''), delta_mojos
         FROM ledger_entries
-        WHERE event_type IN ('bridge_deposit', 'bridge_withdrawal');
+        WHERE event_type IN ('bridge_deposit', 'bridge_withdrawal',
+                             'options_deposit', 'options_withdrawal');
     )SQL";
 
     sqlite3_stmt* bstmt = nullptr;
@@ -518,9 +523,10 @@ void PnLTracker::rehydrate_from_db()
     sqlite3_finalize(bstmt);
 
     if (bridge_rows > 0) {
-        spdlog::info("PnLTracker: rehydrated {} bridge flow(s) from the "
-                     "ledger ({} mojos, ${:+.6f} net deposits)",
-                     bridge_rows, bridge_mojos, bridge_usd);
+        // (mojos: summed across assets, a count of what moved, not a value.)
+        spdlog::info("PnLTracker: rehydrated {} bridge and options flow "
+                     "leg(s) from the ledger ({} mojos, ${:+.6f} net "
+                     "deposits)", bridge_rows, bridge_mojos, bridge_usd);
     }
 }
 

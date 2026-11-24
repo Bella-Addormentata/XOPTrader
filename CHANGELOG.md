@@ -98,6 +98,45 @@ out a billion times off.
 - Fills were never affected: they are priced from the settled amounts by a
   formula that had the decimals. The readers now share that one formula.
 
+### An options top-up is a transfer, not a loss (#258)
+
+When the options book tops up its sub-account, those coins leave the funds
+the engine trades with. The engine's books had no entry for that. The ledger
+sat above the wallet by the amount, which the divergence check lets pass only
+while enough offers rest. And the equity that left read as a trading loss:
+at once for wUSDC.b, at the next engine start for XCH. Three top-ups were
+waiting like that: 1.5 XCH and 2 wUSDC.b on 2026-11-20, 0.5 XCH on
+2026-11-21.
+
+- **A top-up is booked as capital that left.** The engine reads the options
+  book's record (read-only) for which top-ups there are, and enters each one
+  and its fee in the ledger as an `options_withdrawal` once it has
+  confirmed. Its value goes to Net Deposits, not to P&L. The three waiting
+  ones are booked the first time this engine runs with the fence up.
+- **Confirmed by its own transaction.** The options book writes a
+  confirmation down minutes after the coins moved (five, for the three
+  above). The engine asks the wallet about that one transaction instead, so
+  a top-up is booked in the heartbeat after it confirms.
+- **So is the fence going down or up** (`engine_fence: auto`). Down, the
+  sub-account's coins are trading funds again: a deposit of what it held.
+  Up, they leave again: a withdrawal of what it holds. Every change is
+  booked, in order, each with the coins the address held at that moment.
+- **Nothing is counted twice.** A top-up counts only if the fence was up
+  when it arrived. One that arrives while it is down is part of what the
+  fence takes when it goes up.
+- **A restart in the middle is safe.** If the engine stops between entering
+  a transfer and updating its tracked balance, the next start knows, and
+  the correction it makes then is not read as a loss.
+- **No alert while a transfer waits to be booked.** If a price or a wallet
+  reading is missing for a heartbeat, the divergence check allows for the
+  known transfer instead of "reconciling" it away as unexplained and then
+  meeting it again.
+- The Net Deposits card counts these beside the bridge flows.
+- Not covered, and still left to the divergence check: a premium (it arrives
+  at an ordinary address of the wallet), and what the options book did
+  across a fence change while the engine was not running.
+- `accounting.options_transfer_ingest_enabled: false` turns it off.
+
 ### Two alerts that fired on nearly every cycle (#251)
 
 - **Natural Hedge Efficiency** was worked out per heartbeat from that block's

@@ -1539,8 +1539,9 @@ class MainWindow(QMainWindow):
     def _net_deposits_payload(self) -> dict[str, Any]:
         """Build the "Net Deposits" card payload ([S19 2026-08-23]).
 
-        External bridge capital, shown beside the P&L cards precisely so
-        it is never read AS P&L: a $415 deposit must not look like a $415
+        External capital (the warp bridge, and what moves to or from the
+        options sub-account), shown beside the P&L cards precisely so it
+        is never read AS P&L: a $415 deposit must not look like a $415
         profit.  Deliberately not sign-coloured (the title carries no
         P&L token), because a deposit is neither a gain nor a loss.
         """
@@ -1554,16 +1555,24 @@ class MainWindow(QMainWindow):
             }
         usd = float(display.get("net_deposits_usd", 0.0))
         flows = int(display.get("bridge_flows", 0))
+        # [OPTIONS-CAPITAL] Capital moved to or from the options sub-account
+        # (top-ups, the fence going down or up) is in the figure too.
+        options = int(display.get("options_flows", 0))
         # Not _fmt_usd: capital carries no "+" (it is not a gain), and a
         # net-negative figure reads "-$20.00", not "$-20.00".
         text = f"-${abs(usd):,.2f}" if usd < 0 else f"${usd:,.2f}"
+        parts = []
+        if flows:
+            parts.append(f"{flows:,} bridge flow(s)")
+        if options:
+            parts.append(f"{options:,} options flow(s)")
         return {
             "value": usd,
             "spark": usd,
             "display_text": text,
             "secondary_text": (
-                f"external capital · {flows:,} bridge flow(s)"
-                if flows else "no bridge flows yet"
+                "external capital · " + ", ".join(parts)
+                if parts else "no external flows yet"
             ),
         }
 

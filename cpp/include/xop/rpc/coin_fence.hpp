@@ -50,6 +50,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -274,6 +275,12 @@ public:
         for (const auto& ph : puzzle_hashes) puzzle_hashes_.insert(fence_normalise_hex(ph));
         refreshed_at_.reset();
         coins_.clear();
+        listed_ = false;
+        first_list_.reset();
+        log_.clear();
+        logging_ = false;
+        seen_up_.clear();
+        seen_since_unix_ = 0.0;
     }
 
     /// Which asset each fenced puzzle hash holds ("xch", or a CAT's asset id),
@@ -310,12 +317,38 @@ public:
     /// whether this changed it.  Either way the list is forgotten: going up,
     /// it is unknown until the next refresh -- never an old list from before
     /// the fence went down -- and going down there is nothing to hold.
+    ///
+    /// [OPTIONS-CAPITAL] Either way capital crosses the edge of the trading
+    /// funds, and the books record how much: going down, the coins of the
+    /// last list (kept in the log's entry before the list is forgotten);
+    /// going up, those of the first list to come (update() fills them in).
     bool set_active(bool active)
     {
         std::lock_guard lock(mtx_);
         if (active_ == active) return false;
+        if (logging_) {
+            Transition change;
+            change.serial  = next_serial_++;
+            change.up      = active;
+            change.at_unix = unix_now();
+            if (!active && listed_) change.holding = holding_of(coins_, change.at_unix);
+            if (!active) {
+                change.seen.assign(seen_up_.begin(), seen_up_.end());
+                change.seen_since_unix = seen_since_unix_;
+            }
+            // Never expected: more changes than the books could be told of.
+            // The oldest round trip after the first entry is given up (the
+            // two are opposite, so the rest still alternates).
+            if (log_.size() >= kMaxLog) log_.erase(log_.begin() + 1, log_.begin() + 3);
+            log_.push_back(std::move(change));
+        }
+        first_list_.reset();
+        // [OPTIONS-CAPITAL] Sightings are of one stretch with the fence up.
+        seen_up_.clear();
+        seen_since_unix_ = 0.0;
         active_ = active;
         coins_.clear();
+        listed_ = false;
         refreshed_at_.reset();
         last_error_.clear();
         return true;
@@ -337,10 +370,27 @@ public:
     {
         std::lock_guard lock(mtx_);
         coins_ = std::move(coins);
+        listed_ = true;
         refreshed_at_ = now;
-        refreshed_unix_ = std::chrono::duration<double>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        refreshed_unix_ = unix_now();
         last_error_.clear();
+        // [OPTIONS-CAPITAL] The first list since the fence went up is what
+        // left the trading funds with it: kept as it was, and given to the
+        // log's entry for that rise (or for a fence found up) when it still
+        // waits for one.
+        if (on() && !first_list_) {
+            first_list_ = holding_of(coins_, refreshed_unix_);
+            if (!log_.empty() && log_.back().up && !log_.back().holding) {
+                log_.back().holding = first_list_;
+            }
+        }
+        // [OPTIONS-CAPITAL] Every coin a list had while the fence was up: the
+        // engine's balances left it out then, whether or not it is still
+        // there when the fence goes down.
+        if (on()) {
+            if (seen_since_unix_ <= 0.0) seen_since_unix_ = refreshed_unix_;
+            for (const auto& c : coins_) seen_up_.insert(fence_normalise_hex(c.id));
+        }
     }
 
     /// The list could not be refreshed: until the next successful update the
@@ -398,6 +448,108 @@ public:
             }
         }
         return std::pair<std::uint64_t, std::size_t>{amount, count};
+    }
+
+    /// [OPTIONS-CAPITAL] Mojos by fenced asset ("xch" or an asset id).
+    using Totals = std::vector<std::pair<std::string, std::uint64_t>>;
+
+    /// [OPTIONS-CAPITAL] What the sub-account held at one moment
+    /// (accounting/options_transfer.hpp books it when the fence moves).
+    struct Holding {
+        /// Every fenced asset in the order the assets were set, also one
+        /// that holds nothing.
+        Totals totals;
+        /// The ids of its coins (lowercase hex, no 0x): a top-up's own coin
+        /// can be looked for among them.
+        std::vector<std::string> coin_ids;
+        /// When (Unix seconds): the list's own time, or, for the last list
+        /// before the fence went down, the moment it went down.
+        double at_unix{0.0};
+    };
+
+    /// [OPTIONS-CAPITAL] One thing the books must hear of, in the order it
+    /// happened: the state the fence was in when the log began (`found`), or
+    /// a change since.
+    struct Transition {
+        std::uint64_t serial{0};
+        bool          up{false};     ///< The fence went (or was found) up.
+        bool          found{false};  ///< Where the log began, not a change.
+        /// Up: the first list had after it, as it was then -- std::nullopt
+        /// until one is had.  Down: the last list had before it; the list
+        /// may have been old, or its last refresh failed, and is still the
+        /// best count of what came back.  std::nullopt for a fence found
+        /// down, and for one that went down with no list had since it went
+        /// up: the amount is then unknown, never zero.
+        std::optional<Holding> holding;
+        double        at_unix{0.0};  ///< When (Unix seconds).
+        /// Down only: every coin a list had while the fence was up, from
+        /// `seen_since_unix` (the first list of that stretch in this
+        /// process; 0 = none) to the change -- its sightings, spent since
+        /// or not.
+        std::vector<std::string> seen;
+        double                   seen_since_unix{0.0};
+    };
+
+    /// [OPTIONS-CAPITAL] Starts the log anew, with the state the fence is in
+    /// now as its first entry.  Until then no change is kept: the books
+    /// compare themselves with where they find the fence, and need every
+    /// change only from that moment on.
+    void begin_transitions()
+    {
+        std::lock_guard lock(mtx_);
+        logging_ = true;
+        log_.clear();
+        Transition here;
+        here.serial  = next_serial_++;
+        here.up      = on();
+        here.found   = true;
+        here.at_unix = unix_now();
+        if (here.up) here.holding = first_list_;
+        log_.push_back(std::move(here));
+    }
+
+    /// [OPTIONS-CAPITAL] The entries not acknowledged yet, oldest first.
+    /// Two changes between two looks are both here, each with its own list:
+    /// comparing only where the fence ends up would lose what the address
+    /// held differently in between.
+    [[nodiscard]] std::vector<Transition> transitions() const
+    {
+        std::lock_guard lock(mtx_);
+        return log_;
+    }
+
+    /// [OPTIONS-CAPITAL] The books hold everything up to and including the
+    /// entry `serial`: those entries are dropped.  Called only once an entry
+    /// is booked (or needs no booking), so one the books could not take yet
+    /// is offered again.
+    void acknowledge(std::uint64_t serial)
+    {
+        std::lock_guard lock(mtx_);
+        log_.erase(std::remove_if(log_.begin(), log_.end(),
+                                  [serial](const Transition& t) { return t.serial <= serial; }),
+                   log_.end());
+    }
+
+    /// [OPTIONS-CAPITAL] Lists the address afresh, whatever the fence's
+    /// state and without changing it: for a fence that went down with no
+    /// list to say what came back.  std::nullopt when it cannot be listed.
+    /// Never throws.
+    boost::asio::awaitable<std::optional<Holding>> list_holding()
+    {
+        Refresher refresher;
+        {
+            std::lock_guard lock(mtx_);
+            if (!enabled_) co_return std::nullopt;
+            refresher = refresher_;
+        }
+        if (!refresher) co_return std::nullopt;
+        try {
+            const std::vector<FencedCoin> coins = co_await refresher();
+            std::lock_guard lock(mtx_);
+            co_return holding_of(coins, unix_now());
+        } catch (const std::exception&) {
+            co_return std::nullopt;
+        }
     }
 
     /// Refresh through the refresher when the list is missing or older than
@@ -458,6 +610,34 @@ private:
         return on() && !puzzle_hashes_.empty() && refreshed_at_ && now - *refreshed_at_ <= max_age_;
     }
 
+    [[nodiscard]] static double unix_now()
+    {
+        return std::chrono::duration<double>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    /// Caller holds mtx_.  `coins` by asset, as Holding describes.  A coin
+    /// at a puzzle hash with no asset counts toward none.
+    [[nodiscard]] Holding holding_of(const std::vector<FencedCoin>& coins, double at_unix) const
+    {
+        Holding holding;
+        holding.at_unix = at_unix;
+        for (const auto& [ph, asset] : asset_of_) {
+            auto slot = std::find_if(holding.totals.begin(), holding.totals.end(),
+                                     [&](const auto& t) { return t.first == asset; });
+            if (slot == holding.totals.end()) {
+                holding.totals.emplace_back(asset, std::uint64_t{0});
+                slot = std::prev(holding.totals.end());
+            }
+            for (const auto& c : coins) {
+                if (fence_normalise_hex(c.puzzle_hash) != ph) continue;
+                slot->second += c.amount;
+                holding.coin_ids.push_back(fence_normalise_hex(c.id));
+            }
+        }
+        return holding;
+    }
+
     mutable std::mutex                 mtx_;
     bool                               enabled_{false};
     bool                               active_{true};
@@ -465,6 +645,19 @@ private:
     std::set<std::string>              puzzle_hashes_;
     std::vector<std::pair<std::string, std::string>> asset_of_;
     std::vector<FencedCoin>            coins_;
+    /// A list was had since the fence last went up (or was configured).
+    bool                               listed_{false};
+    /// The first such list, as it was then.
+    std::optional<Holding>             first_list_;
+    /// [OPTIONS-CAPITAL] The transitions the books have not acknowledged.
+    static constexpr std::size_t       kMaxLog = 64;
+    bool                               logging_{false};
+    std::uint64_t                      next_serial_{1};
+    std::vector<Transition>            log_;
+    /// The coins listed since the fence last went up, and the time of the
+    /// first of those lists.
+    std::set<std::string>              seen_up_;
+    double                             seen_since_unix_{0.0};
     std::optional<Clock::time_point>   refreshed_at_;
     double                             refreshed_unix_{0.0};
     std::string                        last_error_;
