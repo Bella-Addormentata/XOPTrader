@@ -32,6 +32,12 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A Dexie offer whose amount is not a number is left out of the range**, and
   a range price that is not a positive number stops quoting whatever the
   tolerance. JSON can carry `NaN`, which slips past every comparison.
+- **An options sub-section that is not a mapping is refused, even an empty
+  one.** `market: []` (or `false`, `0`, `''`) used to be read as an empty
+  section, its defaults, so a strict `0` tolerance could go unseen. This
+  covers `wallet`, `pricing`, `limits`, `market`, `node` and `splash`. Left
+  out or blank (null) is still empty. Settings sends such a section back as
+  it is, from the file or the Raw YAML Editor, so Save says what is wrong.
 
 ### Options: 1, 10, 100... XCH contracts side by side (#261)
 
