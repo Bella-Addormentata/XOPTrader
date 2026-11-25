@@ -173,6 +173,9 @@ cannot show:
 7. `python -m gui.services.options --config config.yaml step`
    - Expect the market line (spot, volatility, Dexie range) and "dry run: would
      mint ...". A "not quoting" note names what was wrong with the price view.
+     Spot up to `market.peg_tolerance_pct` (3%) outside the Dexie range, or a
+     book crossed by no more than that, is read as stale Dexie offers: the book
+     quotes, and the market line says how far off the Dexie book was.
 8. `python -m gui.services.options --config config.yaml monitor`
    - Read-only. Expect the desk's listings with the site's price, ours, and the
      edge after hedging. Leave it running with `--interval 300` to build a

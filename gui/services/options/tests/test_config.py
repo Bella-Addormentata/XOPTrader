@@ -631,3 +631,34 @@ def test_a_number_too_large_to_count_in_mojos_is_a_config_error() -> None:
         _parse(target={"xch": 1, "quote": 1e306})
     # The largest sizes that do count still parse.
     assert _parse(contract_xch=1e6).contract_xch_mojos == 10**18
+
+
+def test_the_off_peg_tolerance_defaults_to_three_percent_and_zero_is_strict() -> None:
+    """[PEG] Left out, as on every install before it existed: 3%."""
+    assert _parse().market.peg_tolerance_pct == config.DEFAULT_PEG_TOLERANCE_PCT == 3.0
+    assert _parse(market={"peg_tolerance_pct": 0}).market.peg_tolerance_pct == 0.0
+    assert _parse(market={"peg_tolerance_pct": 1.5}).market.peg_tolerance_pct == 1.5
+    # [review #263] Blank is left out, as the Settings tab shows it: null, or an
+    # empty string, as a blank limit is unset.
+    for blank in (None, "", "  "):
+        assert _parse(market={"peg_tolerance_pct": blank}).market.peg_tolerance_pct == 3.0
+
+
+@pytest.mark.parametrize("name", ["wallet", "pricing", "limits", "market", "node", "splash"])
+@pytest.mark.parametrize("raw", [[], False, 0, "", ["max_spread_pct", 10]])
+def test_a_section_that_is_not_a_mapping_is_refused_even_an_empty_one(name, raw) -> None:
+    """[review #263] `market: []` (or false, 0, '') was read as {}: the defaults, a
+    strict 0 tolerance gone unseen. Only a section left out or null is empty."""
+    with pytest.raises(config.OptionsConfigError, match=f"options.{name} must be a mapping"):
+        _parse(**{name: raw})
+
+
+@pytest.mark.parametrize("name", ["pricing", "limits", "market", "node", "splash"])
+def test_a_section_left_blank_is_read_as_its_defaults(name) -> None:
+    assert _parse(**{name: None}) == _parse(**{name: {}})
+
+
+@pytest.mark.parametrize("raw", [-1, "wide", "%", True, float("nan")])
+def test_a_bad_off_peg_tolerance_is_refused(raw) -> None:
+    with pytest.raises(config.OptionsConfigError, match="peg_tolerance_pct"):
+        _parse(market={"peg_tolerance_pct": raw})

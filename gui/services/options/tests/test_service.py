@@ -299,6 +299,39 @@ def test_spot_outside_the_executable_range_stops_quoting() -> None:
     assert rig.contracts() == []
 
 
+@pytest.mark.parametrize(
+    "bid, ask, said",
+    [
+        (1.12, 1.16, "dexie 1.1200/1.1600 (spot 1.79% outside it)"),
+        (1.105, 1.10, "dexie 1.1050/1.1000 (crossed by 0.45%)"),
+    ],
+    ids=["under a stale bid", "crossed by a stale bid"],
+)
+def test_stale_dexie_offers_within_the_tolerance_are_quoted_and_said(
+    caplog, bid, ask, said
+) -> None:
+    """[PEG] 2026-11-24: stale Dexie bids stood 1-2% over the market for hours. Inside
+    the default tolerance the book quotes, on spot, and the log says how far off the
+    Dexie book was; at 0 the book stops, as it did before the tolerance."""
+    for tolerance, quotes in ((None, True), (0, False)):
+        rig = Rig() if tolerance is None else Rig(market={"peg_tolerance_pct": tolerance})
+        rig.read_market = lambda rig=rig: market.Market(  # type: ignore[method-assign]
+            spot=1.10, sigma=0.86, bid=bid, ask=ask, as_of=rig.world.now()
+        )
+        rig.book = rig.make_book()
+        caplog.clear()
+        with caplog.at_level("INFO", logger="gui.services.options.service"):
+            (report,) = rig.steps(1)
+
+        if quotes:
+            assert report.market_error == ""
+            assert sum("minting" in action for action in report.actions) == 1
+            assert said in caplog.text
+        else:
+            assert report.market_error, "the strict rule"
+            assert rig.contracts() == []
+
+
 # ---------------------------------------------------------------------------
 # The grid
 # ---------------------------------------------------------------------------
