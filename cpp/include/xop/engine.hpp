@@ -1560,6 +1560,9 @@ private:
     /// Settled takes the settle step keeps because their record does not map
     /// onto their pair as configured now, warned once.
     std::unordered_set<std::string> take_unmapped_warned_;
+    /// Tracked takes whose wallet record or payment stayed unreadable past
+    /// execution::kTakeSettleGiveUpBlocks, warned once.
+    std::unordered_set<std::string> take_unreadable_warned_;
     /// [TAKE-SETTLE review r5] Per asset, what the takes of ours that the last
     /// missed-take sweep found unresolved in the wallet could move: pending
     /// ones nothing tracks, and settled ones not booked yet (inside the
