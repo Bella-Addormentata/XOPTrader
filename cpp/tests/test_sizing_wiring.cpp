@@ -308,7 +308,7 @@ TEST(SizingWiring, EveryBalanceCacheWriterReadsFromASyncedWallet) {
     const std::string fetch = function_body(raw, "asio::awaitable<bool> Engine::fetch_bridge_balance(");
     ASSERT_FALSE(fetch.empty());
     EXPECT_EQ(count_of(fetch, "cached_wallet_balances_["), 1u);
-    EXPECT_EQ(count_of(engine, "co_await fetch_bridge_balance("), 4u) << "the four callers below";
+    EXPECT_EQ(count_of(engine, "co_await fetch_bridge_balance("), 5u) << "the five callers below";
     const std::string primary = function_body(raw, "asio::awaitable<void> Engine::step_ingest_bridge_flows(");
     ASSERT_FALSE(primary.empty());
     EXPECT_NE(position_of(primary, "snapshot_current = co_await secondary_wallet_synced(block_height) "
@@ -345,6 +345,18 @@ TEST(SizingWiring, EveryBalanceCacheWriterReadsFromASyncedWallet) {
     ASSERT_NE(options_fetch_at, std::string::npos);
     EXPECT_LT(options_synced_at, options_fetch_at);
     EXPECT_EQ(count_of(options, "fetch_bridge_balance("), 1u);
+    // [TAKE-SETTLE] So does the read a take booking makes first.
+    const std::string take_fresh =
+        function_body(raw, "asio::awaitable<bool> Engine::refresh_take_balances(");
+    ASSERT_FALSE(take_fresh.empty());
+    const std::size_t take_fresh_synced_at =
+        position_of(take_fresh, "if (!co_await secondary_wallet_synced(block_height)) co_return false;");
+    const std::size_t take_fresh_fetch_at =
+        position_of(take_fresh, "(void)co_await fetch_bridge_balance(asset, block_height, &validated);");
+    ASSERT_NE(take_fresh_synced_at, std::string::npos);
+    ASSERT_NE(take_fresh_fetch_at, std::string::npos);
+    EXPECT_LT(take_fresh_synced_at, take_fresh_fetch_at);
+    EXPECT_EQ(count_of(take_fresh, "fetch_bridge_balance("), 1u);
 
     // Synced means Step 8 passed its gate this heartbeat, or an on-demand
     // reading the way that gate reads it.

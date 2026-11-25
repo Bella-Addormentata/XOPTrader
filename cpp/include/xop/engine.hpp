@@ -53,6 +53,7 @@
 #include "xop/execution/market_data.hpp"
 #include "xop/execution/offer_manager.hpp"
 #include "xop/execution/take_retry.hpp"
+#include "xop/execution/take_settlement.hpp"
 #include "xop/execution/wallet_sync_watch.hpp"
 
 // Data / analytics
@@ -1542,6 +1543,46 @@ private:
     /// memory: a restart forgets them, and a cancel adopted at boot (fee
     /// unknown) never gets one.
     std::unordered_map<std::string, strategy::fee::Ticket> fee_tickets_;
+
+    /// [TAKE-SETTLE 2026-11-24] Takes the wallet accepted that are not booked
+    /// yet, by trade id (execution/take_settlement.hpp).
+    std::unordered_map<std::string, execution::PendingTake> pending_takes_;
+    /// Dexie offer id -> a take request for it that may have reached the
+    /// wallet without an answer, or whose reply named no trade id.
+    std::unordered_map<std::string, execution::UncertainTake> uncertain_take_offers_;
+    /// Settled takes the sweep has booked (or found inside an asset's
+    /// opening) in this process, by normalised trade id.
+    std::unordered_set<std::string> take_sweep_done_;
+    /// Height the missed-take sweep last ran at (0: not yet).
+    BlockHeight last_take_sweep_block_{0};
+    /// Settled takes the sweep could not book (no configured pair), warned once.
+    std::unordered_set<std::string> take_sweep_warned_;
+    /// Settled takes the settle step keeps because their record does not map
+    /// onto their pair as configured now, warned once.
+    std::unordered_set<std::string> take_unmapped_warned_;
+    /// [TAKE-SETTLE review r5] Per asset, what the takes of ours that the last
+    /// missed-take sweep found unresolved in the wallet could move: pending
+    /// ones nothing tracks, and settled ones not booked yet (inside the
+    /// sweep's grace, unproven, too shallow, or the GUI's awaiting its own
+    /// confirmation).  The divergence control's tolerance until the next sweep.
+    std::unordered_map<std::string, Mojo> sweep_take_slack_;
+    /// The last sweep that found no take of ours -- the GUI's aside --
+    /// unresolved in the wallet (0: none yet).  An uncertain hold ends only
+    /// after one (execution::uncertain_hold_ends).
+    BlockHeight take_sweep_clear_block_{0};
+    /// [TAKE-SETTLE review r5] Per asset, what the GUI's own takes that are
+    /// not booked yet could move (dexie_takes rows submitted and not
+    /// confirmed there, or confirmed and not booked here), read every
+    /// heartbeat by the top-up ingest, before the invariant.
+    std::unordered_map<std::string, Mojo> gui_take_slack_;
+    /// [review #262 r5] Reward-sized coins left unbooked for arriving outside
+    /// a payout burst, logged once.
+    std::unordered_set<std::string> reward_unevidenced_warned_;
+    /// take_holds has been read back (restore_take_holds).  Until it has, no
+    /// take is sent (an unread hold may be holding the very offer) and the
+    /// ledger invariant does not run (what a take in flight could move is
+    /// unknown).
+    bool take_holds_restored_{false};
     /// [review #163 r2] The height the engine is working at NOW: the startup
     /// height while the startup reconcile runs, then each cycle's own height,
     /// stamped at the TOP of on_new_block_coro.  last_block_ cannot serve: it
@@ -1861,15 +1902,29 @@ private:
     /// balance) and a taker_fills row (so the trade is attributable to the
     /// strategy that placed it).
     ///
-    /// Every take_offer() success site must call this.  Before 2026-07-30
-    /// none of them did: 70 taker trades across the retained logs wrote
-    /// nothing to trade_log, offer_log or the ledger, which is why the
-    /// strategies placing them had no measurable P&L.
+    /// Before 2026-07-30 no take site recorded anything: 70 taker trades
+    /// across the retained logs wrote nothing to trade_log, offer_log or the
+    /// ledger, which is why the strategies placing them had no measurable P&L.
     ///
-    /// @param we_bought_base true when we acquired the base asset and paid
-    ///                       quote; false for the reverse.
-    /// @param base_mojos     Absolute size of the base leg.
-    /// @param price_mojos    Execution price in engine pseudo-units.
+    /// [TAKE-SETTLE 2026-11-24] Called only for a take that SETTLED: by
+    /// step_settle_pending_takes for one a take site tracked
+    /// (track_pending_take), and by step_sweep_missed_takes for one nothing
+    /// tracked.  Never at a take site -- 13 takes booked there since
+    /// 2026-09-03 never settled (execution/take_settlement.hpp).
+    ///
+    /// @param we_bought_base     true when we acquired the base asset and
+    ///                           paid quote; false for the reverse.
+    /// @param base_mojos         Absolute size of the base leg.
+    /// @param price_mojos        Execution price in engine pseudo-units.
+    /// @param block_height       The height the take settled at.
+    /// @param exact_quote_mojos  The quote leg as the wallet states it, when
+    ///                           known; else derived from base and price.
+    /// @param receipt_coin_ids   [TAKE-SETTLE] The payment coins the take
+    ///                           claims (take_receipts), and
+    /// @param release_hold_key   the hold its booking ends -- all written in
+    ///                           ONE transaction with the taker_fills row and
+    ///                           the ledger legs (Database::book_take).
+    /// @param booked             Set true when that transaction committed.
     void record_taker_fill(const std::string& strategy,
                            const std::string& trade_id,
                            const std::string& counterparty_offer_id,
@@ -1878,7 +1933,106 @@ private:
                            Mojo base_mojos,
                            Mojo price_mojos,
                            std::uint64_t fee_mojos,
-                           BlockHeight block_height) noexcept;
+                           BlockHeight block_height,
+                           std::optional<Mojo> exact_quote_mojos = std::nullopt,
+                           const std::vector<std::string>& receipt_coin_ids = {},
+                           const std::string& release_hold_key = {},
+                           bool* booked = nullptr) noexcept;
+
+    /// [TAKE-SETTLE 2026-11-24] A take the wallet ACCEPTED: tracked, not
+    /// booked.  step_settle_pending_takes books it through record_taker_fill
+    /// once the wallet reports it settled and its payment is in our coin
+    /// store; one that failed or was cancelled books nothing.  The same
+    /// arguments every take site used to pass to record_taker_fill.
+    void track_pending_take(const std::string& strategy,
+                            const std::string& trade_id,
+                            const std::string& counterparty_offer_id,
+                            const PairConfig& pc,
+                            bool we_bought_base,
+                            Mojo base_mojos,
+                            Mojo price_mojos,
+                            std::uint64_t fee_mojos,
+                            BlockHeight block_height) noexcept;
+
+    /// [TAKE-SETTLE 2026-11-24] The one door to the wallet's take_offer.
+    /// Refuses -- {"success": false, "error": ...}, and no RPC -- a take of a
+    /// Dexie offer an unsettled take of ours already holds, or one under an
+    /// uncertain hold.  A request that fails in a way that may have reached
+    /// the wallet (rpc::request_possibly_submitted) puts the offer under an
+    /// uncertain hold (hold_uncertain_take) and is rethrown.  `intent`
+    /// carries the take's fee and what it could move.
+    asio::awaitable<nlohmann::json> take_offer_guarded(
+        const std::string&           counterparty_offer_id,
+        const std::string&           offer_text,
+        BlockHeight                  block_height,
+        const execution::TakeIntent& intent);
+
+    /// [TAKE-SETTLE 2026-11-24] What a take on `pair_name` could move, per
+    /// asset (base, quote, and the fee on xch), held from `at`.
+    [[nodiscard]] execution::UncertainTake take_exposure(const std::string& pair_name,
+                                                         bool we_bought_base,
+                                                         Mojo base_mojos,
+                                                         Mojo price_mojos,
+                                                         std::uint64_t fee_mojos,
+                                                         BlockHeight at) const;
+
+    /// [TAKE-SETTLE 2026-11-24] Hold Dexie offer `offer_id` back for
+    /// execution::kUncertainTakeHoldBlocks from `at`, widening the divergence
+    /// control's tolerance by what the take could move, and write the hold to
+    /// take_holds so a restart keeps it.  take_offer_guarded holds every offer
+    /// this way BEFORE sending its take.
+    /// @return false when the hold could not be written.
+    [[nodiscard]] bool hold_uncertain_take(const std::string& offer_id,
+                                           const execution::TakeIntent& intent,
+                                           BlockHeight at) noexcept;
+
+    /// [TAKE-SETTLE 2026-11-24] Drop the uncertain hold on `offer_id`: the
+    /// wallet refused the take, or a pending hold took its place.
+    void release_uncertain_take(const std::string& offer_id) noexcept;
+
+    /// [TAKE-SETTLE 2026-11-24] Read take_holds back at start, before any
+    /// take step runs: the takes the last process left unsettled, and its
+    /// uncertain requests.
+    /// @return true when the hold set was read (or there is no database).
+    bool restore_take_holds() noexcept;
+
+    /// [TAKE-SETTLE 2026-11-24] Each received asset's wallet id, for the
+    /// payment proof (execution::receipts_paid); an unresolved asset is left
+    /// out, which fails the proof.
+    [[nodiscard]] std::unordered_map<std::string, std::int64_t> receipt_wallet_ids(
+        const std::vector<execution::AssetAmount>& received) const;
+
+    /// [TAKE-SETTLE 2026-11-24] The payment proof for `take` from `coins`
+    /// (execution::prove_receipts): each receipt in its own asset's wallet,
+    /// within kReceiptGiveBlocks, and not a coin another booked take claimed
+    /// (take_receipts).  std::nullopt when unproven or the claims are unread.
+    /// `claims_read`, when given, is set false when the claims could not be
+    /// read (as opposed to a proof that failed).
+    [[nodiscard]] std::optional<execution::ReceiptProof> prove_take_receipts(
+        const execution::WalletTake& take, const std::vector<nlohmann::json>& coins,
+        bool* claims_read = nullptr) const;
+
+    /// [TAKE-SETTLE 2026-11-24] Fresh, validated wallet balances of `assets`
+    /// at `block_height` (fetch_bridge_balance), read after a take's payment
+    /// was proven and before it is booked: the invariant must tie books that
+    /// carry the take to a snapshot that carries it too, not to one a paused
+    /// Step 8 left from before it.  An asset with no snapshot at all is not
+    /// compared by the invariant and needs none.  False when any read fails
+    /// or is incomplete; the booking then waits a heartbeat.
+    asio::awaitable<bool> refresh_take_balances(std::vector<AssetId> assets,
+                                                BlockHeight block_height);
+
+    /// [TAKE-SETTLE 2026-11-24] Book the tracked takes that settled; drop the
+    /// ones that failed or were cancelled.  At most
+    /// execution::kTakeSettlePerHeartbeat wallet reads, oldest take first.
+    /// Runs before the invariant.
+    asio::awaitable<void> step_settle_pending_takes(BlockHeight block_height);
+
+    /// [TAKE-SETTLE 2026-11-24] Every execution::kTakeSweepEveryBlocks, book
+    /// a settled take of ours that the ledger does not hold and nothing
+    /// tracks, from the wallet's own record of it and after the same payment
+    /// proof.  Runs before the invariant.
+    asio::awaitable<void> step_sweep_missed_takes(BlockHeight block_height);
 
     /// Notional of asset @p asset_id currently committed to live offers.
     /// This bounds how much the wallet can legitimately move before the
@@ -3549,6 +3703,9 @@ private:
     /// repeated LOG LINE, not an accounting decision, so a restart
     /// legitimately re-reports whatever it still finds unbooked.
     std::unordered_set<std::string> reward_stale_warned_;
+    /// [REWARD-CATCHUP 2026-11-24] Height of the last reward scan that read
+    /// past its first page (0: none yet; accounting/reward_ingest.hpp).
+    BlockHeight last_reward_deep_scan_block_{0};
 
     // -- [T4-05] GUI-requested pause via signal file ----------------------
     // The GUI creates / removes a "pause.flag" file next to the database.

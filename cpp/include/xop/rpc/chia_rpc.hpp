@@ -815,6 +815,33 @@ public:
         const std::vector<std::uint64_t>& amounts);
 
     /**
+     * @brief [TAKE-SETTLE 2026-11-24] The wallet's takes of ours -- other
+     * makers' offers we accepted (exclude_my_offers) -- rows @p start to
+     * @p end, newest confirmation first (the default CONFIRMED_AT_HEIGHT
+     * order, which sorts pending ones last).  With @p include_completed false,
+     * only the ones still pending.
+     *
+     * The missed-take sweep's source (execution/take_settlement.hpp).
+     *
+     * @return The trade records, as get_all_offers returns them.
+     */
+    asio::awaitable<std::vector<json>> get_recent_takes(std::int64_t start,
+                                                        std::int64_t end,
+                                                        bool include_completed = true);
+
+    /**
+     * @brief [TAKE-SETTLE 2026-11-24] Our coins confirmed from `start` to
+     * `stop` (inclusive) whose amount is one of `amounts`, from the wallet's
+     * own store -- get_coin_records_at_height over a range, for a take's
+     * payment that may land a block after the trade's confirmed_at_index.
+     * Same caveats: no sync check, so call it right after a synced answer.
+     */
+    asio::awaitable<std::vector<json>> get_coin_records_in_range(
+        std::uint64_t                     start,
+        std::uint64_t                     stop,
+        const std::vector<std::uint64_t>& amounts);
+
+    /**
      * @brief Retrieve offers with pagination.
      *
      * [WALLET-LOAD 2026-08-04] Verified against docs.chia.net offer-rpc

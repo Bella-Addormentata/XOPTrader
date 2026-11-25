@@ -35,9 +35,11 @@ of legs**. Summing `delta_mojos` per asset gives the ledger's implied balance.
 | `opening` | one leg per asset = wallet confirmed balance at genesis |
 | `fill` (bid) | base `+size`, quote `−quote_mojos`, `xch −fee` |
 | `fill` (ask) | base `−size`, quote `+quote_mojos`, `xch −fee` |
+| `take` | a take of ours that settled: base `±size`, quote `∓quote_mojos`, `xch −fee` (below) |
 | `options_withdrawal` | capital that left for the options sub-account: a top-up (`options −amount`, `fee −fee` on `xch`), or the fence going up (`options −held`, one leg per asset) |
 | `options_deposit` | the fence going down: `options +held`, one leg per asset |
 | `adjust` | single leg, explicitly labelled, for movements with no internal event; also the correction of an earlier auto-adjust (below) |
+| `fee` | network fees paid outside any fill or take (cancels, coin splits): `xch −fee`; posted so far only by the 2026-11 repair (§8) |
 | `reversal` | one leg per leg of the booking it reverses: same `leg`, `asset_id`, `pair_name` and `block_height`, `delta_mojos` negated |
 
 **Sign convention**: positive is an inflow to the bot, negative an outflow.
@@ -114,6 +116,62 @@ the books had not yet heard of when the engine stopped, and the fence taken
 away by switching the options book off in `config.yaml`.
 
 `accounting.options_transfer_ingest_enabled: false` stops all of it.
+
+### A take is booked when it settles (2026-11-24)
+
+A take is one of our `take_offer` calls: we accept another maker's offer.
+The wallet accepting the call is not the take happening: another taker, or
+an earlier take of ours, may spend the maker's coins first, and the wallet
+then marks ours FAILED or CANCELLED.  From the 2026-09-03 re-tie to
+2026-11-24 the engine booked 13 such takes at the moment of the call, and
+the ledger held 44.54 XCH that never moved.
+
+- **Booked on settlement.**  A take's legs are posted only once the wallet
+  reports its trade CONFIRMED and the coin it pays us -- exactly each amount
+  the maker offered, in that asset's own wallet -- is in our coin store, at
+  the trade's height or up to two blocks after it, and as deep as a maker
+  fill's payment must be (`strategy.confirmation_depth_blocks`).  The legs are the wallet's
+  own amounts, at the block that payment landed in; a leg at or below its
+  asset's opening block is suppressed, as for a fill.  A settled take whose
+  record does not read as two legs of its pair as configured is kept tracked,
+  never booked from estimates.  The `taker_fills` row, the legs, the payment
+  coins the take claims (`take_receipts`: one coin pays one take, for good)
+  and the end of its hold commit in one transaction; a payment coin another
+  take claimed stops the booking whole.  Evidence is read only from a wallet
+  that reports itself synced, and the balances of the assets a booking moves
+  are read again after the proof and before the booking, so the divergence
+  control ties the booked take to a snapshot that holds it.
+- **A take that fails books nothing.**  FAILED or CANCELLED in the wallet: no
+  legs, no `taker_fills` row.  A take still pending is given up after five
+  hours only on an answer the wallet gave, never on a read that failed; the
+  sweep still books it if it settles.  A take booked under one spelling of
+  its id is not booked again under the other (`0x<id>` or `<id>`, any case).
+- **One take of an offer at a time.**  While a take of a Dexie offer is
+  unsettled the engine does not take that offer again, and a take request that
+  may have reached the wallet unanswered is never re-sent.  The hold is written
+  to `take_holds` before the take is sent, and kept across restarts.  While a
+  take is tracked, or an unanswered request held, the divergence control's
+  tolerance includes what that take moves, so a take about to be booked is
+  not absorbed by an auto-adjust first.  Until the saved holds are read back
+  at start, no take is sent and the divergence control does not run.  A hold
+  keeps the per-asset exposure it was written with.  An unanswered request's
+  hold lasts at least 64 blocks, and then until a sweep finds no take of ours
+  unresolved in the wallet (960 blocks at most).
+- **The sweep.**  A settled take of ours that the ledger does not hold and the
+  engine is not tracking -- a request that timed out, a take of a process that
+  has since stopped -- is booked from the wallet's record of it after the same
+  proof, under strategy `wallet_sweep`, with fee 0 (the wallet's record does
+  not state our fee).  It reads the day's takes page by page and the pending
+  ones, and what each unresolved take moves -- pending, settled but not yet
+  booked -- is the divergence control's tolerance until the next sweep.  It
+  leaves to the top-up ingest every GUI take the GUI may still confirm (every
+  `dexie_takes` row but a `failed` one), and waits when that table cannot be
+  read; the ingest in turn books nothing the sweep booked, and counts the
+  GUI's unbooked takes as tolerance every heartbeat.  It asks the ledger under both spellings of a take's event id
+  (`take:0x<id>` and the top-up ingest's `take:<id>`), and looks back one day;
+  older history is a repair's.
+
+Rules and measurements: `cpp/include/xop/execution/take_settlement.hpp`.
 
 ### Reversal: a booking proven wrong (2026-09-26)
 
@@ -379,7 +437,10 @@ at post time would manufacture a systematic phantom XCH outflow.
 
 Known gap: cancelled-offer fees (roughly 32× the filled-offer fees in
 aggregate) are recorded only in `offer_log` and are not yet part of the P&L
-fee leg.
+fee leg.  The 2026-11 ledger repair measured the network fees paid outside
+fills and takes from 2026-09-03 to 2026-11-24 from the coin store (0.34
+XCH) and booked them as one `fee` event (`docs/LEDGER-GAP-REPAIR-2026-11.md`);
+later ones are still unbooked.
 
 ## 9. Tax reporting — known divergence
 

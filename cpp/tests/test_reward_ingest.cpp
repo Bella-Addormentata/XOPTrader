@@ -27,7 +27,7 @@ namespace {
 using namespace xop::accounting;
 
 // Production-shaped constants.
-constexpr xop::Mojo  kMaxRewardMojos = 2'000;      // config default
+constexpr xop::Mojo  kMaxRewardMojos = 20'000;     // config default
 constexpr xop::BlockHeight kGenesis  = 9'080'000;  // ledger opening block
 
 // ============================================================================
@@ -76,8 +76,8 @@ TEST(RewardIngestFilterTest, MeasuredRewardCoinIsAccepted) {
 }
 
 TEST(RewardIngestFilterTest, TradingFlowsAreRejectedByCeiling) {
-    // The smallest observed trading flow (100,589 mojos) is 50x the
-    // 2,000-mojo ceiling: never bookable as a reward.
+    // The smallest observed trading flow of 2026-08 (100,589 mojos) is 5x the
+    // 20,000-mojo ceiling: never bookable as a reward.
     EXPECT_FALSE(is_reward_inflow(kIncomingTx, 100'589, 9'085'813, kGenesis,
                                   kMaxRewardMojos, false));
     // A typical ladder-size flow.
@@ -279,7 +279,92 @@ TEST(RewardIngestConfigTest, Defaults) {
     EXPECT_TRUE(d.reward_ingest_enabled);
     EXPECT_EQ(d.reward_asset_id,
               "db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20");
-    EXPECT_EQ(d.reward_max_mojos_per_coin, 2'000LL);
+    EXPECT_EQ(d.reward_max_mojos_per_coin, 20'000LL);
+}
+
+// ============================================================================
+// [REWARD-CATCHUP 2026-11-24] The 2026-11 bursts
+// ============================================================================
+
+// Coins measured on the live DBX wallet that the 2,000 ceiling dropped, and
+// the smallest trading flow of the same month: 1 XCH sold for 76.958 DBX.
+TEST(RewardIngestFilterTest, NovemberRewardCoinsPassAndTradesStillDoNot) {
+    constexpr xop::BlockHeight kBurst = 9'584'747;
+    for (const xop::Mojo coin : {2'208, 2'426, 3'086, 3'212, 4'395}) {
+        EXPECT_TRUE(is_reward_inflow(kIncomingTx, coin, kBurst, kGenesis,
+                                     kMaxRewardMojos, false)) << coin;
+    }
+    EXPECT_FALSE(is_reward_inflow(kIncomingTx, 76'958, kBurst, kGenesis,
+                                  kMaxRewardMojos, false));
+    EXPECT_TRUE(is_reward_inflow(kIncomingTx, kMaxRewardMojos, kBurst, kGenesis,
+                                 kMaxRewardMojos, false));
+    EXPECT_FALSE(is_reward_inflow(kIncomingTx, kMaxRewardMojos + 1, kBurst,
+                                  kGenesis, kMaxRewardMojos, false));
+}
+
+TEST(RewardIngestScanTest, DeepScanIsDueEveryThirtyBlocks) {
+    EXPECT_TRUE(reward_deep_scan_due(0, 9'600'000));           // never ran
+    EXPECT_FALSE(reward_deep_scan_due(9'600'000, 9'600'000));
+    EXPECT_FALSE(reward_deep_scan_due(9'600'000, 9'600'029));
+    EXPECT_TRUE(reward_deep_scan_due(9'600'000, 9'600'030));
+    EXPECT_TRUE(reward_deep_scan_due(9'600'000, 9'599'000));   // height went back
+    EXPECT_FALSE(reward_deep_scan_due(0, 0));
+}
+
+// A 220-coin burst does not fit one page of 200: the deep scan reads on.
+TEST(RewardIngestScanTest, ACoinAboveTheOldCeilingNeedsAPayoutBurst) {
+    // [review #262 r5] Up to 2,000 mojos a coin reads as a reward alone, as it
+    // always has; above that only among at least kRewardBurstMinCoins receipts
+    // in its block.  A 5 DBX deposit is one coin.
+    EXPECT_TRUE(reward_size_evidenced(2'000, 1));
+    EXPECT_FALSE(reward_size_evidenced(2'001, 1));
+    EXPECT_FALSE(reward_size_evidenced(5'000, kRewardBurstMinCoins - 1));
+    EXPECT_TRUE(reward_size_evidenced(4'395, kRewardBurstMinCoins));
+    EXPECT_TRUE(reward_size_evidenced(4'395, 219));
+}
+
+TEST(RewardIngestScanTest, AFullPageOfRecentRowsIsFollowedOnADeepScan) {
+    constexpr xop::BlockHeight kNow = 9'575'500;
+    EXPECT_TRUE(reward_scan_reads_on(true, false, 1, kRewardScanPageRows, 9'575'482, kNow));
+    // Not on an ordinary heartbeat: one page each.
+    EXPECT_FALSE(reward_scan_reads_on(false, false, 1, kRewardScanPageRows, 9'575'482, kNow));
+    // A short page is the wallet's last.
+    EXPECT_FALSE(reward_scan_reads_on(true, false, 1, kRewardScanPageRows - 1, 9'575'482, kNow));
+    // A page whose oldest row is unconfirmed says nothing about age: read on.
+    EXPECT_TRUE(reward_scan_reads_on(true, false, 1, kRewardScanPageRows, 0, kNow));
+    // [review #262 r5] ... on an ordinary heartbeat too: a full page of
+    // unconfirmed rows holds no candidate, and hides the confirmed ones.
+    EXPECT_TRUE(reward_scan_reads_on(false, false, 1, kRewardScanPageRows, 0, kNow));
+    EXPECT_FALSE(reward_scan_reads_on(false, false, kRewardScanMaxPages, kRewardScanPageRows, 0,
+                                      kNow));
+    // [review #262 r6] ... and past a full page whose oldest row came after
+    // the last deep scan: more than a page arrived since, unread by any scan.
+    EXPECT_TRUE(reward_scan_reads_on(false, false, 1, kRewardScanPageRows, 9'575'482, kNow,
+                                     9'575'470));
+    EXPECT_FALSE(reward_scan_reads_on(false, false, 1, kRewardScanPageRows, 9'575'482, kNow,
+                                      9'575'482));
+    EXPECT_FALSE(reward_scan_reads_on(false, false, 1, kRewardScanPageRows, 9'575'482, kNow,
+                                      9'575'490));
+    // [review #262] Between deep scans, a full page that still holds an
+    // unbooked receipt is followed at once: the burst's tail must not wait.
+    EXPECT_TRUE(reward_scan_reads_on(false, true, 1, kRewardScanPageRows, 9'575'482, kNow));
+    EXPECT_FALSE(reward_scan_reads_on(false, true, 1, kRewardScanPageRows - 1, 9'575'482, kNow));
+    EXPECT_FALSE(reward_scan_reads_on(false, true, kRewardScanMaxPages, kRewardScanPageRows,
+                                      9'575'482, kNow));
+}
+
+TEST(RewardIngestScanTest, TheScanStopsWhereNothingFurtherBackCouldBook) {
+    constexpr xop::BlockHeight kNow = 9'616'967;
+    // Past the backlog bound every older row is too stale to book.
+    EXPECT_FALSE(reward_scan_reads_on(true, false, 1, kRewardScanPageRows,
+                                      kNow - kMaxRewardBacklogBlocks - 1, kNow));
+    EXPECT_TRUE(reward_scan_reads_on(true, false, 1, kRewardScanPageRows,
+                                     kNow - kMaxRewardBacklogBlocks, kNow));
+    // And never more than kRewardScanMaxPages pages.
+    EXPECT_TRUE(reward_scan_reads_on(true, false, kRewardScanMaxPages - 1,
+                                     kRewardScanPageRows, kNow, kNow));
+    EXPECT_FALSE(reward_scan_reads_on(true, false, kRewardScanMaxPages,
+                                      kRewardScanPageRows, kNow, kNow));
 }
 
 }  // namespace

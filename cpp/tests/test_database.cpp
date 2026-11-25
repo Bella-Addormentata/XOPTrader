@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -529,6 +530,236 @@ TEST(DatabaseTest, InventoryStateRoundTripsAcrossReopen) {
     EXPECT_EQ(cat->total_quantity, 25'000LL);
     EXPECT_DOUBLE_EQ(cat->total_cost, 25'000.0);
     EXPECT_TRUE(cat->basis_is_seed_sentinel);
+}
+
+// [TAKE-SETTLE 2026-11-24] Take holds survive a restart and end when deleted.
+TEST(DatabaseTest, TakeHoldsRoundTripAcrossReopen) {
+    TempDbPath temp("take_holds_roundtrip");
+    {
+        xop::Database db(temp.path().string());
+        const auto none = db.take_holds();
+        ASSERT_TRUE(none.has_value());
+        EXPECT_TRUE(none->empty());
+
+        xop::DbTakeHold pending;
+        pending.hold_key       = "take:0x3d58e29d";
+        pending.kind           = "pending";
+        pending.offer_id       = "AkA6GJrWFG";
+        pending.trade_id       = "0x3d58e29d";
+        pending.strategy       = "crossed_book";
+        pending.pair_name      = "XCH/DBX";
+        pending.we_bought_base = true;
+        pending.base_mojos     = 5'000'000'000'000LL;
+        pending.price_mojos    = 81'200'000'000'000LL;
+        pending.fee_mojos      = 15'000'000;
+        pending.block_height   = 9'600'106;
+        EXPECT_TRUE(db.save_take_hold(pending));
+
+        xop::DbTakeHold uncertain = pending;
+        uncertain.hold_key = "uncertain:nMDyHor9J8";
+        uncertain.kind     = "uncertain";
+        uncertain.offer_id = "nMDyHor9J8";
+        uncertain.trade_id = "";
+        uncertain.fee_mojos = std::numeric_limits<std::uint64_t>::max();   // clamped, not wrapped
+        EXPECT_TRUE(db.save_take_hold(uncertain));
+        uncertain.block_height = 9'600'463;          // rewritten, not doubled
+        EXPECT_TRUE(db.save_take_hold(uncertain));
+    }
+    xop::Database db(temp.path().string());
+    auto holds = db.take_holds();
+    ASSERT_TRUE(holds.has_value());
+    ASSERT_EQ(holds->size(), 2u);
+    const xop::DbTakeHold& first = holds->front();   // ordered by block height
+    EXPECT_EQ(first.hold_key, "take:0x3d58e29d");
+    EXPECT_EQ(first.kind, "pending");
+    EXPECT_EQ(first.offer_id, "AkA6GJrWFG");
+    EXPECT_EQ(first.trade_id, "0x3d58e29d");
+    EXPECT_EQ(first.strategy, "crossed_book");
+    EXPECT_TRUE(first.we_bought_base);
+    EXPECT_EQ(first.base_mojos, 5'000'000'000'000LL);
+    EXPECT_EQ(first.price_mojos, 81'200'000'000'000LL);
+    EXPECT_EQ(first.fee_mojos, 15'000'000u);
+    EXPECT_EQ(first.block_height, 9'600'106u);
+    EXPECT_EQ(holds->back().block_height, 9'600'463u);
+    EXPECT_EQ(holds->back().fee_mojos,
+              static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()));
+
+    EXPECT_TRUE(db.delete_take_hold("take:0x3d58e29d"));
+    EXPECT_TRUE(db.delete_take_hold("take:never-held"));
+    holds = db.take_holds();
+    ASSERT_TRUE(holds.has_value());
+    ASSERT_EQ(holds->size(), 1u);
+    EXPECT_EQ(holds->front().hold_key, "uncertain:nMDyHor9J8");
+}
+
+// [TAKE-SETTLE 2026-11-24] A settled take books in one transaction, and a
+// replay writes nothing new.
+TEST(DatabaseTest, BookTakeIsOneTransactionAndIdempotent) {
+    TempDbPath temp("book_take");
+    xop::Database db(temp.path().string());
+
+    xop::DbTakeHold hold;
+    hold.hold_key = "take:0x72a48007";
+    hold.kind     = "pending";
+    hold.offer_id = "Dq3TqEWpW5";
+    hold.trade_id = "0x72a48007";
+    ASSERT_TRUE(db.save_take_hold(hold));
+
+    xop::DbTakerFill fill;
+    fill.taken_at          = "2026-11-20T10:13:23.000Z";
+    fill.block_height      = 9'600'516;
+    fill.strategy          = "crossed_book";
+    fill.trade_id          = "0x72a48007";
+    fill.pair_name         = "XCH/DBX";
+    fill.we_bought_base    = true;
+    fill.base_asset        = "xch";
+    fill.base_delta_mojos  = 5'000'000'000'000LL;
+    fill.quote_asset       = "db1a";
+    fill.quote_delta_mojos = -427'000;
+    fill.price_mojos       = 85'400'000'000'000LL;
+    fill.fee_mojos         = 330'000;
+
+    std::vector<xop::DbLedgerEntry> legs(2);
+    legs[0].entry_time = "2026-11-20T10:13:23.000Z";
+    legs[0].event_type = "take";
+    legs[0].event_id   = "take:0x72a48007";
+    legs[0].leg        = "base";
+    legs[0].asset_id   = "xch";
+    legs[0].delta_mojos = 5'000'000'000'000LL;
+    legs[1] = legs[0];
+    legs[1].leg        = "quote";
+    legs[1].asset_id   = "db1a";
+    legs[1].delta_mojos = -427'000;
+
+    const auto first = db.book_take(fill, legs, {"c0ffee"}, "take:0x72a48007");
+    ASSERT_TRUE(first.has_value());
+    EXPECT_TRUE(first->fill_inserted);
+    EXPECT_EQ(first->legs_inserted, 2u);
+    EXPECT_TRUE(db.ledger_has_event("take:0x72a48007"));
+    EXPECT_TRUE(db.taker_fill_exists("72a48007"));
+    EXPECT_TRUE(db.taker_fill_exists("0x72A48007"));
+    EXPECT_FALSE(db.taker_fill_exists("0x5ed85168"));
+    auto holds = db.take_holds();
+    ASSERT_TRUE(holds.has_value());
+    EXPECT_TRUE(holds->empty());   // the booking ended the hold
+    auto owners = db.take_receipt_owners({"c0ffee", "beef"});
+    ASSERT_TRUE(owners.has_value());
+    ASSERT_EQ(owners->size(), 1u);
+    EXPECT_EQ(owners->at("c0ffee"), "0x72a48007");
+
+    // A replay inserts nothing new.
+    const auto again = db.book_take(fill, legs, {"c0ffee"}, "take:0x72a48007");
+    ASSERT_TRUE(again.has_value());
+    EXPECT_FALSE(again->fill_inserted);
+    EXPECT_EQ(again->legs_inserted, 0u);
+
+    // Every leg suppressed: the row alone still marks the take booked.
+    fill.trade_id = "0x0b5bba65";
+    const auto rowless = db.book_take(fill, {}, {}, "");
+    ASSERT_TRUE(rowless.has_value());
+    EXPECT_TRUE(rowless->fill_inserted);
+    EXPECT_EQ(rowless->legs_inserted, 0u);
+    EXPECT_TRUE(db.taker_fill_exists("0x0b5bba65"));
+}
+
+TEST(DatabaseTest, BookTakeRefusesACoinAnotherTakeClaimed) {
+    TempDbPath temp("book_take_owner");
+    xop::Database db(temp.path().string());
+
+    xop::DbTakerFill fill;
+    fill.taken_at          = "2026-11-20T10:13:23.000Z";
+    fill.block_height      = 9'600'516;
+    fill.strategy          = "crossed_book";
+    fill.trade_id          = "0x72a48007";
+    fill.pair_name         = "XCH/DBX";
+    fill.we_bought_base    = true;
+    fill.base_asset        = "xch";
+    fill.base_delta_mojos  = 5'000'000'000'000LL;
+    fill.quote_asset       = "db1a";
+    fill.quote_delta_mojos = -427'000;
+    fill.price_mojos       = 85'400'000'000'000LL;
+
+    xop::DbLedgerEntry leg;
+    leg.entry_time  = "2026-11-20T10:13:23.000Z";
+    leg.event_type  = "take";
+    leg.event_id    = "take:0x72a48007";
+    leg.leg         = "base";
+    leg.asset_id    = "xch";
+    leg.delta_mojos = 5'000'000'000'000LL;
+    ASSERT_TRUE(db.book_take(fill, {leg}, {"c0ffee"}, "").has_value());
+
+    // A second take whose proof names the same coin writes nothing at all,
+    // and keeps its hold for the next heartbeat.
+    xop::DbTakeHold hold;
+    hold.hold_key = "take:0x5ed85168";
+    hold.kind     = "pending";
+    hold.offer_id = "AkA6GJ";
+    hold.trade_id = "0x5ed85168";
+    ASSERT_TRUE(db.save_take_hold(hold));
+    xop::DbTakerFill other = fill;
+    other.trade_id = "0x5ed85168";
+    xop::DbLedgerEntry other_leg = leg;
+    other_leg.event_id = "take:0x5ed85168";
+    EXPECT_FALSE(db.book_take(other, {other_leg}, {"beef", "c0ffee"}, "take:0x5ed85168")
+                     .has_value());
+    EXPECT_FALSE(db.taker_fill_exists("0x5ed85168"));
+    EXPECT_FALSE(db.ledger_has_event("take:0x5ed85168"));
+    auto owners = db.take_receipt_owners({"beef", "c0ffee"});
+    ASSERT_TRUE(owners.has_value());
+    ASSERT_EQ(owners->size(), 1u);   // not even the free coin was claimed
+    EXPECT_EQ(owners->at("c0ffee"), "0x72a48007");
+    auto holds = db.take_holds();
+    ASSERT_TRUE(holds.has_value());
+    ASSERT_EQ(holds->size(), 1u);
+    EXPECT_EQ(holds->front().hold_key, "take:0x5ed85168");
+
+    // [review #262 r5] The same take replayed in the other spelling of its id
+    // is a replay: no second row, no second legs, no claim; its hold ends.
+    xop::DbTakeHold replay_hold = hold;
+    replay_hold.hold_key = "take:72A48007";
+    replay_hold.trade_id = "72A48007";
+    ASSERT_TRUE(db.save_take_hold(replay_hold));
+    xop::DbTakerFill replay = fill;
+    replay.trade_id = "72A48007";
+    xop::DbLedgerEntry replay_leg = leg;
+    replay_leg.event_id = "take:72A48007";
+    const auto again = db.book_take(replay, {replay_leg}, {"c0ffee"}, "take:72A48007");
+    ASSERT_TRUE(again.has_value());
+    EXPECT_FALSE(again->fill_inserted);
+    EXPECT_EQ(again->legs_inserted, 0u);
+    EXPECT_EQ(db.ledger_balances().at("xch"), 5'000'000'000'000LL);
+    sqlite3* raw = nullptr;
+    ASSERT_EQ(sqlite3_open_v2(temp.path().string().c_str(), &raw, SQLITE_OPEN_READONLY, nullptr),
+              SQLITE_OK);
+    sqlite3_stmt* count = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(raw, "SELECT COUNT(*) FROM taker_fills;", -1, &count, nullptr),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(count), SQLITE_ROW);
+    EXPECT_EQ(sqlite3_column_int(count, 0), 1);
+    sqlite3_finalize(count);
+    sqlite3_close(raw);
+    holds = db.take_holds();
+    ASSERT_TRUE(holds.has_value());
+    for (const auto& h : *holds) EXPECT_NE(h.hold_key, "take:72A48007");
+}
+
+TEST(DatabaseTest, TakeHoldsKeepTheirExposure) {
+    // [review #262 r5] What a take moves is restored as it was written.
+    TempDbPath temp("take_hold_exposure");
+    {
+        xop::Database db(temp.path().string());
+        xop::DbTakeHold hold;
+        hold.hold_key = "uncertain:nMDyHor9J8";
+        hold.kind     = "uncertain";
+        hold.offer_id = "nMDyHor9J8";
+        hold.exposure = "xch=5000000000000;db1a=423000";
+        ASSERT_TRUE(db.save_take_hold(hold));
+    }
+    xop::Database reopened(temp.path().string());
+    const auto holds = reopened.take_holds();
+    ASSERT_TRUE(holds.has_value());
+    ASSERT_EQ(holds->size(), 1u);
+    EXPECT_EQ(holds->front().exposure, "xch=5000000000000;db1a=423000");
 }
 
 TEST(DatabaseTest, InventoryStateUpsertReplacesPriorSnapshot) {

@@ -130,6 +130,7 @@ add_executable(xop_tests
     test_settled_fill.cpp
     test_summary_offer.cpp
     test_options_transfer.cpp
+    test_take_settlement.cpp
     test_wallet_poll_throttle.cpp
     test_client_logger.cpp
     test_pid_reachability.cpp

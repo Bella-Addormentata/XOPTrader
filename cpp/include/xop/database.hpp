@@ -376,6 +376,33 @@ struct DbTakerFill {
 };
 
 // ---------------------------------------------------------------------------
+// [TAKE-SETTLE 2026-11-24] DbTakeHold -- a take the engine is holding: one
+// the wallet accepted that has not settled ("pending", keyed "take:<trade
+// id>"), or a take request that may have reached the wallet unanswered
+// ("uncertain", keyed "uncertain:<offer id>", no trade id).  Written when the
+// hold starts and deleted when it ends, so a restart restores both before
+// any take step runs (execution/take_settlement.hpp).
+// ---------------------------------------------------------------------------
+
+struct DbTakeHold {
+    std::string   hold_key;               ///< "take:<trade id>" | "uncertain:<offer id>"
+    std::string   kind;                   ///< "pending" | "uncertain"
+    std::string   offer_id;               ///< The Dexie offer taken.
+    std::string   trade_id;               ///< "" for an uncertain request.
+    std::string   strategy;
+    std::string   pair_name;
+    bool          we_bought_base{false};
+    Mojo          base_mojos{0};
+    Mojo          price_mojos{0};
+    std::uint64_t fee_mojos{0};
+    BlockHeight   block_height{0};        ///< Submitted at (pending) / requested at (uncertain).
+    /// What the take moves, per asset, as it was when the hold was written
+    /// (execution::encode_exposure): restored as written, not recomputed from
+    /// a pair that may have changed since.  "" in a row written before it.
+    std::string   exposure;
+};
+
+// ---------------------------------------------------------------------------
 // [PACE 2026-09-13] DbPaceFillRow -- one raw fill for the pace controller's
 // progress accounting: a maker row (trade_log) or a taker row (taker_fills).
 // No arithmetic happens in SQL: price x size reaches ~1e24, past int64.
@@ -718,6 +745,48 @@ public:
     /// holds reaching the tracker -- a capital event (it re-anchors the
     /// drawdown peak), with no second Net Deposits entry.
     [[nodiscard]] std::optional<std::vector<std::string>> capital_reconcile_pending() const;
+
+    /// [TAKE-SETTLE] Write (or rewrite) one take hold.  Never throws.
+    /// @return false when it could not be written.
+    bool save_take_hold(const DbTakeHold& hold) noexcept;
+
+    /// [TAKE-SETTLE] The hold ended: drop it.  Never throws.
+    bool delete_take_hold(const std::string& hold_key) noexcept;
+
+    /// [TAKE-SETTLE] Every hold, or std::nullopt when the table could not be
+    /// read.
+    [[nodiscard]] std::optional<std::vector<DbTakeHold>> take_holds() const;
+
+    /// [TAKE-SETTLE] What book_take wrote.
+    struct TakeBooking {
+        bool        fill_inserted{false};   ///< the taker_fills row is new
+        std::size_t legs_inserted{0};       ///< ledger legs that are new
+    };
+
+    /// [TAKE-SETTLE] Book a settled take in ONE transaction: its taker_fills
+    /// row, its ledger legs, the receipt coins it claims (take_receipts), and
+    /// the end of its hold (`release_hold_key`, "" for none).  All of it or
+    /// none of it, and idempotent: a replay inserts nothing new -- also one
+    /// spelled the other way ("0x<id>" or "<id>", any case), whose row or
+    /// legs are found under the first spelling; it only ends the hold.  A
+    /// receipt coin another take has claimed (either spelling of the ids
+    /// compared) stops the booking: nothing is written and the hold stays.
+    /// Never throws.
+    /// @return std::nullopt when nothing was written.
+    [[nodiscard]] std::optional<TakeBooking> book_take(
+        const DbTakerFill&                fill,
+        const std::vector<DbLedgerEntry>& legs,
+        const std::vector<std::string>&   receipt_coin_ids,
+        const std::string&                release_hold_key) noexcept;
+
+    /// [TAKE-SETTLE] Which of `coin_ids` a booked take has claimed: coin id
+    /// -> trade id.  std::nullopt when the table could not be read.
+    [[nodiscard]] std::optional<std::unordered_map<std::string, std::string>> take_receipt_owners(
+        const std::vector<std::string>& coin_ids) const;
+
+    /// [TAKE-SETTLE] Does taker_fills hold this trade, under either spelling
+    /// of its id ("0x..." or bare)?
+    [[nodiscard]] bool taker_fill_exists(const std::string& trade_id) const;
 
     /// The entry_time of this asset's 'opening' leg (ISO-8601 UTC), or ""
     /// when none exists / the query fails.  [S19] The bridge ingester
