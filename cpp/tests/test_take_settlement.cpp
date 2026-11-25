@@ -812,11 +812,16 @@ TEST(TakeSettlementWiring, Round5TheSweepAndTheSettleStepWaitForEvidence) {
               std::string::npos);
     EXPECT_NE(position_of(sweep, "sweep_take_slack_ = std::move(unresolved_slack);"),
               std::string::npos);
-    EXPECT_NE(position_of(sweep, "if (!engine_take_unresolved && !pending_truncated) "
-                                 "take_sweep_clear_block_ = block_height;"), std::string::npos);
-    // [review #262 r6] Malformed coin records are no evidence to give up on.
+    EXPECT_NE(position_of(sweep, "if (!engine_take_unresolved && !pending_truncated && "
+                                 "!lookback_capped) { take_sweep_clear_block_ = block_height; }"),
+              std::string::npos);
+    // [review #262 r8] A capped lookback is noticed, and an unknown wallet is unread.
+    EXPECT_NE(position_of(sweep, "lookback_capped = page + 1 >= execution::kTakeSweepMaxPages"),
+              std::string::npos);
     EXPECT_NE(position_of(settle, "payment_read = claims_read && "
-                                  "execution::coin_records_read(coins);"), std::string::npos);
+                                  "execution::coin_records_read(coins) && wallets_known;"),
+              std::string::npos);
+
     // The GUI's unbooked takes are tolerance from the top-up ingest.
     const std::string topup = function_body(
         raw, "asio::awaitable<void> Engine::step_ingest_topup_takes(BlockHeight block_height)");

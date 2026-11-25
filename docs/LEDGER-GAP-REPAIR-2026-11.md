@@ -50,7 +50,11 @@ the options address. The script reports both.
   not proof (an insecure cancel writes CANCELLED whatever happened), so the
   script refuses a reversal while a coin that could be the take's payment is
   in the store and unclaimed by every proven trade: any amount the take
-  would have paid us, from its booking to a day after. Each gets one
+  would have paid us, from its booking to a day after. That day must have
+  passed: the newest, peg-arb #700, was booked at block 9,618,482, so the
+  script refuses until block 9,623,090 (about 2:45 AM CT on 2026-11-25).
+  Every trade C books must also be `strategy.confirmation_depth_blocks`
+  deep. Each gets one
   `reversal` leg per leg, `event_id` `reversal:take:<trade_id>`. Each
   `taker_fills` row is archived as JSON in `offer_closure_events`
   (`phantom_take_correction`) and deleted, so pacing and history no longer

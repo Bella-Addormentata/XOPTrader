@@ -140,6 +140,10 @@ class Wallet:
         st = self.rpc("get_sync_status", {})
         return st.get("synced") is True and st.get("syncing") is False
 
+    def height(self) -> int:
+        """The wallet's peak height."""
+        return int(self.rpc("get_height_info", {})["height"])
+
     def wallet_ids(self) -> dict:
         """asset id (normalised, 'xch' for the standard wallet) -> wallet id."""
         ids = {}
@@ -325,8 +329,9 @@ def proven_trades(trades: list, coins: dict, booked: dict) -> tuple[dict, CoinPo
 
 
 def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
-               pairs: list) -> dict:
+               pairs: list, depth: int) -> dict:
     snapshot = ledger_snapshot(db)
+    now_h = wallet.height()
     led = db.execute(LEDGER_QUERY).fetchall()
     if any(TAG in (r[9] or "") for r in led):
         raise SystemExit(f"the ledger already holds rows tagged {TAG}: the repair has run")
@@ -380,10 +385,16 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
             raise SystemExit(f"{eid}: the coins of {unread} were not read, so its payment "
                              "cannot be ruled out -- resolve it by hand")
         h0 = min(int(r[8] or 0) for r in legs)
+        # The whole window must lie in the past: a payment cannot be absent
+        # from blocks that have not been made yet.
+        if h0 + PHANTOM_WINDOW > now_h:
+            raise SystemExit(f"{eid}: a payment for it could still land until block "
+                             f"{h0 + PHANTOM_WINDOW} (the wallet is at {now_h}) -- run again "
+                             "after that block")
         payable = [asset for asset, amount in recv.items()
                    if any(unclaimed.free[(asset, h, amount)] > 0
                           for h in range(h0 - GIVE, h0 + PHANTOM_WINDOW + 1))]
-        if len(payable) == len(recv):
+        if payable:   # any asset that could have been paid is reason enough
             raise SystemExit(f"{eid}: the wallet holds it {status}, but a coin that could be "
                              f"its payment is in the store and unclaimed ({sorted(recv.items())} "
                              f"from block {h0}) -- resolve it by hand")
@@ -409,6 +420,9 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
         recv, paid = receive_and_pay(t)
         if len(recv) != 1 or len(paid) != 1:
             raise SystemExit(f"trade 0x{tid}: not a two-asset trade, book it by hand")
+        if now_h - h < depth:   # strategy.confirmation_depth_blocks, as for a fill
+            raise SystemExit(f"trade 0x{tid}: its payment at block {h} is not yet {depth} "
+                             f"blocks deep (the wallet is at {now_h}) -- run again shortly")
         name, base, quote = pair_for(pairs, set(recv) | set(paid))
         missed.append(t)
         if t.get("is_my_offer"):
@@ -819,7 +833,8 @@ def apply(db_path: pathlib.Path, plan: dict, wallet: Wallet) -> None:
                 raise SystemExit(f"taker_fills row not written (already there?): {t['trade_id']}")
         con.execute("COMMIT")
     except BaseException:
-        con.execute("ROLLBACK")
+        if con.in_transaction:   # BEGIN itself may be what failed (a lock)
+            con.execute("ROLLBACK")
         raise
     finally:
         con.close()
@@ -864,7 +879,8 @@ def main() -> None:
     if not wallet.synced():
         raise SystemExit("the wallet is not synced (or is syncing) -- wait for it, then run again")
     db = sqlite3.connect(f"file:{args.db.as_posix()}?mode=ro", uri=True)
-    plan = build_plan(db, wallet, address, pairs)
+    depth = int(((cfg.get("strategy") or {}).get("confirmation_depth_blocks")) or 6)
+    plan = build_plan(db, wallet, address, pairs, depth)
     if not wallet.synced():
         raise SystemExit("the wallet stopped being synced while the plan was read -- run again")
     after = report(plan)

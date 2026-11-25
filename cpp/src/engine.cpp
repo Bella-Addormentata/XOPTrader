@@ -23092,7 +23092,16 @@ asio::awaitable<void> Engine::step_settle_pending_takes(BlockHeight block_height
                 bool claims_read = true;
                 proof = prove_take_receipts(*take, coins, &claims_read);
                 // [review #262 r6] Read whole: the claims, and every coin record.
-                payment_read = claims_read && execution::coin_records_read(coins);
+                // [review #262 r8] And every received asset's wallet known: one
+                // that is not proves nothing either way.
+                const auto wallets = receipt_wallet_ids(take->received);
+                const bool wallets_known = std::all_of(
+                    take->received.begin(), take->received.end(),
+                    [&wallets](const execution::AssetAmount& r) {
+                        return wallets.count(r.first) > 0;
+                    });
+                payment_read = claims_read && execution::coin_records_read(coins)
+                               && wallets_known;
             } catch (const std::exception& e) {
                 spdlog::debug("[Engine] [TAKE-SETTLE] payment read failed for take "
                               "{}: {} -- read again later", short_id, e.what());
@@ -23289,6 +23298,9 @@ asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)
     // a missed take out of sight), then the ones still pending.
     std::vector<nlohmann::json> records;
     std::vector<nlohmann::json> pending_records;
+    // [review #262 r8] Stopped by the page cap with the lookback still
+    // unread: this sweep then proves nothing clear (see below).
+    bool lookback_capped = false;
     try {
         for (std::int64_t page = 0;; ++page) {
             const auto rows = co_await wallet_->get_recent_takes(
@@ -23298,8 +23310,16 @@ asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)
                 : static_cast<BlockHeight>(execution::confirmed_height_from_record(rows.back(), 0U));
             if (!execution::take_sweep_reads_on(static_cast<std::int64_t>(rows.size()), oldest,
                                                 block_height, page + 1)) {
+                lookback_capped = page + 1 >= execution::kTakeSweepMaxPages
+                    && execution::take_sweep_reads_on(static_cast<std::int64_t>(rows.size()),
+                                                      oldest, block_height, 0);
                 break;
             }
+        }
+        if (lookback_capped) {
+            spdlog::warn("[Engine] [TAKE-SETTLE] sweep: more than {} takes of ours inside the last "
+                         "day -- the oldest are not read, and uncertain holds stay",
+                         execution::kTakeSweepMaxPages * execution::kTakeSweepWindow);
         }
         pending_records = co_await wallet_->get_recent_takes(
             0, execution::kTakePendingWindow, /*include_completed=*/false);
@@ -23447,7 +23467,9 @@ asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)
     sweep_take_slack_ = std::move(unresolved_slack);
     const bool pending_truncated =
         static_cast<std::int64_t>(pending_records.size()) >= execution::kTakePendingWindow;
-    if (!engine_take_unresolved && !pending_truncated) take_sweep_clear_block_ = block_height;
+    if (!engine_take_unresolved && !pending_truncated && !lookback_capped) {
+        take_sweep_clear_block_ = block_height;
+    }
 }
 
 Mojo Engine::live_offer_exposure(const AssetId& asset_id) const
