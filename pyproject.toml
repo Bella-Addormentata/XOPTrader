@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xop-trader"
-version = "0.10.57"
+version = "0.10.58"
 description = "CHIA DEX market maker — Avellaneda-Stoikov / GLFT strategy engine"
 # XOPTrader itself is WTFPL. The package also carries code ported from
 # warp.green (MIT), Pieter Wuille's bech32 (MIT), Chia (Apache-2.0) and the
