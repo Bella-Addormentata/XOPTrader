@@ -7,6 +7,8 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.58] — 2026-11-24 — takes booked once they settle, Dexie rewards caught up, offers left in the wallet read at start, option contracts of 1, 10 and 100 XCH, and a tolerance for stale Dexie offers
+
 ### A take is booked when it settles, not when the wallet accepts it (#262)
 
 A trace of the live ledger on 2026-11-24 found it 17.4 XCH above the wallet.
@@ -49,7 +51,7 @@ listing an offer while our first take of it waits to be mined.
   one that settled while the GUI was closed, and the ledger check allows
   for them from the moment the GUI records them.
 
-### Dexie rewards: bigger coins and bigger bursts are booked (#262)
+### Dexie rewards: bigger coins and bigger bursts are booked (#262, #264)
 
 - Reward coins up to 20 DBX each are booked (was 2 DBX) when they come in a
   payout burst of at least 5 coins in one block: November's coins reach
@@ -65,7 +67,7 @@ listing an offer while our first take of it waits to be mined.
   cannot be valued at today's price. After a stop longer than that, those
   rewards stay a difference for the ledger check to absorb.
 
-### Options: stale Dexie offers no longer stop the book as a depeg
+### Options: stale Dexie offers no longer stop the book as a depeg (#263)
 
 - **The off-peg check has a tolerance**, `options.market.peg_tolerance_pct`
   (3% when left out or blank, also in Settings > Options > Market checks; a
