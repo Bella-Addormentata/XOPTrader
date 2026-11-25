@@ -81,8 +81,50 @@ FEE_PER_HEIGHT_MAX = 1_000_000_000        # 0.001 XCH: the most one block's fees
 REWARD_MAX_MOJOS = 20_000                 # accounting.reward_max_mojos_per_coin's default
 REWARD_LONE_MAX_MOJOS = 2_000             # accounting::kRewardLoneCoinMaxMojos
 REWARD_BURST_MIN_COINS = 5                # accounting::kRewardBurstMinCoins
-GIVE = 50                                 # blocks a payment coin may trail its trade
+# Blocks a payment coin may trail its trade: the engine's kReceiptGiveBlocks.
+# A wider window would let a trade the wallet wrongly calls CONFIRMED claim a
+# later trade's payment of the same amount.  (50 gave the same plan on
+# 2026-11-24, row for row.)
+GIVE = 2
 PHANTOM_WINDOW = 4_608                    # blocks after a take's booking its payment is looked for
+
+# The plan verified by hand on 2026-11-24 (docs/LEDGER-GAP-REPAIR-2026-11.md).
+# The script refuses any other: an item it would add or leave out is a trade
+# or a transfer to resolve first, not something to post unread.
+VERIFIED_REVERSALS = {"take:0x" + t for t in (
+    "083be5b2a5aee8db061f8f63bd13b2e667f070e8a49db71a34b5e83f2a53e294",
+    "1bcf6dccc8877ab3bd3c86dd39e71a459156a2657ac32246c7aece52469c5fcf",
+    "1f3a9fd8ad9eca2f36df409998880e78e10880439e8167f366122c5b82b32e18",
+    "35dcf500055a55d022c2ef8170e8883c8f444a8f28c97a503a14945a8f3f0512",
+    "43cbe65bb9a3010707d8d41d8818311a3a2462f2373d2a0d4922c1f57c0f9971",
+    "6d43bfe5e05b8ccb265a04806126548d095323253ca0bdf10c7138a1bde581ed",
+    "7b95898ea8da11652cc6e2afc3e20a9b82ea8feae4430129271a207dc7895b63",
+    "8acbdbfeffce24dff923230341a28ce14e9b79903720ff9227ed099a1b0a3753",
+    "a757b5f60b15b0df635c4a72e2ca40b1f3b51583ce672754ea7a04b90693df83",
+    "bcd441957f494517cdac95a9c2a7d44b38bb11d9d382881d0706b43de87dab16",
+    "da2edc4382d4a2543b50f2de7932080cb60e67c3dca619a826031ea1431ff436",
+    "da716925eff0b231c4df7e6253fffa6b0ca5bb934f401acae72ecd867efcd401",
+    "e2d47d4edc6afdb1cf88a909a9c47a938719f1d6e25c1324d8265fc89912161d",
+    "f8a59d4b33c52de197098040074fd460be7cafd72f9569579303dc13bc3389c3")}
+VERIFIED_BOOKINGS = {
+    "0xe5c70eac31157f5f344dd56858b5dc9e146aba1b4896492583bf4b9fd86429cf",
+    *("take:0x" + t for t in (
+        "0b5bba65716fbe5884e0c32fb19e4ab31f35b9d55f7dedf5415908bda61d0c6e",
+        "3ea8fe38d0aacc9e2865204aba392fbfdb440e640e8ee42312467abec7a36873",
+        "415e30274ff14fadb4658df90b846e4f2468a2ef3bd39886b416fc70f5e2d078",
+        "5ed85168beb7f7f20e2bb03c691632e61019b0d82f0c760ecf46bd84ee482a30",
+        "72a48007a5a32656c5a22765ed10fac9948873696de5862379d46dad52ef27eb",
+        "c6915c78da48e6041b1703d2991419a9a06e019ed15d071b1492cd5067b25795"))}
+VERIFIED_OPTIONS = {
+    "options_send:0xcaa0e94f65ef18dd8cb13c5daae0cd5d34367c40fd245d5d68f68dada02d242d",
+    *("options_return:0x" + c for c in (
+        "04687384c59794452510c561bc21ba7caa722f27f8020e33ca103a5f50226dfc",
+        "63b973afea82185aa0fc67a432db6b884d868c3831ae98301cc450ff97b94036",
+        "bf77d688be2cd8d7d79eb44f51cc2aa9290d3ce487836c5fe8cbea18c9d3d3f3",
+        "67ae30cf896fad1c90fa88a41949da8003e4e2cf0d6241e4434e40b3887a1294",
+        "04dd12d4aa88ca30058e6b0e3b515881c0254b96cc19b433769aee87063c6d42",
+        "fde7e732a2cce676cf41fe100625c767007e5e85acf95d96b87cdcc45125becf",
+        "40b8a93ff964cea06969e3a832f6179d5bd923d10c795de5b3bc490412dde2ac"))}
 MOJOS_PER_XCH = 10 ** 12
 
 TAKER_COLUMNS = ("taken_at", "block_height", "strategy", "trade_id", "counterparty_offer_id",
@@ -412,10 +454,20 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
     for r in led:
         if r[2] == "opening":
             opening_block[norm(r[5])] = max(opening_block[norm(r[5])], int(r[8] or 0))
+    # A fill of an offer the engine still holds open (offer_log pending or
+    # cancel_pending) -- one taken while it is stopped, say -- is booked by
+    # the engine itself at start, with its trade_log row.  Booking it here
+    # too would post it twice.
+    held_open = {norm(r[0]) for r in db.execute(
+        "SELECT offer_id FROM offer_log WHERE status IN ('pending', 'cancel_pending')")}
     missed = []
     for tid, t in real.items():
         h = int(t["settled_at"])   # the block its payment landed in
         if h <= retie_h or tid in booked:
+            continue
+        if t.get("is_my_offer") and tid in held_open:
+            print(f"  C: 0x{tid[:12]} is a fill of an offer the engine holds open -- the engine "
+                  "books it at start, not this repair")
             continue
         recv, paid = receive_and_pay(t)
         if len(recv) != 1 or len(paid) != 1:
@@ -452,6 +504,23 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
                 "quote_delta_mojos": legs[quote],
                 "price_mojos": engine_price(base, abs(legs[base]), quote, abs(legs[quote])),
                 "fee_mojos": 0})
+
+    # Auto-adjusts after the re-tie on any asset but BYC (B reconciles BYC's)
+    # must not come after an item A or C posts for that asset: such an adjust
+    # may have absorbed it, and posting it again would count it twice.  The
+    # check on the XCH remainder cannot see that for a CAT.
+    for asset in sorted({norm(r[5]) for r in led} - {BYC}):
+        adjusts = [r for r in led if r[0] > retie_id and r[2] == "adjust"
+                   and norm(r[5]) == asset and (r[3] or "").startswith("adjust:")]
+        if not adjusts:
+            continue
+        last_adjust_h = max(int(r[8] or 0) for r in adjusts)
+        early = sorted({e["event_id"] for e in entries
+                        if e["kind"] in ("A", "C") and e["asset_id"] == asset
+                        and e["block_height"] <= last_adjust_h})
+        if early:
+            raise SystemExit(f"{asset[:8]}: auto-adjusts up to block {last_adjust_h} may have "
+                             f"absorbed {early} -- reconcile them as B does for BYC first")
 
     # B. BYC auto-adjusts after the re-tie ----------------------------------
     byc_adjusts = [r for r in led if r[0] > retie_id and r[2] == "adjust" and norm(r[5]) == BYC
@@ -625,6 +694,15 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
     # beyond the XCH legs of the trades settled there, by more than
     # FEE_PER_HEIGHT_MAX is a payment to someone, not a fee: refuse to call
     # it one.
+    # A negative one is XCH that came in at that block and nothing here
+    # explains (a return missed, say): it would understate the fees while the
+    # remainder still nets to zero.
+    came_in = {h: v for h, v in left_by_height.items() if v < 0}
+    if came_in:
+        listed = ", ".join(f"block {h}: {v / MOJOS_PER_XCH:+.6f} XCH"
+                           for h, v in sorted(came_in.items())[:20])
+        raise SystemExit(f"{len(came_in)} block(s) took in XCH that no item explains -- "
+                         f"explain them before repairing: {listed}")
     not_fees = {h: v for h, v in left_by_height.items() if v > FEE_PER_HEIGHT_MAX}
     if not_fees:
         listed = ", ".join(f"block {h}: {v / MOJOS_PER_XCH:.6f} XCH"
@@ -644,6 +722,18 @@ def build_plan(db: sqlite3.Connection, wallet: Wallet, options_address: str,
          f"{RETIE_EVENT_ID} to block {end_h}, measured from the coin store: {left_wallet} "
          f"mojos left trading coins, {paid_xch} of them trades' XCH legs and {booked_fees} "
          "fees already booked; ACCOUNTING-POLICY s.8 known gap")
+    planned = {
+        "reversals": ({e for e, _t, _s, _l in phantoms}, VERIFIED_REVERSALS),
+        "bookings": ({("0x" if t.get("is_my_offer") else "take:0x") + norm(t["trade_id"])
+                      for t in missed}, VERIFIED_BOOKINGS),
+        "options transfers": ({e["event_id"] for e in entries if e["kind"] == "D"},
+                              VERIFIED_OPTIONS),
+    }
+    for what, (got, verified) in planned.items():
+        if got != verified:
+            raise SystemExit(f"the {what} differ from the plan verified on 2026-11-24: "
+                             f"new {sorted(got - verified)}, missing {sorted(verified - got)} "
+                             "-- resolve them before repairing")
     return {"entries": entries, "taker_rows": taker_rows, "snapshot": snapshot,
             "phantoms": [(e, t, s) for e, t, s, _ in phantoms],
             "missed": [norm(t["trade_id"]) for t in missed], "coins": coins, "oph": oph,
@@ -879,7 +969,8 @@ def main() -> None:
     if not wallet.synced():
         raise SystemExit("the wallet is not synced (or is syncing) -- wait for it, then run again")
     db = sqlite3.connect(f"file:{args.db.as_posix()}?mode=ro", uri=True)
-    depth = int(((cfg.get("strategy") or {}).get("confirmation_depth_blocks")) or 6)
+    configured = (cfg.get("strategy") or {}).get("confirmation_depth_blocks")
+    depth = 6 if configured is None else int(configured)   # 0 is a setting, not "unset"
     plan = build_plan(db, wallet, address, pairs, depth)
     if not wallet.synced():
         raise SystemExit("the wallet stopped being synced while the plan was read -- run again")

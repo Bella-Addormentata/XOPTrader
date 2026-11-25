@@ -85,7 +85,8 @@ the options address. The script reports both.
   become `options_deposit` rows. Two of those coins were clawed-back
   collateral that a cancel spent as a fee coin. `flow_usd` is valued at the
   engine's own XCH mark from the nearest snapshot, so Net Deposits picks the
-  flows up.
+  flows up. (The returns are seven coins, 3.695727 XCH: one of them is 0.00009
+  XCH, at block 9,580,990.)
 - **E. Rewards.** These coins were dropped by the 2,000-mojo ceiling or the
   200-row window, or arrived while the engine was stopped for over two days
   (2026-11-16 to 18). They are booked as `reward` rows keyed on their wallet
@@ -122,6 +123,10 @@ All commands run from `C:\GitHub\XOPTrader`, with the Chia wallet running and sy
 3. Dry run, and read the summary. "XCH left after every item" must be
    within ±0.01. Read the lists too: "A reverses" must name exactly the 14
    takes above, and "C books" exactly the six takes and the 2026-09-11 fill.
+   The script itself refuses a plan whose reversals, bookings or options
+   transfers differ from these, and it leaves to the engine the fill of any
+   offer the engine still holds open. A payment must land within two blocks
+   of its trade's confirmation, as in the engine.
    A fill or take that settled while the engine was stopped can appear in
    C, or in the XCH remainder. If anything else appears, stop: do not start
    the old release to let it book it, and resolve that trade first. The

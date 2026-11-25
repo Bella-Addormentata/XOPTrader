@@ -61,6 +61,9 @@ listing an offer while our first take of it waits to be mined.
   holds only unconfirmed rows, or arrived since the last such read, so a
   burst of more than 200 coins is booked whole. On 2026-11-15 a burst of
   220 coins left 20 unbooked.
+- Still a limit: a reward more than two days old is not booked, since it
+  cannot be valued at today's price. After a stop longer than that, those
+  rewards stay a difference for the ledger check to absorb.
 
 ### Options: stale Dexie offers no longer stop the book as a depeg
 

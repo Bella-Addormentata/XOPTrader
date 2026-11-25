@@ -794,8 +794,11 @@ TEST(TakeSettlementWiring, Round5TheSweepAndTheSettleStepWaitForEvidence) {
     EXPECT_NE(position_of(settle, "if (!execution::uncertain_hold_ends(it->second.at, "
                                   "block_height, take_sweep_clear_block_)) {"),
               std::string::npos);
-    // Given up only on evidence read whole.
+    // Given up only on evidence read whole; an old unreadable take is warned
+    // about, once, with the way out.
     EXPECT_NE(position_of(settle, "state, proof.has_value() && take.has_value(), evidence_read,"),
+              std::string::npos);
+    EXPECT_NE(position_of(settle, "&& take_unreadable_warned_.insert(trade_id).second) {"),
               std::string::npos);
     // Booked only into ready books, and only once deep enough -- in both.
     const std::size_t ready = position_of(settle, "&& (!ledger_genesis_done_ || ledger_incomplete_)) {");

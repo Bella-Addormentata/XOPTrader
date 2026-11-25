@@ -144,8 +144,11 @@ the ledger held 44.54 XCH that never moved.
 - **A take that fails books nothing.**  FAILED or CANCELLED in the wallet: no
   legs, no `taker_fills` row.  A take still pending is given up after five
   hours only on an answer the wallet gave, never on a read that failed; the
-  sweep still books it if it settles.  A take booked under one spelling of
-  its id is not booked again under the other (`0x<id>` or `<id>`, any case).
+  sweep still books it if it settles.  A take whose record or payment stays
+  unreadable is kept, and warned about once after five hours: if the wallet
+  no longer has the trade, the operator stops the engine and deletes its
+  `take_holds` row.  A take booked under one spelling of its id is not booked
+  again under the other (`0x<id>` or `<id>`, any case).
 - **One take of an offer at a time.**  While a take of a Dexie offer is
   unsettled the engine does not take that offer again, and a take request that
   may have reached the wallet unanswered is never re-sent.  The hold is written
