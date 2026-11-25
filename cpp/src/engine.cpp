@@ -23434,9 +23434,11 @@ asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)
             if (!price) break;
 
             // Balances with this take in them before it is booked, as the
-            // settle step reads them.
-            if (!co_await refresh_take_balances({pc->base_asset_id, pc->quote_asset_id},
-                                                block_height)) {
+            // settle step reads them.  A named vector, not a braced list in
+            // the co_await: GCC 13 fails on that (an internal compiler error
+            // in build_special_member_call).
+            std::vector<AssetId> moved{pc->base_asset_id, pc->quote_asset_id};
+            if (!co_await refresh_take_balances(std::move(moved), block_height)) {
                 spdlog::debug("[Engine] [TAKE-SETTLE] sweep: no fresh wallet balance "
                               "for take {} -- next sweep", short_id);
                 break;

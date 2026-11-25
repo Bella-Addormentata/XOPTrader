@@ -746,8 +746,9 @@ TEST(TakeSettlementWiring, ABookingTiesToFreshBalancesAndNoGuiTakeIsSweptTwice) 
     const std::string sweep = function_body(
         raw, "asio::awaitable<void> Engine::step_sweep_missed_takes(BlockHeight block_height)");
     const std::size_t sweep_fresh = position_of(
-        sweep, "if (!co_await refresh_take_balances({pc->base_asset_id, pc->quote_asset_id}, "
-               "block_height)) {");
+        sweep, "if (!co_await refresh_take_balances(std::move(moved), block_height)) {");
+    // A named vector, not a braced list inside the co_await (GCC 13 fails on it).
+    EXPECT_EQ(count_of(squeeze(raw), "co_await refresh_take_balances({"), 0u);
     ASSERT_NE(sweep_fresh, std::string::npos);
     EXPECT_LT(position_of(sweep, "proof = prove_take_receipts(*take, coins);"), sweep_fresh);
     // The re-check after the awaits comes after this one too.
