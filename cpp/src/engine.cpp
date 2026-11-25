@@ -23120,10 +23120,12 @@ asio::awaitable<void> Engine::step_settle_pending_takes(BlockHeight block_height
         const execution::TakeVerdict verdict = execution::judge_take(
             state, proof.has_value() && take.has_value(), evidence_read,
             it->second.submitted_block, block_height);
-        // An unanswered read is never evidence, so such a take is kept -- say
-        // so once it is old, with the way out, since its exposure widens the
-        // ledger check's tolerance for as long as it is kept.
-        if (!evidence_read && block_height > it->second.submitted_block
+        // An unanswered read is never evidence, and neither is a status the
+        // wallet reports that reads as no known state: such a take is kept --
+        // say so once it is old, with the way out, since its exposure widens
+        // the ledger check's tolerance for as long as it is kept.
+        if ((!evidence_read || state == execution::WalletCancelState::Unknown)
+            && block_height > it->second.submitted_block
             && block_height - it->second.submitted_block > execution::kTakeSettleGiveUpBlocks
             && take_unreadable_warned_.insert(trade_id).second) {
             spdlog::warn("[Engine] [TAKE-SETTLE] {} take {} on {}: its wallet record or "

@@ -800,6 +800,8 @@ TEST(TakeSettlementWiring, Round5TheSweepAndTheSettleStepWaitForEvidence) {
               std::string::npos);
     EXPECT_NE(position_of(settle, "&& take_unreadable_warned_.insert(trade_id).second) {"),
               std::string::npos);
+    EXPECT_NE(position_of(settle, "if ((!evidence_read || state == "
+                                  "execution::WalletCancelState::Unknown)"), std::string::npos);
     // Booked only into ready books, and only once deep enough -- in both.
     const std::size_t ready = position_of(settle, "&& (!ledger_genesis_done_ || ledger_incomplete_)) {");
     const std::size_t deep = position_of(settle, "if (!execution::take_deep_enough(");
